@@ -693,6 +693,24 @@ class MicrogliaAnalysisGUI(QMainWindow):
         sharpen_layout.addWidget(self.sharpen_label)
         extra_layout.addLayout(sharpen_layout)
 
+        # CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        extra_layout.addWidget(self.clahe_check)
+
+        clahe_clip_layout = QHBoxLayout()
+        clahe_clip_layout.addWidget(QLabel("  Clip limit:"))
+        clahe_clip_layout.addWidget(self.clahe_clip_slider)
+        self.clahe_clip_slider.valueChanged.connect(lambda v: self.clahe_clip_label.setText(f"{v / 100:.2f}"))
+        clahe_clip_layout.addWidget(self.clahe_clip_label)
+        clahe_clip_layout.addStretch()
+        extra_layout.addLayout(clahe_clip_layout)
+
+        clahe_grid_layout = QHBoxLayout()
+        clahe_grid_layout.addWidget(QLabel("  Grid size:"))
+        clahe_grid_layout.addWidget(self.clahe_grid_spin)
+        clahe_grid_layout.addWidget(QLabel("(tiles)"))
+        clahe_grid_layout.addStretch()
+        extra_layout.addLayout(clahe_grid_layout)
+
         extra_processing_group.setLayout(extra_layout)
         param_layout.addWidget(extra_processing_group)
 
