@@ -15,7 +15,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush
 from PIL import Image
 import tifffile
-from skimage import restoration, color, measure, exposure
+from skimage import restoration, color, measure, exposure, morphology
 from scipy import ndimage, stats
 from matplotlib.path import Path as mplPath
 import cv2
@@ -125,7 +125,7 @@ class BatchProcessingThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, denoise_enabled, denoise_size, sharpen_enabled,
-                    sharpen_amount, threshold_enabled, threshold_value) in enumerate(
+                    sharpen_amount, tophat_enabled, tophat_size) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
@@ -133,10 +133,10 @@ class BatchProcessingThread(QThread):
                     img = ensure_grayscale(img)
                     img_dtype = img.dtype
 
-                    # Apply threshold blackening FIRST (before rolling ball)
-                    if threshold_enabled:
-                        img = img.copy()
-                        img[img <= threshold_value] = 0
+                    # Apply top-hat background removal FIRST (before rolling ball)
+                    if tophat_enabled:
+                        selem = morphology.disk(tophat_size)
+                        img = morphology.white_tophat(img, selem)
 
                     # Apply rolling ball background removal
                     background = restoration.rolling_ball(img, radius=radius)
@@ -252,7 +252,7 @@ class BackgroundRemovalThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, denoise_enabled, denoise_size, sharpen_enabled,
-                    sharpen_amount, threshold_enabled, threshold_value) in enumerate(
+                    sharpen_amount, tophat_enabled, tophat_size) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
@@ -260,10 +260,10 @@ class BackgroundRemovalThread(QThread):
                     img = ensure_grayscale(img)
                     img_dtype = img.dtype
 
-                    # Apply threshold blackening FIRST (before rolling ball)
-                    if threshold_enabled:
-                        img = img.copy()
-                        img[img <= threshold_value] = 0
+                    # Apply top-hat background removal FIRST (before rolling ball)
+                    if tophat_enabled:
+                        selem = morphology.disk(tophat_size)
+                        img = morphology.white_tophat(img, selem)
 
                     # Apply rolling ball background removal
                     background = restoration.rolling_ball(img, radius=radius)
@@ -607,18 +607,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.use_imagej = False
 
         rb_layout = QHBoxLayout()
-        # Threshold blackening controls (will be added to Additional Processing section)
-        self.threshold_check = QCheckBox("Blacken pixels below threshold (applied FIRST)")
-        self.threshold_check.setChecked(False)
-        self.threshold_check.setToolTip("Set all pixels below threshold to black before any processing")
+        # Top-hat background removal controls (will be added to Additional Processing section)
+        self.tophat_check = QCheckBox("Apply Top-Hat Background Removal (applied FIRST)")
+        self.tophat_check.setChecked(False)
+        self.tophat_check.setToolTip("Morphological top-hat transform to remove background before rolling ball")
 
-        # Threshold slider and spinbox (0-255)
-        self.threshold_slider = QSlider(Qt.Horizontal)
-        self.threshold_slider.setRange(0, 255)
-        self.threshold_slider.setValue(10)  # Default threshold
-        self.threshold_spinbox = QSpinBox()
-        self.threshold_spinbox.setRange(0, 255)
-        self.threshold_spinbox.setValue(10)  # Default threshold
+        # Top-hat size spinbox (disk radius for structuring element)
+        self.tophat_spinbox = QSpinBox()
+        self.tophat_spinbox.setRange(1, 50)
+        self.tophat_spinbox.setValue(15)  # Default size
 
         rb_layout.addWidget(QLabel("Rolling ball radius:"))
         self.rb_slider = QSlider(Qt.Horizontal)
@@ -675,19 +672,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         extra_layout.addSpacing(8)
 
-        # Threshold blackening (applied BEFORE rolling ball)
-        extra_layout.addWidget(self.threshold_check)
+        # Top-hat background removal (applied BEFORE rolling ball)
+        extra_layout.addWidget(self.tophat_check)
 
-        threshold_layout = QHBoxLayout()
-        threshold_layout.addWidget(QLabel("  Threshold value:"))
-        threshold_layout.addWidget(self.threshold_slider)
-        threshold_layout.addWidget(self.threshold_spinbox)
-        threshold_layout.addWidget(QLabel("(0-255)"))
-        # Connect slider and spinbox to sync with each other
-        self.threshold_slider.valueChanged.connect(self.threshold_spinbox.setValue)
-        self.threshold_spinbox.valueChanged.connect(self.threshold_slider.setValue)
-        threshold_layout.addStretch()
-        extra_layout.addLayout(threshold_layout)
+        tophat_layout = QHBoxLayout()
+        tophat_layout.addWidget(QLabel("  Disk radius:"))
+        tophat_layout.addWidget(self.tophat_spinbox)
+        tophat_layout.addWidget(QLabel("(structuring element size)"))
+        tophat_layout.addStretch()
+        extra_layout.addLayout(tophat_layout)
 
         extra_processing_group.setLayout(extra_layout)
         param_layout.addWidget(extra_processing_group)
@@ -1220,11 +1213,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         raw_img = load_tiff_image(img_data['raw_path'])
         raw_img = ensure_grayscale(raw_img)
 
-        # Apply threshold blackening FIRST (before any other processing)
-        if self.threshold_check.isChecked():
-            threshold_value = self.threshold_slider.value()
-            raw_img = raw_img.copy()  # Don't modify original
-            raw_img[raw_img <= threshold_value] = 0
+        # Apply top-hat background removal FIRST (before rolling ball)
+        if self.tophat_check.isChecked():
+            tophat_size = self.tophat_spinbox.value()
+            selem = morphology.disk(tophat_size)
+            raw_img = morphology.white_tophat(raw_img, selem)
 
         # Now apply rolling ball background removal
         background = restoration.rolling_ball(raw_img, radius=radius)
@@ -1252,8 +1245,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.preview_label.set_image(pixmap)
         self.tabs.setCurrentIndex(1)
         steps = []
-        if self.threshold_check.isChecked():
-            steps.append(f"Threshold≤{self.threshold_slider.value()}→Black")
+        if self.tophat_check.isChecked():
+            steps.append(f"TopHat(r={self.tophat_spinbox.value()})")
         steps.append(f"RB={radius}")
         if self.denoise_check.isChecked():
             steps.append(f"Denoise={self.denoise_spin.value()}")
@@ -1275,14 +1268,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         denoise_size = self.denoise_spin.value()
         sharpen_enabled = self.sharpen_check.isChecked()
         sharpen_amount = self.sharpen_slider.value() / 10.0
-        threshold_enabled = self.threshold_check.isChecked()
-        threshold_value = self.threshold_slider.value()
+        tophat_enabled = self.tophat_check.isChecked()
+        tophat_size = self.tophat_spinbox.value()
 
         process_list = []
         for img_name, img_data in selected_images:
             process_list.append((img_data['raw_path'], img_name, radius,
                                  denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount,
-                                 threshold_enabled, threshold_value))
+                                 tophat_enabled, tophat_size))
 
         self.thread = BackgroundRemovalThread(process_list, self.output_dir)
         self.thread.status_update.connect(self.log)
