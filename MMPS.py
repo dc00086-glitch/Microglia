@@ -612,11 +612,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.threshold_check.setChecked(False)
         self.threshold_check.setToolTip("Set all pixels below threshold to black before any processing")
 
-        # Threshold slider (0-65535 for 16-bit, will scale for 8-bit)
+        # Threshold slider and spinbox (0-255)
         self.threshold_slider = QSlider(Qt.Horizontal)
-        self.threshold_slider.setRange(0, 1000)
-        self.threshold_slider.setValue(100)  # Default threshold
-        self.threshold_label = QLabel("100")
+        self.threshold_slider.setRange(0, 255)
+        self.threshold_slider.setValue(10)  # Default threshold
+        self.threshold_spinbox = QSpinBox()
+        self.threshold_spinbox.setRange(0, 255)
+        self.threshold_spinbox.setValue(10)  # Default threshold
 
         rb_layout.addWidget(QLabel("Rolling ball radius:"))
         self.rb_slider = QSlider(Qt.Horizontal)
@@ -679,9 +681,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         threshold_layout = QHBoxLayout()
         threshold_layout.addWidget(QLabel("  Threshold value:"))
         threshold_layout.addWidget(self.threshold_slider)
-        self.threshold_slider.valueChanged.connect(lambda v: self.threshold_label.setText(str(v)))
-        threshold_layout.addWidget(self.threshold_label)
-        threshold_layout.addWidget(QLabel("(0-1000)"))
+        threshold_layout.addWidget(self.threshold_spinbox)
+        threshold_layout.addWidget(QLabel("(0-255)"))
+        # Connect slider and spinbox to sync with each other
+        self.threshold_slider.valueChanged.connect(self.threshold_spinbox.setValue)
+        self.threshold_spinbox.valueChanged.connect(self.threshold_slider.setValue)
         threshold_layout.addStretch()
         extra_layout.addLayout(threshold_layout)
 
