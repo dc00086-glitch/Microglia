@@ -138,20 +138,28 @@ class BatchProcessingThread(QThread):
 
                     # Apply optional CLAHE
                     if clahe_enabled:
+                        # Create mask to only enhance foreground pixels (preserve black background)
+                        threshold = np.percentile(result[result > 0], 10) if np.any(result > 0) else 0
+                        mask = result > threshold
+
                         if img_dtype == np.uint16:
                             result_clahe = exposure.equalize_adapthist(
                                 result,
                                 kernel_size=clahe_grid,
                                 clip_limit=clahe_clip
                             )
-                            result = (result_clahe * 65535).astype(np.uint16)
+                            # Apply CLAHE only to masked regions, keep background dark
+                            result_enhanced = (result_clahe * 65535).astype(np.uint16)
+                            result = np.where(mask, result_enhanced, result).astype(np.uint16)
                         else:
                             result_clahe = exposure.equalize_adapthist(
                                 result,
                                 kernel_size=clahe_grid,
                                 clip_limit=clahe_clip
                             )
-                            result = (result_clahe * 255).astype(np.uint8)
+                            # Apply CLAHE only to masked regions, keep background dark
+                            result_enhanced = (result_clahe * 255).astype(np.uint8)
+                            result = np.where(mask, result_enhanced, result).astype(np.uint8)
 
                     # Apply optional denoising
                     if denoise_enabled:
@@ -275,20 +283,28 @@ class BackgroundRemovalThread(QThread):
 
                     # Apply optional CLAHE
                     if clahe_enabled:
+                        # Create mask to only enhance foreground pixels (preserve black background)
+                        threshold = np.percentile(result[result > 0], 10) if np.any(result > 0) else 0
+                        mask = result > threshold
+
                         if img_dtype == np.uint16:
                             result_clahe = exposure.equalize_adapthist(
                                 result,
                                 kernel_size=clahe_grid,
                                 clip_limit=clahe_clip
                             )
-                            result = (result_clahe * 65535).astype(np.uint16)
+                            # Apply CLAHE only to masked regions, keep background dark
+                            result_enhanced = (result_clahe * 65535).astype(np.uint16)
+                            result = np.where(mask, result_enhanced, result).astype(np.uint16)
                         else:
                             result_clahe = exposure.equalize_adapthist(
                                 result,
                                 kernel_size=clahe_grid,
                                 clip_limit=clahe_clip
                             )
-                            result = (result_clahe * 255).astype(np.uint8)
+                            # Apply CLAHE only to masked regions, keep background dark
+                            result_enhanced = (result_clahe * 255).astype(np.uint8)
+                            result = np.where(mask, result_enhanced, result).astype(np.uint8)
 
                     # Apply optional denoising
                     if denoise_enabled:
@@ -1253,20 +1269,30 @@ class MicrogliaAnalysisGUI(QMainWindow):
             clahe_clip = self.clahe_clip_slider.value() / 100.0
             clahe_grid = self.clahe_grid_spin.value()
             img_dtype = result.dtype
+
+            # Create mask to only enhance foreground pixels (preserve black background)
+            # Use percentile to find threshold - only enhance pixels above background noise
+            threshold = np.percentile(result[result > 0], 10) if np.any(result > 0) else 0
+            mask = result > threshold
+
             if img_dtype == np.uint16:
                 result_clahe = exposure.equalize_adapthist(
                     result,
                     kernel_size=clahe_grid,
                     clip_limit=clahe_clip
                 )
-                result = (result_clahe * 65535).astype(np.uint16)
+                # Apply CLAHE only to masked regions, keep background dark
+                result_enhanced = (result_clahe * 65535).astype(np.uint16)
+                result = np.where(mask, result_enhanced, result).astype(np.uint16)
             else:
                 result_clahe = exposure.equalize_adapthist(
                     result,
                     kernel_size=clahe_grid,
                     clip_limit=clahe_clip
                 )
-                result = (result_clahe * 255).astype(np.uint8)
+                # Apply CLAHE only to masked regions, keep background dark
+                result_enhanced = (result_clahe * 255).astype(np.uint8)
+                result = np.where(mask, result_enhanced, result).astype(np.uint8)
         # Apply optional denoising
         if self.denoise_check.isChecked():
             denoise_size = self.denoise_spin.value()
