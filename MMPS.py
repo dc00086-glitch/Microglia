@@ -658,8 +658,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Additional processing options
         extra_processing_group = QGroupBox("Additional Processing (Optional)")
-        extra_processing_group.setMinimumHeight(150)
+        extra_processing_group.setMinimumHeight(280)
         extra_layout = QVBoxLayout()
+        extra_layout.setSpacing(10)
 
         # Denoising
         self.denoise_check = QCheckBox("Apply Denoising (Median Filter)")
@@ -677,6 +678,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         denoise_layout.addStretch()
         extra_layout.addLayout(denoise_layout)
 
+        extra_layout.addSpacing(8)
+
         # Sharpening
         self.sharpen_check = QCheckBox("Apply Sharpening (Unsharp Mask)")
         self.sharpen_check.setChecked(False)
@@ -692,6 +695,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.sharpen_slider.valueChanged.connect(lambda v: self.sharpen_label.setText(f"{v / 10:.1f}"))
         sharpen_layout.addWidget(self.sharpen_label)
         extra_layout.addLayout(sharpen_layout)
+
+        extra_layout.addSpacing(8)
 
         # CLAHE (Contrast Limited Adaptive Histogram Equalization)
         extra_layout.addWidget(self.clahe_check)
