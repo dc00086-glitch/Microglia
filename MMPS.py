@@ -125,41 +125,23 @@ class BatchProcessingThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, denoise_enabled, denoise_size, sharpen_enabled,
-                    sharpen_amount, clahe_enabled, clahe_clip, clahe_grid) in enumerate(
+                    sharpen_amount, threshold_enabled, threshold_value) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
                     img = load_tiff_image(img_path)
                     img = ensure_grayscale(img)
                     img_dtype = img.dtype
+
+                    # Apply threshold blackening FIRST (before rolling ball)
+                    if threshold_enabled:
+                        img = img.copy()
+                        img[img <= threshold_value] = 0
+
+                    # Apply rolling ball background removal
                     background = restoration.rolling_ball(img, radius=radius)
                     result = img - background
                     result = np.clip(result, 0, np.iinfo(img_dtype).max)
-
-                    # Apply optional CLAHE
-                    if clahe_enabled:
-                        # Create mask to only enhance foreground pixels (preserve black background)
-                        threshold = np.percentile(result[result > 0], 10) if np.any(result > 0) else 0
-                        mask = result > threshold
-
-                        if img_dtype == np.uint16:
-                            result_clahe = exposure.equalize_adapthist(
-                                result,
-                                kernel_size=clahe_grid,
-                                clip_limit=clahe_clip
-                            )
-                            # Apply CLAHE only to masked regions, keep background dark
-                            result_enhanced = (result_clahe * 65535).astype(np.uint16)
-                            result = np.where(mask, result_enhanced, result).astype(np.uint16)
-                        else:
-                            result_clahe = exposure.equalize_adapthist(
-                                result,
-                                kernel_size=clahe_grid,
-                                clip_limit=clahe_clip
-                            )
-                            # Apply CLAHE only to masked regions, keep background dark
-                            result_enhanced = (result_clahe * 255).astype(np.uint8)
-                            result = np.where(mask, result_enhanced, result).astype(np.uint8)
 
                     # Apply optional denoising
                     if denoise_enabled:
@@ -270,41 +252,23 @@ class BackgroundRemovalThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, denoise_enabled, denoise_size, sharpen_enabled,
-                    sharpen_amount, clahe_enabled, clahe_clip, clahe_grid) in enumerate(
+                    sharpen_amount, threshold_enabled, threshold_value) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
                     img = load_tiff_image(img_path)
                     img = ensure_grayscale(img)
                     img_dtype = img.dtype
+
+                    # Apply threshold blackening FIRST (before rolling ball)
+                    if threshold_enabled:
+                        img = img.copy()
+                        img[img <= threshold_value] = 0
+
+                    # Apply rolling ball background removal
                     background = restoration.rolling_ball(img, radius=radius)
                     result = img - background
                     result = np.clip(result, 0, np.iinfo(img_dtype).max)
-
-                    # Apply optional CLAHE
-                    if clahe_enabled:
-                        # Create mask to only enhance foreground pixels (preserve black background)
-                        threshold = np.percentile(result[result > 0], 10) if np.any(result > 0) else 0
-                        mask = result > threshold
-
-                        if img_dtype == np.uint16:
-                            result_clahe = exposure.equalize_adapthist(
-                                result,
-                                kernel_size=clahe_grid,
-                                clip_limit=clahe_clip
-                            )
-                            # Apply CLAHE only to masked regions, keep background dark
-                            result_enhanced = (result_clahe * 65535).astype(np.uint16)
-                            result = np.where(mask, result_enhanced, result).astype(np.uint16)
-                        else:
-                            result_clahe = exposure.equalize_adapthist(
-                                result,
-                                kernel_size=clahe_grid,
-                                clip_limit=clahe_clip
-                            )
-                            # Apply CLAHE only to masked regions, keep background dark
-                            result_enhanced = (result_clahe * 255).astype(np.uint8)
-                            result = np.where(mask, result_enhanced, result).astype(np.uint8)
 
                     # Apply optional denoising
                     if denoise_enabled:
@@ -643,22 +607,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.use_imagej = False
 
         rb_layout = QHBoxLayout()
-        # CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        self.clahe_check = QCheckBox("Apply CLAHE (Enhance Local Contrast)")
-        self.clahe_check.setChecked(False)
-        self.clahe_check.setToolTip("CLAHE improves contrast in local regions, useful for uneven illumination")
+        # Threshold blackening controls (will be added to Additional Processing section)
+        self.threshold_check = QCheckBox("Blacken pixels below threshold (applied FIRST)")
+        self.threshold_check.setChecked(False)
+        self.threshold_check.setToolTip("Set all pixels below threshold to black before any processing")
 
-        # Clip limit slider (controls contrast enhancement strength)
-        self.clahe_clip_slider = QSlider(Qt.Horizontal)
-        self.clahe_clip_slider.setRange(1, 50)
-        self.clahe_clip_slider.setValue(3)  # Default: 0.03
-        self.clahe_clip_label = QLabel("0.03")
+        # Threshold slider (0-65535 for 16-bit, will scale for 8-bit)
+        self.threshold_slider = QSlider(Qt.Horizontal)
+        self.threshold_slider.setRange(0, 1000)
+        self.threshold_slider.setValue(100)  # Default threshold
+        self.threshold_label = QLabel("100")
 
-        # Grid size spinner (controls how local the enhancement is)
-        self.clahe_grid_spin = QSpinBox()
-        self.clahe_grid_spin.setRange(4, 32)
-        self.clahe_grid_spin.setValue(8)  # Default: 8x8 tiles
-        self.clahe_grid_spin.setSingleStep(4)
         rb_layout.addWidget(QLabel("Rolling ball radius:"))
         self.rb_slider = QSlider(Qt.Horizontal)
         self.rb_slider.setRange(5, 150)
@@ -714,23 +673,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         extra_layout.addSpacing(8)
 
-        # CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        extra_layout.addWidget(self.clahe_check)
+        # Threshold blackening (applied BEFORE rolling ball)
+        extra_layout.addWidget(self.threshold_check)
 
-        clahe_clip_layout = QHBoxLayout()
-        clahe_clip_layout.addWidget(QLabel("  Clip limit:"))
-        clahe_clip_layout.addWidget(self.clahe_clip_slider)
-        self.clahe_clip_slider.valueChanged.connect(lambda v: self.clahe_clip_label.setText(f"{v / 100:.2f}"))
-        clahe_clip_layout.addWidget(self.clahe_clip_label)
-        clahe_clip_layout.addStretch()
-        extra_layout.addLayout(clahe_clip_layout)
-
-        clahe_grid_layout = QHBoxLayout()
-        clahe_grid_layout.addWidget(QLabel("  Grid size:"))
-        clahe_grid_layout.addWidget(self.clahe_grid_spin)
-        clahe_grid_layout.addWidget(QLabel("(tiles)"))
-        clahe_grid_layout.addStretch()
-        extra_layout.addLayout(clahe_grid_layout)
+        threshold_layout = QHBoxLayout()
+        threshold_layout.addWidget(QLabel("  Threshold value:"))
+        threshold_layout.addWidget(self.threshold_slider)
+        self.threshold_slider.valueChanged.connect(lambda v: self.threshold_label.setText(str(v)))
+        threshold_layout.addWidget(self.threshold_label)
+        threshold_layout.addWidget(QLabel("(0-1000)"))
+        threshold_layout.addStretch()
+        extra_layout.addLayout(threshold_layout)
 
         extra_processing_group.setLayout(extra_layout)
         param_layout.addWidget(extra_processing_group)
@@ -1262,37 +1215,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         radius = self.rb_slider.value()
         raw_img = load_tiff_image(img_data['raw_path'])
         raw_img = ensure_grayscale(raw_img)
+
+        # Apply threshold blackening FIRST (before any other processing)
+        if self.threshold_check.isChecked():
+            threshold_value = self.threshold_slider.value()
+            raw_img = raw_img.copy()  # Don't modify original
+            raw_img[raw_img <= threshold_value] = 0
+
+        # Now apply rolling ball background removal
         background = restoration.rolling_ball(raw_img, radius=radius)
         result = raw_img - background
         result = np.clip(result, 0, raw_img.max())
-        if self.clahe_check.isChecked():
-            clahe_clip = self.clahe_clip_slider.value() / 100.0
-            clahe_grid = self.clahe_grid_spin.value()
-            img_dtype = result.dtype
 
-            # Create mask to only enhance foreground pixels (preserve black background)
-            # Use percentile to find threshold - only enhance pixels above background noise
-            threshold = np.percentile(result[result > 0], 10) if np.any(result > 0) else 0
-            mask = result > threshold
-
-            if img_dtype == np.uint16:
-                result_clahe = exposure.equalize_adapthist(
-                    result,
-                    kernel_size=clahe_grid,
-                    clip_limit=clahe_clip
-                )
-                # Apply CLAHE only to masked regions, keep background dark
-                result_enhanced = (result_clahe * 65535).astype(np.uint16)
-                result = np.where(mask, result_enhanced, result).astype(np.uint16)
-            else:
-                result_clahe = exposure.equalize_adapthist(
-                    result,
-                    kernel_size=clahe_grid,
-                    clip_limit=clahe_clip
-                )
-                # Apply CLAHE only to masked regions, keep background dark
-                result_enhanced = (result_clahe * 255).astype(np.uint8)
-                result = np.where(mask, result_enhanced, result).astype(np.uint8)
         # Apply optional denoising
         if self.denoise_check.isChecked():
             denoise_size = self.denoise_spin.value()
@@ -1313,7 +1247,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
         self.preview_label.set_image(pixmap)
         self.tabs.setCurrentIndex(1)
-        steps = [f"RB={radius}"]
+        steps = []
+        if self.threshold_check.isChecked():
+            steps.append(f"Threshold≤{self.threshold_slider.value()}→Black")
+        steps.append(f"RB={radius}")
         if self.denoise_check.isChecked():
             steps.append(f"Denoise={self.denoise_spin.value()}")
         if self.sharpen_check.isChecked():
@@ -1334,15 +1271,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         denoise_size = self.denoise_spin.value()
         sharpen_enabled = self.sharpen_check.isChecked()
         sharpen_amount = self.sharpen_slider.value() / 10.0
-        clahe_enabled = self.clahe_check.isChecked()
-        clahe_clip = self.clahe_clip_slider.value() / 100.0
-        clahe_grid = self.clahe_grid_spin.value()
+        threshold_enabled = self.threshold_check.isChecked()
+        threshold_value = self.threshold_slider.value()
 
         process_list = []
         for img_name, img_data in selected_images:
             process_list.append((img_data['raw_path'], img_name, radius,
                                  denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount,
-                                 clahe_enabled, clahe_clip, clahe_grid))
+                                 threshold_enabled, threshold_value))
 
         self.thread = BackgroundRemovalThread(process_list, self.output_dir)
         self.thread.status_update.connect(self.log)
