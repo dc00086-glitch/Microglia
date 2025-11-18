@@ -245,7 +245,7 @@ class BackgroundRemovalThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, denoise_enabled, denoise_size, sharpen_enabled,
-                    sharpen_amount) in enumerate(
+                    sharpen_amount, clahe_enabled, clahe_clip, clahe_grid) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
@@ -255,6 +255,23 @@ class BackgroundRemovalThread(QThread):
                     background = restoration.rolling_ball(img, radius=radius)
                     result = img - background
                     result = np.clip(result, 0, np.iinfo(img_dtype).max)
+
+                    # Apply optional CLAHE
+                    if clahe_enabled:
+                        if img_dtype == np.uint16:
+                            result_clahe = exposure.equalize_adapthist(
+                                result,
+                                kernel_size=clahe_grid,
+                                clip_limit=clahe_clip
+                            )
+                            result = (result_clahe * 65535).astype(np.uint16)
+                        else:
+                            result_clahe = exposure.equalize_adapthist(
+                                result,
+                                kernel_size=clahe_grid,
+                                clip_limit=clahe_clip
+                            )
+                            result = (result_clahe * 255).astype(np.uint8)
 
                     # Apply optional denoising
                     if denoise_enabled:
@@ -1251,20 +1268,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         denoise_size = self.denoise_spin.value()
         sharpen_enabled = self.sharpen_check.isChecked()
         sharpen_amount = self.sharpen_slider.value() / 10.0
+        clahe_enabled = self.clahe_check.isChecked()
+        clahe_clip = self.clahe_clip_slider.value() / 100.0  # Convert to 0.0-0.5 range
+        clahe_grid = self.clahe_grid_spin.value()
 
         process_list = []
         for img_name, img_data in selected_images:
             process_list.append((img_data['raw_path'], img_name, radius,
-                                 denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount))
-        clahe_enabled = self.clahe_check.isChecked()
-        clahe_clip = self.clahe_clip_slider.value()
-        clahe_grid = self.clahe_grid_spin.value()
+                                 denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount,
+                                 clahe_enabled, clahe_clip, clahe_grid))  # Added CLAHE params
 
-        process_list.append((img_data['raw_path'], img_name, radius,
-                             denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount,
-                             clahe_enabled, clahe_clip, clahe_grid))  # Added CLAHE params
-        if self.clahe_check.isChecked():
-            steps.append(f"CLAHE(clip={self.clahe_clip_slider.value() / 100:.2f}, grid={self.clahe_grid_spin.value()})")
         self.thread = BackgroundRemovalThread(process_list, self.output_dir)
         self.thread.status_update.connect(self.log)
         self.thread.progress.connect(self._update_progress)
