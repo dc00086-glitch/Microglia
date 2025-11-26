@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Install appropriate packages if not already installed"""
 
 import sys
@@ -1001,13 +1002,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         legend_text = """
 <h3>Workflow Status Colors:</h3>
 <p style='line-height: 1.8;'>
-<span style='color: #808080;'><b>⚪ Image(s) Loaded</b></span> - Images have been loaded into the application<br>
-<span style='color: #009600;'><b>🟢 Image(s) Processed</b></span> - Background removal completed<br>
-<span style='color: #0064C8;'><b>🔵 Somas Selected</b></span> - Soma centers have been marked<br>
-<span style='color: #C89600;'><b>🟡 Somas Outlined</b></span> - Soma boundaries have been outlined<br>
-<span style='color: #FF8C00;'><b>🟠 Masks Generated</b></span> - Cell masks have been generated<br>
-<span style='color: #800080;'><b>🟣 Masks QA'ed</b></span> - Quality assurance review completed<br>
-<span style='color: #00B400;'><b>✅ Mask Characteristics Processed</b></span> - Morphological analysis complete
+<span style='color: #808080;'><b>[ ] Image(s) Loaded</b></span> - Images have been loaded into the application<br>
+<span style='color: #009600;'><b>[P] Image(s) Processed</b></span> - Background removal completed<br>
+<span style='color: #0064C8;'><b>[S] Somas Selected</b></span> - Soma centers have been marked<br>
+<span style='color: #C89600;'><b>[O] Somas Outlined</b></span> - Soma boundaries have been outlined<br>
+<span style='color: #FF8C00;'><b>[M] Masks Generated</b></span> - Cell masks have been generated<br>
+<span style='color: #800080;'><b>[Q] Masks QA'ed</b></span> - Quality assurance review completed<br>
+<span style='color: #00B400;'><b>[A] Mask Characteristics Processed</b></span> - Morphological analysis complete
 </p>
         """
 
