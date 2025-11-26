@@ -314,32 +314,55 @@ class InteractiveImageLabel(QLabel):
         self._update_display()
 
     def _update_display(self):
-        """Update the displayed image with current zoom"""
+        """Update the displayed image with current zoom and pan"""
         if not self.base_pixmap:
             super().setPixmap(QPixmap())
             return
 
-        label_size = self.size()
+        label_w = self.size().width()
+        label_h = self.size().height()
 
-        # First fit to label size
+        # Scale base image to fit label
         fitted_pix = self.base_pixmap.scaled(
-            label_size.width(),
-            label_size.height(),
+            label_w, label_h,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation
         )
 
-        # Then apply zoom if needed
+        # If zoomed, create a cropped view
         if self.zoom_factor != 1.0:
-            scaled_w = int(fitted_pix.width() * self.zoom_factor)
-            scaled_h = int(fitted_pix.height() * self.zoom_factor)
-            fitted_pix = fitted_pix.scaled(
-                scaled_w, scaled_h,
+            # Scale to zoomed size
+            zoomed_w = int(fitted_pix.width() * self.zoom_factor)
+            zoomed_h = int(fitted_pix.height() * self.zoom_factor)
+            zoomed_pix = fitted_pix.scaled(
+                zoomed_w, zoomed_h,
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
 
-        super().setPixmap(fitted_pix)
+            # Calculate crop region (centered, adjusted by pan offset)
+            # Center point in zoomed image
+            center_x = zoomed_w / 2
+            center_y = zoomed_h / 2
+
+            # Adjust by pan offset
+            center_x -= self.pan_offset[0]
+            center_y -= self.pan_offset[1]
+
+            # Calculate crop rectangle
+            crop_x = int(center_x - label_w / 2)
+            crop_y = int(center_y - label_h / 2)
+
+            # Clamp to valid region
+            crop_x = max(0, min(crop_x, zoomed_w - label_w))
+            crop_y = max(0, min(crop_y, zoomed_h - label_h))
+
+            # Crop the zoomed pixmap
+            cropped_pix = zoomed_pix.copy(crop_x, crop_y, label_w, label_h)
+            super().setPixmap(cropped_pix)
+        else:
+            super().setPixmap(fitted_pix)
+
         self.update()
 
     def paintEvent(self, event):
@@ -406,13 +429,14 @@ class InteractiveImageLabel(QLabel):
         point_y_in_zoomed = point_y_in_fitted * self.zoom_factor
 
         # Calculate pan offset to center the point
-        self.pan_offset[0] = (label_w / 2) - point_x_in_zoomed
-        self.pan_offset[1] = (label_h / 2) - point_y_in_zoomed
-
-        self._update_display()
+        # pan_offset is how much to shift from the default center (zoomed_w/2, zoomed_h/2)
+        self.pan_offset[0] = (zoomed_w / 2) - point_x_in_zoomed
+        self.pan_offset[1] = (zoomed_h / 2) - point_y_in_zoomed
 
         if self.parent_widget and hasattr(self.parent_widget, 'log'):
-            self.parent_widget.log(f"✓ Zoomed to {zoom_level}x at point ({img_y}, {img_x})")
+            self.parent_widget.log(f"🔍 Auto-zoom to {zoom_level}x at ({img_y}, {img_x}) | pan_offset=({self.pan_offset[0]:.1f}, {self.pan_offset[1]:.1f})")
+
+        self._update_display()
 
     def reset_view(self):
         """Reset zoom and pan to default"""
@@ -483,7 +507,7 @@ class InteractiveImageLabel(QLabel):
 
     def _to_display_coords(self, img_coords):
         """Convert image coordinates to display coordinates accounting for zoom and pan"""
-        if not self.pix_source:
+        if not self.pix_source or not self.base_pixmap:
             return 0, 0
 
         img_y, img_x = img_coords[0], img_coords[1]
@@ -495,7 +519,7 @@ class InteractiveImageLabel(QLabel):
             label_w, label_h,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation
-        ) if self.base_pixmap else self.pix_source
+        )
         fitted_w = fitted_pix.width()
         fitted_h = fitted_pix.height()
 
@@ -503,20 +527,34 @@ class InteractiveImageLabel(QLabel):
         scale_x = fitted_w / img_w
         scale_y = fitted_h / img_h
 
-        # Apply scale and zoom
+        # Apply scale to get position in fitted image
         x_in_fitted = img_x * scale_x
         y_in_fitted = img_y * scale_y
 
-        x_in_zoomed = x_in_fitted * self.zoom_factor
-        y_in_zoomed = y_in_fitted * self.zoom_factor
+        if self.zoom_factor != 1.0:
+            # Apply zoom
+            x_in_zoomed = x_in_fitted * self.zoom_factor
+            y_in_zoomed = y_in_fitted * self.zoom_factor
 
-        # Center the fitted/zoomed image in label
-        offset_x = (label_w - fitted_w * self.zoom_factor) / 2
-        offset_y = (label_h - fitted_h * self.zoom_factor) / 2
+            # Calculate crop offset (same as in _update_display)
+            zoomed_w = fitted_w * self.zoom_factor
+            zoomed_h = fitted_h * self.zoom_factor
 
-        # Apply offsets (including pan)
-        x = x_in_zoomed + offset_x + self.pan_offset[0]
-        y = y_in_zoomed + offset_y + self.pan_offset[1]
+            center_x = zoomed_w / 2 - self.pan_offset[0]
+            center_y = zoomed_h / 2 - self.pan_offset[1]
+
+            crop_x = max(0, min(int(center_x - label_w / 2), int(zoomed_w - label_w)))
+            crop_y = max(0, min(int(center_y - label_h / 2), int(zoomed_h - label_h)))
+
+            # Convert to display coords (relative to cropped region)
+            x = x_in_zoomed - crop_x
+            y = y_in_zoomed - crop_y
+        else:
+            # No zoom - center in label
+            offset_x = (label_w - fitted_w) / 2
+            offset_y = (label_h - fitted_h) / 2
+            x = x_in_fitted + offset_x
+            y = y_in_fitted + offset_y
 
         return x, y
 
@@ -525,7 +563,7 @@ class InteractiveImageLabel(QLabel):
         if not self.parent_widget or not hasattr(self.parent_widget, 'get_current_processed_image'):
             return None
         current_img = self.parent_widget.get_current_processed_image()
-        if current_img is None:
+        if current_img is None or not self.base_pixmap:
             return None
 
         img_shape = current_img.shape
@@ -533,9 +571,6 @@ class InteractiveImageLabel(QLabel):
         label_w, label_h = self.size().width(), self.size().height()
 
         # Get fitted size (before zoom)
-        if not self.base_pixmap:
-            return None
-
         fitted_pix = self.base_pixmap.scaled(
             label_w, label_h,
             Qt.KeepAspectRatio,
@@ -544,17 +579,30 @@ class InteractiveImageLabel(QLabel):
         fitted_w = fitted_pix.width()
         fitted_h = fitted_pix.height()
 
-        # Calculate offsets
-        offset_x = (label_w - fitted_w * self.zoom_factor) / 2
-        offset_y = (label_h - fitted_h * self.zoom_factor) / 2
+        if self.zoom_factor != 1.0:
+            # Calculate crop offset (same as in _update_display and _to_display_coords)
+            zoomed_w = fitted_w * self.zoom_factor
+            zoomed_h = fitted_h * self.zoom_factor
 
-        # Remove offsets (including pan)
-        x_in_zoomed = display_x - offset_x - self.pan_offset[0]
-        y_in_zoomed = display_y - offset_y - self.pan_offset[1]
+            center_x = zoomed_w / 2 - self.pan_offset[0]
+            center_y = zoomed_h / 2 - self.pan_offset[1]
 
-        # Remove zoom
-        x_in_fitted = x_in_zoomed / self.zoom_factor
-        y_in_fitted = y_in_zoomed / self.zoom_factor
+            crop_x = max(0, min(int(center_x - label_w / 2), int(zoomed_w - label_w)))
+            crop_y = max(0, min(int(center_y - label_h / 2), int(zoomed_h - label_h)))
+
+            # Convert from display coords to zoomed coords
+            x_in_zoomed = display_x + crop_x
+            y_in_zoomed = display_y + crop_y
+
+            # Remove zoom
+            x_in_fitted = x_in_zoomed / self.zoom_factor
+            y_in_fitted = y_in_zoomed / self.zoom_factor
+        else:
+            # No zoom - remove center offset
+            offset_x = (label_w - fitted_w) / 2
+            offset_y = (label_h - fitted_h) / 2
+            x_in_fitted = display_x - offset_x
+            y_in_fitted = display_y - offset_y
 
         # Calculate scale from fitted to image
         scale_x = img_w / fitted_w
