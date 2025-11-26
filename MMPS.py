@@ -296,22 +296,50 @@ class InteractiveImageLabel(QLabel):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setScaledContents(False)
 
+        # Zoom and pan variables
+        self.zoom_factor = 1.0
+        self.pan_offset = [0, 0]
+        self.is_panning = False
+        self.last_pan_point = None
+        self.base_pixmap = None
+
     def set_image(self, qpix, centroids=None, mask_overlay=None, polygon_pts=None):
+        """Set image and overlays - does NOT apply zoom yet"""
+        self.base_pixmap = qpix
         self.pix_source = qpix
         self.centroids = centroids or []
         self.mask_overlay = mask_overlay
         self.polygon_pts = polygon_pts or []
-        if qpix is not None:
-            # Scale the pixmap to fit the label while maintaining aspect ratio
-            label_size = self.size()
-            scaled_pix = qpix.scaled(
-                label_size.width(),
-                label_size.height(),
+        self._update_display()
+
+    def _update_display(self):
+        """Update the displayed image with current zoom"""
+        if not self.base_pixmap:
+            super().setPixmap(QPixmap())
+            return
+
+        label_size = self.size()
+
+        # First fit to label size
+        fitted_pix = self.base_pixmap.scaled(
+            label_size.width(),
+            label_size.height(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+
+        # Then apply zoom if needed
+        if self.zoom_factor != 1.0:
+            scaled_w = int(fitted_pix.width() * self.zoom_factor)
+            scaled_h = int(fitted_pix.height() * self.zoom_factor)
+            fitted_pix = fitted_pix.scaled(
+                scaled_w, scaled_h,
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
-            super().setPixmap(scaled_pix)
-        self.repaint()
+
+        super().setPixmap(fitted_pix)
+        self.update()
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -333,19 +361,69 @@ class InteractiveImageLabel(QLabel):
     def resizeEvent(self, event):
         """Re-scale the image when the label is resized"""
         super().resizeEvent(event)
-        if self.pix_source is not None:
-            # Re-scale the image to fit the new size
-            label_size = self.size()
-            scaled_pix = self.pix_source.scaled(
-                label_size.width(),
-                label_size.height(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            super().setPixmap(scaled_pix)
-            self.repaint()
+        if self.base_pixmap is not None:
+            self._update_display()
+
+    def auto_zoom_to_point(self, point, zoom_level=3.0):
+        """Auto zoom and center on a specific point"""
+        if not self.base_pixmap or not point:
+            return
+
+        self.zoom_factor = zoom_level
+        img_y, img_x = point
+
+        # Get original image dimensions
+        orig_w = self.base_pixmap.width()
+        orig_h = self.base_pixmap.height()
+
+        # Get label dimensions
+        label_w = self.size().width()
+        label_h = self.size().height()
+
+        # Calculate fitted size (before zoom)
+        fitted_pix = self.base_pixmap.scaled(
+            label_w, label_h,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+        fitted_w = fitted_pix.width()
+        fitted_h = fitted_pix.height()
+
+        # Calculate zoomed size
+        zoomed_w = fitted_w * self.zoom_factor
+        zoomed_h = fitted_h * self.zoom_factor
+
+        # Calculate where the point is in the fitted/zoomed image
+        scale_x = fitted_w / orig_w
+        scale_y = fitted_h / orig_h
+
+        point_x_in_fitted = img_x * scale_x
+        point_y_in_fitted = img_y * scale_y
+
+        # Apply zoom to point position
+        point_x_in_zoomed = point_x_in_fitted * self.zoom_factor
+        point_y_in_zoomed = point_y_in_fitted * self.zoom_factor
+
+        # Calculate pan offset to center the point
+        self.pan_offset[0] = (label_w / 2) - point_x_in_zoomed
+        self.pan_offset[1] = (label_h / 2) - point_y_in_zoomed
+
+        self._update_display()
+
+        if self.parent_widget and hasattr(self.parent_widget, 'log'):
+            self.parent_widget.log(f"✓ Zoomed to {zoom_level}x at point ({img_y}, {img_x})")
+
+    def reset_view(self):
+        """Reset zoom and pan to default"""
+        self.zoom_factor = 1.0
+        self.pan_offset = [0, 0]
+        self._update_display()
+
+        if self.parent_widget and hasattr(self.parent_widget, 'log'):
+            self.parent_widget.log("✓ Reset zoom to 1x")
 
     def _draw_mask_overlay(self, painter):
+        """Draw mask overlay accounting for zoom and pan"""
         if self.mask_overlay is None:
             return
         mask = self.mask_overlay
@@ -354,25 +432,38 @@ class InteractiveImageLabel(QLabel):
         mask_coords = np.argwhere(mask > 0)
         if len(mask_coords) == 0:
             return
+
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(0, 255, 0))
         painter.setOpacity(0.4)
+
         img_h, img_w = self.pix_source.height(), self.pix_source.width()
-        current_pixmap = self.pixmap()
-        if current_pixmap:
-            pixmap_w = current_pixmap.width()
-            pixmap_h = current_pixmap.height()
-        else:
-            pixmap_w = img_w
-            pixmap_h = img_h
-        scale_x = pixmap_w / img_w
-        scale_y = pixmap_h / img_h
-        rect_w = max(1, int(scale_x))
-        rect_h = max(1, int(scale_y))
+        label_w, label_h = self.size().width(), self.size().height()
+
+        # Get fitted size
+        if not self.base_pixmap:
+            return
+
+        fitted_pix = self.base_pixmap.scaled(
+            label_w, label_h,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+        fitted_w = fitted_pix.width()
+        fitted_h = fitted_pix.height()
+
+        scale_x = fitted_w / img_w
+        scale_y = fitted_h / img_h
+
+        # Account for zoom
+        rect_w = max(1, int(scale_x * self.zoom_factor))
+        rect_h = max(1, int(scale_y * self.zoom_factor))
+
         for coord in mask_coords:
             img_y, img_x = coord[0], coord[1]
             x_pos, y_pos = self._to_display_coords((img_y, img_x))
             painter.drawRect(int(x_pos), int(y_pos), rect_w, rect_h)
+
         painter.setOpacity(1.0)
 
     def _draw_polygon(self, painter):
@@ -390,47 +481,92 @@ class InteractiveImageLabel(QLabel):
             painter.drawEllipse(int(x - 4), int(y - 4), 8, 8)
 
     def _to_display_coords(self, img_coords):
+        """Convert image coordinates to display coordinates accounting for zoom and pan"""
         if not self.pix_source:
             return 0, 0
+
+        img_y, img_x = img_coords[0], img_coords[1]
         img_h, img_w = self.pix_source.height(), self.pix_source.width()
         label_w, label_h = self.size().width(), self.size().height()
-        current_pixmap = self.pixmap()
-        if current_pixmap:
-            pixmap_w = current_pixmap.width()
-            pixmap_h = current_pixmap.height()
-        else:
-            pixmap_w = img_w
-            pixmap_h = img_h
-        offset_x = (label_w - pixmap_w) / 2
-        offset_y = (label_h - pixmap_h) / 2
-        scale_x = pixmap_w / img_w
-        scale_y = pixmap_h / img_h
-        x = img_coords[1] * scale_x + offset_x
-        y = img_coords[0] * scale_y + offset_y
+
+        # Get fitted size (before zoom)
+        fitted_pix = self.base_pixmap.scaled(
+            label_w, label_h,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        ) if self.base_pixmap else self.pix_source
+        fitted_w = fitted_pix.width()
+        fitted_h = fitted_pix.height()
+
+        # Calculate scale from image to fitted
+        scale_x = fitted_w / img_w
+        scale_y = fitted_h / img_h
+
+        # Apply scale and zoom
+        x_in_fitted = img_x * scale_x
+        y_in_fitted = img_y * scale_y
+
+        x_in_zoomed = x_in_fitted * self.zoom_factor
+        y_in_zoomed = y_in_fitted * self.zoom_factor
+
+        # Center the fitted/zoomed image in label
+        offset_x = (label_w - fitted_w * self.zoom_factor) / 2
+        offset_y = (label_h - fitted_h * self.zoom_factor) / 2
+
+        # Apply offsets (including pan)
+        x = x_in_zoomed + offset_x + self.pan_offset[0]
+        y = y_in_zoomed + offset_y + self.pan_offset[1]
+
         return x, y
 
     def _to_image_coords(self, display_x, display_y):
+        """Convert display coordinates to image coordinates accounting for zoom and pan"""
         if not self.parent_widget or not hasattr(self.parent_widget, 'get_current_processed_image'):
             return None
         current_img = self.parent_widget.get_current_processed_image()
         if current_img is None:
             return None
+
         img_shape = current_img.shape
         img_h, img_w = img_shape[:2]
         label_w, label_h = self.size().width(), self.size().height()
-        current_pixmap = self.pixmap()
-        if current_pixmap:
-            pixmap_w = current_pixmap.width()
-            pixmap_h = current_pixmap.height()
-        else:
-            pixmap_w = img_w
-            pixmap_h = img_h
-        offset_x = (label_w - pixmap_w) / 2
-        offset_y = (label_h - pixmap_h) / 2
-        scale_x = img_w / pixmap_w
-        scale_y = img_h / pixmap_h
-        img_x = round((display_x - offset_x) * scale_x)
-        img_y = round((display_y - offset_y) * scale_y)
+
+        # Get fitted size (before zoom)
+        if not self.base_pixmap:
+            return None
+
+        fitted_pix = self.base_pixmap.scaled(
+            label_w, label_h,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+        fitted_w = fitted_pix.width()
+        fitted_h = fitted_pix.height()
+
+        # Calculate offsets
+        offset_x = (label_w - fitted_w * self.zoom_factor) / 2
+        offset_y = (label_h - fitted_h * self.zoom_factor) / 2
+
+        # Remove offsets (including pan)
+        x_in_zoomed = display_x - offset_x - self.pan_offset[0]
+        y_in_zoomed = display_y - offset_y - self.pan_offset[1]
+
+        # Remove zoom
+        x_in_fitted = x_in_zoomed / self.zoom_factor
+        y_in_fitted = y_in_zoomed / self.zoom_factor
+
+        # Calculate scale from fitted to image
+        scale_x = img_w / fitted_w
+        scale_y = img_h / fitted_h
+
+        # Convert to image coords
+        img_x = round(x_in_fitted * scale_x)
+        img_y = round(y_in_fitted * scale_y)
+
+        # Clamp to image bounds
+        img_x = max(0, min(img_x, img_w - 1))
+        img_y = max(0, min(img_y, img_h - 1))
+
         return (img_y, img_x)
 
     def mousePressEvent(self, event):
@@ -449,6 +585,22 @@ class InteractiveImageLabel(QLabel):
     def mouseDoubleClickEvent(self, event):
         if self.polygon_mode and self.parent_widget:
             self.parent_widget.finish_polygon()
+
+    def wheelEvent(self, event):
+        """Handle mouse wheel for zooming"""
+        delta = event.angleDelta().y()
+
+        if delta > 0:
+            self.zoom_factor *= 1.15
+        else:
+            self.zoom_factor /= 1.15
+
+        self.zoom_factor = max(0.5, min(self.zoom_factor, 10.0))
+
+        self._update_display()
+
+        if self.parent_widget:
+            self.parent_widget.log(f"Zoom: {self.zoom_factor:.2f}x")
 
 
 class MicrogliaAnalysisGUI(QMainWindow):
@@ -493,6 +645,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
             elif key == Qt.Key_Return or key == Qt.Key_Enter:
                 # Alternative way to finish polygon
                 self.finish_polygon()
+                return
+            elif key == Qt.Key_Home or key == Qt.Key_0:
+                # Reset zoom
+                self.processed_label.reset_view()
                 return
 
         # Handle soma picking mode shortcuts
@@ -1484,8 +1640,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("=" * 50)
         self.log(f"📐 BATCH OUTLINING MODE")
         self.log(f"Total somas to outline: {len(self.outlining_queue)}")
-        self.log("Left-click to add points, right-click to finish outline")
-        self.log("Press 'Z' or Backspace to undo last point | 'Escape' to restart | 'Enter' to finish")
+        self.log("✓ Auto-zoom enabled - each soma will be zoomed to 3x")
+        self.log("Mouse Controls:")
+        self.log("  • Left-click: add point | Right-click or Double-click: finish outline")
+        self.log("  • Mouse wheel: zoom in/out")
+        self.log("Keyboard Shortcuts:")
+        self.log("  • Z/Backspace: undo last point | Escape: restart | Enter: finish")
+        self.log("  • Home/0: reset zoom to 1x")
         self.log("=" * 50)
 
     def _load_soma_for_outlining(self, queue_idx):
@@ -1499,6 +1660,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         soma_id = img_data['soma_ids'][soma_idx]
         pixmap = self._array_to_pixmap(img_data['processed'])
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+
+        # Auto-zoom to the soma for easier outlining
+        self.processed_label.auto_zoom_to_point(soma, zoom_level=3.0)
+
         self.tabs.setCurrentIndex(2)
         self.nav_status_label.setText(
             f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
