@@ -438,13 +438,13 @@ class InteractiveImageLabel(QLabel):
 
         self._update_display()
 
-    def reset_view(self):
+    def reset_view(self, silent=False):
         """Reset zoom and pan to default"""
         self.zoom_factor = 1.0
         self.pan_offset = [0, 0]
         self._update_display()
 
-        if self.parent_widget and hasattr(self.parent_widget, 'log'):
+        if not silent and self.parent_widget and hasattr(self.parent_widget, 'log'):
             self.parent_widget.log("✓ Reset zoom to 1x")
 
     def _draw_mask_overlay(self, painter):
@@ -1927,6 +1927,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_mode = False
         self.processed_label.polygon_mode = False
         self.redo_outline_btn.setEnabled(False)  # Disable redo button when outlining complete
+
+        # Reset zoom after outlining is complete
+        self.processed_label.reset_view()
+
         for img_name, img_data in self.images.items():
             if img_data['selected'] and len(img_data['soma_outlines']) == len(img_data['somas']):
                 img_data['status'] = 'outlined'
@@ -1935,6 +1939,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # self.update_workflow_status()
         self.log("=" * 50)
         self.log("✓ All somas outlined!")
+        self.log("✓ Zoom reset to 1x")
         self.log("✓ Ready to generate masks")
         self.log("=" * 50)
         QMessageBox.information(self, "Complete", "All somas outlined!\n\nReady to generate masks.")
@@ -2289,6 +2294,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "No masks to QA")
             return
 
+        # Reset zoom on all image labels for QA (prevents lag)
+        self.mask_label.reset_view(silent=True)
+        self.processed_label.reset_view(silent=True)
+        self.original_label.reset_view(silent=True)
+        self.preview_label.reset_view(silent=True)
+
         self.mask_qa_active = True
         self.mask_qa_idx = 0
 
@@ -2304,6 +2315,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("=" * 50)
         self.log("🎯 BATCH MASK QA MODE")
         self.log(f"Total masks to review: {len(self.all_masks_flat)}")
+        self.log("✓ Zoom reset to 1x for better performance")
         self.log("Keyboard: A=Approve, R=Reject, ←→=Navigate, Space=Approve&Next")
         self.log("=" * 50)
 
