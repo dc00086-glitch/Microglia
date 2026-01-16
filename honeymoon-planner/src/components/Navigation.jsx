@@ -1,4 +1,4 @@
-import { Calendar, Plane, BookHeart, Home } from 'lucide-react';
+import { Calendar, Plane, BookHeart, Home, Settings } from 'lucide-react';
 
 export default function Navigation({ currentPage, setCurrentPage }) {
   const navItems = [
@@ -6,6 +6,7 @@ export default function Navigation({ currentPage, setCurrentPage }) {
     { id: 'itinerary', label: 'Itinerary', icon: Calendar },
     { id: 'bookings', label: 'Bookings', icon: Plane },
     { id: 'scrapbook', label: 'Scrapbook', icon: BookHeart },
+    { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
   return (

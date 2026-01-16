@@ -1181,3 +1181,81 @@ body {
     justify-content: flex-end;
   }
 }
+
+/* ===== Settings Page ===== */
+.settings-page {
+  max-width: 600px;
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.settings-card {
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  box-shadow: var(--shadow);
+}
+
+.settings-card h2 {
+  font-size: 1.1rem;
+  margin-bottom: 1rem;
+  color: var(--primary);
+}
+
+.destinations-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.destination-tag {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--background);
+  border-radius: 20px;
+  font-size: 0.9rem;
+}
+
+.destination-tag button {
+  background: transparent;
+  border: none;
+  padding: 0.25rem;
+  cursor: pointer;
+  color: var(--text-light);
+  display: flex;
+  align-items: center;
+}
+
+.destination-tag button:hover {
+  color: #dc3545;
+}
+
+.add-destination {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.add-destination input {
+  flex: 1;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.9rem;
+}
+
+.add-destination input:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
+}

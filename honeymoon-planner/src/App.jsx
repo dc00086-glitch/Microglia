@@ -5,6 +5,7 @@ import HomePage from './pages/HomePage';
 import ItineraryPage from './pages/ItineraryPage';
 import BookingsPage from './pages/BookingsPage';
 import ScrapbookPage from './pages/ScrapbookPage';
+import SettingsPage from './pages/SettingsPage';
 import './App.css';
 
 function App() {
@@ -20,6 +21,8 @@ function App() {
         return <BookingsPage />;
       case 'scrapbook':
         return <ScrapbookPage />;
+      case 'settings':
+        return <SettingsPage />;
       default:
         return <HomePage setCurrentPage={setCurrentPage} />;
     }
