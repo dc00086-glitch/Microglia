@@ -54,7 +54,16 @@ const curatedImages = {
   'Positano': 'https://images.unsplash.com/photo-1534113414509-0eec2bfb493f?w=400&q=80',
 };
 
-// Generate image URL for any city - uses curated image if available, otherwise fetches dynamically
+// Default fallback images for unknown cities (rotating beautiful travel photos)
+const fallbackImages = [
+  'https://images.unsplash.com/photo-1488646953014-85cb44e25828?w=400&q=80', // Travel map
+  'https://images.unsplash.com/photo-1469854523086-cc02fe5d8800?w=400&q=80', // Road trip
+  'https://images.unsplash.com/photo-1476514525535-07fb3b4ae5f1?w=400&q=80', // Lake mountains
+  'https://images.unsplash.com/photo-1530789253388-582c481c54b0?w=400&q=80', // Travel adventure
+  'https://images.unsplash.com/photo-1504150558240-0b4fd8946624?w=400&q=80', // Passport travel
+];
+
+// Generate image URL for any city - uses curated image if available, otherwise uses fallback
 const getCityImage = (city) => {
   // Check for exact match first
   if (curatedImages[city]) {
@@ -68,9 +77,10 @@ const getCityImage = (city) => {
     return curatedImages[matchedKey];
   }
 
-  // For any other city, dynamically generate an Unsplash image URL
-  const searchQuery = encodeURIComponent(`${city} city landmark travel`);
-  return `https://source.unsplash.com/400x300/?${searchQuery}`;
+  // For unknown cities, use a consistent fallback based on city name
+  // This ensures the same city always gets the same image
+  const index = city.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0) % fallbackImages.length;
+  return fallbackImages[index];
 };
 
 export default function HomePage({ setCurrentPage, goToItinerary }) {
