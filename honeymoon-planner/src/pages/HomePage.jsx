@@ -2,6 +2,29 @@ import { useHoneymoon } from '../context/HoneymoonContext';
 import { MapPin, Calendar, Heart, Plane, Hotel, Camera } from 'lucide-react';
 import { format, differenceInDays, parseISO } from 'date-fns';
 
+const cityImages = {
+  'Paris': 'https://images.unsplash.com/photo-1502602898657-3e91760cbb34?w=400&q=80',
+  'Rome': 'https://images.unsplash.com/photo-1552832230-c0197dd311b5?w=400&q=80',
+  'Barcelona': 'https://images.unsplash.com/photo-1583422409516-2895a77efded?w=400&q=80',
+  'Santorini': 'https://images.unsplash.com/photo-1613395877344-13d4a8e0d49e?w=400&q=80',
+  'Venice': 'https://images.unsplash.com/photo-1514890547357-a9ee288728e0?w=400&q=80',
+  'Florence': 'https://images.unsplash.com/photo-1543429258-c5ca3ea2e8a5?w=400&q=80',
+  'Amsterdam': 'https://images.unsplash.com/photo-1534351590666-13e3e96b5017?w=400&q=80',
+  'London': 'https://images.unsplash.com/photo-1513635269975-59663e0ac1ad?w=400&q=80',
+  'Prague': 'https://images.unsplash.com/photo-1519677100203-a0e668c92439?w=400&q=80',
+  'Vienna': 'https://images.unsplash.com/photo-1516550893923-42d28e5677af?w=400&q=80',
+  'Lisbon': 'https://images.unsplash.com/photo-1585208798174-6cedd86e019a?w=400&q=80',
+  'Athens': 'https://images.unsplash.com/photo-1555993539-1732b0258235?w=400&q=80',
+  'Dublin': 'https://images.unsplash.com/photo-1549918864-48ac978761a4?w=400&q=80',
+  'Munich': 'https://images.unsplash.com/photo-1595867818082-083862f3d630?w=400&q=80',
+  'Nice': 'https://images.unsplash.com/photo-1491166617655-0723a0999cfc?w=400&q=80',
+  'Amalfi': 'https://images.unsplash.com/photo-1633321702518-7feccafb94d5?w=400&q=80',
+  'Cinque Terre': 'https://images.unsplash.com/photo-1516483638261-f4dbaf036963?w=400&q=80',
+  'Swiss Alps': 'https://images.unsplash.com/photo-1531366936337-7c912a4589a7?w=400&q=80',
+};
+
+const defaultImage = 'https://images.unsplash.com/photo-1488646953014-85cb44e25828?w=400&q=80';
+
 export default function HomePage({ setCurrentPage }) {
   const { tripInfo, itinerary, bookings, scrapbook, getTotalBudget } = useHoneymoon();
 
@@ -37,11 +60,14 @@ export default function HomePage({ setCurrentPage }) {
 
       <section className="destinations-section">
         <h2>Your Destinations</h2>
-        <div className="destination-cards">
+        <div className="destination-cards-grid">
           {tripInfo.destinations.map((city, index) => (
-            <div key={city} className="destination-card" style={{ animationDelay: `${index * 0.1}s` }}>
-              <MapPin size={24} />
-              <span>{city}</span>
+            <div key={city} className="destination-card-img" style={{ animationDelay: `${index * 0.1}s` }}>
+              <img src={cityImages[city] || defaultImage} alt={city} />
+              <div className="destination-overlay">
+                <MapPin size={18} />
+                <span>{city}</span>
+              </div>
             </div>
           ))}
         </div>
