@@ -159,13 +159,13 @@ function DayCard({ day, onAddActivity, onEditActivity, onDeleteActivity, onDelet
   );
 }
 
-export default function ItineraryPage() {
-  const { itinerary, addDay, deleteDay, addActivity, updateActivity, deleteActivity } = useHoneymoon();
+export default function ItineraryPage({ filterCity, clearFilter }) {
+  const { itinerary, tripInfo, addDay, deleteDay, addActivity, updateActivity, deleteActivity } = useHoneymoon();
   const [showNewDayForm, setShowNewDayForm] = useState(false);
   const [newDay, setNewDay] = useState({
     day: itinerary.length + 1,
     date: '',
-    city: '',
+    city: filterCity || '',
     country: '',
     activities: []
   });
@@ -177,7 +177,7 @@ export default function ItineraryPage() {
       setNewDay({
         day: itinerary.length + 2,
         date: '',
-        city: '',
+        city: filterCity || '',
         country: '',
         activities: []
       });
@@ -185,7 +185,11 @@ export default function ItineraryPage() {
     }
   };
 
-  const sortedItinerary = [...itinerary].sort((a, b) => a.day - b.day);
+  const sortedItinerary = [...itinerary]
+    .filter(day => !filterCity || day.city === filterCity)
+    .sort((a, b) => a.day - b.day);
+
+  const allCities = [...new Set(itinerary.map(day => day.city))];
 
   return (
     <div className="itinerary-page">
@@ -193,14 +197,39 @@ export default function ItineraryPage() {
         <div className="header-content">
           <Calendar size={32} />
           <div>
-            <h1>Trip Itinerary</h1>
-            <p>Plan your perfect days across Europe</p>
+            <h1>{filterCity ? `${filterCity} Itinerary` : 'Trip Itinerary'}</h1>
+            <p>{filterCity ? `Your plans for ${filterCity}` : 'Plan your perfect days across Europe'}</p>
           </div>
         </div>
-        <button className="btn-primary" onClick={() => setShowNewDayForm(true)}>
-          <Plus size={18} /> Add Day
-        </button>
+        <div className="header-actions">
+          {filterCity && (
+            <button className="btn-secondary" onClick={clearFilter}>
+              <X size={18} /> Show All
+            </button>
+          )}
+          <button className="btn-primary" onClick={() => setShowNewDayForm(true)}>
+            <Plus size={18} /> Add Day
+          </button>
+        </div>
       </header>
+
+      {!filterCity && allCities.length > 0 && (
+        <div className="city-filter-bar">
+          <span>Filter by city:</span>
+          {tripInfo.destinations.map(city => {
+            const count = itinerary.filter(day => day.city === city).length;
+            return (
+              <button
+                key={city}
+                className="filter-btn"
+                onClick={() => clearFilter(city)}
+              >
+                {city} ({count})
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {showNewDayForm && (
         <div className="modal-overlay" onClick={() => setShowNewDayForm(false)}>

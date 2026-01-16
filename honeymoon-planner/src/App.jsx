@@ -10,13 +10,23 @@ import './App.css';
 
 function App() {
   const [currentPage, setCurrentPage] = useState('home');
+  const [filterCity, setFilterCity] = useState(null);
+
+  const goToItinerary = (city = null) => {
+    setFilterCity(city);
+    setCurrentPage('itinerary');
+  };
+
+  const clearFilter = (city = null) => {
+    setFilterCity(city);
+  };
 
   const renderPage = () => {
     switch (currentPage) {
       case 'home':
-        return <HomePage setCurrentPage={setCurrentPage} />;
+        return <HomePage setCurrentPage={setCurrentPage} goToItinerary={goToItinerary} />;
       case 'itinerary':
-        return <ItineraryPage />;
+        return <ItineraryPage filterCity={filterCity} clearFilter={clearFilter} />;
       case 'bookings':
         return <BookingsPage />;
       case 'scrapbook':
@@ -24,7 +34,7 @@ function App() {
       case 'settings':
         return <SettingsPage />;
       default:
-        return <HomePage setCurrentPage={setCurrentPage} />;
+        return <HomePage setCurrentPage={setCurrentPage} goToItinerary={goToItinerary} />;
     }
   };
 

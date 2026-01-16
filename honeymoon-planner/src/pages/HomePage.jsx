@@ -25,7 +25,7 @@ const cityImages = {
 
 const defaultImage = 'https://images.unsplash.com/photo-1488646953014-85cb44e25828?w=400&q=80';
 
-export default function HomePage({ setCurrentPage }) {
+export default function HomePage({ setCurrentPage, goToItinerary }) {
   const { tripInfo, itinerary, bookings, scrapbook, getTotalBudget } = useHoneymoon();
 
   const daysUntilTrip = differenceInDays(parseISO(tripInfo.startDate), new Date());
@@ -60,16 +60,26 @@ export default function HomePage({ setCurrentPage }) {
 
       <section className="destinations-section">
         <h2>Your Destinations</h2>
+        <p className="destinations-hint">Click a destination to see its itinerary</p>
         <div className="destination-cards-grid">
-          {tripInfo.destinations.map((city, index) => (
-            <div key={city} className="destination-card-img" style={{ animationDelay: `${index * 0.1}s` }}>
-              <img src={cityImages[city] || defaultImage} alt={city} />
-              <div className="destination-overlay">
-                <MapPin size={18} />
-                <span>{city}</span>
+          {tripInfo.destinations.map((city, index) => {
+            const daysInCity = itinerary.filter(day => day.city === city).length;
+            return (
+              <div
+                key={city}
+                className="destination-card-img"
+                style={{ animationDelay: `${index * 0.1}s` }}
+                onClick={() => goToItinerary(city)}
+              >
+                <img src={cityImages[city] || defaultImage} alt={city} />
+                <div className="destination-overlay">
+                  <MapPin size={18} />
+                  <span>{city}</span>
+                  {daysInCity > 0 && <span className="days-badge">{daysInCity} days</span>}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </section>
 

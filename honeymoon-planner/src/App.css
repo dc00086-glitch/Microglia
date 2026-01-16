@@ -1310,3 +1310,37 @@ body {
   display: flex;
   justify-content: flex-end;
 }
+
+/* ===== Destination Enhancements ===== */
+.destinations-hint {
+  color: var(--text-light);
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+  margin-top: -0.5rem;
+}
+
+.days-badge {
+  background: var(--primary);
+  padding: 0.2rem 0.6rem;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  margin-left: auto;
+}
+
+.header-actions {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.city-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.city-filter-bar span {
+  color: var(--text-light);
+  font-size: 0.9rem;
+}
