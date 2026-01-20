@@ -304,8 +304,9 @@ class InteractiveImageLabel(QLabel):
         self.zoom_level = 1.0
         self.min_zoom = 0.5
         self.max_zoom = 10.0
-        self.pan_offset_x = 0
-        self.pan_offset_y = 0
+        # View center in image coordinates (0-1 normalized)
+        self.view_center_x = 0.5
+        self.view_center_y = 0.5
         self.is_panning = False
         self.last_pan_pos = None
         # Enable mouse tracking for smooth panning
@@ -319,22 +320,21 @@ class InteractiveImageLabel(QLabel):
         self._update_display()
 
     def _update_display(self):
-        """Update the displayed image with current zoom and pan"""
+        """Update the displayed image with current zoom"""
         if self.pix_source is None:
             return
-        # Calculate the zoomed size
-        label_size = self.size()
-        base_w = label_size.width()
-        base_h = label_size.height()
 
-        # Scale source to fit label first (maintaining aspect ratio)
         img_w = self.pix_source.width()
         img_h = self.pix_source.height()
-        scale_to_fit = min(base_w / img_w, base_h / img_h)
+        label_w = self.size().width()
+        label_h = self.size().height()
+
+        # Calculate base scale to fit
+        base_scale = min(label_w / img_w, label_h / img_h)
 
         # Apply zoom
-        final_w = int(img_w * scale_to_fit * self.zoom_level)
-        final_h = int(img_h * scale_to_fit * self.zoom_level)
+        final_w = int(img_w * base_scale * self.zoom_level)
+        final_h = int(img_h * base_scale * self.zoom_level)
 
         scaled_pix = self.pix_source.scaled(
             final_w,
@@ -348,14 +348,43 @@ class InteractiveImageLabel(QLabel):
     def reset_zoom(self):
         """Reset zoom and pan to default"""
         self.zoom_level = 1.0
-        self.pan_offset_x = 0
-        self.pan_offset_y = 0
+        self.view_center_x = 0.5
+        self.view_center_y = 0.5
         self._update_display()
 
     def set_zoom(self, level):
         """Set zoom to a specific level"""
         self.zoom_level = max(self.min_zoom, min(self.max_zoom, level))
         self._update_display()
+
+    def _get_pan_offset(self):
+        """Calculate pan offset based on view center"""
+        if not self.pix_source:
+            return 0, 0
+
+        img_w = self.pix_source.width()
+        img_h = self.pix_source.height()
+        label_w = self.size().width()
+        label_h = self.size().height()
+
+        current_pixmap = self.pixmap()
+        if not current_pixmap:
+            return 0, 0
+
+        pixmap_w = current_pixmap.width()
+        pixmap_h = current_pixmap.height()
+
+        # Center offset (where image would be if centered)
+        center_offset_x = (label_w - pixmap_w) / 2
+        center_offset_y = (label_h - pixmap_h) / 2
+
+        # Pan offset based on view center
+        # view_center is in normalized image coords (0-1)
+        # We want that point to be at the label center
+        pan_x = (0.5 - self.view_center_x) * pixmap_w
+        pan_y = (0.5 - self.view_center_y) * pixmap_h
+
+        return center_offset_x + pan_x, center_offset_y + pan_y
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -369,7 +398,9 @@ class InteractiveImageLabel(QLabel):
             painter.setPen(pen)
             for centroid in self.centroids:
                 x, y = self._to_display_coords(centroid)
-                painter.drawEllipse(int(x - 6), int(y - 6), 12, 12)
+                # Only draw if visible
+                if 0 <= x <= self.width() and 0 <= y <= self.height():
+                    painter.drawEllipse(int(x - 6), int(y - 6), 12, 12)
         if self.polygon_mode and len(self.polygon_pts) > 0:
             self._draw_polygon(painter)
         # Draw zoom indicator
@@ -391,34 +422,38 @@ class InteractiveImageLabel(QLabel):
         if not self.pix_source:
             return
 
-        # Get mouse position before zoom
+        # Get mouse position in image coordinates before zoom
         mouse_pos = event.pos()
+        img_coords = self._to_image_coords(mouse_pos.x(), mouse_pos.y())
 
         # Calculate zoom change
         delta = event.angleDelta().y()
         if delta > 0:
-            zoom_factor = 1.15
+            zoom_factor = 1.2
         else:
-            zoom_factor = 1 / 1.15
+            zoom_factor = 1 / 1.2
 
         old_zoom = self.zoom_level
-        new_zoom = old_zoom * zoom_factor
-        new_zoom = max(self.min_zoom, min(self.max_zoom, new_zoom))
+        new_zoom = max(self.min_zoom, min(self.max_zoom, old_zoom * zoom_factor))
 
-        if new_zoom != old_zoom:
-            # Adjust pan to zoom toward mouse position
-            # Calculate the image point under the mouse before zoom
-            img_coords = self._to_image_coords(mouse_pos.x(), mouse_pos.y())
+        if new_zoom != old_zoom and img_coords:
+            # Set view center to zoom toward mouse position
+            img_h, img_w = self.pix_source.height(), self.pix_source.width()
+            # Convert image coords to normalized (0-1)
+            norm_x = img_coords[1] / img_w
+            norm_y = img_coords[0] / img_h
+
+            # Blend current center toward mouse position
+            blend = 0.3  # How much to move toward mouse
+            self.view_center_x = self.view_center_x + (norm_x - self.view_center_x) * blend
+            self.view_center_y = self.view_center_y + (norm_y - self.view_center_y) * blend
 
             self.zoom_level = new_zoom
             self._update_display()
 
-            # After zoom, adjust pan so the same image point is under the mouse
-            if img_coords:
-                new_display = self._to_display_coords(img_coords)
-                self.pan_offset_x += mouse_pos.x() - new_display[0]
-                self.pan_offset_y += mouse_pos.y() - new_display[1]
-                self.repaint()
+            # Update parent's zoom label if available
+            if self.parent_widget and hasattr(self.parent_widget, 'zoom_level_label'):
+                self.parent_widget.zoom_level_label.setText(f"{self.zoom_level:.1f}x")
 
     def mousePressEvent(self, event):
         # Middle button or Ctrl+Left for panning
@@ -444,8 +479,17 @@ class InteractiveImageLabel(QLabel):
         """Handle mouse move for panning"""
         if self.is_panning and self.last_pan_pos:
             delta = event.pos() - self.last_pan_pos
-            self.pan_offset_x += delta.x()
-            self.pan_offset_y += delta.y()
+
+            # Convert pixel delta to normalized image coords
+            current_pixmap = self.pixmap()
+            if current_pixmap:
+                # Move view center opposite to drag direction
+                self.view_center_x -= delta.x() / current_pixmap.width()
+                self.view_center_y -= delta.y() / current_pixmap.height()
+                # Clamp to valid range
+                self.view_center_x = max(0, min(1, self.view_center_x))
+                self.view_center_y = max(0, min(1, self.view_center_y))
+
             self.last_pan_pos = event.pos()
             self.repaint()
 
@@ -505,7 +549,6 @@ class InteractiveImageLabel(QLabel):
         if not self.pix_source:
             return 0, 0
         img_h, img_w = self.pix_source.height(), self.pix_source.width()
-        label_w, label_h = self.size().width(), self.size().height()
         current_pixmap = self.pixmap()
         if current_pixmap:
             pixmap_w = current_pixmap.width()
@@ -513,8 +556,10 @@ class InteractiveImageLabel(QLabel):
         else:
             pixmap_w = img_w
             pixmap_h = img_h
-        offset_x = (label_w - pixmap_w) / 2 + self.pan_offset_x
-        offset_y = (label_h - pixmap_h) / 2 + self.pan_offset_y
+
+        # Get pan offset from view center
+        offset_x, offset_y = self._get_pan_offset()
+
         scale_x = pixmap_w / img_w
         scale_y = pixmap_h / img_h
         x = img_coords[1] * scale_x + offset_x
@@ -522,14 +567,10 @@ class InteractiveImageLabel(QLabel):
         return x, y
 
     def _to_image_coords(self, display_x, display_y):
-        if not self.parent_widget or not hasattr(self.parent_widget, 'get_current_processed_image'):
+        if not self.pix_source:
             return None
-        current_img = self.parent_widget.get_current_processed_image()
-        if current_img is None:
-            return None
-        img_shape = current_img.shape
-        img_h, img_w = img_shape[:2]
-        label_w, label_h = self.size().width(), self.size().height()
+
+        img_h, img_w = self.pix_source.height(), self.pix_source.width()
         current_pixmap = self.pixmap()
         if current_pixmap:
             pixmap_w = current_pixmap.width()
@@ -537,8 +578,10 @@ class InteractiveImageLabel(QLabel):
         else:
             pixmap_w = img_w
             pixmap_h = img_h
-        offset_x = (label_w - pixmap_w) / 2 + self.pan_offset_x
-        offset_y = (label_h - pixmap_h) / 2 + self.pan_offset_y
+
+        # Get pan offset from view center
+        offset_x, offset_y = self._get_pan_offset()
+
         scale_x = img_w / pixmap_w
         scale_y = img_h / pixmap_h
         img_x = round((display_x - offset_x) * scale_x)
@@ -552,37 +595,41 @@ class InteractiveImageLabel(QLabel):
 
 class ChannelSelectDialog(QDialog):
     """Dialog to select which channels to display"""
-    def __init__(self, parent=None, current_channels=None, channel_names=None):
+    def __init__(self, parent=None, current_channels=None, channel_names=None, color_image=None):
         super().__init__(parent)
         self.setWindowTitle("Channel Display Settings")
         self.setModal(True)
 
-        # Default channel settings
-        self.channels = current_channels or {'R': True, 'G': True, 'B': True}
-        self.names = channel_names or {0: 'Channel 1 (Green)', 1: 'Channel 2 (Red)', 2: 'Channel 3 (Blue)'}
+        # Default channel settings - now indexed by channel number
+        self.channels = current_channels or {0: True, 1: True, 2: True}
+        self.names = channel_names or {0: 'Channel 1', 1: 'Channel 2', 2: 'Channel 3'}
+
+        # Detect actual display colors from image
+        self.display_colors = self._detect_display_colors(color_image)
 
         layout = QVBoxLayout(self)
 
         # Instructions
-        instructions = QLabel("Select which channels to display:")
+        instructions = QLabel("Select which channels to display:\n(Colors shown match what you see on screen)")
         instructions.setStyleSheet("font-weight: bold;")
         layout.addWidget(instructions)
 
-        # Channel checkboxes
-        self.green_check = QCheckBox(f"Green - {self.names.get(0, 'Channel 1')}")
-        self.green_check.setChecked(self.channels.get('G', True))
-        self.green_check.setStyleSheet("color: green; font-weight: bold;")
-        layout.addWidget(self.green_check)
-
-        self.red_check = QCheckBox(f"Red - {self.names.get(1, 'Channel 2')}")
-        self.red_check.setChecked(self.channels.get('R', True))
-        self.red_check.setStyleSheet("color: red; font-weight: bold;")
-        layout.addWidget(self.red_check)
-
-        self.blue_check = QCheckBox(f"Blue - {self.names.get(2, 'Channel 3')}")
-        self.blue_check.setChecked(self.channels.get('B', True))
-        self.blue_check.setStyleSheet("color: blue; font-weight: bold;")
-        layout.addWidget(self.blue_check)
+        # Channel checkboxes - labeled by what color they appear as
+        self.ch_checks = []
+        for i in range(3):
+            color_name = self.display_colors.get(i, 'Unknown')
+            user_name = self.names.get(i, f'Channel {i+1}')
+            check = QCheckBox(f"Ch{i+1} ({color_name}): {user_name}")
+            check.setChecked(self.channels.get(i, True))
+            # Style with the detected color
+            if color_name == 'Red':
+                check.setStyleSheet("color: red; font-weight: bold;")
+            elif color_name == 'Green':
+                check.setStyleSheet("color: green; font-weight: bold;")
+            elif color_name == 'Blue':
+                check.setStyleSheet("color: blue; font-weight: bold;")
+            layout.addWidget(check)
+            self.ch_checks.append(check)
 
         # Channel naming section
         layout.addSpacing(10)
@@ -591,31 +638,28 @@ class ChannelSelectDialog(QDialog):
         layout.addWidget(name_label)
 
         name_form = QFormLayout()
-        self.name_ch1 = QLineEdit(self.names.get(0, 'Channel 1'))
-        self.name_ch2 = QLineEdit(self.names.get(1, 'Channel 2'))
-        self.name_ch3 = QLineEdit(self.names.get(2, 'Channel 3'))
-        name_form.addRow("Green channel:", self.name_ch1)
-        name_form.addRow("Red channel:", self.name_ch2)
-        name_form.addRow("Blue channel:", self.name_ch3)
+        self.name_inputs = []
+        for i in range(3):
+            color_name = self.display_colors.get(i, f'Ch{i+1}')
+            name_input = QLineEdit(self.names.get(i, f'Channel {i+1}'))
+            name_form.addRow(f"{color_name} channel:", name_input)
+            self.name_inputs.append(name_input)
         layout.addLayout(name_form)
 
         # Quick presets
         layout.addSpacing(10)
-        preset_label = QLabel("Quick presets:")
-        layout.addWidget(preset_label)
-
         preset_layout = QHBoxLayout()
         all_btn = QPushButton("All Channels")
         all_btn.clicked.connect(self.select_all)
         preset_layout.addWidget(all_btn)
 
-        green_only_btn = QPushButton("Green Only")
-        green_only_btn.clicked.connect(self.select_green_only)
-        preset_layout.addWidget(green_only_btn)
+        ch1_only_btn = QPushButton("Ch1 Only")
+        ch1_only_btn.clicked.connect(lambda: self.select_only(0))
+        preset_layout.addWidget(ch1_only_btn)
 
-        red_only_btn = QPushButton("Red Only")
-        red_only_btn.clicked.connect(self.select_red_only)
-        preset_layout.addWidget(red_only_btn)
+        ch2_only_btn = QPushButton("Ch2 Only")
+        ch2_only_btn.clicked.connect(lambda: self.select_only(1))
+        preset_layout.addWidget(ch2_only_btn)
 
         layout.addLayout(preset_layout)
 
@@ -630,34 +674,59 @@ class ChannelSelectDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
 
+    def _detect_display_colors(self, color_image):
+        """Detect which color each channel displays as based on the image format"""
+        colors = {}
+        if color_image is None:
+            return {0: 'Green', 1: 'Red', 2: 'Blue'}  # Default assumption
+
+        if color_image.ndim == 3:
+            num_ch = color_image.shape[2]
+            if num_ch == 3:
+                # Standard RGB image
+                colors = {0: 'Red', 1: 'Green', 2: 'Blue'}
+            elif num_ch == 2:
+                # 2-channel mapped as Green, Red in _array_to_pixmap_color
+                colors = {0: 'Green', 1: 'Red'}
+            elif num_ch == 4:
+                # RGBA
+                colors = {0: 'Red', 1: 'Green', 2: 'Blue', 3: 'Alpha'}
+            else:
+                # Other multi-channel - use the mapping from _array_to_pixmap_color
+                colors = {0: 'Green', 1: 'Red', 2: 'Blue'}
+        else:
+            colors = {0: 'Gray'}
+        return colors
+
     def select_all(self):
-        self.green_check.setChecked(True)
-        self.red_check.setChecked(True)
-        self.blue_check.setChecked(True)
+        for check in self.ch_checks:
+            check.setChecked(True)
 
-    def select_green_only(self):
-        self.green_check.setChecked(True)
-        self.red_check.setChecked(False)
-        self.blue_check.setChecked(False)
-
-    def select_red_only(self):
-        self.green_check.setChecked(False)
-        self.red_check.setChecked(True)
-        self.blue_check.setChecked(False)
+    def select_only(self, ch_idx):
+        for i, check in enumerate(self.ch_checks):
+            check.setChecked(i == ch_idx)
 
     def get_settings(self):
         """Return the selected channel settings and names"""
+        # Map channel indices to display colors for the main app
+        channels = {}
+        for i, check in enumerate(self.ch_checks):
+            color = self.display_colors.get(i)
+            if color == 'Red':
+                channels['R'] = check.isChecked()
+            elif color == 'Green':
+                channels['G'] = check.isChecked()
+            elif color == 'Blue':
+                channels['B'] = check.isChecked()
+
+        # Ensure all keys exist
+        channels.setdefault('R', True)
+        channels.setdefault('G', True)
+        channels.setdefault('B', True)
+
         return {
-            'channels': {
-                'R': self.red_check.isChecked(),
-                'G': self.green_check.isChecked(),
-                'B': self.blue_check.isChecked()
-            },
-            'names': {
-                0: self.name_ch1.text(),
-                1: self.name_ch2.text(),
-                2: self.name_ch3.text()
-            }
+            'channels': channels,
+            'names': {i: inp.text() for i, inp in enumerate(self.name_inputs)}
         }
 
 
@@ -1420,10 +1489,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
             )
             return
 
+        # Get a sample color image to detect channel format
+        sample_color_img = None
+        for img_name, img_data in self.images.items():
+            if 'color_image' in img_data:
+                sample_color_img = img_data['color_image']
+                break
+
         dialog = ChannelSelectDialog(
             self,
             current_channels=self.display_channels,
-            channel_names=self.channel_names
+            channel_names=self.channel_names,
+            color_image=sample_color_img
         )
 
         if dialog.exec_() == QDialog.Accepted:
