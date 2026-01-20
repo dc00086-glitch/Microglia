@@ -480,6 +480,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.use_min_intensity = True
         self.min_intensity_percent = 30
         self.use_imagej = False
+        # Colocalization settings
+        self.colocalization_enabled = False
+        self.colocalization_images = {}  # Maps image name to colocalization channel data
+        self.colocalization_folder = None
         self.init_ui()
 
     def keyPressEvent(self, event):
@@ -651,6 +655,37 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         extra_processing_group.setLayout(extra_layout)
         param_layout.addWidget(extra_processing_group)
+
+        # Colocalization options
+        coloc_group = QGroupBox("Colocalization Analysis (Optional)")
+        coloc_layout = QVBoxLayout()
+
+        self.coloc_check = QCheckBox("Enable Colocalization Analysis")
+        self.coloc_check.setChecked(False)
+        self.coloc_check.setToolTip("Analyze overlap between microglia and a second channel")
+        self.coloc_check.stateChanged.connect(self._on_coloc_checkbox_changed)
+        coloc_layout.addWidget(self.coloc_check)
+
+        coloc_btn_layout = QHBoxLayout()
+        self.coloc_folder_btn = QPushButton("Select Channel 2 Folder")
+        self.coloc_folder_btn.clicked.connect(self.select_colocalization_folder)
+        self.coloc_folder_btn.setEnabled(False)
+        coloc_btn_layout.addWidget(self.coloc_folder_btn)
+        coloc_layout.addLayout(coloc_btn_layout)
+
+        self.coloc_status_label = QLabel("Colocalization: Disabled")
+        self.coloc_status_label.setStyleSheet("color: #666; font-style: italic;")
+        coloc_layout.addWidget(self.coloc_status_label)
+
+        coloc_help = QLabel(
+            "<small>💡 Load matching images from a second channel (e.g., protein markers)\n"
+            "to calculate colocalization with microglia masks</small>"
+        )
+        coloc_help.setWordWrap(True)
+        coloc_layout.addWidget(coloc_help)
+
+        coloc_group.setLayout(coloc_layout)
+        param_layout.addWidget(coloc_group)
 
         self.preview_btn = QPushButton("Preview Current Image")
         self.preview_btn.clicked.connect(self.preview_current_image)
@@ -1016,6 +1051,238 @@ class MicrogliaAnalysisGUI(QMainWindow):
         adjusted = np.clip(adjusted, 0, 255)
 
         return adjusted.astype(np.uint8)
+
+    def _on_coloc_checkbox_changed(self, state):
+        """Handle colocalization checkbox state change"""
+        self.colocalization_enabled = state == Qt.Checked
+        self.coloc_folder_btn.setEnabled(self.colocalization_enabled)
+
+        if self.colocalization_enabled:
+            self.coloc_status_label.setText("Colocalization: Enabled - Select Channel 2 folder")
+            self.coloc_status_label.setStyleSheet("color: #0066cc; font-style: italic;")
+        else:
+            self.coloc_status_label.setText("Colocalization: Disabled")
+            self.coloc_status_label.setStyleSheet("color: #666; font-style: italic;")
+            self.colocalization_images = {}
+            self.colocalization_folder = None
+
+    def select_colocalization_folder(self):
+        """Select folder containing colocalization channel images"""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Colocalization Channel (Channel 2) Folder",
+            options=QFileDialog.DontUseNativeDialog
+        )
+        if not folder:
+            return
+
+        self.colocalization_folder = folder
+
+        # Find all image files in the folder
+        exts = ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg',
+                '*.TIF', '*.TIFF', '*.PNG', '*.JPG', '*.JPEG']
+        files = []
+        for ext in exts:
+            files.extend(glob.glob(os.path.join(folder, ext)))
+        files = list(set(files))
+
+        # Try to match colocalization images to loaded images
+        self.colocalization_images = {}
+        matched_count = 0
+
+        for coloc_path in sorted(files):
+            coloc_name = os.path.basename(coloc_path)
+            coloc_base = os.path.splitext(coloc_name)[0]
+
+            # Try various matching strategies
+            matched = False
+            for img_name in self.images.keys():
+                img_base = os.path.splitext(img_name)[0]
+
+                # Strategy 1: Exact base name match
+                if coloc_base == img_base:
+                    self.colocalization_images[img_name] = {
+                        'path': coloc_path,
+                        'name': coloc_name,
+                        'data': None  # Will load on demand
+                    }
+                    matched = True
+                    matched_count += 1
+                    break
+
+                # Strategy 2: Check if one is a prefix/suffix of other (handles _ch1, _ch2 naming)
+                if coloc_base.startswith(img_base) or img_base.startswith(coloc_base):
+                    self.colocalization_images[img_name] = {
+                        'path': coloc_path,
+                        'name': coloc_name,
+                        'data': None
+                    }
+                    matched = True
+                    matched_count += 1
+                    break
+
+                # Strategy 3: Common prefix matching (handles different channel suffixes)
+                # Find longest common prefix
+                min_len = min(len(coloc_base), len(img_base))
+                common_len = 0
+                for i in range(min_len):
+                    if coloc_base[i] == img_base[i]:
+                        common_len += 1
+                    else:
+                        break
+                # If more than 70% of the shorter name matches, consider it a match
+                if common_len >= min_len * 0.7 and common_len >= 5:
+                    self.colocalization_images[img_name] = {
+                        'path': coloc_path,
+                        'name': coloc_name,
+                        'data': None
+                    }
+                    matched = True
+                    matched_count += 1
+                    break
+
+        # Update status
+        total_images = len(self.images)
+        if matched_count > 0:
+            self.coloc_status_label.setText(
+                f"Colocalization: {matched_count}/{total_images} images matched"
+            )
+            self.coloc_status_label.setStyleSheet("color: #008800; font-style: italic;")
+            self.log(f"✓ Colocalization: Matched {matched_count} of {total_images} images")
+            self.log(f"  Folder: {folder}")
+
+            # List unmatched images
+            unmatched = [name for name in self.images.keys() if name not in self.colocalization_images]
+            if unmatched:
+                self.log(f"  ⚠️ Unmatched images ({len(unmatched)}):")
+                for name in unmatched[:5]:  # Show first 5
+                    self.log(f"     - {name}")
+                if len(unmatched) > 5:
+                    self.log(f"     ... and {len(unmatched) - 5} more")
+        else:
+            self.coloc_status_label.setText("Colocalization: No matches found!")
+            self.coloc_status_label.setStyleSheet("color: #cc0000; font-style: italic;")
+            self.log(f"⚠️ Colocalization: No matching images found in {folder}")
+            self.log("  Make sure images have matching names (e.g., image1_ch1.tif ↔ image1_ch2.tif)")
+
+    def load_colocalization_image(self, img_name):
+        """Load colocalization image data on demand"""
+        if img_name not in self.colocalization_images:
+            return None
+
+        coloc_data = self.colocalization_images[img_name]
+        if coloc_data['data'] is None:
+            try:
+                img = load_tiff_image(coloc_data['path'])
+                img = ensure_grayscale(img)
+                coloc_data['data'] = img
+                self.log(f"  Loaded colocalization image: {coloc_data['name']}")
+            except Exception as e:
+                self.log(f"  ⚠️ Failed to load colocalization image: {e}")
+                return None
+
+        return coloc_data['data']
+
+    def calculate_colocalization(self, mask, img_name):
+        """Calculate colocalization metrics between mask and second channel"""
+        if not self.colocalization_enabled:
+            return {}
+
+        if img_name not in self.colocalization_images:
+            return {'coloc_status': 'no_match'}
+
+        # Load the colocalization image
+        coloc_img = self.load_colocalization_image(img_name)
+        if coloc_img is None:
+            return {'coloc_status': 'load_failed'}
+
+        # Get the processed image for channel 1
+        img_data = None
+        for full_name, data in self.images.items():
+            if full_name == img_name or os.path.splitext(full_name)[0] == os.path.splitext(img_name)[0]:
+                img_data = data
+                break
+
+        if img_data is None or img_data['processed'] is None:
+            return {'coloc_status': 'no_ch1'}
+
+        ch1_img = img_data['processed']
+
+        # Ensure same dimensions
+        if ch1_img.shape != coloc_img.shape:
+            self.log(f"  ⚠️ Image dimensions mismatch: {ch1_img.shape} vs {coloc_img.shape}")
+            return {'coloc_status': 'dim_mismatch'}
+
+        # Apply mask to both channels
+        mask_bool = mask > 0
+        if not np.any(mask_bool):
+            return {'coloc_status': 'empty_mask'}
+
+        ch1_masked = ch1_img[mask_bool].astype(np.float64)
+        ch2_masked = coloc_img[mask_bool].astype(np.float64)
+
+        results = {'coloc_status': 'ok'}
+
+        # 1. Pearson's correlation coefficient
+        if len(ch1_masked) > 1 and np.std(ch1_masked) > 0 and np.std(ch2_masked) > 0:
+            pearson_r, _ = stats.pearsonr(ch1_masked, ch2_masked)
+            results['pearson_r'] = pearson_r
+        else:
+            results['pearson_r'] = 0.0
+
+        # 2. Manders' coefficients
+        # M1: Fraction of ch1 intensity that colocalizes with ch2
+        # M2: Fraction of ch2 intensity that colocalizes with ch1
+
+        # Use Otsu threshold for determining "positive" signal
+        try:
+            from skimage.filters import threshold_otsu
+            ch1_thresh = threshold_otsu(ch1_img)
+            ch2_thresh = threshold_otsu(coloc_img)
+        except:
+            ch1_thresh = np.percentile(ch1_img, 50)
+            ch2_thresh = np.percentile(coloc_img, 50)
+
+        # Within the mask, find colocalized pixels
+        ch1_positive = (ch1_img > ch1_thresh) & mask_bool
+        ch2_positive = (coloc_img > ch2_thresh) & mask_bool
+        colocalized = ch1_positive & ch2_positive
+
+        # Manders M1: Sum of Ch1 where Ch2 > threshold / Sum of Ch1
+        ch1_sum = np.sum(ch1_img[mask_bool])
+        if ch1_sum > 0:
+            m1 = np.sum(ch1_img[colocalized]) / ch1_sum
+        else:
+            m1 = 0.0
+        results['manders_m1'] = m1
+
+        # Manders M2: Sum of Ch2 where Ch1 > threshold / Sum of Ch2
+        ch2_sum = np.sum(coloc_img[mask_bool])
+        if ch2_sum > 0:
+            m2 = np.sum(coloc_img[colocalized]) / ch2_sum
+        else:
+            m2 = 0.0
+        results['manders_m2'] = m2
+
+        # 3. Colocalized area percentage
+        mask_area = np.sum(mask_bool)
+        coloc_area = np.sum(colocalized)
+        results['coloc_area_percent'] = (coloc_area / mask_area) * 100 if mask_area > 0 else 0.0
+
+        # 4. Mean intensities within mask
+        results['ch1_mean_intensity'] = np.mean(ch1_masked)
+        results['ch2_mean_intensity'] = np.mean(ch2_masked)
+
+        # 5. Intensity correlation quotient (ICQ)
+        # Measures if intensities vary together or independently
+        ch1_diff = ch1_masked - np.mean(ch1_masked)
+        ch2_diff = ch2_masked - np.mean(ch2_masked)
+        product = ch1_diff * ch2_diff
+        n_positive = np.sum(product > 0)
+        n_total = len(product)
+        results['icq'] = (n_positive / n_total) - 0.5 if n_total > 0 else 0.0
+
+        return results
 
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -2369,6 +2636,31 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_calculate_btn.setEnabled(True)
         self.timer_label.setVisible(False)
 
+        # Calculate colocalization if enabled
+        if self.colocalization_enabled and self.colocalization_images:
+            self.log("=" * 50)
+            self.log("Calculating colocalization metrics...")
+            coloc_count = 0
+            for i, result in enumerate(all_results):
+                img_name = result.get('image_name', '')
+                # Find the matching mask data
+                matching_mask = None
+                for flat_data in self.all_masks_flat:
+                    if (flat_data['mask_data'].get('approved') and
+                        flat_data['mask_data'].get('soma_id') == result.get('soma_id') and
+                        os.path.splitext(flat_data['image_name'])[0] == img_name):
+                        matching_mask = flat_data['mask_data'].get('mask')
+                        img_name = flat_data['image_name']  # Use full name for colocalization lookup
+                        break
+
+                if matching_mask is not None:
+                    coloc_results = self.calculate_colocalization(matching_mask, img_name)
+                    result.update(coloc_results)
+                    if coloc_results.get('coloc_status') == 'ok':
+                        coloc_count += 1
+
+            self.log(f"✓ Colocalization calculated for {coloc_count} masks")
+
         # Collect metadata for images
         self.log("=" * 50)
         self.log("Checking metadata... (any missing info will be requested)")
@@ -2386,6 +2678,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.log("=" * 50)
         self.log(f"✓ Simple characteristics calculated for {len(all_results)} cells")
+        if self.colocalization_enabled:
+            coloc_success_count = sum(1 for r in all_results if r.get('coloc_status') == 'ok')
+            self.log(f"✓ Colocalization analysis: {coloc_success_count}/{len(all_results)} cells analyzed")
         self.log(f"✓ Masks exported to: {self.masks_dir}")
         self.log("")
         self.log("NEXT STEP: Run ImageJ batch analysis")
@@ -2394,14 +2689,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("  3. Select the masks folder when prompted")
         self.log("=" * 50)
 
-        QMessageBox.information(
-            self, "Success",
-            f"Simple characteristics calculated for {len(all_results)} cells!\n\n"
-            f"Masks exported to:\n{self.masks_dir}\n\n"
-            f"NEXT STEP:\n"
-            f"Run the ImageJ macro (imagej_batch_analysis.ijm)\n"
-            f"to calculate Sholl & Skeleton parameters."
-        )
+        # Build success message
+        success_msg = f"Simple characteristics calculated for {len(all_results)} cells!\n\n"
+        if self.colocalization_enabled:
+            coloc_success_count = sum(1 for r in all_results if r.get('coloc_status') == 'ok')
+            success_msg += f"Colocalization analysis: {coloc_success_count}/{len(all_results)} cells\n\n"
+        success_msg += f"Masks exported to:\n{self.masks_dir}\n\n"
+        success_msg += "NEXT STEP:\nRun the ImageJ macro (imagej_batch_analysis.ijm)\nto calculate Sholl & Skeleton parameters."
+
+        QMessageBox.information(self, "Success", success_msg)
 
     def _on_morph_error(self, error_msg):
         """Handle errors during morphology calculation"""
@@ -2612,8 +2908,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
             if key in keys:
                 keys.remove(key)
 
-        # Put them in the desired order at the front
-        ordered_keys = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx'] + sorted(keys)
+        # Separate colocalization keys from morphology keys
+        coloc_keys = ['coloc_status', 'pearson_r', 'manders_m1', 'manders_m2',
+                      'coloc_area_percent', 'ch1_mean_intensity', 'ch2_mean_intensity', 'icq']
+        morph_keys = [k for k in keys if k not in coloc_keys]
+        coloc_present = [k for k in coloc_keys if k in keys]
+
+        # Put them in the desired order: identifiers, morphology, colocalization
+        ordered_keys = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx'] + sorted(morph_keys) + coloc_present
 
         with open(combined_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=ordered_keys)
@@ -2626,10 +2928,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         metadata_path = os.path.join(self.masks_dir, "mask_metadata.csv")
         with open(metadata_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['mask_filename', 'soma_filename', 'image_name', 'soma_id', 'soma_idx',
-                             'soma_x', 'soma_y', 'soma_area_um2', 'cell_area_um2',
-                             'pixel_size_um', 'perimeter', 'eccentricity', 'roundness',
-                             'cell_spread', 'animal_id', 'treatment'])
+
+            # Base header columns
+            header = ['mask_filename', 'soma_filename', 'image_name', 'soma_id', 'soma_idx',
+                      'soma_x', 'soma_y', 'soma_area_um2', 'cell_area_um2',
+                      'pixel_size_um', 'perimeter', 'eccentricity', 'roundness',
+                      'cell_spread', 'animal_id', 'treatment']
+
+            # Add colocalization columns if present
+            if coloc_present:
+                header.extend(coloc_present)
+
+            writer.writerow(header)
 
             for result in results:
                 img_name = result['image_name']
@@ -2647,7 +2957,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 mask_filename = f"{img_name}_{soma_id}_mask.tif"
                 soma_filename = f"{img_name}_{soma_id}_soma.tif"
 
-                writer.writerow([
+                row = [
                     mask_filename,
                     soma_filename,
                     img_name,
@@ -2664,7 +2974,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     result.get('cell_spread', 0),
                     result.get('animal_id', ''),
                     result.get('treatment', '')
-                ])
+                ]
+
+                # Add colocalization values if present
+                if coloc_present:
+                    for coloc_key in coloc_present:
+                        row.append(result.get(coloc_key, ''))
+
+                writer.writerow(row)
 
         self.log(f"Metadata saved to: {metadata_path}")
 
