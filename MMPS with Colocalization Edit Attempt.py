@@ -634,6 +634,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Initialize display adjustment values
         self.brightness_value = 0
         self.contrast_value = 0
+        # Per-channel brightness for colocalization mode
+        self.channel_brightness = {'R': 0, 'G': 0, 'B': 0}
         # Mask generation settings (defaults)
         self.use_min_intensity = True
         self.min_intensity_percent = 30
@@ -1119,8 +1121,77 @@ class MicrogliaAnalysisGUI(QMainWindow):
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
-        # Brightness slider
-        brightness_group = QGroupBox("Brightness")
+        # Per-channel brightness in colocalization mode
+        channel_sliders = {}
+        if self.colocalization_mode:
+            channel_group = QGroupBox("Channel Brightness")
+            channel_layout = QVBoxLayout()
+
+            # Green channel
+            green_layout = QHBoxLayout()
+            green_label = QLabel("Green:")
+            green_label.setStyleSheet("color: green; font-weight: bold;")
+            green_label.setFixedWidth(50)
+            green_slider = QSlider(Qt.Horizontal)
+            green_slider.setRange(-100, 100)
+            green_slider.setValue(self.channel_brightness.get('G', 0))
+            green_value = QLabel(str(self.channel_brightness.get('G', 0)))
+            green_value.setFixedWidth(40)
+            green_layout.addWidget(green_label)
+            green_layout.addWidget(green_slider)
+            green_layout.addWidget(green_value)
+            channel_layout.addLayout(green_layout)
+            channel_sliders['G'] = (green_slider, green_value)
+
+            # Red channel
+            red_layout = QHBoxLayout()
+            red_label = QLabel("Red:")
+            red_label.setStyleSheet("color: red; font-weight: bold;")
+            red_label.setFixedWidth(50)
+            red_slider = QSlider(Qt.Horizontal)
+            red_slider.setRange(-100, 100)
+            red_slider.setValue(self.channel_brightness.get('R', 0))
+            red_value = QLabel(str(self.channel_brightness.get('R', 0)))
+            red_value.setFixedWidth(40)
+            red_layout.addWidget(red_label)
+            red_layout.addWidget(red_slider)
+            red_layout.addWidget(red_value)
+            channel_layout.addLayout(red_layout)
+            channel_sliders['R'] = (red_slider, red_value)
+
+            # Blue channel
+            blue_layout = QHBoxLayout()
+            blue_label = QLabel("Blue:")
+            blue_label.setStyleSheet("color: blue; font-weight: bold;")
+            blue_label.setFixedWidth(50)
+            blue_slider = QSlider(Qt.Horizontal)
+            blue_slider.setRange(-100, 100)
+            blue_slider.setValue(self.channel_brightness.get('B', 0))
+            blue_value = QLabel(str(self.channel_brightness.get('B', 0)))
+            blue_value.setFixedWidth(40)
+            blue_layout.addWidget(blue_label)
+            blue_layout.addWidget(blue_slider)
+            blue_layout.addWidget(blue_value)
+            channel_layout.addLayout(blue_layout)
+            channel_sliders['B'] = (blue_slider, blue_value)
+
+            channel_group.setLayout(channel_layout)
+            layout.addWidget(channel_group)
+
+            # Connect channel sliders
+            def make_channel_updater(ch, value_label):
+                def updater(value):
+                    value_label.setText(str(value))
+                    self.channel_brightness[ch] = value
+                    self.update_display()
+                return updater
+
+            green_slider.valueChanged.connect(make_channel_updater('G', green_value))
+            red_slider.valueChanged.connect(make_channel_updater('R', red_value))
+            blue_slider.valueChanged.connect(make_channel_updater('B', blue_value))
+
+        # Global Brightness slider
+        brightness_group = QGroupBox("Global Brightness")
         brightness_layout = QVBoxLayout()
         brightness_slider = QSlider(Qt.Horizontal)
         brightness_slider.setRange(-100, 100)
@@ -1166,11 +1237,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Buttons
         button_layout = QHBoxLayout()
 
-        reset_btn = QPushButton("Reset")
+        reset_btn = QPushButton("Reset All")
 
         def reset_values():
             brightness_slider.setValue(0)
             contrast_slider.setValue(0)
+            if self.colocalization_mode:
+                for ch, (slider, _) in channel_sliders.items():
+                    slider.setValue(0)
 
         reset_btn.clicked.connect(reset_values)
 
@@ -1259,9 +1333,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 if current_tab == 0:  # Original
                     if 'raw_path' in img_data:
                         raw_img = load_tiff_image(img_data['raw_path'])
-                        raw_img = ensure_grayscale(raw_img)
-                        adjusted = self._apply_display_adjustments(raw_img)
-                        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                        # In colocalization mode, keep color
+                        if self.colocalization_mode and raw_img.ndim == 3:
+                            adjusted = self._apply_display_adjustments_color(raw_img)
+                            pixmap = self._array_to_pixmap_color(adjusted)
+                        else:
+                            raw_img = ensure_grayscale(raw_img)
+                            adjusted = self._apply_display_adjustments(raw_img)
+                            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         self.original_label.set_image(pixmap)
                 elif current_tab == 1:  # Preview
                     if 'preview' in img_data and img_data['preview'] is not None:
@@ -1269,7 +1348,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         self.preview_label.set_image(pixmap)
                 elif current_tab == 2:  # Processed
-                    if img_data['processed'] is not None:
+                    # In colocalization mode (not outlining), show color image
+                    if self.colocalization_mode and not self.processed_label.polygon_mode and 'color_image' in img_data:
+                        adjusted = self._apply_display_adjustments_color(img_data['color_image'])
+                        pixmap = self._array_to_pixmap_color(adjusted)
+                        if self.soma_mode or self.processed_label.soma_mode:
+                            self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+                        else:
+                            self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+                    elif img_data['processed'] is not None:
                         adjusted = self._apply_display_adjustments(img_data['processed'])
                         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         # Preserve soma markers if in soma picking mode
@@ -1327,6 +1414,69 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Clip to valid range
         adjusted = np.clip(adjusted, 0, 255)
 
+        return adjusted.astype(np.uint8)
+
+    def _apply_display_adjustments_color(self, img):
+        """Apply per-channel brightness adjustments for color images"""
+        if img is None:
+            return None
+
+        # Work with a copy
+        adjusted = img.astype(np.float32).copy()
+
+        # Handle different array shapes - convert to RGB format
+        if adjusted.ndim == 2:
+            adjusted = np.stack([adjusted, adjusted, adjusted], axis=-1)
+        elif adjusted.ndim == 3:
+            if adjusted.shape[2] == 4:
+                adjusted = adjusted[:, :, :3]
+            elif adjusted.shape[2] != 3 and adjusted.shape[2] >= 2:
+                # Multi-channel - map to RGB (Green, Red, Blue)
+                h, w, c = adjusted.shape
+                rgb = np.zeros((h, w, 3), dtype=np.float32)
+                rgb[:, :, 1] = adjusted[:, :, 0]  # Green
+                rgb[:, :, 0] = adjusted[:, :, 1]  # Red
+                if c >= 3:
+                    rgb[:, :, 2] = adjusted[:, :, 2]  # Blue
+                adjusted = rgb
+
+        # Normalize each channel to 0-255
+        for i in range(3):
+            channel = adjusted[:, :, i]
+            c_min, c_max = channel.min(), channel.max()
+            if c_max > c_min:
+                adjusted[:, :, i] = (channel - c_min) / (c_max - c_min) * 255.0
+
+        # Apply per-channel brightness
+        # R channel (index 0)
+        brightness_r = self.channel_brightness.get('R', 0)
+        if brightness_r != 0:
+            adjusted[:, :, 0] = adjusted[:, :, 0] + (brightness_r * 1.5)
+
+        # G channel (index 1)
+        brightness_g = self.channel_brightness.get('G', 0)
+        if brightness_g != 0:
+            adjusted[:, :, 1] = adjusted[:, :, 1] + (brightness_g * 1.5)
+
+        # B channel (index 2)
+        brightness_b = self.channel_brightness.get('B', 0)
+        if brightness_b != 0:
+            adjusted[:, :, 2] = adjusted[:, :, 2] + (brightness_b * 1.5)
+
+        # Apply global brightness/contrast on top
+        if self.brightness_value != 0:
+            adjusted = adjusted + (self.brightness_value * 1.5)
+
+        if self.contrast_value != 0:
+            if self.contrast_value > 0:
+                factor = 1.0 + (self.contrast_value / 100.0) * 2.0
+            else:
+                factor = 1.0 + (self.contrast_value / 100.0) * 0.9
+            midpoint = 127.5
+            adjusted = (adjusted - midpoint) * factor + midpoint
+
+        # Clip and return
+        adjusted = np.clip(adjusted, 0, 255)
         return adjusted.astype(np.uint8)
 
     def select_folder(self):
