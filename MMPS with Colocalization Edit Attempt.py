@@ -300,23 +300,62 @@ class InteractiveImageLabel(QLabel):
         from PyQt5.QtWidgets import QSizePolicy
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setScaledContents(False)
+        # Zoom and pan settings
+        self.zoom_level = 1.0
+        self.min_zoom = 0.5
+        self.max_zoom = 10.0
+        self.pan_offset_x = 0
+        self.pan_offset_y = 0
+        self.is_panning = False
+        self.last_pan_pos = None
+        # Enable mouse tracking for smooth panning
+        self.setMouseTracking(True)
 
     def set_image(self, qpix, centroids=None, mask_overlay=None, polygon_pts=None):
         self.pix_source = qpix
         self.centroids = centroids or []
         self.mask_overlay = mask_overlay
         self.polygon_pts = polygon_pts or []
-        if qpix is not None:
-            # Scale the pixmap to fit the label while maintaining aspect ratio
-            label_size = self.size()
-            scaled_pix = qpix.scaled(
-                label_size.width(),
-                label_size.height(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            super().setPixmap(scaled_pix)
+        self._update_display()
+
+    def _update_display(self):
+        """Update the displayed image with current zoom and pan"""
+        if self.pix_source is None:
+            return
+        # Calculate the zoomed size
+        label_size = self.size()
+        base_w = label_size.width()
+        base_h = label_size.height()
+
+        # Scale source to fit label first (maintaining aspect ratio)
+        img_w = self.pix_source.width()
+        img_h = self.pix_source.height()
+        scale_to_fit = min(base_w / img_w, base_h / img_h)
+
+        # Apply zoom
+        final_w = int(img_w * scale_to_fit * self.zoom_level)
+        final_h = int(img_h * scale_to_fit * self.zoom_level)
+
+        scaled_pix = self.pix_source.scaled(
+            final_w,
+            final_h,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+        super().setPixmap(scaled_pix)
         self.repaint()
+
+    def reset_zoom(self):
+        """Reset zoom and pan to default"""
+        self.zoom_level = 1.0
+        self.pan_offset_x = 0
+        self.pan_offset_y = 0
+        self._update_display()
+
+    def set_zoom(self, level):
+        """Set zoom to a specific level"""
+        self.zoom_level = max(self.min_zoom, min(self.max_zoom, level))
+        self._update_display()
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -333,22 +372,90 @@ class InteractiveImageLabel(QLabel):
                 painter.drawEllipse(int(x - 6), int(y - 6), 12, 12)
         if self.polygon_mode and len(self.polygon_pts) > 0:
             self._draw_polygon(painter)
+        # Draw zoom indicator
+        if self.zoom_level != 1.0:
+            painter.setPen(QPen(QColor(50, 50, 50)))
+            painter.setBrush(QColor(255, 255, 255, 200))
+            painter.drawRect(5, 5, 70, 20)
+            painter.setPen(QColor(0, 0, 0))
+            painter.drawText(10, 20, f"Zoom: {self.zoom_level:.1f}x")
         painter.end()
 
     def resizeEvent(self, event):
         """Re-scale the image when the label is resized"""
         super().resizeEvent(event)
-        if self.pix_source is not None:
-            # Re-scale the image to fit the new size
-            label_size = self.size()
-            scaled_pix = self.pix_source.scaled(
-                label_size.width(),
-                label_size.height(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            super().setPixmap(scaled_pix)
+        self._update_display()
+
+    def wheelEvent(self, event):
+        """Handle mouse wheel for zooming"""
+        if not self.pix_source:
+            return
+
+        # Get mouse position before zoom
+        mouse_pos = event.pos()
+
+        # Calculate zoom change
+        delta = event.angleDelta().y()
+        if delta > 0:
+            zoom_factor = 1.15
+        else:
+            zoom_factor = 1 / 1.15
+
+        old_zoom = self.zoom_level
+        new_zoom = old_zoom * zoom_factor
+        new_zoom = max(self.min_zoom, min(self.max_zoom, new_zoom))
+
+        if new_zoom != old_zoom:
+            # Adjust pan to zoom toward mouse position
+            # Calculate the image point under the mouse before zoom
+            img_coords = self._to_image_coords(mouse_pos.x(), mouse_pos.y())
+
+            self.zoom_level = new_zoom
+            self._update_display()
+
+            # After zoom, adjust pan so the same image point is under the mouse
+            if img_coords:
+                new_display = self._to_display_coords(img_coords)
+                self.pan_offset_x += mouse_pos.x() - new_display[0]
+                self.pan_offset_y += mouse_pos.y() - new_display[1]
+                self.repaint()
+
+    def mousePressEvent(self, event):
+        # Middle button or Ctrl+Left for panning
+        if event.button() == Qt.MiddleButton or (event.button() == Qt.LeftButton and event.modifiers() == Qt.ControlModifier):
+            self.is_panning = True
+            self.last_pan_pos = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+
+        coords = self._to_image_coords(event.pos().x(), event.pos().y())
+        if not coords:
+            return
+        if self.soma_mode and self.parent_widget:
+            self.parent_widget.add_soma(coords)
+        elif self.polygon_mode and self.parent_widget:
+            # Left click adds point, right click finishes
+            if event.button() == Qt.LeftButton:
+                self.parent_widget.add_polygon_point(coords)
+            elif event.button() == Qt.RightButton:
+                self.parent_widget.finish_polygon()
+
+    def mouseMoveEvent(self, event):
+        """Handle mouse move for panning"""
+        if self.is_panning and self.last_pan_pos:
+            delta = event.pos() - self.last_pan_pos
+            self.pan_offset_x += delta.x()
+            self.pan_offset_y += delta.y()
+            self.last_pan_pos = event.pos()
             self.repaint()
+
+    def mouseReleaseEvent(self, event):
+        """Handle mouse release to stop panning"""
+        if event.button() == Qt.MiddleButton or event.button() == Qt.LeftButton:
+            if self.is_panning:
+                self.is_panning = False
+                self.last_pan_pos = None
+                self.setCursor(Qt.ArrowCursor)
 
     def _draw_mask_overlay(self, painter):
         if self.mask_overlay is None:
@@ -406,8 +513,8 @@ class InteractiveImageLabel(QLabel):
         else:
             pixmap_w = img_w
             pixmap_h = img_h
-        offset_x = (label_w - pixmap_w) / 2
-        offset_y = (label_h - pixmap_h) / 2
+        offset_x = (label_w - pixmap_w) / 2 + self.pan_offset_x
+        offset_y = (label_h - pixmap_h) / 2 + self.pan_offset_y
         scale_x = pixmap_w / img_w
         scale_y = pixmap_h / img_h
         x = img_coords[1] * scale_x + offset_x
@@ -430,26 +537,13 @@ class InteractiveImageLabel(QLabel):
         else:
             pixmap_w = img_w
             pixmap_h = img_h
-        offset_x = (label_w - pixmap_w) / 2
-        offset_y = (label_h - pixmap_h) / 2
+        offset_x = (label_w - pixmap_w) / 2 + self.pan_offset_x
+        offset_y = (label_h - pixmap_h) / 2 + self.pan_offset_y
         scale_x = img_w / pixmap_w
         scale_y = img_h / pixmap_h
         img_x = round((display_x - offset_x) * scale_x)
         img_y = round((display_y - offset_y) * scale_y)
         return (img_y, img_x)
-
-    def mousePressEvent(self, event):
-        coords = self._to_image_coords(event.pos().x(), event.pos().y())
-        if not coords:
-            return
-        if self.soma_mode and self.parent_widget:
-            self.parent_widget.add_soma(coords)
-        elif self.polygon_mode and self.parent_widget:
-            # Left click adds point, right click finishes
-            if event.button() == Qt.LeftButton:
-                self.parent_widget.add_polygon_point(coords)
-            elif event.button() == Qt.RightButton:
-                self.parent_widget.finish_polygon()
 
     def mouseDoubleClickEvent(self, event):
         if self.polygon_mode and self.parent_widget:
@@ -944,6 +1038,41 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         layout.addLayout(display_btn_layout)
 
+        # Zoom controls row
+        zoom_layout = QHBoxLayout()
+        zoom_label = QLabel("Zoom:")
+        zoom_layout.addWidget(zoom_label)
+
+        zoom_out_btn = QPushButton("-")
+        zoom_out_btn.setFixedWidth(30)
+        zoom_out_btn.setToolTip("Zoom out")
+        zoom_out_btn.clicked.connect(self.zoom_out)
+        zoom_layout.addWidget(zoom_out_btn)
+
+        self.zoom_level_label = QLabel("1.0x")
+        self.zoom_level_label.setFixedWidth(40)
+        self.zoom_level_label.setAlignment(Qt.AlignCenter)
+        zoom_layout.addWidget(self.zoom_level_label)
+
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setFixedWidth(30)
+        zoom_in_btn.setToolTip("Zoom in")
+        zoom_in_btn.clicked.connect(self.zoom_in)
+        zoom_layout.addWidget(zoom_in_btn)
+
+        reset_zoom_btn = QPushButton("Reset")
+        reset_zoom_btn.setToolTip("Reset zoom to 1x")
+        reset_zoom_btn.clicked.connect(self.reset_zoom)
+        zoom_layout.addWidget(reset_zoom_btn)
+
+        zoom_layout.addStretch()
+
+        zoom_hint = QLabel("Scroll to zoom, Ctrl+drag to pan")
+        zoom_hint.setStyleSheet("color: #666; font-size: 10px;")
+        zoom_layout.addWidget(zoom_hint)
+
+        layout.addLayout(zoom_layout)
+
         # Progress bar with timer
         progress_container = QHBoxLayout()
         self.progress_bar = QProgressBar()
@@ -1344,6 +1473,43 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.brightness_value = 0
         self.contrast_value = 0
         self.update_display()
+
+    def zoom_in(self):
+        """Zoom in on the current image view"""
+        current_tab = self.tabs.currentIndex()
+        label = self._get_current_label()
+        if label:
+            new_zoom = label.zoom_level * 1.25
+            label.set_zoom(new_zoom)
+            self.zoom_level_label.setText(f"{label.zoom_level:.1f}x")
+
+    def zoom_out(self):
+        """Zoom out on the current image view"""
+        label = self._get_current_label()
+        if label:
+            new_zoom = label.zoom_level / 1.25
+            label.set_zoom(new_zoom)
+            self.zoom_level_label.setText(f"{label.zoom_level:.1f}x")
+
+    def reset_zoom(self):
+        """Reset zoom to 1x on the current image view"""
+        label = self._get_current_label()
+        if label:
+            label.reset_zoom()
+            self.zoom_level_label.setText("1.0x")
+
+    def _get_current_label(self):
+        """Get the InteractiveImageLabel for the current tab"""
+        current_tab = self.tabs.currentIndex()
+        if current_tab == 0:
+            return self.original_label
+        elif current_tab == 1:
+            return self.preview_label
+        elif current_tab == 2:
+            return self.processed_label
+        elif current_tab == 3:
+            return self.mask_label
+        return None
 
     def update_display(self):
         """Update the display with current brightness/contrast settings"""
