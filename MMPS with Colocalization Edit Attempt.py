@@ -456,6 +456,164 @@ class InteractiveImageLabel(QLabel):
             self.parent_widget.finish_polygon()
 
 
+class ChannelSelectDialog(QDialog):
+    """Dialog to select which channels to display"""
+    def __init__(self, parent=None, current_channels=None, channel_names=None):
+        super().__init__(parent)
+        self.setWindowTitle("Channel Display Settings")
+        self.setModal(True)
+
+        # Default channel settings
+        self.channels = current_channels or {'R': True, 'G': True, 'B': True}
+        self.names = channel_names or {0: 'Channel 1 (Green)', 1: 'Channel 2 (Red)', 2: 'Channel 3 (Blue)'}
+
+        layout = QVBoxLayout(self)
+
+        # Instructions
+        instructions = QLabel("Select which channels to display:")
+        instructions.setStyleSheet("font-weight: bold;")
+        layout.addWidget(instructions)
+
+        # Channel checkboxes
+        self.green_check = QCheckBox(f"Green - {self.names.get(0, 'Channel 1')}")
+        self.green_check.setChecked(self.channels.get('G', True))
+        self.green_check.setStyleSheet("color: green; font-weight: bold;")
+        layout.addWidget(self.green_check)
+
+        self.red_check = QCheckBox(f"Red - {self.names.get(1, 'Channel 2')}")
+        self.red_check.setChecked(self.channels.get('R', True))
+        self.red_check.setStyleSheet("color: red; font-weight: bold;")
+        layout.addWidget(self.red_check)
+
+        self.blue_check = QCheckBox(f"Blue - {self.names.get(2, 'Channel 3')}")
+        self.blue_check.setChecked(self.channels.get('B', True))
+        self.blue_check.setStyleSheet("color: blue; font-weight: bold;")
+        layout.addWidget(self.blue_check)
+
+        # Channel naming section
+        layout.addSpacing(10)
+        name_label = QLabel("Customize channel names:")
+        name_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(name_label)
+
+        name_form = QFormLayout()
+        self.name_ch1 = QLineEdit(self.names.get(0, 'Channel 1'))
+        self.name_ch2 = QLineEdit(self.names.get(1, 'Channel 2'))
+        self.name_ch3 = QLineEdit(self.names.get(2, 'Channel 3'))
+        name_form.addRow("Green channel:", self.name_ch1)
+        name_form.addRow("Red channel:", self.name_ch2)
+        name_form.addRow("Blue channel:", self.name_ch3)
+        layout.addLayout(name_form)
+
+        # Quick presets
+        layout.addSpacing(10)
+        preset_label = QLabel("Quick presets:")
+        layout.addWidget(preset_label)
+
+        preset_layout = QHBoxLayout()
+        all_btn = QPushButton("All Channels")
+        all_btn.clicked.connect(self.select_all)
+        preset_layout.addWidget(all_btn)
+
+        green_only_btn = QPushButton("Green Only")
+        green_only_btn.clicked.connect(self.select_green_only)
+        preset_layout.addWidget(green_only_btn)
+
+        red_only_btn = QPushButton("Red Only")
+        red_only_btn.clicked.connect(self.select_red_only)
+        preset_layout.addWidget(red_only_btn)
+
+        layout.addLayout(preset_layout)
+
+        # OK/Cancel buttons
+        layout.addSpacing(10)
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def select_all(self):
+        self.green_check.setChecked(True)
+        self.red_check.setChecked(True)
+        self.blue_check.setChecked(True)
+
+    def select_green_only(self):
+        self.green_check.setChecked(True)
+        self.red_check.setChecked(False)
+        self.blue_check.setChecked(False)
+
+    def select_red_only(self):
+        self.green_check.setChecked(False)
+        self.red_check.setChecked(True)
+        self.blue_check.setChecked(False)
+
+    def get_settings(self):
+        """Return the selected channel settings and names"""
+        return {
+            'channels': {
+                'R': self.red_check.isChecked(),
+                'G': self.green_check.isChecked(),
+                'B': self.blue_check.isChecked()
+            },
+            'names': {
+                0: self.name_ch1.text(),
+                1: self.name_ch2.text(),
+                2: self.name_ch3.text()
+            }
+        }
+
+
+class GrayscaleChannelDialog(QDialog):
+    """Dialog to select which channel to use for grayscale conversion"""
+    def __init__(self, parent=None, channel_names=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Channel for Outlining")
+        self.setModal(True)
+
+        self.names = channel_names or {0: 'Channel 1', 1: 'Channel 2', 2: 'Channel 3'}
+        self.selected_channel = 0
+
+        layout = QVBoxLayout(self)
+
+        # Instructions
+        instructions = QLabel(
+            "Select which channel to use for grayscale during outlining:\n"
+            "(The image will switch to grayscale for precise mask drawing)"
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+
+        # Channel radio buttons
+        from PyQt5.QtWidgets import QRadioButton, QButtonGroup
+        self.button_group = QButtonGroup(self)
+
+        self.ch1_radio = QRadioButton(f"Channel 1 (Green): {self.names.get(0, '')}")
+        self.ch1_radio.setChecked(True)
+        self.button_group.addButton(self.ch1_radio, 0)
+        layout.addWidget(self.ch1_radio)
+
+        self.ch2_radio = QRadioButton(f"Channel 2 (Red): {self.names.get(1, '')}")
+        self.button_group.addButton(self.ch2_radio, 1)
+        layout.addWidget(self.ch2_radio)
+
+        self.ch3_radio = QRadioButton(f"Channel 3 (Blue): {self.names.get(2, '')}")
+        self.button_group.addButton(self.ch3_radio, 2)
+        layout.addWidget(self.ch3_radio)
+
+        # OK button
+        layout.addSpacing(10)
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+        layout.addWidget(ok_btn)
+
+    def get_selected_channel(self):
+        return self.button_group.checkedId()
+
+
 class MicrogliaAnalysisGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -482,6 +640,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.use_imagej = False
         # Colocalization mode - show images in color
         self.colocalization_mode = False
+        # Channel display settings: which channels to show (R, G, B booleans)
+        self.display_channels = {'R': True, 'G': True, 'B': True}
+        # Which channel to use for grayscale during outlining (0=first/Green, 1=second/Red, 2=third/Blue)
+        self.grayscale_channel = 0
+        # Channel names (can be customized by user)
+        self.channel_names = {0: 'Channel 1 (Green)', 1: 'Channel 2 (Red)', 2: 'Channel 3 (Blue)'}
         self.init_ui()
 
     def keyPressEvent(self, event):
@@ -739,10 +903,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Give tabs most of the space (stretch factor)
         layout.addWidget(self.tabs, stretch=1)
 
-        # Display adjustments button (no stretch)
+        # Display adjustments buttons in a row
+        display_btn_layout = QHBoxLayout()
         display_adjust_btn = QPushButton("Display Adjustments")
         display_adjust_btn.clicked.connect(self.open_display_adjustments)
-        layout.addWidget(display_adjust_btn, stretch=0)
+        display_btn_layout.addWidget(display_adjust_btn)
+
+        # Channel selection button (only visible in colocalization mode)
+        self.channel_select_btn = QPushButton("Channel Display")
+        self.channel_select_btn.clicked.connect(self.open_channel_selector)
+        self.channel_select_btn.setToolTip("Select which color channels to display")
+        self.channel_select_btn.setVisible(False)  # Hidden until colocalization mode
+        display_btn_layout.addWidget(self.channel_select_btn)
+
+        layout.addLayout(display_btn_layout)
 
         # Progress bar with timer
         progress_container = QHBoxLayout()
@@ -1010,6 +1184,63 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         dialog.exec_()
 
+    def open_channel_selector(self):
+        """Open channel selection dialog to choose which channels to display"""
+        if not self.colocalization_mode:
+            QMessageBox.information(
+                self, "Channel Selection",
+                "Channel selection is only available in colocalization mode."
+            )
+            return
+
+        dialog = ChannelSelectDialog(
+            self,
+            current_channels=self.display_channels,
+            channel_names=self.channel_names
+        )
+
+        if dialog.exec_() == QDialog.Accepted:
+            settings = dialog.get_settings()
+            self.display_channels = settings['channels']
+            self.channel_names = settings['names']
+
+            # Log the change
+            active_channels = [ch for ch, active in self.display_channels.items() if active]
+            self.log(f"Channel display: {', '.join(active_channels)}")
+
+            # Refresh the current display
+            self._refresh_color_display()
+
+    def _refresh_color_display(self):
+        """Refresh the display with current channel settings"""
+        if not self.current_image_name or self.current_image_name not in self.images:
+            return
+
+        img_data = self.images[self.current_image_name]
+
+        # Only refresh if in colocalization mode and we have color data
+        if self.colocalization_mode and 'color_image' in img_data:
+            pixmap = self._array_to_pixmap_color(img_data['color_image'])
+            # Preserve markers
+            if self.processed_label.soma_mode:
+                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+            elif self.processed_label.polygon_mode:
+                queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
+                if queue_idx < len(self.outlining_queue):
+                    img_name, soma_idx = self.outlining_queue[queue_idx]
+                    if img_name == self.current_image_name:
+                        soma = img_data['somas'][soma_idx]
+                        self.processed_label.set_image(pixmap, centroids=[soma],
+                                                       polygon_pts=self.polygon_points)
+            else:
+                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+
+            # Also refresh original tab if viewing
+            raw_img = load_tiff_image(img_data['raw_path'])
+            if raw_img.ndim == 3:
+                orig_pixmap = self._array_to_pixmap_color(raw_img)
+                self.original_label.set_image(orig_pixmap)
+
     def reset_display_adjustments(self):
         """Reset brightness and contrast to default"""
         self.brightness_value = 0
@@ -1123,8 +1354,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.log("=" * 50)
             self.log("🎨 COLOCALIZATION MODE ENABLED")
             self.log("Images will be displayed in color")
+            self.log("Use 'Channel Display' button to select which channels to show")
             self.log("Grayscale conversion will occur when outlining begins")
             self.log("=" * 50)
+            # Show channel selection button
+            self.channel_select_btn.setVisible(True)
+        else:
+            # Hide channel selection button
+            self.channel_select_btn.setVisible(False)
 
         # Include both lowercase and uppercase extensions for macOS compatibility
         exts = ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg',
@@ -1288,7 +1525,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         return QPixmap.fromImage(img)
 
     def _array_to_pixmap_color(self, arr):
-        """Convert a color (RGB) numpy array to QPixmap"""
+        """Convert a color (RGB) numpy array to QPixmap, respecting channel selection"""
         if arr is None:
             return self._create_blank_pixmap()
 
@@ -1312,13 +1549,26 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         rgb[:, :, 2] = arr[:, :, 2]  # Blue channel
                     arr = rgb
 
+        # Apply channel selection mask
+        arr_display = arr.copy()
+        if not self.display_channels.get('R', True):
+            arr_display[:, :, 0] = 0  # Turn off Red channel
+        if not self.display_channels.get('G', True):
+            arr_display[:, :, 1] = 0  # Turn off Green channel
+        if not self.display_channels.get('B', True):
+            arr_display[:, :, 2] = 0  # Turn off Blue channel
+
         # Normalize to 0-255
-        arr_float = arr.astype(np.float32)
-        for i in range(arr.shape[2]):
+        arr_float = arr_display.astype(np.float32)
+        for i in range(arr_display.shape[2]):
             channel = arr_float[:, :, i]
-            c_min, c_max = channel.min(), channel.max()
-            if c_max > c_min:
-                arr_float[:, :, i] = (channel - c_min) / (c_max - c_min) * 255
+            # Only normalize if channel is enabled
+            if (i == 0 and self.display_channels.get('R', True)) or \
+               (i == 1 and self.display_channels.get('G', True)) or \
+               (i == 2 and self.display_channels.get('B', True)):
+                c_min, c_max = channel.min(), channel.max()
+                if c_max > c_min:
+                    arr_float[:, :, i] = (channel - c_min) / (c_max - c_min) * 255
 
         arr8 = arr_float.clip(0, 255).astype(np.uint8)
         arr8 = np.ascontiguousarray(arr8)
@@ -1616,6 +1866,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if not self.outlining_queue:
             QMessageBox.warning(self, "Warning", "No somas to outline")
             return
+
+        # In colocalization mode, ask which channel to use for grayscale outlining
+        if self.colocalization_mode:
+            dialog = GrayscaleChannelDialog(self, channel_names=self.channel_names)
+            if dialog.exec_() == QDialog.Accepted:
+                self.grayscale_channel = dialog.get_selected_channel()
+                channel_name = self.channel_names.get(self.grayscale_channel, f'Channel {self.grayscale_channel + 1}')
+                self.log(f"Using '{channel_name}' for grayscale outlining")
+            else:
+                # User cancelled, abort outlining
+                return
+
         self.batch_mode = True
         self.polygon_points = []
         self.processed_label.polygon_mode = True
@@ -1630,11 +1892,28 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("=" * 50)
         self.log(f"📐 BATCH OUTLINING MODE")
         if self.colocalization_mode:
-            self.log("Switching to grayscale for precise outlining")
+            channel_name = self.channel_names.get(self.grayscale_channel, f'Channel {self.grayscale_channel + 1}')
+            self.log(f"Switched to grayscale ({channel_name}) for precise outlining")
         self.log(f"Total somas to outline: {len(self.outlining_queue)}")
         self.log("Left-click to add points, right-click to finish outline")
         self.log("Press 'Z' or Backspace to undo last point | 'Escape' to restart | 'Enter' to finish")
         self.log("=" * 50)
+
+    def _get_outlining_pixmap(self, img_data):
+        """Get the appropriate grayscale pixmap for outlining"""
+        if self.colocalization_mode and 'color_image' in img_data:
+            # Extract the selected channel from color image for grayscale display
+            color_img = img_data['color_image']
+            if color_img.ndim == 3 and color_img.shape[2] > self.grayscale_channel:
+                # Get the selected channel
+                channel_img = color_img[:, :, self.grayscale_channel].astype(np.float32)
+                # Normalize
+                c_min, c_max = channel_img.min(), channel_img.max()
+                if c_max > c_min:
+                    channel_img = (channel_img - c_min) / (c_max - c_min) * 255
+                return self._array_to_pixmap(channel_img.astype(np.uint8))
+        # Default: use processed image
+        return self._array_to_pixmap(img_data['processed'])
 
     def _load_soma_for_outlining(self, queue_idx):
         if queue_idx >= len(self.outlining_queue):
@@ -1645,7 +1924,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         img_data = self.images[img_name]
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
-        pixmap = self._array_to_pixmap(img_data['processed'])
+        pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
         self.tabs.setCurrentIndex(2)
         self.nav_status_label.setText(
@@ -1662,7 +1941,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             img_data = self.images[img_name]
             soma = img_data['somas'][soma_idx]
             soma_id = img_data['soma_ids'][soma_idx]
-            pixmap = self._array_to_pixmap(img_data['processed'])
+            pixmap = self._get_outlining_pixmap(img_data)
             self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
             # Update status to show point count
             self.nav_status_label.setText(
@@ -1682,7 +1961,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 img_data = self.images[img_name]
                 soma = img_data['somas'][soma_idx]
                 soma_id = img_data['soma_ids'][soma_idx]
-                pixmap = self._array_to_pixmap(img_data['processed'])
+                pixmap = self._get_outlining_pixmap(img_data)
                 self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
                 self.nav_status_label.setText(
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
@@ -1703,7 +1982,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 img_data = self.images[img_name]
                 soma = img_data['somas'][soma_idx]
                 soma_id = img_data['soma_ids'][soma_idx]
-                pixmap = self._array_to_pixmap(img_data['processed'])
+                pixmap = self._get_outlining_pixmap(img_data)
                 self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
                 self.nav_status_label.setText(
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
