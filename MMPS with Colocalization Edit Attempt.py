@@ -569,13 +569,30 @@ class ChannelSelectDialog(QDialog):
 
 class GrayscaleChannelDialog(QDialog):
     """Dialog to select which channel to use for grayscale conversion"""
-    def __init__(self, parent=None, channel_names=None):
+    def __init__(self, parent=None, channel_names=None, color_image=None):
         super().__init__(parent)
         self.setWindowTitle("Select Channel for Outlining")
         self.setModal(True)
 
         self.names = channel_names or {0: 'Channel 1', 1: 'Channel 2', 2: 'Channel 3'}
         self.selected_channel = 0
+        self.color_image = color_image
+
+        # Determine the display color mapping based on image format
+        # For 2-channel: Ch0=Green, Ch1=Red
+        # For 3-channel RGB: Ch0=Red, Ch1=Green, Ch2=Blue
+        if color_image is not None and color_image.ndim == 3:
+            num_channels = color_image.shape[2]
+            if num_channels == 3:
+                # Standard RGB
+                self.color_labels = {0: 'Red', 1: 'Green', 2: 'Blue'}
+            elif num_channels == 2:
+                # 2-channel: mapped as Green, Red
+                self.color_labels = {0: 'Green', 1: 'Red'}
+            else:
+                self.color_labels = {i: f'Ch{i+1}' for i in range(num_channels)}
+        else:
+            self.color_labels = {0: 'Green', 1: 'Red', 2: 'Blue'}
 
         layout = QVBoxLayout(self)
 
@@ -591,18 +608,25 @@ class GrayscaleChannelDialog(QDialog):
         from PyQt5.QtWidgets import QRadioButton, QButtonGroup
         self.button_group = QButtonGroup(self)
 
-        self.ch1_radio = QRadioButton(f"Channel 1 (Green): {self.names.get(0, '')}")
-        self.ch1_radio.setChecked(True)
-        self.button_group.addButton(self.ch1_radio, 0)
-        layout.addWidget(self.ch1_radio)
-
-        self.ch2_radio = QRadioButton(f"Channel 2 (Red): {self.names.get(1, '')}")
-        self.button_group.addButton(self.ch2_radio, 1)
-        layout.addWidget(self.ch2_radio)
-
-        self.ch3_radio = QRadioButton(f"Channel 3 (Blue): {self.names.get(2, '')}")
-        self.button_group.addButton(self.ch3_radio, 2)
-        layout.addWidget(self.ch3_radio)
+        # Create radio buttons based on available channels
+        num_ch = len(self.color_labels)
+        self.radios = []
+        for i in range(min(num_ch, 3)):
+            color = self.color_labels.get(i, f'Ch{i+1}')
+            name = self.names.get(i, '')
+            radio = QRadioButton(f"{color}: {name}" if name else color)
+            if i == 0:
+                radio.setChecked(True)
+            # Style with the actual color
+            if color == 'Red':
+                radio.setStyleSheet("color: red;")
+            elif color == 'Green':
+                radio.setStyleSheet("color: green;")
+            elif color == 'Blue':
+                radio.setStyleSheet("color: blue;")
+            self.button_group.addButton(radio, i)
+            layout.addWidget(radio)
+            self.radios.append(radio)
 
         # OK button
         layout.addSpacing(10)
@@ -2019,7 +2043,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # In colocalization mode, ask which channel to use for grayscale outlining
         if self.colocalization_mode:
-            dialog = GrayscaleChannelDialog(self, channel_names=self.channel_names)
+            # Get a sample color image to determine channel format
+            sample_color_img = None
+            for img_name, img_data in self.images.items():
+                if 'color_image' in img_data:
+                    sample_color_img = img_data['color_image']
+                    break
+
+            dialog = GrayscaleChannelDialog(
+                self,
+                channel_names=self.channel_names,
+                color_image=sample_color_img
+            )
             if dialog.exec_() == QDialog.Accepted:
                 self.grayscale_channel = dialog.get_selected_channel()
                 channel_name = self.channel_names.get(self.grayscale_channel, f'Channel {self.grayscale_channel + 1}')
