@@ -769,8 +769,33 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_label.setText("No masks yet")
         self.tabs.addTab(self.mask_label, "Masks")
 
+        # Colocalization overlay tab
+        self.coloc_label = InteractiveImageLabel(self)
+        self.coloc_label.setText("Enable colocalization and load Channel 2 images")
+        self.tabs.addTab(self.coloc_label, "Colocalization")
+
         # Give tabs most of the space (stretch factor)
         layout.addWidget(self.tabs, stretch=1)
+
+        # Colocalization view controls
+        coloc_view_layout = QHBoxLayout()
+        self.coloc_overlay_btn = QPushButton("Show Colocalization Overlay")
+        self.coloc_overlay_btn.setCheckable(True)
+        self.coloc_overlay_btn.setChecked(False)
+        self.coloc_overlay_btn.clicked.connect(self._toggle_coloc_overlay)
+        self.coloc_overlay_btn.setEnabled(False)
+        self.coloc_overlay_btn.setStyleSheet("""
+            QPushButton { background-color: #f0f0f0; }
+            QPushButton:checked { background-color: #90EE90; font-weight: bold; }
+        """)
+        coloc_view_layout.addWidget(self.coloc_overlay_btn)
+
+        self.coloc_view_label = QLabel("Ch1: Green | Ch2: Red")
+        self.coloc_view_label.setStyleSheet("color: #666; font-style: italic;")
+        coloc_view_layout.addWidget(self.coloc_view_label)
+        coloc_view_layout.addStretch()
+
+        layout.addLayout(coloc_view_layout)
 
         # Display adjustments button (no stretch)
         display_adjust_btn = QPushButton("Display Adjustments")
@@ -1065,6 +1090,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.coloc_status_label.setStyleSheet("color: #666; font-style: italic;")
             self.colocalization_images = {}
             self.colocalization_folder = None
+            self.coloc_overlay_btn.setEnabled(False)
+            self.coloc_overlay_btn.setChecked(False)
+            self.coloc_label.setText("Enable colocalization and load Channel 2 images")
 
     def select_colocalization_folder(self):
         """Select folder containing colocalization channel images"""
@@ -1151,6 +1179,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.log(f"✓ Colocalization: Matched {matched_count} of {total_images} images")
             self.log(f"  Folder: {folder}")
 
+            # Enable the overlay button
+            self.coloc_overlay_btn.setEnabled(True)
+
+            # Update colocalization display for current image
+            self._update_colocalization_display()
+
             # List unmatched images
             unmatched = [name for name in self.images.keys() if name not in self.colocalization_images]
             if unmatched:
@@ -1162,6 +1196,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         else:
             self.coloc_status_label.setText("Colocalization: No matches found!")
             self.coloc_status_label.setStyleSheet("color: #cc0000; font-style: italic;")
+            self.coloc_overlay_btn.setEnabled(False)
             self.log(f"⚠️ Colocalization: No matching images found in {folder}")
             self.log("  Make sure images have matching names (e.g., image1_ch1.tif ↔ image1_ch2.tif)")
 
@@ -1283,6 +1318,133 @@ class MicrogliaAnalysisGUI(QMainWindow):
         results['icq'] = (n_positive / n_total) - 0.5 if n_total > 0 else 0.0
 
         return results
+
+    def create_colocalization_composite(self, img_name, mask_overlay=None):
+        """Create an RGB composite image showing Ch1 (green) and Ch2 (red) overlay"""
+        if img_name not in self.images:
+            return None
+
+        img_data = self.images[img_name]
+
+        # Get Channel 1 (processed microglia image)
+        ch1 = img_data.get('processed')
+        if ch1 is None:
+            # Use raw image if not processed yet
+            try:
+                ch1 = load_tiff_image(img_data['raw_path'])
+                ch1 = ensure_grayscale(ch1)
+            except:
+                return None
+
+        # Get Channel 2 (colocalization image)
+        ch2 = self.load_colocalization_image(img_name)
+        if ch2 is None:
+            return None
+
+        # Ensure same dimensions
+        if ch1.shape != ch2.shape:
+            self.log(f"⚠️ Dimension mismatch for composite: {ch1.shape} vs {ch2.shape}")
+            return None
+
+        # Normalize both channels to 0-255 range
+        def normalize_channel(img):
+            img_float = img.astype(np.float32)
+            img_min, img_max = img_float.min(), img_float.max()
+            if img_max > img_min:
+                img_norm = (img_float - img_min) / (img_max - img_min) * 255
+            else:
+                img_norm = np.zeros_like(img_float)
+            return img_norm.astype(np.uint8)
+
+        ch1_norm = normalize_channel(ch1)
+        ch2_norm = normalize_channel(ch2)
+
+        # Create RGB composite: Ch1 = Green, Ch2 = Red, overlap = Yellow
+        h, w = ch1.shape
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        rgb[:, :, 0] = ch2_norm  # Red channel = Ch2
+        rgb[:, :, 1] = ch1_norm  # Green channel = Ch1
+        rgb[:, :, 2] = 0         # Blue channel = 0
+
+        # Add mask overlay if provided (shown in blue/cyan)
+        if mask_overlay is not None and np.any(mask_overlay):
+            mask_bool = mask_overlay > 0
+            # Add blue tint to masked area
+            rgb[mask_bool, 2] = np.clip(rgb[mask_bool, 2].astype(np.int32) + 100, 0, 255).astype(np.uint8)
+
+        return rgb
+
+    def _array_to_pixmap_rgb(self, rgb_array):
+        """Convert RGB numpy array to QPixmap"""
+        if rgb_array is None:
+            return None
+
+        h, w, c = rgb_array.shape
+        rgb_array = np.ascontiguousarray(rgb_array)
+        bytes_per_line = 3 * w
+        img = QImage(rgb_array.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        img = img.copy()  # Make a copy to ensure data persists
+        return QPixmap.fromImage(img)
+
+    def _toggle_coloc_overlay(self, checked):
+        """Toggle colocalization overlay display"""
+        if checked:
+            self.coloc_view_label.setText("Overlay ON - Ch1: Green | Ch2: Red | Overlap: Yellow")
+            self.coloc_view_label.setStyleSheet("color: #008800; font-weight: bold;")
+        else:
+            self.coloc_view_label.setText("Ch1: Green | Ch2: Red")
+            self.coloc_view_label.setStyleSheet("color: #666; font-style: italic;")
+
+        # Refresh the display
+        self._update_colocalization_display()
+
+    def _update_colocalization_display(self):
+        """Update the colocalization tab display"""
+        if not self.current_image_name:
+            return
+
+        if not self.colocalization_enabled or self.current_image_name not in self.colocalization_images:
+            self.coloc_label.setText("No colocalization data available for this image")
+            return
+
+        # Create composite image
+        img_data = self.images.get(self.current_image_name, {})
+        mask_overlay = None
+
+        # Get current mask if in QA mode
+        if self.mask_qa_active and self.all_masks_flat:
+            if self.mask_qa_idx < len(self.all_masks_flat):
+                flat_data = self.all_masks_flat[self.mask_qa_idx]
+                if flat_data['image_name'] == self.current_image_name:
+                    mask_overlay = flat_data['mask_data'].get('mask')
+
+        rgb_composite = self.create_colocalization_composite(
+            self.current_image_name,
+            mask_overlay=mask_overlay if self.coloc_overlay_btn.isChecked() else None
+        )
+
+        if rgb_composite is not None:
+            pixmap = self._array_to_pixmap_rgb(rgb_composite)
+            # Preserve soma markers if available
+            centroids = img_data.get('somas', [])
+            self.coloc_label.set_image(pixmap, centroids=centroids)
+        else:
+            self.coloc_label.setText("Failed to create colocalization composite")
+
+    def _update_colocalization_display_with_polygon(self, soma_centroid, polygon_pts):
+        """Update colocalization display showing current soma and polygon outline"""
+        if not self.current_image_name:
+            return
+
+        if not self.colocalization_enabled or self.current_image_name not in self.colocalization_images:
+            return
+
+        rgb_composite = self.create_colocalization_composite(self.current_image_name)
+
+        if rgb_composite is not None:
+            pixmap = self._array_to_pixmap_rgb(rgb_composite)
+            # Show current soma and polygon being drawn
+            self.coloc_label.set_image(pixmap, centroids=[soma_centroid], polygon_pts=polygon_pts)
 
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -1412,6 +1574,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
             else:
                 self.processed_label.set_image(self._create_blank_pixmap())
                 self.processed_label.setText("Not processed yet")
+
+            # Update colocalization display if enabled
+            if self.colocalization_enabled and self.colocalization_images:
+                self._update_colocalization_display()
         except Exception as e:
             self.log(f"ERROR displaying image: {str(e)}")
             import traceback
@@ -1604,6 +1770,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_mode = True
         self.current_image_name = self.soma_picking_queue[0]
         self.processed_label.soma_mode = True
+        self.coloc_label.soma_mode = True  # Enable soma picking on colocalization tab too
         self.original_label.soma_mode = False
         self.preview_label.soma_mode = False
         self.mask_label.soma_mode = False
@@ -1630,6 +1797,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f"Image {current_idx + 1}/{len(self.soma_picking_queue)}: {self.current_image_name} | "
             f"Somas: {len(img_data['somas'])}"
         )
+
+        # Update colocalization display
+        if self.colocalization_enabled and self.colocalization_images:
+            self._update_colocalization_display()
 
     def add_soma(self, coords):
         if not self.current_image_name:
@@ -1675,6 +1846,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def _finish_soma_picking(self):
         self.batch_mode = False
         self.processed_label.soma_mode = False
+        self.coloc_label.soma_mode = False
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.done_btn.setEnabled(False)
@@ -1704,6 +1876,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.polygon_points = []
         self.processed_label.polygon_mode = True
         self.processed_label.soma_mode = False
+        self.coloc_label.polygon_mode = True  # Enable polygon mode on colocalization tab too
+        self.coloc_label.soma_mode = False
         self.original_label.polygon_mode = False
         self.preview_label.polygon_mode = False
         self.mask_label.polygon_mode = False
@@ -1736,6 +1910,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         )
         self.log(f"Outlining {soma_id} ({queue_idx + 1}/{len(self.outlining_queue)})")
 
+        # Update colocalization display with polygon
+        if self.colocalization_enabled and self.colocalization_images:
+            self._update_colocalization_display_with_polygon(soma, self.polygon_points)
+
     def add_polygon_point(self, coords):
         self.polygon_points.append(coords)
         queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
@@ -1751,6 +1929,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
                 f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
             )
+            # Update colocalization display with polygon
+            if self.colocalization_enabled and self.colocalization_images:
+                self._update_colocalization_display_with_polygon(soma, self.polygon_points)
 
     def undo_last_polygon_point(self):
         """Remove the last point added to the polygon"""
@@ -1770,6 +1951,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
                     f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
                 )
+                # Update colocalization display
+                if self.colocalization_enabled and self.colocalization_images:
+                    self._update_colocalization_display_with_polygon(soma, self.polygon_points)
         else:
             self.log("⚠️ No points to undo")
 
@@ -1791,6 +1975,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
                     f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
                 )
+                # Update colocalization display
+                if self.colocalization_enabled and self.colocalization_images:
+                    self._update_colocalization_display_with_polygon(soma, self.polygon_points)
         else:
             self.log("⚠️ No points to clear")
 
@@ -1942,6 +2129,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def _finish_outlining(self):
         self.batch_mode = False
         self.processed_label.polygon_mode = False
+        self.coloc_label.polygon_mode = False
         self.redo_outline_btn.setEnabled(False)  # Disable redo button when outlining complete
         for img_name, img_data in self.images.items():
             if img_data['selected'] and len(img_data['soma_outlines']) == len(img_data['somas']):
@@ -2332,6 +2520,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         processed_img = flat_data['processed_img']
         img_name = flat_data['image_name']
 
+        # Update current image name for colocalization display
+        self.current_image_name = img_name
+
         pixmap = self._array_to_pixmap(processed_img)
         self.mask_label.set_image(pixmap, mask_overlay=mask_data['mask'])
 
@@ -2343,6 +2534,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f"{img_name} | {mask_data['soma_id']} | "
             f"Area: {mask_data['area_um2']} µm² | {status_text}"
         )
+
+        # Update colocalization display with current mask overlay
+        if self.colocalization_enabled and self.colocalization_images:
+            self._update_colocalization_display()
 
     def approve_current_mask(self):
         if not self.mask_qa_active or self.mask_qa_idx >= len(self.all_masks_flat):
