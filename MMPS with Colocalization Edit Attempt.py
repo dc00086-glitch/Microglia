@@ -417,14 +417,22 @@ class InteractiveImageLabel(QLabel):
         super().resizeEvent(event)
         self._update_display()
 
+    def center_on_soma(self):
+        """Center the view on the current soma (first centroid)"""
+        if not self.pix_source or not self.centroids:
+            return
+        # Get first centroid (current soma)
+        soma = self.centroids[0]
+        img_h, img_w = self.pix_source.height(), self.pix_source.width()
+        # Convert to normalized coords
+        self.view_center_x = soma[1] / img_w
+        self.view_center_y = soma[0] / img_h
+        self._update_display()
+
     def wheelEvent(self, event):
-        """Handle mouse wheel for zooming"""
+        """Handle mouse wheel for zooming - always centers on soma if available"""
         if not self.pix_source:
             return
-
-        # Get mouse position in image coordinates before zoom
-        mouse_pos = event.pos()
-        img_coords = self._to_image_coords(mouse_pos.x(), mouse_pos.y())
 
         # Calculate zoom change
         delta = event.angleDelta().y()
@@ -436,17 +444,13 @@ class InteractiveImageLabel(QLabel):
         old_zoom = self.zoom_level
         new_zoom = max(self.min_zoom, min(self.max_zoom, old_zoom * zoom_factor))
 
-        if new_zoom != old_zoom and img_coords:
-            # Set view center to zoom toward mouse position
-            img_h, img_w = self.pix_source.height(), self.pix_source.width()
-            # Convert image coords to normalized (0-1)
-            norm_x = img_coords[1] / img_w
-            norm_y = img_coords[0] / img_h
-
-            # Blend current center toward mouse position
-            blend = 0.3  # How much to move toward mouse
-            self.view_center_x = self.view_center_x + (norm_x - self.view_center_x) * blend
-            self.view_center_y = self.view_center_y + (norm_y - self.view_center_y) * blend
+        if new_zoom != old_zoom:
+            # If we have a soma marker, center on it
+            if self.centroids:
+                soma = self.centroids[0]
+                img_h, img_w = self.pix_source.height(), self.pix_source.width()
+                self.view_center_x = soma[1] / img_w
+                self.view_center_y = soma[0] / img_h
 
             self.zoom_level = new_zoom
             self._update_display()
@@ -600,66 +604,57 @@ class ChannelSelectDialog(QDialog):
         self.setWindowTitle("Channel Display Settings")
         self.setModal(True)
 
-        # Default channel settings - now indexed by channel number
+        # Default channel settings - indexed by channel number
         self.channels = current_channels or {0: True, 1: True, 2: True}
         self.names = channel_names or {0: 'Channel 1', 1: 'Channel 2', 2: 'Channel 3'}
 
-        # Detect actual display colors from image
-        self.display_colors = self._detect_display_colors(color_image)
+        # Detect number of channels
+        self.num_channels = 3
+        if color_image is not None and color_image.ndim == 3:
+            self.num_channels = min(color_image.shape[2], 3)
 
         layout = QVBoxLayout(self)
 
         # Instructions
-        instructions = QLabel("Select which channels to display:\n(Colors shown match what you see on screen)")
-        instructions.setStyleSheet("font-weight: bold;")
+        instructions = QLabel("Select which channels to display:")
         layout.addWidget(instructions)
 
-        # Channel checkboxes - labeled by what color they appear as
+        # Channel checkboxes - simple numbered labels
         self.ch_checks = []
-        for i in range(3):
-            color_name = self.display_colors.get(i, 'Unknown')
-            user_name = self.names.get(i, f'Channel {i+1}')
-            check = QCheckBox(f"Ch{i+1} ({color_name}): {user_name}")
+        for i in range(self.num_channels):
+            user_name = self.names.get(i, '')
+            label = f"Channel {i+1}"
+            if user_name and user_name != f'Channel {i+1}':
+                label += f": {user_name}"
+            check = QCheckBox(label)
             check.setChecked(self.channels.get(i, True))
-            # Style with the detected color
-            if color_name == 'Red':
-                check.setStyleSheet("color: red; font-weight: bold;")
-            elif color_name == 'Green':
-                check.setStyleSheet("color: green; font-weight: bold;")
-            elif color_name == 'Blue':
-                check.setStyleSheet("color: blue; font-weight: bold;")
             layout.addWidget(check)
             self.ch_checks.append(check)
 
         # Channel naming section
         layout.addSpacing(10)
         name_label = QLabel("Customize channel names:")
-        name_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(name_label)
 
         name_form = QFormLayout()
         self.name_inputs = []
-        for i in range(3):
-            color_name = self.display_colors.get(i, f'Ch{i+1}')
-            name_input = QLineEdit(self.names.get(i, f'Channel {i+1}'))
-            name_form.addRow(f"{color_name} channel:", name_input)
+        for i in range(self.num_channels):
+            name_input = QLineEdit(self.names.get(i, ''))
+            name_form.addRow(f"Channel {i+1}:", name_input)
             self.name_inputs.append(name_input)
         layout.addLayout(name_form)
 
         # Quick presets
         layout.addSpacing(10)
         preset_layout = QHBoxLayout()
-        all_btn = QPushButton("All Channels")
+        all_btn = QPushButton("All")
         all_btn.clicked.connect(self.select_all)
         preset_layout.addWidget(all_btn)
 
-        ch1_only_btn = QPushButton("Ch1 Only")
-        ch1_only_btn.clicked.connect(lambda: self.select_only(0))
-        preset_layout.addWidget(ch1_only_btn)
-
-        ch2_only_btn = QPushButton("Ch2 Only")
-        ch2_only_btn.clicked.connect(lambda: self.select_only(1))
-        preset_layout.addWidget(ch2_only_btn)
+        for i in range(self.num_channels):
+            btn = QPushButton(f"Ch{i+1} Only")
+            btn.clicked.connect(lambda checked, idx=i: self.select_only(idx))
+            preset_layout.addWidget(btn)
 
         layout.addLayout(preset_layout)
 
@@ -674,30 +669,6 @@ class ChannelSelectDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
 
-    def _detect_display_colors(self, color_image):
-        """Detect which color each channel displays as based on the image format"""
-        colors = {}
-        if color_image is None:
-            return {0: 'Green', 1: 'Red', 2: 'Blue'}  # Default assumption
-
-        if color_image.ndim == 3:
-            num_ch = color_image.shape[2]
-            if num_ch == 3:
-                # Standard RGB image
-                colors = {0: 'Red', 1: 'Green', 2: 'Blue'}
-            elif num_ch == 2:
-                # 2-channel mapped as Green, Red in _array_to_pixmap_color
-                colors = {0: 'Green', 1: 'Red'}
-            elif num_ch == 4:
-                # RGBA
-                colors = {0: 'Red', 1: 'Green', 2: 'Blue', 3: 'Alpha'}
-            else:
-                # Other multi-channel - use the mapping from _array_to_pixmap_color
-                colors = {0: 'Green', 1: 'Red', 2: 'Blue'}
-        else:
-            colors = {0: 'Gray'}
-        return colors
-
     def select_all(self):
         for check in self.ch_checks:
             check.setChecked(True)
@@ -708,22 +679,8 @@ class ChannelSelectDialog(QDialog):
 
     def get_settings(self):
         """Return the selected channel settings and names"""
-        # Map channel indices to display colors for the main app
-        channels = {}
-        for i, check in enumerate(self.ch_checks):
-            color = self.display_colors.get(i)
-            if color == 'Red':
-                channels['R'] = check.isChecked()
-            elif color == 'Green':
-                channels['G'] = check.isChecked()
-            elif color == 'Blue':
-                channels['B'] = check.isChecked()
-
-        # Ensure all keys exist
-        channels.setdefault('R', True)
-        channels.setdefault('G', True)
-        channels.setdefault('B', True)
-
+        # Return by channel index
+        channels = {i: check.isChecked() for i, check in enumerate(self.ch_checks)}
         return {
             'channels': channels,
             'names': {i: inp.text() for i, inp in enumerate(self.name_inputs)}
@@ -737,25 +694,12 @@ class GrayscaleChannelDialog(QDialog):
         self.setWindowTitle("Select Channel for Outlining")
         self.setModal(True)
 
-        self.names = channel_names or {0: 'Channel 1', 1: 'Channel 2', 2: 'Channel 3'}
-        self.selected_channel = 0
-        self.color_image = color_image
+        self.names = channel_names or {0: '', 1: '', 2: ''}
 
-        # Determine the display color mapping based on image format
-        # For 2-channel: Ch0=Green, Ch1=Red
-        # For 3-channel RGB: Ch0=Red, Ch1=Green, Ch2=Blue
+        # Detect number of channels
+        self.num_channels = 3
         if color_image is not None and color_image.ndim == 3:
-            num_channels = color_image.shape[2]
-            if num_channels == 3:
-                # Standard RGB
-                self.color_labels = {0: 'Red', 1: 'Green', 2: 'Blue'}
-            elif num_channels == 2:
-                # 2-channel: mapped as Green, Red
-                self.color_labels = {0: 'Green', 1: 'Red'}
-            else:
-                self.color_labels = {i: f'Ch{i+1}' for i in range(num_channels)}
-        else:
-            self.color_labels = {0: 'Green', 1: 'Red', 2: 'Blue'}
+            self.num_channels = min(color_image.shape[2], 3)
 
         layout = QVBoxLayout(self)
 
@@ -771,22 +715,15 @@ class GrayscaleChannelDialog(QDialog):
         from PyQt5.QtWidgets import QRadioButton, QButtonGroup
         self.button_group = QButtonGroup(self)
 
-        # Create radio buttons based on available channels
-        num_ch = len(self.color_labels)
         self.radios = []
-        for i in range(min(num_ch, 3)):
-            color = self.color_labels.get(i, f'Ch{i+1}')
+        for i in range(self.num_channels):
             name = self.names.get(i, '')
-            radio = QRadioButton(f"{color}: {name}" if name else color)
+            label = f"Channel {i+1}"
+            if name and name != f'Channel {i+1}':
+                label += f": {name}"
+            radio = QRadioButton(label)
             if i == 0:
                 radio.setChecked(True)
-            # Style with the actual color
-            if color == 'Red':
-                radio.setStyleSheet("color: red;")
-            elif color == 'Green':
-                radio.setStyleSheet("color: green;")
-            elif color == 'Blue':
-                radio.setStyleSheet("color: blue;")
             self.button_group.addButton(radio, i)
             layout.addWidget(radio)
             self.radios.append(radio)
@@ -829,12 +766,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.use_imagej = False
         # Colocalization mode - show images in color
         self.colocalization_mode = False
-        # Channel display settings: which channels to show (R, G, B booleans)
-        self.display_channels = {'R': True, 'G': True, 'B': True}
-        # Which channel to use for grayscale during outlining (0=first/Green, 1=second/Red, 2=third/Blue)
+        # Channel display settings: which channels to show (by index)
+        self.display_channels = {0: True, 1: True, 2: True}
+        # Which channel to use for grayscale during outlining
         self.grayscale_channel = 0
         # Channel names (can be customized by user)
-        self.channel_names = {0: 'Channel 1 (Green)', 1: 'Channel 2 (Red)', 2: 'Channel 3 (Blue)'}
+        self.channel_names = {0: '', 1: '', 2: ''}
         self.init_ui()
 
     def keyPressEvent(self, event):
@@ -1509,7 +1446,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.channel_names = settings['names']
 
             # Log the change
-            active_channels = [ch for ch, active in self.display_channels.items() if active]
+            active_channels = [f"Ch{ch+1}" for ch, active in self.display_channels.items() if active]
             self.log(f"Channel display: {', '.join(active_channels)}")
 
             # Refresh the current display
@@ -1552,18 +1489,21 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.update_display()
 
     def zoom_in(self):
-        """Zoom in on the current image view"""
-        current_tab = self.tabs.currentIndex()
+        """Zoom in on the current image view, centered on soma"""
         label = self._get_current_label()
         if label:
+            # Center on soma before zooming
+            label.center_on_soma()
             new_zoom = label.zoom_level * 1.25
             label.set_zoom(new_zoom)
             self.zoom_level_label.setText(f"{label.zoom_level:.1f}x")
 
     def zoom_out(self):
-        """Zoom out on the current image view"""
+        """Zoom out on the current image view, centered on soma"""
         label = self._get_current_label()
         if label:
+            # Center on soma before zooming
+            label.center_on_soma()
             new_zoom = label.zoom_level / 1.25
             label.set_zoom(new_zoom)
             self.zoom_level_label.setText(f"{label.zoom_level:.1f}x")
@@ -1966,23 +1906,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         rgb[:, :, 2] = arr[:, :, 2]  # Blue channel
                     arr = rgb
 
-        # Apply channel selection mask
+        # Apply channel selection mask (using channel indices)
         arr_display = arr.copy()
-        if not self.display_channels.get('R', True):
-            arr_display[:, :, 0] = 0  # Turn off Red channel
-        if not self.display_channels.get('G', True):
-            arr_display[:, :, 1] = 0  # Turn off Green channel
-        if not self.display_channels.get('B', True):
-            arr_display[:, :, 2] = 0  # Turn off Blue channel
+        for i in range(min(3, arr_display.shape[2])):
+            if not self.display_channels.get(i, True):
+                arr_display[:, :, i] = 0
 
         # Normalize to 0-255
         arr_float = arr_display.astype(np.float32)
         for i in range(arr_display.shape[2]):
             channel = arr_float[:, :, i]
             # Only normalize if channel is enabled
-            if (i == 0 and self.display_channels.get('R', True)) or \
-               (i == 1 and self.display_channels.get('G', True)) or \
-               (i == 2 and self.display_channels.get('B', True)):
+            if self.display_channels.get(i, True):
                 c_min, c_max = channel.min(), channel.max()
                 if c_max > c_min:
                     arr_float[:, :, i] = (channel - c_min) / (c_max - c_min) * 255
