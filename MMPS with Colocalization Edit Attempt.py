@@ -308,12 +308,8 @@ class InteractiveImageLabel(QLabel):
         # View center in image coordinates (0-1 normalized)
         self.view_center_x = 0.5
         self.view_center_y = 0.5
-        self.is_panning = False
-        self.last_pan_pos = None
         # Store the scaled pixmap for custom drawing
         self.scaled_pixmap = None
-        # Enable mouse tracking for smooth panning
-        self.setMouseTracking(True)
 
     def set_image(self, qpix, centroids=None, mask_overlay=None, polygon_pts=None):
         self.pix_source = qpix
@@ -448,13 +444,6 @@ class InteractiveImageLabel(QLabel):
         event.ignore()
 
     def mousePressEvent(self, event):
-        # Middle button or Ctrl+Left for panning (use bitwise AND for modifier check)
-        if event.button() == Qt.MiddleButton or (event.button() == Qt.LeftButton and (event.modifiers() & Qt.ControlModifier)):
-            self.is_panning = True
-            self.last_pan_pos = event.pos()
-            self.setCursor(Qt.ClosedHandCursor)
-            return
-
         # Check if Z key is held for zoom
         if self.parent_widget and hasattr(self.parent_widget, 'z_key_held') and self.parent_widget.z_key_held:
             # Z+click = zoom at clicked location
@@ -503,32 +492,6 @@ class InteractiveImageLabel(QLabel):
         # Update parent's zoom label if available
         if self.parent_widget and hasattr(self.parent_widget, 'zoom_level_label'):
             self.parent_widget.zoom_level_label.setText(f"{self.zoom_level:.1f}x")
-
-    def mouseMoveEvent(self, event):
-        """Handle mouse move for panning"""
-        if self.is_panning and self.last_pan_pos:
-            delta = event.pos() - self.last_pan_pos
-
-            # Convert pixel delta to normalized image coords
-            current_pixmap = self.pixmap()
-            if current_pixmap:
-                # Move view center opposite to drag direction
-                self.view_center_x -= delta.x() / current_pixmap.width()
-                self.view_center_y -= delta.y() / current_pixmap.height()
-                # Clamp to valid range
-                self.view_center_x = max(0, min(1, self.view_center_x))
-                self.view_center_y = max(0, min(1, self.view_center_y))
-
-            self.last_pan_pos = event.pos()
-            self.repaint()
-
-    def mouseReleaseEvent(self, event):
-        """Handle mouse release to stop panning"""
-        if event.button() == Qt.MiddleButton or event.button() == Qt.LeftButton:
-            if self.is_panning:
-                self.is_panning = False
-                self.last_pan_pos = None
-                self.setCursor(Qt.ArrowCursor)
 
     def _draw_mask_overlay(self, painter):
         if self.mask_overlay is None:
@@ -793,6 +756,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if key == Qt.Key_Z:
             self.z_key_held = True
             return  # Don't process further, Z is for zoom
+
+        # R key resets zoom on current view
+        if key == Qt.Key_R:
+            self._reset_current_zoom()
+            return
 
         # Handle polygon outlining mode shortcuts
         if self.processed_label.polygon_mode:
@@ -1070,7 +1038,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Zoom hint row
         zoom_layout = QHBoxLayout()
-        zoom_hint = QLabel("Hold Z + Left-click to zoom in, Z + Right-click to zoom out, Ctrl+drag to pan")
+        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, R: reset zoom")
         zoom_hint.setStyleSheet("color: #666; font-size: 10px;")
         zoom_layout.addWidget(zoom_hint)
         zoom_layout.addStretch()
@@ -1488,6 +1456,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.brightness_value = 0
         self.contrast_value = 0
         self.update_display()
+
+    def _reset_current_zoom(self):
+        """Reset zoom on all image labels"""
+        for label in [self.original_label, self.preview_label, self.processed_label, self.mask_label]:
+            if label:
+                label.reset_zoom()
+        self.zoom_level_label.setText("1.0x")
 
     def update_display(self):
         """Update the display with current brightness/contrast settings"""
