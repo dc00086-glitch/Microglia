@@ -294,7 +294,8 @@ class InteractiveImageLabel(QLabel):
         self.soma_mode = False
         self.polygon_mode = False
         self.setMinimumSize(400, 400)
-        self.setAlignment(Qt.AlignCenter)
+        # Don't use QLabel's auto-centering - we'll position the pixmap ourselves
+        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.setStyleSheet("border: 2px solid #cccccc; background-color: #f5f5f5;")
         # Allow label to expand
         from PyQt5.QtWidgets import QSizePolicy
@@ -309,6 +310,8 @@ class InteractiveImageLabel(QLabel):
         self.view_center_y = 0.5
         self.is_panning = False
         self.last_pan_pos = None
+        # Store the scaled pixmap for custom drawing
+        self.scaled_pixmap = None
         # Enable mouse tracking for smooth panning
         self.setMouseTracking(True)
 
@@ -336,13 +339,14 @@ class InteractiveImageLabel(QLabel):
         final_w = int(img_w * base_scale * self.zoom_level)
         final_h = int(img_h * base_scale * self.zoom_level)
 
-        scaled_pix = self.pix_source.scaled(
+        # Store the scaled pixmap for custom drawing in paintEvent
+        self.scaled_pixmap = self.pix_source.scaled(
             final_w,
             final_h,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation
         )
-        super().setPixmap(scaled_pix)
+        # Don't use QLabel's setPixmap - we draw it ourselves with pan offset
         self.repaint()
 
     def reset_zoom(self):
@@ -359,20 +363,14 @@ class InteractiveImageLabel(QLabel):
 
     def _get_pan_offset(self):
         """Calculate pan offset based on view center"""
-        if not self.pix_source:
+        if not self.pix_source or not self.scaled_pixmap:
             return 0, 0
 
-        img_w = self.pix_source.width()
-        img_h = self.pix_source.height()
         label_w = self.size().width()
         label_h = self.size().height()
 
-        current_pixmap = self.pixmap()
-        if not current_pixmap:
-            return 0, 0
-
-        pixmap_w = current_pixmap.width()
-        pixmap_h = current_pixmap.height()
+        pixmap_w = self.scaled_pixmap.width()
+        pixmap_h = self.scaled_pixmap.height()
 
         # Center offset (where image would be if centered)
         center_offset_x = (label_w - pixmap_w) / 2
@@ -387,12 +385,23 @@ class InteractiveImageLabel(QLabel):
         return center_offset_x + pan_x, center_offset_y + pan_y
 
     def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.pix_source:
-            return
+        # Draw background first (from QLabel)
         painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(245, 245, 245))  # Match background color
+
+        if not self.pix_source or not self.scaled_pixmap:
+            painter.end()
+            return
+
+        # Draw the pixmap at the correct pan offset position
+        offset_x, offset_y = self._get_pan_offset()
+        painter.drawPixmap(int(offset_x), int(offset_y), self.scaled_pixmap)
+
+        # Draw mask overlay
         if self.mask_overlay is not None:
             self._draw_mask_overlay(painter)
+
+        # Draw soma markers (centroids)
         if self.centroids:
             pen = QPen(QColor(255, 0, 0), 3)
             painter.setPen(pen)
@@ -401,8 +410,11 @@ class InteractiveImageLabel(QLabel):
                 # Only draw if visible
                 if 0 <= x <= self.width() and 0 <= y <= self.height():
                     painter.drawEllipse(int(x - 6), int(y - 6), 12, 12)
+
+        # Draw polygon points
         if self.polygon_mode and len(self.polygon_pts) > 0:
             self._draw_polygon(painter)
+
         # Draw zoom indicator
         if self.zoom_level != 1.0:
             painter.setPen(QPen(QColor(50, 50, 50)))
@@ -410,6 +422,7 @@ class InteractiveImageLabel(QLabel):
             painter.drawRect(5, 5, 70, 20)
             painter.setPen(QColor(0, 0, 0))
             painter.drawText(10, 20, f"Zoom: {self.zoom_level:.1f}x")
+
         painter.end()
 
     def resizeEvent(self, event):
@@ -435,8 +448,8 @@ class InteractiveImageLabel(QLabel):
         event.ignore()
 
     def mousePressEvent(self, event):
-        # Middle button or Ctrl+Left for panning
-        if event.button() == Qt.MiddleButton or (event.button() == Qt.LeftButton and event.modifiers() == Qt.ControlModifier):
+        # Middle button or Ctrl+Left for panning (use bitwise AND for modifier check)
+        if event.button() == Qt.MiddleButton or (event.button() == Qt.LeftButton and (event.modifiers() & Qt.ControlModifier)):
             self.is_panning = True
             self.last_pan_pos = event.pos()
             self.setCursor(Qt.ClosedHandCursor)
@@ -521,7 +534,7 @@ class InteractiveImageLabel(QLabel):
         if self.mask_overlay is None:
             return
         mask = self.mask_overlay
-        if not self.pix_source:
+        if not self.pix_source or not self.scaled_pixmap:
             return
         mask_coords = np.argwhere(mask > 0)
         if len(mask_coords) == 0:
@@ -530,13 +543,8 @@ class InteractiveImageLabel(QLabel):
         painter.setBrush(QColor(0, 255, 0))
         painter.setOpacity(0.4)
         img_h, img_w = self.pix_source.height(), self.pix_source.width()
-        current_pixmap = self.pixmap()
-        if current_pixmap:
-            pixmap_w = current_pixmap.width()
-            pixmap_h = current_pixmap.height()
-        else:
-            pixmap_w = img_w
-            pixmap_h = img_h
+        pixmap_w = self.scaled_pixmap.width()
+        pixmap_h = self.scaled_pixmap.height()
         scale_x = pixmap_w / img_w
         scale_y = pixmap_h / img_h
         rect_w = max(1, int(scale_x))
@@ -562,16 +570,11 @@ class InteractiveImageLabel(QLabel):
             painter.drawEllipse(int(x - 4), int(y - 4), 8, 8)
 
     def _to_display_coords(self, img_coords):
-        if not self.pix_source:
+        if not self.pix_source or not self.scaled_pixmap:
             return 0, 0
         img_h, img_w = self.pix_source.height(), self.pix_source.width()
-        current_pixmap = self.pixmap()
-        if current_pixmap:
-            pixmap_w = current_pixmap.width()
-            pixmap_h = current_pixmap.height()
-        else:
-            pixmap_w = img_w
-            pixmap_h = img_h
+        pixmap_w = self.scaled_pixmap.width()
+        pixmap_h = self.scaled_pixmap.height()
 
         # Get pan offset from view center
         offset_x, offset_y = self._get_pan_offset()
@@ -583,17 +586,12 @@ class InteractiveImageLabel(QLabel):
         return x, y
 
     def _to_image_coords(self, display_x, display_y):
-        if not self.pix_source:
+        if not self.pix_source or not self.scaled_pixmap:
             return None
 
         img_h, img_w = self.pix_source.height(), self.pix_source.width()
-        current_pixmap = self.pixmap()
-        if current_pixmap:
-            pixmap_w = current_pixmap.width()
-            pixmap_h = current_pixmap.height()
-        else:
-            pixmap_w = img_w
-            pixmap_h = img_h
+        pixmap_w = self.scaled_pixmap.width()
+        pixmap_h = self.scaled_pixmap.height()
 
         # Get pan offset from view center
         offset_x, offset_y = self._get_pan_offset()
