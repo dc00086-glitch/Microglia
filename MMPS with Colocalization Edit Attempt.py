@@ -1130,7 +1130,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Keep the final time visible
 
     def calculate_colocalization(self, mask, img_name):
-        """Calculate colocalization metrics between mask and color channels"""
+        """Calculate colocalization metrics using Costes thresholding within the cell mask"""
         if not self.colocalization_mode:
             return {}
 
@@ -1142,71 +1142,162 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if color_img.ndim != 3 or color_img.shape[2] < 2:
             return {'coloc_status': 'not_multichannel'}
 
-        # Apply mask to both channels
+        # Apply mask - ONLY analyze pixels within the cell mask
         mask_bool = mask > 0
         if not np.any(mask_bool):
             return {'coloc_status': 'empty_mask'}
 
         results = {'coloc_status': 'ok'}
 
-        # Get channels (assuming first 2-3 channels are meaningful)
-        ch1 = color_img[:, :, 0].astype(np.float64)  # First channel (often Green/Microglia)
-        ch2 = color_img[:, :, 1].astype(np.float64)  # Second channel (often Red/Marker)
+        # Get channels within mask only
+        ch1_full = color_img[:, :, 0].astype(np.float64)
+        ch2_full = color_img[:, :, 1].astype(np.float64)
 
-        ch1_masked = ch1[mask_bool]
-        ch2_masked = ch2[mask_bool]
+        ch1_masked = ch1_full[mask_bool]
+        ch2_masked = ch2_full[mask_bool]
 
-        # 1. Pearson's correlation coefficient
-        if len(ch1_masked) > 1 and np.std(ch1_masked) > 0 and np.std(ch2_masked) > 0:
-            pearson_r, _ = stats.pearsonr(ch1_masked, ch2_masked)
+        # Find Costes automatic threshold within masked region
+        costes_thresh1, costes_thresh2 = self._find_costes_threshold(ch1_masked, ch2_masked)
+        results['costes_thresh_ch1'] = round(costes_thresh1, 2)
+        results['costes_thresh_ch2'] = round(costes_thresh2, 2)
+
+        # Apply Costes threshold - pixels above threshold are "signal"
+        signal_mask = (ch1_masked > costes_thresh1) & (ch2_masked > costes_thresh2)
+        n_signal = np.sum(signal_mask)
+
+        if n_signal < 2:
+            # Not enough signal pixels after thresholding
+            results['pearson_r'] = 0.0
+            results['manders_m1'] = 0.0
+            results['manders_m2'] = 0.0
+            results['coloc_area_percent'] = 0.0
+            results['ch1_mean_intensity'] = round(np.mean(ch1_masked), 2)
+            results['ch2_mean_intensity'] = round(np.mean(ch2_masked), 2)
+            results['icq'] = 0.0
+            results['n_signal_pixels'] = n_signal
+            return results
+
+        # Get signal pixels only
+        ch1_signal = ch1_masked[signal_mask]
+        ch2_signal = ch2_masked[signal_mask]
+
+        # 1. Pearson's correlation on signal pixels only (above Costes threshold)
+        if np.std(ch1_signal) > 0 and np.std(ch2_signal) > 0:
+            pearson_r, _ = stats.pearsonr(ch1_signal, ch2_signal)
             results['pearson_r'] = round(pearson_r, 4)
         else:
             results['pearson_r'] = 0.0
 
-        # 2. Manders' coefficients
-        # Use Otsu threshold or percentile for determining "positive" signal
-        ch1_thresh = np.percentile(ch1, 50)
-        ch2_thresh = np.percentile(ch2, 50)
+        # 2. Manders' coefficients using Costes thresholds
+        # M1: Fraction of Ch1 intensity that colocalizes with Ch2
+        ch1_above_thresh = ch1_masked > costes_thresh1
+        ch2_above_thresh = ch2_masked > costes_thresh2
+        colocalized = ch1_above_thresh & ch2_above_thresh
 
-        # Within the mask, find colocalized pixels
-        ch1_positive = (ch1 > ch1_thresh) & mask_bool
-        ch2_positive = (ch2 > ch2_thresh) & mask_bool
-        colocalized = ch1_positive & ch2_positive
-
-        # Manders M1: Sum of Ch1 where Ch2 > threshold / Sum of Ch1
-        ch1_sum = np.sum(ch1[mask_bool])
+        # M1: Sum of Ch1 where both channels are above threshold / Sum of Ch1 above its threshold
+        ch1_sum = np.sum(ch1_masked[ch1_above_thresh])
         if ch1_sum > 0:
-            m1 = np.sum(ch1[colocalized]) / ch1_sum
+            m1 = np.sum(ch1_masked[colocalized]) / ch1_sum
         else:
             m1 = 0.0
         results['manders_m1'] = round(m1, 4)
 
-        # Manders M2: Sum of Ch2 where Ch1 > threshold / Sum of Ch2
-        ch2_sum = np.sum(ch2[mask_bool])
+        # M2: Sum of Ch2 where both channels are above threshold / Sum of Ch2 above its threshold
+        ch2_sum = np.sum(ch2_masked[ch2_above_thresh])
         if ch2_sum > 0:
-            m2 = np.sum(ch2[colocalized]) / ch2_sum
+            m2 = np.sum(ch2_masked[colocalized]) / ch2_sum
         else:
             m2 = 0.0
         results['manders_m2'] = round(m2, 4)
 
-        # 3. Colocalized area percentage
-        mask_area = np.sum(mask_bool)
-        coloc_area = np.sum(colocalized)
-        results['coloc_area_percent'] = round((coloc_area / mask_area) * 100, 2) if mask_area > 0 else 0.0
+        # 3. Colocalized area percentage (of signal pixels)
+        n_coloc = np.sum(colocalized)
+        results['coloc_area_percent'] = round((n_coloc / len(ch1_masked)) * 100, 2)
+        results['n_signal_pixels'] = n_signal
 
-        # 4. Mean intensities within mask
+        # 4. Mean intensities within mask (all masked pixels)
         results['ch1_mean_intensity'] = round(np.mean(ch1_masked), 2)
         results['ch2_mean_intensity'] = round(np.mean(ch2_masked), 2)
 
-        # 5. Intensity correlation quotient (ICQ)
-        ch1_diff = ch1_masked - np.mean(ch1_masked)
-        ch2_diff = ch2_masked - np.mean(ch2_masked)
+        # 5. Intensity correlation quotient (ICQ) on signal pixels
+        ch1_diff = ch1_signal - np.mean(ch1_signal)
+        ch2_diff = ch2_signal - np.mean(ch2_signal)
         product = ch1_diff * ch2_diff
         n_positive = np.sum(product > 0)
         n_total = len(product)
         results['icq'] = round((n_positive / n_total) - 0.5, 4) if n_total > 0 else 0.0
 
         return results
+
+    def _find_costes_threshold(self, ch1, ch2, step_percent=2):
+        """
+        Find Costes automatic threshold for two channels.
+
+        The algorithm finds the threshold where pixels below it have
+        Pearson's r approaching zero (i.e., they're just background noise).
+
+        Args:
+            ch1, ch2: 1D arrays of intensity values (already masked to cell region)
+            step_percent: Percentage step for threshold iteration
+
+        Returns:
+            (threshold_ch1, threshold_ch2): Thresholds for each channel
+        """
+        if len(ch1) < 10:
+            # Not enough pixels, return minimum values
+            return np.min(ch1), np.min(ch2)
+
+        # Use percentile-based stepping for efficiency
+        max_ch1, max_ch2 = np.max(ch1), np.max(ch2)
+        min_ch1, min_ch2 = np.min(ch1), np.min(ch2)
+
+        # Start from high threshold and work down
+        best_thresh1 = min_ch1
+        best_thresh2 = min_ch2
+
+        # Calculate threshold pairs based on the regression line approach
+        # Fit linear regression to find relationship between channels
+        if np.std(ch1) > 0 and np.std(ch2) > 0:
+            slope, intercept = np.polyfit(ch1, ch2, 1)
+        else:
+            # No variation, return minimums
+            return min_ch1, min_ch2
+
+        # Iterate from high to low threshold
+        for percentile in range(95, 5, -step_percent):
+            thresh1 = np.percentile(ch1, percentile)
+            # Use regression line to find corresponding ch2 threshold
+            thresh2 = slope * thresh1 + intercept
+            thresh2 = max(min_ch2, min(max_ch2, thresh2))  # Clamp to valid range
+
+            # Get pixels below both thresholds (potential background)
+            below_thresh = (ch1 < thresh1) & (ch2 < thresh2)
+            n_below = np.sum(below_thresh)
+
+            if n_below < 10:
+                continue
+
+            ch1_below = ch1[below_thresh]
+            ch2_below = ch2[below_thresh]
+
+            # Calculate Pearson's r for sub-threshold pixels
+            if np.std(ch1_below) > 0 and np.std(ch2_below) > 0:
+                r_below, _ = stats.pearsonr(ch1_below, ch2_below)
+            else:
+                r_below = 0
+
+            # When correlation of sub-threshold pixels approaches 0,
+            # we've found the threshold separating signal from background
+            if r_below <= 0.0:
+                best_thresh1 = thresh1
+                best_thresh2 = thresh2
+                break
+
+            # Keep track of the threshold as we go
+            best_thresh1 = thresh1
+            best_thresh2 = thresh2
+
+        return best_thresh1, best_thresh2
 
     def log(self, message):
         self.log_text.append(str(message))
