@@ -430,34 +430,9 @@ class InteractiveImageLabel(QLabel):
         self._update_display()
 
     def wheelEvent(self, event):
-        """Handle mouse wheel for zooming - always centers on soma if available"""
-        if not self.pix_source:
-            return
-
-        # Calculate zoom change
-        delta = event.angleDelta().y()
-        if delta > 0:
-            zoom_factor = 1.2
-        else:
-            zoom_factor = 1 / 1.2
-
-        old_zoom = self.zoom_level
-        new_zoom = max(self.min_zoom, min(self.max_zoom, old_zoom * zoom_factor))
-
-        if new_zoom != old_zoom:
-            # If we have a soma marker, center on it
-            if self.centroids:
-                soma = self.centroids[0]
-                img_h, img_w = self.pix_source.height(), self.pix_source.width()
-                self.view_center_x = soma[1] / img_w
-                self.view_center_y = soma[0] / img_h
-
-            self.zoom_level = new_zoom
-            self._update_display()
-
-            # Update parent's zoom label if available
-            if self.parent_widget and hasattr(self.parent_widget, 'zoom_level_label'):
-                self.parent_widget.zoom_level_label.setText(f"{self.zoom_level:.1f}x")
+        """Mouse wheel disabled - use Z+click to zoom"""
+        # Pass to parent (no zoom on scroll)
+        event.ignore()
 
     def mousePressEvent(self, event):
         # Middle button or Ctrl+Left for panning
@@ -466,6 +441,15 @@ class InteractiveImageLabel(QLabel):
             self.last_pan_pos = event.pos()
             self.setCursor(Qt.ClosedHandCursor)
             return
+
+        # Check if Z key is held for zoom
+        if self.parent_widget and hasattr(self.parent_widget, 'z_key_held') and self.parent_widget.z_key_held:
+            # Z+click = zoom at clicked location
+            if event.button() == Qt.LeftButton:
+                self.zoom_at_point(event.pos(), zoom_in=True)
+            elif event.button() == Qt.RightButton:
+                self.zoom_at_point(event.pos(), zoom_in=False)
+            return  # Don't place any points
 
         coords = self._to_image_coords(event.pos().x(), event.pos().y())
         if not coords:
@@ -478,6 +462,34 @@ class InteractiveImageLabel(QLabel):
                 self.parent_widget.add_polygon_point(coords)
             elif event.button() == Qt.RightButton:
                 self.parent_widget.finish_polygon()
+
+    def zoom_at_point(self, pos, zoom_in=True):
+        """Zoom in or out centered on the clicked position"""
+        if not self.pix_source:
+            return
+
+        # Convert click position to normalized image coordinates
+        coords = self._to_image_coords(pos.x(), pos.y())
+        if not coords:
+            return
+
+        img_h, img_w = self.pix_source.height(), self.pix_source.width()
+        # coords is (row, col) = (y, x) in image coords
+        self.view_center_x = coords[1] / img_w
+        self.view_center_y = coords[0] / img_h
+
+        # Apply zoom
+        if zoom_in:
+            new_zoom = self.zoom_level * 1.5
+        else:
+            new_zoom = self.zoom_level / 1.5
+
+        self.zoom_level = max(self.min_zoom, min(self.max_zoom, new_zoom))
+        self._update_display()
+
+        # Update parent's zoom label if available
+        if self.parent_widget and hasattr(self.parent_widget, 'zoom_level_label'):
+            self.parent_widget.zoom_level_label.setText(f"{self.zoom_level:.1f}x")
 
     def mouseMoveEvent(self, event):
         """Handle mouse move for panning"""
@@ -772,15 +784,22 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.grayscale_channel = 0
         # Channel names (can be customized by user)
         self.channel_names = {0: '', 1: '', 2: ''}
+        # Z key tracking for zoom functionality
+        self.z_key_held = False
         self.init_ui()
 
     def keyPressEvent(self, event):
         key = event.key()
 
+        # Track Z key for zoom functionality
+        if key == Qt.Key_Z:
+            self.z_key_held = True
+            return  # Don't process further, Z is for zoom
+
         # Handle polygon outlining mode shortcuts
         if self.processed_label.polygon_mode:
-            if key == Qt.Key_Z or key == Qt.Key_Backspace:
-                # Undo last point
+            if key == Qt.Key_Backspace:
+                # Undo last point (use Backspace only, Z is for zoom)
                 self.undo_last_polygon_point()
                 return
             elif key == Qt.Key_Escape:
@@ -833,6 +852,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 super().keyPressEvent(event)
         except Exception as e:
             self.log(f"ERROR handling keypress: {e}")
+
+    def keyReleaseEvent(self, event):
+        """Track Z key release for zoom functionality"""
+        if event.key() == Qt.Key_Z:
+            self.z_key_held = False
+        else:
+            super().keyReleaseEvent(event)
 
     def init_ui(self):
         self.setWindowTitle("Microglia Analysis - Multi-Image Batch Processing")
@@ -1044,39 +1070,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         layout.addLayout(display_btn_layout)
 
-        # Zoom controls row
+        # Zoom hint row
         zoom_layout = QHBoxLayout()
-        zoom_label = QLabel("Zoom:")
-        zoom_layout.addWidget(zoom_label)
-
-        zoom_out_btn = QPushButton("-")
-        zoom_out_btn.setFixedWidth(30)
-        zoom_out_btn.setToolTip("Zoom out")
-        zoom_out_btn.clicked.connect(self.zoom_out)
-        zoom_layout.addWidget(zoom_out_btn)
-
-        self.zoom_level_label = QLabel("1.0x")
-        self.zoom_level_label.setFixedWidth(40)
-        self.zoom_level_label.setAlignment(Qt.AlignCenter)
-        zoom_layout.addWidget(self.zoom_level_label)
-
-        zoom_in_btn = QPushButton("+")
-        zoom_in_btn.setFixedWidth(30)
-        zoom_in_btn.setToolTip("Zoom in")
-        zoom_in_btn.clicked.connect(self.zoom_in)
-        zoom_layout.addWidget(zoom_in_btn)
-
-        reset_zoom_btn = QPushButton("Reset")
-        reset_zoom_btn.setToolTip("Reset zoom to 1x")
-        reset_zoom_btn.clicked.connect(self.reset_zoom)
-        zoom_layout.addWidget(reset_zoom_btn)
-
-        zoom_layout.addStretch()
-
-        zoom_hint = QLabel("Scroll to zoom, Ctrl+drag to pan")
+        zoom_hint = QLabel("Hold Z + Left-click to zoom in, Z + Right-click to zoom out, Ctrl+drag to pan")
         zoom_hint.setStyleSheet("color: #666; font-size: 10px;")
         zoom_layout.addWidget(zoom_hint)
-
+        zoom_layout.addStretch()
+        self.zoom_level_label = QLabel("1.0x")
+        self.zoom_level_label.setFixedWidth(50)
+        self.zoom_level_label.setStyleSheet("color: #666; font-size: 10px;")
+        zoom_layout.addWidget(self.zoom_level_label)
         layout.addLayout(zoom_layout)
 
         # Progress bar with timer
@@ -1487,46 +1490,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.brightness_value = 0
         self.contrast_value = 0
         self.update_display()
-
-    def zoom_in(self):
-        """Zoom in on the current image view, centered on soma"""
-        label = self._get_current_label()
-        if label:
-            # Center on soma before zooming
-            label.center_on_soma()
-            new_zoom = label.zoom_level * 1.25
-            label.set_zoom(new_zoom)
-            self.zoom_level_label.setText(f"{label.zoom_level:.1f}x")
-
-    def zoom_out(self):
-        """Zoom out on the current image view, centered on soma"""
-        label = self._get_current_label()
-        if label:
-            # Center on soma before zooming
-            label.center_on_soma()
-            new_zoom = label.zoom_level / 1.25
-            label.set_zoom(new_zoom)
-            self.zoom_level_label.setText(f"{label.zoom_level:.1f}x")
-
-    def reset_zoom(self):
-        """Reset zoom to 1x on the current image view"""
-        label = self._get_current_label()
-        if label:
-            label.reset_zoom()
-            self.zoom_level_label.setText("1.0x")
-
-    def _get_current_label(self):
-        """Get the InteractiveImageLabel for the current tab"""
-        current_tab = self.tabs.currentIndex()
-        if current_tab == 0:
-            return self.original_label
-        elif current_tab == 1:
-            return self.preview_label
-        elif current_tab == 2:
-            return self.processed_label
-        elif current_tab == 3:
-            return self.mask_label
-        return None
 
     def update_display(self):
         """Update the display with current brightness/contrast settings"""
