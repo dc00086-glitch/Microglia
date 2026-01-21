@@ -1161,11 +1161,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
         results['costes_thresh_ch1'] = round(costes_thresh1, 2)
         results['costes_thresh_ch2'] = round(costes_thresh2, 2)
 
-        # Apply Costes threshold - pixels above threshold are "signal"
-        signal_mask = (ch1_masked > costes_thresh1) & (ch2_masked > costes_thresh2)
-        n_signal = np.sum(signal_mask)
+        # Identify signal pixels for each channel independently
+        ch1_above_thresh = ch1_masked > costes_thresh1
+        ch2_above_thresh = ch2_masked > costes_thresh2
 
-        if n_signal < 2:
+        # For Pearson: use pixels where EITHER channel has signal (OR)
+        # This avoids biasing toward already-colocalized pixels
+        any_signal_mask = ch1_above_thresh | ch2_above_thresh
+        n_any_signal = np.sum(any_signal_mask)
+
+        # For Manders: pixels where BOTH channels have signal (AND) = colocalized
+        colocalized = ch1_above_thresh & ch2_above_thresh
+        n_coloc = np.sum(colocalized)
+
+        if n_any_signal < 2:
             # Not enough signal pixels after thresholding
             results['pearson_r'] = 0.0
             results['manders_m1'] = 0.0
@@ -1174,27 +1183,24 @@ class MicrogliaAnalysisGUI(QMainWindow):
             results['ch1_mean_intensity'] = round(np.mean(ch1_masked), 2)
             results['ch2_mean_intensity'] = round(np.mean(ch2_masked), 2)
             results['icq'] = 0.0
-            results['n_signal_pixels'] = n_signal
+            results['n_signal_pixels'] = n_any_signal
+            results['n_coloc_pixels'] = 0
             return results
 
-        # Get signal pixels only
-        ch1_signal = ch1_masked[signal_mask]
-        ch2_signal = ch2_masked[signal_mask]
+        # Get pixels where either channel has signal (for Pearson/ICQ)
+        ch1_any_signal = ch1_masked[any_signal_mask]
+        ch2_any_signal = ch2_masked[any_signal_mask]
 
-        # 1. Pearson's correlation on signal pixels only (above Costes threshold)
-        if np.std(ch1_signal) > 0 and np.std(ch2_signal) > 0:
-            pearson_r, _ = stats.pearsonr(ch1_signal, ch2_signal)
+        # 1. Pearson's correlation on pixels where EITHER channel has signal
+        # This properly measures: "when there's signal, do the channels correlate?"
+        if np.std(ch1_any_signal) > 0 and np.std(ch2_any_signal) > 0:
+            pearson_r, _ = stats.pearsonr(ch1_any_signal, ch2_any_signal)
             results['pearson_r'] = round(pearson_r, 4)
         else:
             results['pearson_r'] = 0.0
 
         # 2. Manders' coefficients using Costes thresholds
-        # M1: Fraction of Ch1 intensity that colocalizes with Ch2
-        ch1_above_thresh = ch1_masked > costes_thresh1
-        ch2_above_thresh = ch2_masked > costes_thresh2
-        colocalized = ch1_above_thresh & ch2_above_thresh
-
-        # M1: Sum of Ch1 where both channels are above threshold / Sum of Ch1 above its threshold
+        # M1: Of Ch1's signal, what fraction overlaps with Ch2's signal?
         ch1_sum = np.sum(ch1_masked[ch1_above_thresh])
         if ch1_sum > 0:
             m1 = np.sum(ch1_masked[colocalized]) / ch1_sum
@@ -1202,7 +1208,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             m1 = 0.0
         results['manders_m1'] = round(m1, 4)
 
-        # M2: Sum of Ch2 where both channels are above threshold / Sum of Ch2 above its threshold
+        # M2: Of Ch2's signal, what fraction overlaps with Ch1's signal?
         ch2_sum = np.sum(ch2_masked[ch2_above_thresh])
         if ch2_sum > 0:
             m2 = np.sum(ch2_masked[colocalized]) / ch2_sum
@@ -1210,18 +1216,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
             m2 = 0.0
         results['manders_m2'] = round(m2, 4)
 
-        # 3. Colocalized area percentage (of signal pixels)
-        n_coloc = np.sum(colocalized)
+        # 3. Colocalized area percentage (of total mask area)
         results['coloc_area_percent'] = round((n_coloc / len(ch1_masked)) * 100, 2)
-        results['n_signal_pixels'] = n_signal
+        results['n_signal_pixels'] = n_any_signal
+        results['n_coloc_pixels'] = n_coloc
 
         # 4. Mean intensities within mask (all masked pixels)
         results['ch1_mean_intensity'] = round(np.mean(ch1_masked), 2)
         results['ch2_mean_intensity'] = round(np.mean(ch2_masked), 2)
 
-        # 5. Intensity correlation quotient (ICQ) on signal pixels
-        ch1_diff = ch1_signal - np.mean(ch1_signal)
-        ch2_diff = ch2_signal - np.mean(ch2_signal)
+        # 5. Intensity correlation quotient (ICQ) on signal pixels (either channel)
+        ch1_diff = ch1_any_signal - np.mean(ch1_any_signal)
+        ch2_diff = ch2_any_signal - np.mean(ch2_any_signal)
         product = ch1_diff * ch2_diff
         n_positive = np.sum(product > 0)
         n_total = len(product)
