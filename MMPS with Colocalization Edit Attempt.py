@@ -779,7 +779,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Handle soma picking mode shortcuts
         if self.processed_label.soma_mode:
-            if key == Qt.Key_Return or key == Qt.Key_Enter:
+            if key == Qt.Key_Backspace:
+                # Undo last soma
+                self.undo_last_soma()
+                return
+            elif key == Qt.Key_Return or key == Qt.Key_Enter:
                 # Done picking somas for current image
                 self.done_with_current()
                 return
@@ -2192,6 +2196,29 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.processed_label.set_image(pixmap, centroids=img_data['somas'])
         self.log(f"✓ {self.current_image_name}: Soma {len(img_data['somas'])} added | ID: {soma_id}")
+        self._load_image_for_soma_picking()
+
+    def undo_last_soma(self):
+        """Remove the last picked soma location"""
+        if not self.current_image_name:
+            return
+        img_data = self.images[self.current_image_name]
+        if len(img_data['somas']) == 0:
+            self.log("⚠ No somas to undo")
+            return
+
+        # Remove the last soma and its ID
+        removed_soma = img_data['somas'].pop()
+        removed_id = img_data['soma_ids'].pop() if img_data['soma_ids'] else None
+
+        # Update the display
+        if self.colocalization_mode and 'color_image' in img_data:
+            pixmap = self._array_to_pixmap_color(img_data['color_image'])
+        else:
+            pixmap = self._array_to_pixmap(img_data['processed'])
+
+        self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+        self.log(f"↩ {self.current_image_name}: Soma removed | Remaining: {len(img_data['somas'])}")
         self._load_image_for_soma_picking()
 
     def done_with_current(self):
