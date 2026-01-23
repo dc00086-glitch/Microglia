@@ -1167,8 +1167,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def calculate_colocalization(self, mask, img_name):
         """
-        Calculate colocalization metrics using user-selected channels.
-        Only reports: Pearson's r, pixel counts, and percent colocalized.
+        Calculate colocalization between two user-selected channels.
+
+        Uses background-based thresholding: a pixel has "signal" only if
+        it's significantly above the estimated background level.
+
+        If a channel has no real signal (e.g., empty green channel),
+        it will have 0 signal pixels and thus 0 colocalization.
         """
         if not self.colocalization_mode:
             return {}
@@ -1202,69 +1207,86 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         results = {
             'coloc_status': 'ok',
-            'coloc_ch1': self.coloc_channel_1 + 1,  # 1-indexed for display
+            'coloc_ch1': self.coloc_channel_1 + 1,
             'coloc_ch2': self.coloc_channel_2 + 1,
             'n_mask_pixels': int(n_mask_pixels)
         }
 
-        # Check if each channel has meaningful signal
-        # A channel with no signal will have very low range (max - min)
-        ch1_range = np.max(ch1_masked) - np.min(ch1_masked)
-        ch2_range = np.max(ch2_masked) - np.min(ch2_masked)
+        # === BACKGROUND-BASED THRESHOLDING ===
+        # Estimate background from the lower 25% of pixel values
+        # Signal threshold = background_mean + 3 * background_std
+        # This ensures empty channels have ~0 signal pixels
 
-        # If range is very small (< 5% of max possible), likely no signal
-        ch1_has_signal = ch1_range > 10  # At least 10 intensity units of range
-        ch2_has_signal = ch2_range > 10
+        def estimate_signal_threshold(channel_data):
+            """Estimate threshold as background + 3*std"""
+            # Use lower 25% of pixels to estimate background
+            sorted_vals = np.sort(channel_data)
+            n_bg = max(10, len(sorted_vals) // 4)
+            background_pixels = sorted_vals[:n_bg]
 
-        results['ch1_has_signal'] = ch1_has_signal
-        results['ch2_has_signal'] = ch2_has_signal
-        results['ch1_range'] = round(float(ch1_range), 2)
-        results['ch2_range'] = round(float(ch2_range), 2)
+            bg_mean = np.mean(background_pixels)
+            bg_std = np.std(background_pixels)
 
-        # If either channel has no real signal, colocalization is meaningless
-        if not ch1_has_signal or not ch2_has_signal:
-            results['pearson_r'] = 0.0
-            results['n_ch1_signal_pixels'] = 0 if not ch1_has_signal else int(np.sum(ch1_masked > np.percentile(ch1_masked, 50)))
-            results['n_ch2_signal_pixels'] = 0 if not ch2_has_signal else int(np.sum(ch2_masked > np.percentile(ch2_masked, 50)))
-            results['n_coloc_pixels'] = 0
-            results['coloc_percent'] = 0.0
-            results['coloc_status'] = 'no_signal_in_channel'
-            return results
+            # Threshold = 3 sigma above background
+            # But ensure threshold is at least somewhat above background
+            threshold = bg_mean + max(3 * bg_std, 10)
+            return threshold, bg_mean, bg_std
 
-        # Use simple percentile thresholds to identify signal pixels
-        # (More robust than Costes for edge cases)
-        ch1_thresh = np.percentile(ch1_masked, 75)  # Top 25% is signal
-        ch2_thresh = np.percentile(ch2_masked, 75)
+        ch1_thresh, ch1_bg_mean, ch1_bg_std = estimate_signal_threshold(ch1_masked)
+        ch2_thresh, ch2_bg_mean, ch2_bg_std = estimate_signal_threshold(ch2_masked)
 
-        ch1_signal = ch1_masked > ch1_thresh
-        ch2_signal = ch2_masked > ch2_thresh
+        # Find signal pixels (significantly above background)
+        ch1_signal_mask = ch1_masked > ch1_thresh
+        ch2_signal_mask = ch2_masked > ch2_thresh
 
-        n_ch1_signal = np.sum(ch1_signal)
-        n_ch2_signal = np.sum(ch2_signal)
+        n_ch1_signal = np.sum(ch1_signal_mask)
+        n_ch2_signal = np.sum(ch2_signal_mask)
 
-        # Colocalized = both channels have signal at same pixel
-        colocalized = ch1_signal & ch2_signal
-        n_coloc = np.sum(colocalized)
+        # Store diagnostic info
+        results['ch1_bg_mean'] = round(ch1_bg_mean, 2)
+        results['ch1_bg_std'] = round(ch1_bg_std, 2)
+        results['ch1_threshold'] = round(ch1_thresh, 2)
+        results['ch2_bg_mean'] = round(ch2_bg_mean, 2)
+        results['ch2_bg_std'] = round(ch2_bg_std, 2)
+        results['ch2_threshold'] = round(ch2_thresh, 2)
+        results['n_ch1_signal'] = int(n_ch1_signal)
+        results['n_ch2_signal'] = int(n_ch2_signal)
 
-        results['n_ch1_signal_pixels'] = int(n_ch1_signal)
-        results['n_ch2_signal_pixels'] = int(n_ch2_signal)
+        # === COLOCALIZATION ===
+        # A pixel is colocalized ONLY if BOTH channels have signal at that location
+        colocalized_mask = ch1_signal_mask & ch2_signal_mask
+        n_coloc = np.sum(colocalized_mask)
         results['n_coloc_pixels'] = int(n_coloc)
 
-        # Percent colocalized (of smaller signal region)
-        min_signal = min(n_ch1_signal, n_ch2_signal)
-        if min_signal > 0:
-            results['coloc_percent'] = round((n_coloc / min_signal) * 100, 2)
+        # Percent colocalized (what fraction of ch1 signal overlaps with ch2 signal)
+        if n_ch1_signal > 0:
+            results['ch1_coloc_percent'] = round((n_coloc / n_ch1_signal) * 100, 2)
         else:
-            results['coloc_percent'] = 0.0
+            results['ch1_coloc_percent'] = 0.0
 
-        # Pearson's r - only on pixels where BOTH channels have signal
-        # This is the proper way: correlate signal intensities where both are present
+        if n_ch2_signal > 0:
+            results['ch2_coloc_percent'] = round((n_coloc / n_ch2_signal) * 100, 2)
+        else:
+            results['ch2_coloc_percent'] = 0.0
+
+        # === PEARSON'S R ===
+        # Only calculate if there are colocalized pixels
         if n_coloc >= 10:
-            ch1_coloc = ch1_masked[colocalized]
-            ch2_coloc = ch2_masked[colocalized]
-            if np.std(ch1_coloc) > 0 and np.std(ch2_coloc) > 0:
-                pearson_r, _ = stats.pearsonr(ch1_coloc, ch2_coloc)
+            ch1_coloc_values = ch1_masked[colocalized_mask]
+            ch2_coloc_values = ch2_masked[colocalized_mask]
+
+            if np.std(ch1_coloc_values) > 0 and np.std(ch2_coloc_values) > 0:
+                pearson_r, _ = stats.pearsonr(ch1_coloc_values, ch2_coloc_values)
                 results['pearson_r'] = round(pearson_r, 4)
+            else:
+                results['pearson_r'] = 0.0
+        else:
+            # No colocalization or too few pixels
+            results['pearson_r'] = 0.0
+            if n_ch1_signal == 0 or n_ch2_signal == 0:
+                results['coloc_status'] = 'no_signal_in_channel'
+
+        return results
             else:
                 results['pearson_r'] = 0.0
         else:
@@ -3495,9 +3517,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Separate colocalization keys from morphology keys for better organization
         coloc_keys = ['coloc_status', 'coloc_ch1', 'coloc_ch2', 'pearson_r',
-                      'n_mask_pixels', 'n_ch1_signal_pixels', 'n_ch2_signal_pixels',
-                      'n_coloc_pixels', 'coloc_percent', 'ch1_has_signal', 'ch2_has_signal',
-                      'ch1_range', 'ch2_range']
+                      'n_mask_pixels', 'n_ch1_signal', 'n_ch2_signal', 'n_coloc_pixels',
+                      'ch1_coloc_percent', 'ch2_coloc_percent',
+                      'ch1_bg_mean', 'ch1_bg_std', 'ch1_threshold',
+                      'ch2_bg_mean', 'ch2_bg_std', 'ch2_threshold']
         morph_keys = [k for k in keys if k not in coloc_keys]
         coloc_present = [k for k in coloc_keys if k in keys]
 
