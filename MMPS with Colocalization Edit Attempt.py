@@ -1287,13 +1287,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 results['coloc_status'] = 'no_signal_in_channel'
 
         return results
-            else:
-                results['pearson_r'] = 0.0
-        else:
-            # Not enough colocalized pixels for meaningful correlation
-            results['pearson_r'] = 0.0
-
-        return results
 
     def log(self, message):
         self.log_text.append(str(message))
