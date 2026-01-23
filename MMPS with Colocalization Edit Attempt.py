@@ -789,8 +789,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.z_key_held = True
             return  # Don't process further, Z is for zoom
 
-        # R key resets zoom on current view
-        if key == Qt.Key_R:
+        # U key resets zoom on current view
+        if key == Qt.Key_U:
             self._reset_current_zoom()
             return
 
@@ -1074,7 +1074,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Zoom hint row
         zoom_layout = QHBoxLayout()
-        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, R: reset zoom")
+        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, U: reset zoom")
         zoom_hint.setStyleSheet("color: #666; font-size: 10px;")
         zoom_layout.addWidget(zoom_hint)
         zoom_layout.addStretch()
@@ -1207,18 +1207,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
             'n_mask_pixels': int(n_mask_pixels)
         }
 
-        # Check if each channel has meaningful signal (not just uniform noise)
-        # A channel with no signal will have very low variance relative to mean
-        ch1_cv = np.std(ch1_masked) / (np.mean(ch1_masked) + 1e-10)  # Coefficient of variation
-        ch2_cv = np.std(ch2_masked) / (np.mean(ch2_masked) + 1e-10)
+        # Check if each channel has meaningful signal
+        # A channel with no signal will have very low range (max - min)
+        ch1_range = np.max(ch1_masked) - np.min(ch1_masked)
+        ch2_range = np.max(ch2_masked) - np.min(ch2_masked)
 
-        # If a channel has very low CV, it's likely just background/noise
-        min_cv_threshold = 0.1  # Require at least 10% variation
-        ch1_has_signal = ch1_cv > min_cv_threshold and np.max(ch1_masked) > np.percentile(ch1_masked, 90) * 1.5
-        ch2_has_signal = ch2_cv > min_cv_threshold and np.max(ch2_masked) > np.percentile(ch2_masked, 90) * 1.5
+        # If range is very small (< 5% of max possible), likely no signal
+        ch1_has_signal = ch1_range > 10  # At least 10 intensity units of range
+        ch2_has_signal = ch2_range > 10
 
         results['ch1_has_signal'] = ch1_has_signal
         results['ch2_has_signal'] = ch2_has_signal
+        results['ch1_range'] = round(float(ch1_range), 2)
+        results['ch2_range'] = round(float(ch2_range), 2)
 
         # If either channel has no real signal, colocalization is meaningless
         if not ch1_has_signal or not ch2_has_signal:
@@ -3495,7 +3496,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Separate colocalization keys from morphology keys for better organization
         coloc_keys = ['coloc_status', 'coloc_ch1', 'coloc_ch2', 'pearson_r',
                       'n_mask_pixels', 'n_ch1_signal_pixels', 'n_ch2_signal_pixels',
-                      'n_coloc_pixels', 'coloc_percent', 'ch1_has_signal', 'ch2_has_signal']
+                      'n_coloc_pixels', 'coloc_percent', 'ch1_has_signal', 'ch2_has_signal',
+                      'ch1_range', 'ch2_range']
         morph_keys = [k for k in keys if k not in coloc_keys]
         coloc_present = [k for k in coloc_keys if k in keys]
 
