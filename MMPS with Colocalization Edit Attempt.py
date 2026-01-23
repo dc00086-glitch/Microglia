@@ -1169,11 +1169,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         """
         Calculate colocalization between two user-selected channels.
 
-        Uses background-based thresholding: a pixel has "signal" only if
-        it's significantly above the estimated background level.
-
-        If a channel has no real signal (e.g., empty green channel),
-        it will have 0 signal pixels and thus 0 colocalization.
+        Uses Otsu thresholding to separate signal from background.
+        A channel with no real signal will have very few pixels above threshold.
         """
         if not self.colocalization_mode:
             return {}
@@ -1212,65 +1209,93 @@ class MicrogliaAnalysisGUI(QMainWindow):
             'n_mask_pixels': int(n_mask_pixels)
         }
 
-        # === BACKGROUND-BASED THRESHOLDING ===
-        # Estimate background from the lower 25% of pixel values
-        # Signal threshold = background_mean + 3 * background_std
-        # This ensures empty channels have ~0 signal pixels
+        # === OTSU THRESHOLDING ===
+        # Use Otsu's method to find optimal threshold separating background from signal
+        from skimage.filters import threshold_otsu
 
-        def estimate_signal_threshold(channel_data):
-            """Estimate threshold as background + 3*std"""
-            # Use lower 25% of pixels to estimate background
-            sorted_vals = np.sort(channel_data)
-            n_bg = max(10, len(sorted_vals) // 4)
-            background_pixels = sorted_vals[:n_bg]
+        # For each channel, find Otsu threshold and check if there's real signal
+        def get_signal_pixels(channel_data):
+            """
+            Use Otsu thresholding to find signal pixels.
+            Returns: threshold, signal_mask, has_real_signal
+            """
+            ch_min = np.min(channel_data)
+            ch_max = np.max(channel_data)
+            ch_range = ch_max - ch_min
 
-            bg_mean = np.mean(background_pixels)
-            bg_std = np.std(background_pixels)
+            # If the range is tiny, there's no real signal
+            if ch_range < 5:
+                return ch_max, np.zeros(len(channel_data), dtype=bool), False
 
-            # Threshold = 3 sigma above background
-            # But ensure threshold is at least somewhat above background
-            threshold = bg_mean + max(3 * bg_std, 10)
-            return threshold, bg_mean, bg_std
+            try:
+                # Otsu threshold
+                thresh = threshold_otsu(channel_data)
+            except:
+                # If Otsu fails, use median
+                thresh = np.median(channel_data)
 
-        ch1_thresh, ch1_bg_mean, ch1_bg_std = estimate_signal_threshold(ch1_masked)
-        ch2_thresh, ch2_bg_mean, ch2_bg_std = estimate_signal_threshold(ch2_masked)
+            signal_mask = channel_data > thresh
+            n_signal = np.sum(signal_mask)
 
-        # Find signal pixels (significantly above background)
-        ch1_signal_mask = ch1_masked > ch1_thresh
-        ch2_signal_mask = ch2_masked > ch2_thresh
+            # Check if this is real signal or just noise
+            # Real signal: threshold should be well below max, and significant pixels above it
+            # No signal: threshold near max, very few pixels above
+            signal_fraction = n_signal / len(channel_data)
+            threshold_position = (thresh - ch_min) / ch_range if ch_range > 0 else 1
+
+            # If threshold is > 80% of the way to max, and < 10% of pixels are "signal",
+            # this channel likely has no real signal
+            has_real_signal = not (threshold_position > 0.8 and signal_fraction < 0.1)
+
+            # Also check: if the "signal" pixels aren't much brighter than threshold, it's noise
+            if n_signal > 0:
+                signal_values = channel_data[signal_mask]
+                mean_signal = np.mean(signal_values)
+                # Signal should be at least 20% brighter than threshold
+                if mean_signal < thresh * 1.2:
+                    has_real_signal = False
+
+            return thresh, signal_mask, has_real_signal
+
+        ch1_thresh, ch1_signal_mask, ch1_has_signal = get_signal_pixels(ch1_masked)
+        ch2_thresh, ch2_signal_mask, ch2_has_signal = get_signal_pixels(ch2_masked)
 
         n_ch1_signal = np.sum(ch1_signal_mask)
         n_ch2_signal = np.sum(ch2_signal_mask)
 
         # Store diagnostic info
-        results['ch1_bg_mean'] = round(ch1_bg_mean, 2)
-        results['ch1_bg_std'] = round(ch1_bg_std, 2)
-        results['ch1_threshold'] = round(ch1_thresh, 2)
-        results['ch2_bg_mean'] = round(ch2_bg_mean, 2)
-        results['ch2_bg_std'] = round(ch2_bg_std, 2)
-        results['ch2_threshold'] = round(ch2_thresh, 2)
+        results['ch1_threshold'] = round(float(ch1_thresh), 2)
+        results['ch1_has_signal'] = ch1_has_signal
+        results['ch1_min'] = round(float(np.min(ch1_masked)), 2)
+        results['ch1_max'] = round(float(np.max(ch1_masked)), 2)
+        results['ch2_threshold'] = round(float(ch2_thresh), 2)
+        results['ch2_has_signal'] = ch2_has_signal
+        results['ch2_min'] = round(float(np.min(ch2_masked)), 2)
+        results['ch2_max'] = round(float(np.max(ch2_masked)), 2)
         results['n_ch1_signal'] = int(n_ch1_signal)
         results['n_ch2_signal'] = int(n_ch2_signal)
 
         # === COLOCALIZATION ===
+        # Only count colocalization if BOTH channels have real signal
+        if not ch1_has_signal or not ch2_has_signal:
+            results['n_coloc_pixels'] = 0
+            results['ch1_coloc_percent'] = 0.0
+            results['ch2_coloc_percent'] = 0.0
+            results['pearson_r'] = 0.0
+            results['coloc_status'] = 'no_signal_in_channel'
+            return results
+
         # A pixel is colocalized ONLY if BOTH channels have signal at that location
         colocalized_mask = ch1_signal_mask & ch2_signal_mask
         n_coloc = np.sum(colocalized_mask)
         results['n_coloc_pixels'] = int(n_coloc)
 
-        # Percent colocalized (what fraction of ch1 signal overlaps with ch2 signal)
-        if n_ch1_signal > 0:
-            results['ch1_coloc_percent'] = round((n_coloc / n_ch1_signal) * 100, 2)
-        else:
-            results['ch1_coloc_percent'] = 0.0
-
-        if n_ch2_signal > 0:
-            results['ch2_coloc_percent'] = round((n_coloc / n_ch2_signal) * 100, 2)
-        else:
-            results['ch2_coloc_percent'] = 0.0
+        # Percent colocalized
+        results['ch1_coloc_percent'] = round((n_coloc / n_ch1_signal) * 100, 2) if n_ch1_signal > 0 else 0.0
+        results['ch2_coloc_percent'] = round((n_coloc / n_ch2_signal) * 100, 2) if n_ch2_signal > 0 else 0.0
 
         # === PEARSON'S R ===
-        # Only calculate if there are colocalized pixels
+        # Only calculate if there are enough colocalized pixels
         if n_coloc >= 10:
             ch1_coloc_values = ch1_masked[colocalized_mask]
             ch2_coloc_values = ch2_masked[colocalized_mask]
@@ -1281,10 +1306,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
             else:
                 results['pearson_r'] = 0.0
         else:
-            # No colocalization or too few pixels
             results['pearson_r'] = 0.0
-            if n_ch1_signal == 0 or n_ch2_signal == 0:
-                results['coloc_status'] = 'no_signal_in_channel'
+
+        return results
 
         return results
 
@@ -3512,8 +3536,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         coloc_keys = ['coloc_status', 'coloc_ch1', 'coloc_ch2', 'pearson_r',
                       'n_mask_pixels', 'n_ch1_signal', 'n_ch2_signal', 'n_coloc_pixels',
                       'ch1_coloc_percent', 'ch2_coloc_percent',
-                      'ch1_bg_mean', 'ch1_bg_std', 'ch1_threshold',
-                      'ch2_bg_mean', 'ch2_bg_std', 'ch2_threshold']
+                      'ch1_has_signal', 'ch2_has_signal',
+                      'ch1_threshold', 'ch1_min', 'ch1_max',
+                      'ch2_threshold', 'ch2_min', 'ch2_max']
         morph_keys = [k for k in keys if k not in coloc_keys]
         coloc_present = [k for k in coloc_keys if k in keys]
 
