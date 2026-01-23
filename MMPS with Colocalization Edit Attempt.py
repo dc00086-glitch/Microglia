@@ -661,10 +661,11 @@ class ChannelSelectDialog(QDialog):
 
 
 class GrayscaleChannelDialog(QDialog):
-    """Dialog to select which channel to use for grayscale conversion"""
-    def __init__(self, parent=None, channel_names=None, color_image=None):
+    """Dialog to select channel for outlining AND channels for colocalization"""
+    def __init__(self, parent=None, channel_names=None, color_image=None,
+                 current_coloc_ch1=0, current_coloc_ch2=1):
         super().__init__(parent)
-        self.setWindowTitle("Select Channel for Outlining")
+        self.setWindowTitle("Channel Selection")
         self.setModal(True)
 
         self.names = channel_names or {0: '', 1: '', 2: ''}
@@ -676,39 +677,67 @@ class GrayscaleChannelDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        # Instructions
-        instructions = QLabel(
-            "Select which channel to use for grayscale during outlining:\n"
-            "(The image will switch to grayscale for precise mask drawing)"
-        )
-        instructions.setWordWrap(True)
-        layout.addWidget(instructions)
+        # === Section 1: Grayscale channel for outlining ===
+        outline_label = QLabel("<b>1. Select channel for outlining (grayscale):</b>")
+        layout.addWidget(outline_label)
 
-        # Channel radio buttons
-        from PyQt5.QtWidgets import QRadioButton, QButtonGroup
-        self.button_group = QButtonGroup(self)
+        from PyQt5.QtWidgets import QRadioButton, QButtonGroup, QComboBox
+        self.outline_group = QButtonGroup(self)
 
-        self.radios = []
+        self.outline_radios = []
         for i in range(self.num_channels):
-            name = self.names.get(i, '')
             label = f"Channel {i+1}"
-            if name and name != f'Channel {i+1}':
-                label += f": {name}"
             radio = QRadioButton(label)
             if i == 0:
                 radio.setChecked(True)
-            self.button_group.addButton(radio, i)
+            self.outline_group.addButton(radio, i)
             layout.addWidget(radio)
-            self.radios.append(radio)
+            self.outline_radios.append(radio)
+
+        layout.addSpacing(15)
+
+        # === Section 2: Colocalization channels ===
+        coloc_label = QLabel("<b>2. Select channels to colocalize:</b>")
+        layout.addWidget(coloc_label)
+
+        # Channel 1 dropdown
+        ch1_layout = QHBoxLayout()
+        ch1_label = QLabel("Colocalization Channel 1:")
+        self.coloc_ch1_combo = QComboBox()
+        for i in range(self.num_channels):
+            self.coloc_ch1_combo.addItem(f"Channel {i+1}", i)
+        self.coloc_ch1_combo.setCurrentIndex(current_coloc_ch1)
+        ch1_layout.addWidget(ch1_label)
+        ch1_layout.addWidget(self.coloc_ch1_combo)
+        layout.addLayout(ch1_layout)
+
+        # Channel 2 dropdown
+        ch2_layout = QHBoxLayout()
+        ch2_label = QLabel("Colocalization Channel 2:")
+        self.coloc_ch2_combo = QComboBox()
+        for i in range(self.num_channels):
+            self.coloc_ch2_combo.addItem(f"Channel {i+1}", i)
+        self.coloc_ch2_combo.setCurrentIndex(current_coloc_ch2 if current_coloc_ch2 < self.num_channels else 1)
+        ch2_layout.addWidget(ch2_label)
+        ch2_layout.addWidget(self.coloc_ch2_combo)
+        layout.addLayout(ch2_layout)
+
+        layout.addSpacing(15)
 
         # OK button
-        layout.addSpacing(10)
         ok_btn = QPushButton("OK")
         ok_btn.clicked.connect(self.accept)
         layout.addWidget(ok_btn)
 
     def get_selected_channel(self):
-        return self.button_group.checkedId()
+        """Get the selected grayscale channel for outlining"""
+        return self.outline_group.checkedId()
+
+    def get_coloc_channels(self):
+        """Get the selected channels for colocalization"""
+        ch1 = self.coloc_ch1_combo.currentData()
+        ch2 = self.coloc_ch2_combo.currentData()
+        return ch1, ch2
 
 
 class MicrogliaAnalysisGUI(QMainWindow):
@@ -743,6 +772,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.display_channels = {0: True, 1: True, 2: True}
         # Which channel to use for grayscale during outlining
         self.grayscale_channel = 0
+        # Which channels to use for colocalization analysis
+        self.coloc_channel_1 = 0  # First channel for colocalization
+        self.coloc_channel_2 = 1  # Second channel for colocalization
         # Channel names (can be customized by user)
         self.channel_names = {0: '', 1: '', 2: ''}
         # Z key tracking for zoom functionality
@@ -1134,7 +1166,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Keep the final time visible
 
     def calculate_colocalization(self, mask, img_name):
-        """Calculate colocalization metrics using Costes thresholding within the cell mask"""
+        """
+        Calculate colocalization metrics using user-selected channels.
+        Only reports: Pearson's r, pixel counts, and percent colocalized.
+        """
         if not self.colocalization_mode:
             return {}
 
@@ -1143,171 +1178,99 @@ class MicrogliaAnalysisGUI(QMainWindow):
             return {'coloc_status': 'no_color_data'}
 
         color_img = img_data['color_image']
-        if color_img.ndim != 3 or color_img.shape[2] < 2:
+        if color_img.ndim != 3:
             return {'coloc_status': 'not_multichannel'}
+
+        # Validate channel indices
+        n_channels = color_img.shape[2]
+        if self.coloc_channel_1 >= n_channels or self.coloc_channel_2 >= n_channels:
+            return {'coloc_status': 'invalid_channels'}
 
         # Apply mask - ONLY analyze pixels within the cell mask
         mask_bool = mask > 0
         if not np.any(mask_bool):
             return {'coloc_status': 'empty_mask'}
 
-        results = {'coloc_status': 'ok'}
+        n_mask_pixels = np.sum(mask_bool)
 
-        # Get channels within mask only
-        ch1_full = color_img[:, :, 0].astype(np.float64)
-        ch2_full = color_img[:, :, 1].astype(np.float64)
+        # Get user-selected channels within mask only
+        ch1_full = color_img[:, :, self.coloc_channel_1].astype(np.float64)
+        ch2_full = color_img[:, :, self.coloc_channel_2].astype(np.float64)
 
         ch1_masked = ch1_full[mask_bool]
         ch2_masked = ch2_full[mask_bool]
 
-        # Find Costes automatic threshold within masked region
-        costes_thresh1, costes_thresh2 = self._find_costes_threshold(ch1_masked, ch2_masked)
-        results['costes_thresh_ch1'] = round(costes_thresh1, 2)
-        results['costes_thresh_ch2'] = round(costes_thresh2, 2)
+        results = {
+            'coloc_status': 'ok',
+            'coloc_ch1': self.coloc_channel_1 + 1,  # 1-indexed for display
+            'coloc_ch2': self.coloc_channel_2 + 1,
+            'n_mask_pixels': int(n_mask_pixels)
+        }
 
-        # Identify signal pixels for each channel independently
-        ch1_above_thresh = ch1_masked > costes_thresh1
-        ch2_above_thresh = ch2_masked > costes_thresh2
+        # Check if each channel has meaningful signal (not just uniform noise)
+        # A channel with no signal will have very low variance relative to mean
+        ch1_cv = np.std(ch1_masked) / (np.mean(ch1_masked) + 1e-10)  # Coefficient of variation
+        ch2_cv = np.std(ch2_masked) / (np.mean(ch2_masked) + 1e-10)
 
-        # For Pearson: use pixels where EITHER channel has signal (OR)
-        # This avoids biasing toward already-colocalized pixels
-        any_signal_mask = ch1_above_thresh | ch2_above_thresh
-        n_any_signal = np.sum(any_signal_mask)
+        # If a channel has very low CV, it's likely just background/noise
+        min_cv_threshold = 0.1  # Require at least 10% variation
+        ch1_has_signal = ch1_cv > min_cv_threshold and np.max(ch1_masked) > np.percentile(ch1_masked, 90) * 1.5
+        ch2_has_signal = ch2_cv > min_cv_threshold and np.max(ch2_masked) > np.percentile(ch2_masked, 90) * 1.5
 
-        # For Manders: pixels where BOTH channels have signal (AND) = colocalized
-        colocalized = ch1_above_thresh & ch2_above_thresh
-        n_coloc = np.sum(colocalized)
+        results['ch1_has_signal'] = ch1_has_signal
+        results['ch2_has_signal'] = ch2_has_signal
 
-        if n_any_signal < 2:
-            # Not enough signal pixels after thresholding
+        # If either channel has no real signal, colocalization is meaningless
+        if not ch1_has_signal or not ch2_has_signal:
             results['pearson_r'] = 0.0
-            results['manders_m1'] = 0.0
-            results['manders_m2'] = 0.0
-            results['coloc_area_percent'] = 0.0
-            results['ch1_mean_intensity'] = round(np.mean(ch1_masked), 2)
-            results['ch2_mean_intensity'] = round(np.mean(ch2_masked), 2)
-            results['icq'] = 0.0
-            results['n_signal_pixels'] = n_any_signal
+            results['n_ch1_signal_pixels'] = 0 if not ch1_has_signal else int(np.sum(ch1_masked > np.percentile(ch1_masked, 50)))
+            results['n_ch2_signal_pixels'] = 0 if not ch2_has_signal else int(np.sum(ch2_masked > np.percentile(ch2_masked, 50)))
             results['n_coloc_pixels'] = 0
+            results['coloc_percent'] = 0.0
+            results['coloc_status'] = 'no_signal_in_channel'
             return results
 
-        # Get pixels where either channel has signal (for Pearson/ICQ)
-        ch1_any_signal = ch1_masked[any_signal_mask]
-        ch2_any_signal = ch2_masked[any_signal_mask]
+        # Use simple percentile thresholds to identify signal pixels
+        # (More robust than Costes for edge cases)
+        ch1_thresh = np.percentile(ch1_masked, 75)  # Top 25% is signal
+        ch2_thresh = np.percentile(ch2_masked, 75)
 
-        # 1. Pearson's correlation on pixels where EITHER channel has signal
-        # This properly measures: "when there's signal, do the channels correlate?"
-        if np.std(ch1_any_signal) > 0 and np.std(ch2_any_signal) > 0:
-            pearson_r, _ = stats.pearsonr(ch1_any_signal, ch2_any_signal)
-            results['pearson_r'] = round(pearson_r, 4)
+        ch1_signal = ch1_masked > ch1_thresh
+        ch2_signal = ch2_masked > ch2_thresh
+
+        n_ch1_signal = np.sum(ch1_signal)
+        n_ch2_signal = np.sum(ch2_signal)
+
+        # Colocalized = both channels have signal at same pixel
+        colocalized = ch1_signal & ch2_signal
+        n_coloc = np.sum(colocalized)
+
+        results['n_ch1_signal_pixels'] = int(n_ch1_signal)
+        results['n_ch2_signal_pixels'] = int(n_ch2_signal)
+        results['n_coloc_pixels'] = int(n_coloc)
+
+        # Percent colocalized (of smaller signal region)
+        min_signal = min(n_ch1_signal, n_ch2_signal)
+        if min_signal > 0:
+            results['coloc_percent'] = round((n_coloc / min_signal) * 100, 2)
         else:
+            results['coloc_percent'] = 0.0
+
+        # Pearson's r - only on pixels where BOTH channels have signal
+        # This is the proper way: correlate signal intensities where both are present
+        if n_coloc >= 10:
+            ch1_coloc = ch1_masked[colocalized]
+            ch2_coloc = ch2_masked[colocalized]
+            if np.std(ch1_coloc) > 0 and np.std(ch2_coloc) > 0:
+                pearson_r, _ = stats.pearsonr(ch1_coloc, ch2_coloc)
+                results['pearson_r'] = round(pearson_r, 4)
+            else:
+                results['pearson_r'] = 0.0
+        else:
+            # Not enough colocalized pixels for meaningful correlation
             results['pearson_r'] = 0.0
 
-        # 2. Manders' coefficients using Costes thresholds
-        # M1: Of Ch1's signal, what fraction overlaps with Ch2's signal?
-        ch1_sum = np.sum(ch1_masked[ch1_above_thresh])
-        if ch1_sum > 0:
-            m1 = np.sum(ch1_masked[colocalized]) / ch1_sum
-        else:
-            m1 = 0.0
-        results['manders_m1'] = round(m1, 4)
-
-        # M2: Of Ch2's signal, what fraction overlaps with Ch1's signal?
-        ch2_sum = np.sum(ch2_masked[ch2_above_thresh])
-        if ch2_sum > 0:
-            m2 = np.sum(ch2_masked[colocalized]) / ch2_sum
-        else:
-            m2 = 0.0
-        results['manders_m2'] = round(m2, 4)
-
-        # 3. Colocalized area percentage (of total mask area)
-        results['coloc_area_percent'] = round((n_coloc / len(ch1_masked)) * 100, 2)
-        results['n_signal_pixels'] = n_any_signal
-        results['n_coloc_pixels'] = n_coloc
-
-        # 4. Mean intensities within mask (all masked pixels)
-        results['ch1_mean_intensity'] = round(np.mean(ch1_masked), 2)
-        results['ch2_mean_intensity'] = round(np.mean(ch2_masked), 2)
-
-        # 5. Intensity correlation quotient (ICQ) on signal pixels (either channel)
-        ch1_diff = ch1_any_signal - np.mean(ch1_any_signal)
-        ch2_diff = ch2_any_signal - np.mean(ch2_any_signal)
-        product = ch1_diff * ch2_diff
-        n_positive = np.sum(product > 0)
-        n_total = len(product)
-        results['icq'] = round((n_positive / n_total) - 0.5, 4) if n_total > 0 else 0.0
-
         return results
-
-    def _find_costes_threshold(self, ch1, ch2, step_percent=2):
-        """
-        Find Costes automatic threshold for two channels.
-
-        The algorithm finds the threshold where pixels below it have
-        Pearson's r approaching zero (i.e., they're just background noise).
-
-        Args:
-            ch1, ch2: 1D arrays of intensity values (already masked to cell region)
-            step_percent: Percentage step for threshold iteration
-
-        Returns:
-            (threshold_ch1, threshold_ch2): Thresholds for each channel
-        """
-        if len(ch1) < 10:
-            # Not enough pixels, return minimum values
-            return np.min(ch1), np.min(ch2)
-
-        # Use percentile-based stepping for efficiency
-        max_ch1, max_ch2 = np.max(ch1), np.max(ch2)
-        min_ch1, min_ch2 = np.min(ch1), np.min(ch2)
-
-        # Start from high threshold and work down
-        best_thresh1 = min_ch1
-        best_thresh2 = min_ch2
-
-        # Calculate threshold pairs based on the regression line approach
-        # Fit linear regression to find relationship between channels
-        if np.std(ch1) > 0 and np.std(ch2) > 0:
-            slope, intercept = np.polyfit(ch1, ch2, 1)
-        else:
-            # No variation, return minimums
-            return min_ch1, min_ch2
-
-        # Iterate from high to low threshold
-        for percentile in range(95, 5, -step_percent):
-            thresh1 = np.percentile(ch1, percentile)
-            # Use regression line to find corresponding ch2 threshold
-            thresh2 = slope * thresh1 + intercept
-            thresh2 = max(min_ch2, min(max_ch2, thresh2))  # Clamp to valid range
-
-            # Get pixels below both thresholds (potential background)
-            below_thresh = (ch1 < thresh1) & (ch2 < thresh2)
-            n_below = np.sum(below_thresh)
-
-            if n_below < 10:
-                continue
-
-            ch1_below = ch1[below_thresh]
-            ch2_below = ch2[below_thresh]
-
-            # Calculate Pearson's r for sub-threshold pixels
-            if np.std(ch1_below) > 0 and np.std(ch2_below) > 0:
-                r_below, _ = stats.pearsonr(ch1_below, ch2_below)
-            else:
-                r_below = 0
-
-            # When correlation of sub-threshold pixels approaches 0,
-            # we've found the threshold separating signal from background
-            if r_below <= 0.0:
-                best_thresh1 = thresh1
-                best_thresh2 = thresh2
-                break
-
-            # Keep track of the threshold as we go
-            best_thresh1 = thresh1
-            best_thresh2 = thresh2
-
-        return best_thresh1, best_thresh2
 
     def log(self, message):
         self.log_text.append(str(message))
@@ -2291,12 +2254,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
             dialog = GrayscaleChannelDialog(
                 self,
                 channel_names=self.channel_names,
-                color_image=sample_color_img
+                color_image=sample_color_img,
+                current_coloc_ch1=self.coloc_channel_1,
+                current_coloc_ch2=self.coloc_channel_2
             )
             if dialog.exec_() == QDialog.Accepted:
                 self.grayscale_channel = dialog.get_selected_channel()
+                self.coloc_channel_1, self.coloc_channel_2 = dialog.get_coloc_channels()
                 channel_name = self.channel_names.get(self.grayscale_channel, f'Channel {self.grayscale_channel + 1}')
-                self.log(f"Using '{channel_name}' for grayscale outlining")
+                self.log(f"Using Channel {self.grayscale_channel + 1} for grayscale outlining")
+                self.log(f"Colocalization: Channel {self.coloc_channel_1 + 1} vs Channel {self.coloc_channel_2 + 1}")
             else:
                 # User cancelled, abort outlining
                 return
@@ -3526,8 +3493,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 keys.remove(key)
 
         # Separate colocalization keys from morphology keys for better organization
-        coloc_keys = ['coloc_status', 'pearson_r', 'manders_m1', 'manders_m2',
-                      'coloc_area_percent', 'ch1_mean_intensity', 'ch2_mean_intensity', 'icq']
+        coloc_keys = ['coloc_status', 'coloc_ch1', 'coloc_ch2', 'pearson_r',
+                      'n_mask_pixels', 'n_ch1_signal_pixels', 'n_ch2_signal_pixels',
+                      'n_coloc_pixels', 'coloc_percent', 'ch1_has_signal', 'ch2_has_signal']
         morph_keys = [k for k in keys if k not in coloc_keys]
         coloc_present = [k for k in coloc_keys if k in keys]
 
