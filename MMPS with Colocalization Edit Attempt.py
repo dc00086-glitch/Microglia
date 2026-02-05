@@ -777,6 +777,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.coloc_channel_2 = 1  # Second channel for colocalization
         # Channel names (can be customized by user)
         self.channel_names = {0: '', 1: '', 2: ''}
+        # Color/grayscale display toggle
+        self.show_color_view = False
         # Z key tracking for zoom functionality
         self.z_key_held = False
         self.init_ui()
@@ -792,6 +794,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # U key resets zoom on current view
         if key == Qt.Key_U:
             self._reset_current_zoom()
+            return
+
+        # C key toggles color/grayscale display
+        if key == Qt.Key_C:
+            self.toggle_color_view()
             return
 
         # Handle polygon outlining mode shortcuts
@@ -1063,11 +1070,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
         display_adjust_btn.clicked.connect(self.open_display_adjustments)
         display_btn_layout.addWidget(display_adjust_btn)
 
-        # Channel selection button (only visible in colocalization mode)
+        # Color/Grayscale toggle button
+        self.color_toggle_btn = QPushButton("Show Color (C)")
+        self.color_toggle_btn.clicked.connect(self.toggle_color_view)
+        self.color_toggle_btn.setToolTip("Toggle between color and grayscale display")
+        display_btn_layout.addWidget(self.color_toggle_btn)
+
+        # Channel selection button (only visible when color view is on)
         self.channel_select_btn = QPushButton("Channel Display")
         self.channel_select_btn.clicked.connect(self.open_channel_selector)
         self.channel_select_btn.setToolTip("Select which color channels to display")
-        self.channel_select_btn.setVisible(False)  # Hidden until colocalization mode
+        self.channel_select_btn.setVisible(False)  # Hidden until color view is on
         display_btn_layout.addWidget(self.channel_select_btn)
 
         layout.addLayout(display_btn_layout)
@@ -1492,10 +1505,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def open_channel_selector(self):
         """Open channel selection dialog to choose which channels to display"""
-        if not self.colocalization_mode:
+        if not self.show_color_view:
             QMessageBox.information(
                 self, "Channel Selection",
-                "Channel selection is only available in colocalization mode."
+                "Channel selection is only available in color view mode.\nPress C to toggle color view."
             )
             return
 
@@ -1532,8 +1545,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         img_data = self.images[self.current_image_name]
 
-        # Only refresh if in colocalization mode and we have color data
-        if self.colocalization_mode and 'color_image' in img_data:
+        # Refresh if color view is on and we have color data
+        if self.show_color_view and 'color_image' in img_data:
             pixmap = self._array_to_pixmap_color(img_data['color_image'])
             # Preserve markers
             if self.processed_label.soma_mode:
@@ -1561,6 +1574,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.contrast_value = 0
         self.update_display()
 
+    def toggle_color_view(self):
+        """Toggle between color and grayscale display"""
+        self.show_color_view = not self.show_color_view
+        if self.show_color_view:
+            self.color_toggle_btn.setText("Show Grayscale (C)")
+            self.channel_select_btn.setVisible(True)
+        else:
+            self.color_toggle_btn.setText("Show Color (C)")
+            self.channel_select_btn.setVisible(False)
+        self.update_display()
+
     def _reset_current_zoom(self):
         """Reset zoom on all image labels"""
         for label in [self.original_label, self.preview_label, self.processed_label, self.mask_label]:
@@ -1577,11 +1601,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 img_data = self.images[self.current_image_name]
 
                 # Determine which image to display based on current tab
+                use_color = self.show_color_view
                 if current_tab == 0:  # Original
                     if 'raw_path' in img_data:
                         raw_img = load_tiff_image(img_data['raw_path'])
-                        # In colocalization mode, keep color
-                        if self.colocalization_mode and raw_img.ndim == 3:
+                        if use_color and raw_img.ndim == 3:
                             adjusted = self._apply_display_adjustments_color(raw_img)
                             pixmap = self._array_to_pixmap_color(adjusted)
                         else:
@@ -1595,8 +1619,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         self.preview_label.set_image(pixmap)
                 elif current_tab == 2:  # Processed
-                    # In colocalization mode (not outlining), show color image
-                    if self.colocalization_mode and not self.processed_label.polygon_mode and 'color_image' in img_data:
+                    # Show color image when color view is on (not during outlining)
+                    if use_color and not self.processed_label.polygon_mode and 'color_image' in img_data:
                         adjusted = self._apply_display_adjustments_color(img_data['color_image'])
                         pixmap = self._array_to_pixmap_color(adjusted)
                         if self.soma_mode or self.processed_label.soma_mode:
@@ -1749,15 +1773,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         if self.colocalization_mode:
             self.log("=" * 50)
-            self.log("🎨 COLOCALIZATION MODE ENABLED")
+            self.log("COLOCALIZATION MODE ENABLED")
             self.log("Images will be displayed in color")
             self.log("Use 'Channel Display' button to select which channels to show")
+            self.log("Press C to toggle between color and grayscale")
             self.log("Grayscale conversion will occur when outlining begins")
             self.log("=" * 50)
-            # Show channel selection button
+            # Auto-enable color view in colocalization mode
+            self.show_color_view = True
+            self.color_toggle_btn.setText("Show Grayscale (C)")
             self.channel_select_btn.setVisible(True)
         else:
-            # Hide channel selection button
+            self.show_color_view = False
+            self.color_toggle_btn.setText("Show Color (C)")
             self.channel_select_btn.setVisible(False)
 
         # Include both lowercase and uppercase extensions for macOS compatibility
@@ -1868,16 +1896,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
             img_data = self.images[self.current_image_name]
             raw_img = load_tiff_image(img_data['raw_path'])
 
-            # In colocalization mode, display in color; otherwise grayscale
-            if self.colocalization_mode and raw_img.ndim == 3:
-                # Keep the color image
+            # Always store color image for toggle functionality
+            if raw_img.ndim == 3:
+                img_data['color_image'] = raw_img.copy()
+
+            # Display in color or grayscale based on toggle
+            if self.show_color_view and raw_img.ndim == 3:
                 pixmap = self._array_to_pixmap_color(raw_img)
                 self.original_label.set_image(pixmap)
-                # Store color image for later use
-                img_data['color_image'] = raw_img.copy()
             else:
                 raw_img = ensure_grayscale(raw_img)
-                # Apply display adjustments
                 adjusted_raw = self._apply_display_adjustments(raw_img)
                 pixmap = self._array_to_pixmap(adjusted_raw, skip_rescale=True)
                 self.original_label.set_image(pixmap)
@@ -2047,8 +2075,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.images[img_name]['processed'] = processed_data
             self.images[img_name]['status'] = 'processed'
 
-            # Store color image if in colocalization mode
-            if self.colocalization_mode and 'color_image' not in self.images[img_name]:
+            # Always store color image for toggle functionality
+            if 'color_image' not in self.images[img_name]:
                 try:
                     raw_img = load_tiff_image(self.images[img_name]['raw_path'])
                     if raw_img.ndim == 3:
@@ -2058,8 +2086,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
             self._update_file_list_item(img_name)
             if img_name == self.current_image_name:
-                # Show color in colocalization mode, grayscale otherwise
-                if self.colocalization_mode and 'color_image' in self.images[img_name]:
+                if self.show_color_view and 'color_image' in self.images[img_name]:
                     pixmap = self._array_to_pixmap_color(self.images[img_name]['color_image'])
                 else:
                     pixmap = self._array_to_pixmap(processed_data)
@@ -2168,8 +2195,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             return
         img_data = self.images[self.current_image_name]
 
-        # In colocalization mode, show color image for soma picking
-        if self.colocalization_mode and 'color_image' in img_data:
+        # Show color or grayscale based on toggle
+        if self.show_color_view and 'color_image' in img_data:
             pixmap = self._array_to_pixmap_color(img_data['color_image'])
         else:
             pixmap = self._array_to_pixmap(img_data['processed'])
@@ -2191,8 +2218,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         soma_id = f"soma_{coords[0]}_{coords[1]}"
         img_data['soma_ids'].append(soma_id)
 
-        # Show color or grayscale depending on mode
-        if self.colocalization_mode and 'color_image' in img_data:
+        # Show color or grayscale based on toggle
+        if self.show_color_view and 'color_image' in img_data:
             pixmap = self._array_to_pixmap_color(img_data['color_image'])
         else:
             pixmap = self._array_to_pixmap(img_data['processed'])
@@ -2207,7 +2234,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             return
         img_data = self.images[self.current_image_name]
         if len(img_data['somas']) == 0:
-            self.log("⚠ No somas to undo")
+            self.log("No somas to undo")
             return
 
         # Remove the last soma and its ID
@@ -2215,7 +2242,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         removed_id = img_data['soma_ids'].pop() if img_data['soma_ids'] else None
 
         # Update the display
-        if self.colocalization_mode and 'color_image' in img_data:
+        if self.show_color_view and 'color_image' in img_data:
             pixmap = self._array_to_pixmap_color(img_data['color_image'])
         else:
             pixmap = self._array_to_pixmap(img_data['processed'])
