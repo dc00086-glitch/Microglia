@@ -129,17 +129,21 @@ class BatchProcessingThread(QThread):
         try:
             total = len(self.image_data_list)
             for i, (
-                    img_path, img_name, radius, denoise_enabled, denoise_size, sharpen_enabled,
-                    sharpen_amount) in enumerate(
+                    img_path, img_name, radius, rb_enabled, denoise_enabled, denoise_size,
+                    sharpen_enabled, sharpen_amount) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
                     img = load_tiff_image(img_path)
                     img = ensure_grayscale(img)
                     img_dtype = img.dtype
-                    background = restoration.rolling_ball(img, radius=radius)
-                    result = img - background
-                    result = np.clip(result, 0, np.iinfo(img_dtype).max)
+                    result = img.copy()
+
+                    # Apply optional rolling ball background subtraction
+                    if rb_enabled:
+                        background = restoration.rolling_ball(img, radius=radius)
+                        result = img - background
+                        result = np.clip(result, 0, np.iinfo(img_dtype).max)
 
                     # Apply optional denoising
                     if denoise_enabled:
@@ -249,17 +253,21 @@ class BackgroundRemovalThread(QThread):
         try:
             total = len(self.image_data_list)
             for i, (
-                    img_path, img_name, radius, denoise_enabled, denoise_size, sharpen_enabled,
-                    sharpen_amount) in enumerate(
+                    img_path, img_name, radius, rb_enabled, denoise_enabled, denoise_size,
+                    sharpen_enabled, sharpen_amount) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
                     img = load_tiff_image(img_path)
                     img = ensure_grayscale(img)
                     img_dtype = img.dtype
-                    background = restoration.rolling_ball(img, radius=radius)
-                    result = img - background
-                    result = np.clip(result, 0, np.iinfo(img_dtype).max)
+                    result = img.copy()
+
+                    # Apply optional rolling ball background subtraction
+                    if rb_enabled:
+                        background = restoration.rolling_ball(img, radius=radius)
+                        result = img - background
+                        result = np.clip(result, 0, np.iinfo(img_dtype).max)
 
                     # Apply optional denoising
                     if denoise_enabled:
@@ -925,8 +933,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         
         self.use_imagej = False
 
+        self.rb_check = QCheckBox("Apply Rolling Ball Background Subtraction")
+        self.rb_check.setChecked(True)
+        param_layout.addWidget(self.rb_check)
+
         rb_layout = QHBoxLayout()
-        rb_layout.addWidget(QLabel("Rolling ball radius:"))
+        rb_layout.addWidget(QLabel("  Rolling ball radius:"))
         self.rb_slider = QSlider(Qt.Horizontal)
         self.rb_slider.setRange(5, 150)
         self.rb_slider.setValue(50)
@@ -2003,12 +2015,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "Select an image first")
             return
         img_data = self.images[self.current_image_name]
-        radius = self.rb_slider.value()
         raw_img = load_tiff_image(img_data['raw_path'])
         raw_img = ensure_grayscale(raw_img)
-        background = restoration.rolling_ball(raw_img, radius=radius)
-        result = raw_img - background
-        result = np.clip(result, 0, raw_img.max())
+        result = raw_img.copy()
+
+        # Apply optional rolling ball background subtraction
+        rb_enabled = self.rb_check.isChecked()
+        if rb_enabled:
+            radius = self.rb_slider.value()
+            background = restoration.rolling_ball(raw_img, radius=radius)
+            result = raw_img - background
+            result = np.clip(result, 0, raw_img.max())
 
         # Apply optional denoising
         if self.denoise_check.isChecked():
@@ -2030,11 +2047,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
         self.preview_label.set_image(pixmap)
         self.tabs.setCurrentIndex(1)
-        steps = [f"RB={radius}"]
+        steps = []
+        if rb_enabled:
+            steps.append(f"RB={self.rb_slider.value()}")
         if self.denoise_check.isChecked():
             steps.append(f"Denoise={self.denoise_spin.value()}")
         if self.sharpen_check.isChecked():
             steps.append(f"Sharpen={self.sharpen_slider.value() / 10:.1f}")
+        if not steps:
+            steps.append("Grayscale only (no processing)")
         self.log(f"Preview {self.current_image_name}: {', '.join(steps)}")
 
     def process_selected_images(self):
@@ -2046,14 +2067,28 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "No images selected")
             return
         radius = self.rb_slider.value()
+        rb_enabled = self.rb_check.isChecked()
         denoise_enabled = self.denoise_check.isChecked()
         denoise_size = self.denoise_spin.value()
         sharpen_enabled = self.sharpen_check.isChecked()
         sharpen_amount = self.sharpen_slider.value() / 10.0
 
+        # Log what processing steps will be applied
+        steps = []
+        if rb_enabled:
+            steps.append(f"Rolling Ball (r={radius})")
+        if denoise_enabled:
+            steps.append(f"Denoise ({denoise_size})")
+        if sharpen_enabled:
+            steps.append(f"Sharpen ({sharpen_amount:.1f})")
+        if not steps:
+            self.log("No processing selected - saving grayscale images for later steps")
+        else:
+            self.log(f"Processing with: {', '.join(steps)}")
+
         process_list = []
         for img_name, img_data in selected_images:
-            process_list.append((img_data['raw_path'], img_name, radius,
+            process_list.append((img_data['raw_path'], img_name, radius, rb_enabled,
                                  denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount))
         self.thread = BackgroundRemovalThread(process_list, self.output_dir)
         self.thread.status_update.connect(self.log)
@@ -2063,7 +2098,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.thread.error_occurred.connect(lambda msg: self.log(f"ERROR: {msg}"))
         self.progress_bar.setVisible(True)
         self.progress_status_label.setVisible(True)
-        self.progress_status_label.setText("Processing images...")
+        if steps:
+            self.progress_status_label.setText("Processing images...")
+        else:
+            self.progress_status_label.setText("Converting to grayscale...")
         self.process_selected_btn.setEnabled(False)
         self.thread.start()
 
