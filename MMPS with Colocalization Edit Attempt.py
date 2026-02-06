@@ -62,6 +62,391 @@ def extract_channel(img, channel_idx):
     return ensure_grayscale(img)
 
 
+# ============================================================================
+# AUTO-OUTLINE ALGORITHMS
+# ============================================================================
+
+def auto_outline_threshold(image, centroid, sensitivity=50, region_size=150):
+    """
+    Auto-outline using threshold + contour detection.
+    Fast and works well for high-contrast images.
+
+    Args:
+        image: Grayscale image (2D numpy array)
+        centroid: (row, col) tuple of soma center
+        sensitivity: 0-100, higher = larger outline (adjusts threshold)
+        region_size: Size of region around centroid to analyze
+
+    Returns:
+        List of (row, col) polygon points, or None if failed
+    """
+    h, w = image.shape[:2]
+    cy, cx = int(centroid[0]), int(centroid[1])
+
+    # Extract region around centroid
+    half = region_size // 2
+    y1, y2 = max(0, cy - half), min(h, cy + half)
+    x1, x2 = max(0, cx - half), min(w, cx + half)
+    region = image[y1:y2, x1:x2].copy()
+
+    if region.size == 0:
+        return None
+
+    # Normalize region
+    region = region.astype(np.float32)
+    if region.max() > region.min():
+        region = (region - region.min()) / (region.max() - region.min()) * 255
+    region = region.astype(np.uint8)
+
+    # Apply Gaussian blur to reduce noise
+    region = cv2.GaussianBlur(region, (5, 5), 0)
+
+    # Calculate threshold based on sensitivity
+    # Higher sensitivity = lower threshold = larger region
+    thresh_val = int(255 * (1 - sensitivity / 100) * 0.5 + region.mean() * 0.3)
+    thresh_val = max(10, min(245, thresh_val))
+
+    # Threshold
+    _, binary = cv2.threshold(region, thresh_val, 255, cv2.THRESH_BINARY)
+
+    # Find contours
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    # Find contour containing the centroid (in local coords)
+    local_cx, local_cy = cx - x1, cy - y1
+    best_contour = None
+    for contour in contours:
+        if cv2.pointPolygonTest(contour, (local_cx, local_cy), False) >= 0:
+            best_contour = contour
+            break
+
+    # If centroid not inside any contour, use largest
+    if best_contour is None:
+        best_contour = max(contours, key=cv2.contourArea)
+
+    # Simplify contour
+    epsilon = 0.01 * cv2.arcLength(best_contour, True)
+    approx = cv2.approxPolyDP(best_contour, epsilon, True)
+
+    # Convert back to image coordinates
+    points = []
+    for pt in approx:
+        px, py = pt[0]
+        img_x = px + x1
+        img_y = py + y1
+        points.append((img_y, img_x))  # (row, col) format
+
+    return points if len(points) >= 3 else None
+
+
+def auto_outline_region_growing(image, centroid, sensitivity=50, max_iterations=10000):
+    """
+    Auto-outline using region growing from centroid.
+    Adapts to local intensity variations.
+
+    Args:
+        image: Grayscale image (2D numpy array)
+        centroid: (row, col) tuple of soma center
+        sensitivity: 0-100, higher = more tolerant intensity difference
+        max_iterations: Maximum pixels to grow
+
+    Returns:
+        List of (row, col) polygon points, or None if failed
+    """
+    h, w = image.shape[:2]
+    cy, cx = int(centroid[0]), int(centroid[1])
+
+    if not (0 <= cy < h and 0 <= cx < w):
+        return None
+
+    # Get seed intensity
+    seed_val = float(image[cy, cx])
+
+    # Tolerance based on sensitivity (higher = more tolerant)
+    tolerance = (sensitivity / 100) * 80 + 10  # Range: 10-90
+
+    # Region growing
+    visited = np.zeros((h, w), dtype=bool)
+    region = np.zeros((h, w), dtype=bool)
+    queue = [(cy, cx)]
+    visited[cy, cx] = True
+    region[cy, cx] = True
+
+    iterations = 0
+    while queue and iterations < max_iterations:
+        y, x = queue.pop(0)
+        iterations += 1
+
+        # Check 4-connected neighbors
+        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx]:
+                visited[ny, nx] = True
+                pixel_val = float(image[ny, nx])
+                if abs(pixel_val - seed_val) <= tolerance:
+                    region[ny, nx] = True
+                    queue.append((ny, nx))
+
+    # Find contour of region
+    region_uint8 = (region * 255).astype(np.uint8)
+    contours, _ = cv2.findContours(region_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    # Get largest contour
+    contour = max(contours, key=cv2.contourArea)
+
+    # Simplify
+    epsilon = 0.01 * cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+
+    points = [(pt[0][1], pt[0][0]) for pt in approx]  # (row, col) format
+    return points if len(points) >= 3 else None
+
+
+def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
+    """
+    Auto-outline using watershed segmentation.
+    Good for separating touching somas.
+
+    Args:
+        image: Grayscale image (2D numpy array)
+        centroid: (row, col) tuple of soma center
+        sensitivity: 0-100, affects marker size and threshold
+        region_size: Size of region around centroid
+
+    Returns:
+        List of (row, col) polygon points, or None if failed
+    """
+    h, w = image.shape[:2]
+    cy, cx = int(centroid[0]), int(centroid[1])
+
+    # Extract region
+    half = region_size // 2
+    y1, y2 = max(0, cy - half), min(h, cy + half)
+    x1, x2 = max(0, cx - half), min(w, cx + half)
+    region = image[y1:y2, x1:x2].copy()
+
+    if region.size == 0:
+        return None
+
+    # Normalize
+    region = region.astype(np.float32)
+    if region.max() > region.min():
+        region = (region - region.min()) / (region.max() - region.min()) * 255
+    region = region.astype(np.uint8)
+
+    # Apply blur
+    region = cv2.GaussianBlur(region, (5, 5), 0)
+
+    # Create markers - soma center is foreground marker
+    markers = np.zeros(region.shape, dtype=np.int32)
+    local_cx, local_cy = cx - x1, cy - y1
+
+    # Foreground marker (soma) - small circle at centroid
+    marker_radius = max(3, int(5 + sensitivity / 20))
+    cv2.circle(markers, (local_cx, local_cy), marker_radius, 1, -1)
+
+    # Background marker - ring at edge
+    edge_mask = np.zeros(region.shape, dtype=np.uint8)
+    cv2.rectangle(edge_mask, (0, 0), (region.shape[1]-1, region.shape[0]-1), 255, 3)
+    markers[edge_mask > 0] = 2
+
+    # Convert to 3-channel for watershed
+    region_color = cv2.cvtColor(region, cv2.COLOR_GRAY2BGR)
+
+    # Apply watershed
+    cv2.watershed(region_color, markers)
+
+    # Extract soma region (marker == 1)
+    soma_mask = (markers == 1).astype(np.uint8) * 255
+
+    # Morphological cleanup
+    kernel = np.ones((3, 3), np.uint8)
+    soma_mask = cv2.morphologyEx(soma_mask, cv2.MORPH_CLOSE, kernel)
+    soma_mask = cv2.morphologyEx(soma_mask, cv2.MORPH_OPEN, kernel)
+
+    # Find contour
+    contours, _ = cv2.findContours(soma_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    contour = max(contours, key=cv2.contourArea)
+    epsilon = 0.01 * cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+
+    # Convert back to image coordinates
+    points = [(pt[0][1] + y1, pt[0][0] + x1) for pt in approx]
+    return points if len(points) >= 3 else None
+
+
+def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=150):
+    """
+    Auto-outline using active contours (snakes).
+    Produces smooth, precise outlines.
+
+    Args:
+        image: Grayscale image (2D numpy array)
+        centroid: (row, col) tuple of soma center
+        sensitivity: 0-100, affects initial circle size and snake parameters
+        region_size: Size of region around centroid
+
+    Returns:
+        List of (row, col) polygon points, or None if failed
+    """
+    from skimage.segmentation import active_contour
+    from skimage.filters import gaussian
+
+    h, w = image.shape[:2]
+    cy, cx = int(centroid[0]), int(centroid[1])
+
+    # Extract region
+    half = region_size // 2
+    y1, y2 = max(0, cy - half), min(h, cy + half)
+    x1, x2 = max(0, cx - half), min(w, cx + half)
+    region = image[y1:y2, x1:x2].copy().astype(np.float64)
+
+    if region.size == 0:
+        return None
+
+    # Normalize
+    if region.max() > region.min():
+        region = (region - region.min()) / (region.max() - region.min())
+
+    # Smooth image
+    region = gaussian(region, sigma=2)
+
+    # Initial circle
+    local_cx, local_cy = cx - x1, cy - y1
+    # Initial radius based on sensitivity
+    init_radius = 10 + sensitivity / 3  # Range: 10-43 pixels
+
+    # Create initial snake points (circle)
+    s = np.linspace(0, 2 * np.pi, 100)
+    init_x = local_cx + init_radius * np.cos(s)
+    init_y = local_cy + init_radius * np.sin(s)
+    init = np.array([init_x, init_y]).T
+
+    # Snake parameters based on sensitivity
+    alpha = 0.01 + (100 - sensitivity) / 5000  # Smoothness
+    beta = 0.1 + (100 - sensitivity) / 500     # Curvature
+
+    try:
+        # Run active contour
+        snake = active_contour(
+            region, init,
+            alpha=alpha, beta=beta,
+            gamma=0.01,
+            max_num_iter=250
+        )
+
+        # Simplify snake to polygon
+        # Sample every few points
+        step = max(1, len(snake) // 30)
+        simplified = snake[::step]
+
+        # Convert back to image coordinates
+        points = [(pt[1] + y1, pt[0] + x1) for pt in simplified]
+        return points if len(points) >= 3 else None
+
+    except Exception:
+        return None
+
+
+def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
+    """
+    Hybrid approach: Watershed for initial segmentation, then Active Contours to refine.
+    Best quality but slower.
+
+    Args:
+        image: Grayscale image (2D numpy array)
+        centroid: (row, col) tuple of soma center
+        sensitivity: 0-100
+        region_size: Size of region around centroid
+
+    Returns:
+        List of (row, col) polygon points, or None if failed
+    """
+    # First, get watershed result
+    watershed_points = auto_outline_watershed(image, centroid, sensitivity, region_size)
+
+    if watershed_points is None or len(watershed_points) < 3:
+        # Fall back to threshold method
+        return auto_outline_threshold(image, centroid, sensitivity, region_size)
+
+    # Use watershed result to create initial contour for active contours
+    from skimage.segmentation import active_contour
+    from skimage.filters import gaussian
+
+    h, w = image.shape[:2]
+    cy, cx = int(centroid[0]), int(centroid[1])
+
+    # Extract region
+    half = region_size // 2
+    y1, y2 = max(0, cy - half), min(h, cy + half)
+    x1, x2 = max(0, cx - half), min(w, cx + half)
+    region = image[y1:y2, x1:x2].copy().astype(np.float64)
+
+    if region.size == 0:
+        return watershed_points
+
+    # Normalize
+    if region.max() > region.min():
+        region = (region - region.min()) / (region.max() - region.min())
+
+    region = gaussian(region, sigma=2)
+
+    # Convert watershed points to local coordinates
+    local_points = [(pt[0] - y1, pt[1] - x1) for pt in watershed_points]
+
+    # Create init array for active contour (need ~100 points)
+    # Interpolate watershed points
+    if len(local_points) < 100:
+        # Interpolate
+        from scipy import interpolate
+        pts = np.array(local_points)
+        # Close the polygon
+        pts = np.vstack([pts, pts[0]])
+
+        # Parametric interpolation
+        t = np.linspace(0, 1, len(pts))
+        t_new = np.linspace(0, 1, 100)
+
+        try:
+            fx = interpolate.interp1d(t, pts[:, 1], kind='linear')
+            fy = interpolate.interp1d(t, pts[:, 0], kind='linear')
+            init_x = fx(t_new)
+            init_y = fy(t_new)
+            init = np.array([init_x, init_y]).T
+        except Exception:
+            return watershed_points
+    else:
+        init = np.array([(pt[1], pt[0]) for pt in local_points[:100]])
+
+    try:
+        # Run active contour with initial shape from watershed
+        snake = active_contour(
+            region, init,
+            alpha=0.01, beta=0.1,
+            gamma=0.01,
+            max_num_iter=150
+        )
+
+        # Simplify
+        step = max(1, len(snake) // 30)
+        simplified = snake[::step]
+
+        # Convert back to image coordinates
+        points = [(pt[1] + y1, pt[0] + x1) for pt in simplified]
+        return points if len(points) >= 3 else None
+
+    except Exception:
+        return watershed_points
 
 
 class MorphologyCalculator:
@@ -339,6 +724,11 @@ class InteractiveImageLabel(QLabel):
         self.view_center_y = 0.5
         # Store the scaled pixmap for custom drawing
         self.scaled_pixmap = None
+        # Point editing for polygon outlines
+        self.point_edit_mode = False
+        self.selected_point_idx = None
+        self.dragging_point = False
+        self.setMouseTracking(True)  # Enable mouse tracking for hover effects
 
     def set_image(self, qpix, centroids=None, mask_overlay=None, polygon_pts=None):
         self.pix_source = qpix
@@ -472,6 +862,20 @@ class InteractiveImageLabel(QLabel):
         # Pass to parent (no zoom on scroll)
         event.ignore()
 
+    def _find_nearest_point(self, click_pos, threshold=15):
+        """Find the nearest polygon point within threshold pixels"""
+        if not self.polygon_pts:
+            return None
+        min_dist = float('inf')
+        nearest_idx = None
+        for i, pt in enumerate(self.polygon_pts):
+            display_x, display_y = self._to_display_coords(pt)
+            dist = ((click_pos.x() - display_x) ** 2 + (click_pos.y() - display_y) ** 2) ** 0.5
+            if dist < min_dist and dist < threshold:
+                min_dist = dist
+                nearest_idx = i
+        return nearest_idx
+
     def mousePressEvent(self, event):
         # Check if Z key is held for zoom
         if self.parent_widget and hasattr(self.parent_widget, 'z_key_held') and self.parent_widget.z_key_held:
@@ -485,14 +889,49 @@ class InteractiveImageLabel(QLabel):
         coords = self._to_image_coords(event.pos().x(), event.pos().y())
         if not coords:
             return
+
         if self.soma_mode and self.parent_widget:
             self.parent_widget.add_soma(coords)
         elif self.polygon_mode and self.parent_widget:
-            # Left click adds point, right click finishes
+            # Check for point editing first (if there are existing points)
+            if self.polygon_pts and event.button() == Qt.LeftButton:
+                nearest_idx = self._find_nearest_point(event.pos())
+                if nearest_idx is not None:
+                    # Start dragging this point
+                    self.selected_point_idx = nearest_idx
+                    self.dragging_point = True
+                    self._update_display()
+                    return
+
+            # Normal polygon mode behavior
             if event.button() == Qt.LeftButton:
                 self.parent_widget.add_polygon_point(coords)
             elif event.button() == Qt.RightButton:
                 self.parent_widget.finish_polygon()
+
+    def mouseMoveEvent(self, event):
+        """Handle mouse move for point dragging"""
+        if self.dragging_point and self.selected_point_idx is not None and self.parent_widget:
+            coords = self._to_image_coords(event.pos().x(), event.pos().y())
+            if coords:
+                # Update the point position in parent's polygon_points
+                self.parent_widget.polygon_points[self.selected_point_idx] = coords
+                # Update our local copy too
+                self.polygon_pts = self.parent_widget.polygon_points.copy()
+                self._update_display()
+
+    def mouseReleaseEvent(self, event):
+        """Handle mouse release to finish dragging"""
+        if self.dragging_point and event.button() == Qt.LeftButton:
+            self.dragging_point = False
+            # Keep the point selected for visibility but stop dragging
+            if self.parent_widget and hasattr(self.parent_widget, 'polygon_points'):
+                # Ensure parent's points are updated
+                self.polygon_pts = self.parent_widget.polygon_points.copy()
+                self._update_display()
+                # Log the adjustment
+                if hasattr(self.parent_widget, 'log'):
+                    self.parent_widget.log(f"  → Point {self.selected_point_idx + 1} adjusted")
 
     def zoom_at_point(self, pos, zoom_in=True):
         """Zoom in or out centered on the clicked position"""
@@ -548,18 +987,29 @@ class InteractiveImageLabel(QLabel):
         painter.setOpacity(1.0)
 
     def _draw_polygon(self, painter):
+        # Draw polygon lines
         pen = QPen(QColor(255, 165, 0), 3)
         painter.setPen(pen)
         for i in range(len(self.polygon_pts)):
             p1 = self._to_display_coords(self.polygon_pts[i])
             p2 = self._to_display_coords(self.polygon_pts[(i + 1) % len(self.polygon_pts)])
             painter.drawLine(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]))
-        pen = QPen(QColor(0, 0, 255), 2)
-        painter.setPen(pen)
-        painter.setBrush(QColor(0, 0, 255))
-        for pt in self.polygon_pts:
+
+        # Draw polygon points - highlight selected/dragging point
+        for i, pt in enumerate(self.polygon_pts):
             x, y = self._to_display_coords(pt)
-            painter.drawEllipse(int(x - 4), int(y - 4), 8, 8)
+            if i == self.selected_point_idx:
+                # Selected point - larger and green
+                pen = QPen(QColor(0, 255, 0), 3)
+                painter.setPen(pen)
+                painter.setBrush(QColor(0, 255, 0))
+                painter.drawEllipse(int(x - 6), int(y - 6), 12, 12)
+            else:
+                # Normal points - blue
+                pen = QPen(QColor(0, 0, 255), 2)
+                painter.setPen(pen)
+                painter.setBrush(QColor(0, 0, 255))
+                painter.drawEllipse(int(x - 4), int(y - 4), 8, 8)
 
     def _to_display_coords(self, img_coords):
         if not self.pix_source or not self.scaled_pixmap:
@@ -898,6 +1348,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         else:
             super().keyReleaseEvent(event)
 
+    def focusOutEvent(self, event):
+        """Reset zoom state when window loses focus to prevent getting stuck"""
+        self.z_key_held = False
+        super().focusOutEvent(event)
+
     def init_ui(self):
         self.setWindowTitle("Microglia Analysis - Multi-Image Batch Processing")
         central = QWidget()
@@ -1044,11 +1499,71 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_pick_somas_btn.clicked.connect(self.start_batch_soma_picking)
         self.batch_pick_somas_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_pick_somas_btn)
-        self.batch_outline_btn = QPushButton("Outline Somas (All)")
+        self.batch_outline_btn = QPushButton("Outline Somas (Manual)")
         self.batch_outline_btn.clicked.connect(self.start_batch_outlining)
         self.batch_outline_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_outline_btn)
-        
+
+        # Auto-outline controls
+        auto_outline_group = QGroupBox("Auto-Outline")
+        auto_outline_layout = QVBoxLayout()
+
+        # Method selector
+        method_layout = QHBoxLayout()
+        method_layout.addWidget(QLabel("Method:"))
+        self.auto_outline_method = QComboBox()
+        self.auto_outline_method.addItems([
+            "Threshold (Fast)",
+            "Region Growing",
+            "Watershed",
+            "Active Contours (Smooth)",
+            "Hybrid (Best)"
+        ])
+        self.auto_outline_method.setCurrentIndex(0)
+        method_layout.addWidget(self.auto_outline_method)
+        auto_outline_layout.addLayout(method_layout)
+
+        # Sensitivity slider
+        sens_layout = QHBoxLayout()
+        sens_layout.addWidget(QLabel("Sensitivity:"))
+        self.auto_outline_sensitivity = QSlider(Qt.Horizontal)
+        self.auto_outline_sensitivity.setRange(10, 90)
+        self.auto_outline_sensitivity.setValue(50)
+        self.auto_outline_sensitivity.setTickPosition(QSlider.TicksBelow)
+        self.auto_outline_sensitivity.setTickInterval(20)
+        sens_layout.addWidget(self.auto_outline_sensitivity)
+        self.sensitivity_label = QLabel("50")
+        self.auto_outline_sensitivity.valueChanged.connect(
+            lambda v: self.sensitivity_label.setText(str(v))
+        )
+        sens_layout.addWidget(self.sensitivity_label)
+        auto_outline_layout.addLayout(sens_layout)
+
+        # Auto-outline buttons
+        auto_btn_layout = QHBoxLayout()
+        self.auto_outline_current_btn = QPushButton("Auto Current")
+        self.auto_outline_current_btn.clicked.connect(self.auto_outline_current_soma)
+        self.auto_outline_current_btn.setEnabled(False)
+        self.auto_outline_current_btn.setStyleSheet("background-color: #90EE90;")
+        auto_btn_layout.addWidget(self.auto_outline_current_btn)
+
+        self.auto_outline_all_btn = QPushButton("Auto All")
+        self.auto_outline_all_btn.clicked.connect(self.auto_outline_all_somas)
+        self.auto_outline_all_btn.setEnabled(False)
+        self.auto_outline_all_btn.setStyleSheet("background-color: #90EE90;")
+        auto_btn_layout.addWidget(self.auto_outline_all_btn)
+        auto_outline_layout.addLayout(auto_btn_layout)
+
+        # Manual override button
+        self.manual_override_btn = QPushButton("✏ Manual Override")
+        self.manual_override_btn.clicked.connect(self.manual_override_outline)
+        self.manual_override_btn.setEnabled(False)
+        self.manual_override_btn.setToolTip("Discard auto-outline and draw manually")
+        auto_outline_layout.addWidget(self.manual_override_btn)
+
+        auto_outline_group.setLayout(auto_outline_layout)
+        batch_layout.addWidget(auto_outline_group)
+
         # Add Redo Last Outline button
         self.redo_outline_btn = QPushButton("↩ Redo Last Outline")
         self.redo_outline_btn.clicked.connect(self.redo_last_outline)
@@ -2557,6 +3072,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.polygon_points = []
         self.processed_label.polygon_mode = True
         self.processed_label.soma_mode = False
+        self.processed_label.point_edit_mode = False
+        self.processed_label.selected_point_idx = None
         self.original_label.polygon_mode = False
         self.preview_label.polygon_mode = False
         self.mask_label.polygon_mode = False
@@ -2564,6 +3081,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.done_btn.setEnabled(False)
+
+        # Enable auto-outline buttons
+        self.auto_outline_current_btn.setEnabled(True)
+        self.auto_outline_all_btn.setEnabled(True)
+        self.manual_override_btn.setEnabled(False)
+
         self.log("=" * 50)
         self.log(f"📐 BATCH OUTLINING MODE")
         if self.colocalization_mode:
@@ -2623,6 +3146,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log(f"Outlining {soma_id} ({queue_idx + 1}/{len(self.outlining_queue)})")
 
     def add_polygon_point(self, coords):
+        # Reset zoom state when adding points (prevents getting stuck)
+        self.z_key_held = False
+
         self.polygon_points.append(coords)
         queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         if queue_idx < len(self.outlining_queue):
@@ -2681,6 +3207,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.log("⚠️ No points to clear")
 
     def finish_polygon(self):
+        # Reset zoom state to prevent getting stuck
+        self.z_key_held = False
+        self.processed_label.selected_point_idx = None
+        self.processed_label.dragging_point = False
+
         if len(self.polygon_points) < 3:
             QMessageBox.warning(self, "Warning", "Need at least 3 points")
             return
@@ -2759,8 +3290,223 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # If no more outlines left, disable the redo button
         if queue_idx == 0:
             self.redo_outline_btn.setEnabled(False)
-        
+
         self._load_soma_for_outlining(queue_idx)
+
+    def _get_auto_outline_method(self):
+        """Get the selected auto-outline method function"""
+        method_idx = self.auto_outline_method.currentIndex()
+        methods = [
+            auto_outline_threshold,
+            auto_outline_region_growing,
+            auto_outline_watershed,
+            auto_outline_active_contours,
+            auto_outline_hybrid
+        ]
+        return methods[method_idx]
+
+    def _get_image_for_outlining(self, img_data):
+        """Get the appropriate grayscale image for auto-outlining"""
+        if img_data['processed'] is not None:
+            return img_data['processed']
+        elif 'color_image' in img_data:
+            return extract_channel(img_data['color_image'], self.grayscale_channel)
+        return None
+
+    def auto_outline_current_soma(self):
+        """Auto-outline the current soma using selected method"""
+        if not self.outlining_queue:
+            QMessageBox.warning(self, "Warning", "No somas in outlining queue")
+            return
+
+        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        if queue_idx >= len(self.outlining_queue):
+            QMessageBox.warning(self, "Warning", "All somas already outlined")
+            return
+
+        img_name, soma_idx = self.outlining_queue[queue_idx]
+        img_data = self.images[img_name]
+        soma = img_data['somas'][soma_idx]
+        soma_id = img_data['soma_ids'][soma_idx]
+
+        # Get the image for outlining
+        outline_img = self._get_image_for_outlining(img_data)
+        if outline_img is None:
+            QMessageBox.warning(self, "Warning", "No processed image available")
+            return
+
+        # Get method and sensitivity
+        method = self._get_auto_outline_method()
+        sensitivity = self.auto_outline_sensitivity.value()
+
+        self.log(f"Auto-outlining {soma_id} using {self.auto_outline_method.currentText()}...")
+
+        # Run auto-outline
+        try:
+            points = method(outline_img, soma, sensitivity)
+        except Exception as e:
+            self.log(f"Error: {str(e)}")
+            points = None
+
+        if points is None or len(points) < 3:
+            self.log(f"⚠ Auto-outline failed for {soma_id} - please outline manually")
+            QMessageBox.warning(
+                self, "Auto-Outline Failed",
+                f"Could not auto-outline {soma_id}.\n\n"
+                "Try adjusting sensitivity or use manual outlining."
+            )
+            return
+
+        # Set the polygon points and display
+        self.polygon_points = list(points)
+        pixmap = self._get_outlining_pixmap(img_data)
+        self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+
+        # Enable point editing mode
+        self.processed_label.point_edit_mode = True
+        self.processed_label.selected_point_idx = None
+
+        self.nav_status_label.setText(
+            f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
+            f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)} (Auto)"
+        )
+        self.log(f"✓ Auto-outlined {soma_id} with {len(self.polygon_points)} points")
+        self.log("  → Click points to adjust, right-click or Enter to accept")
+
+        # Enable manual override
+        self.manual_override_btn.setEnabled(True)
+
+    def auto_outline_all_somas(self):
+        """Auto-outline all remaining somas in the queue"""
+        if not self.outlining_queue:
+            QMessageBox.warning(self, "Warning", "No somas in outlining queue")
+            return
+
+        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        remaining = len(self.outlining_queue) - queue_idx
+
+        if remaining <= 0:
+            QMessageBox.warning(self, "Warning", "All somas already outlined")
+            return
+
+        reply = QMessageBox.question(
+            self, 'Auto-Outline All',
+            f"Auto-outline {remaining} remaining soma(s)?\n\n"
+            f"Method: {self.auto_outline_method.currentText()}\n"
+            f"Sensitivity: {self.auto_outline_sensitivity.value()}\n\n"
+            "You can review and adjust each outline afterward.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.No:
+            return
+
+        method = self._get_auto_outline_method()
+        sensitivity = self.auto_outline_sensitivity.value()
+
+        success_count = 0
+        fail_count = 0
+        failed_somas = []
+
+        self.log(f"Auto-outlining {remaining} somas...")
+
+        for i in range(queue_idx, len(self.outlining_queue)):
+            img_name, soma_idx = self.outlining_queue[i]
+            img_data = self.images[img_name]
+            soma = img_data['somas'][soma_idx]
+            soma_id = img_data['soma_ids'][soma_idx]
+
+            outline_img = self._get_image_for_outlining(img_data)
+            if outline_img is None:
+                fail_count += 1
+                failed_somas.append(soma_id)
+                continue
+
+            try:
+                points = method(outline_img, soma, sensitivity)
+            except Exception:
+                points = None
+
+            if points is None or len(points) < 3:
+                fail_count += 1
+                failed_somas.append(soma_id)
+                continue
+
+            # Create mask from points
+            mask = self._polygon_to_mask(points, outline_img.shape)
+            pixel_size = float(self.pixel_size_input.text())
+            soma_area_um2 = np.sum(mask) * (pixel_size ** 2)
+
+            # Save outline
+            img_data['soma_outlines'].append({
+                'soma_idx': soma_idx,
+                'soma_id': soma_id,
+                'centroid': soma,
+                'outline': mask,
+                'polygon_points': list(points),
+                'soma_area_um2': soma_area_um2,
+                'auto_outlined': True  # Mark as auto-outlined for review
+            })
+
+            # Export soma outline
+            self._export_soma_outline(img_name, soma_id, mask, pixel_size, soma_area_um2)
+            success_count += 1
+
+        self.log(f"✓ Auto-outlined {success_count} somas")
+        if fail_count > 0:
+            self.log(f"⚠ Failed to auto-outline {fail_count} somas: {', '.join(failed_somas)}")
+
+        # Check if all done
+        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        if queue_idx >= len(self.outlining_queue):
+            self._finish_outlining()
+        else:
+            # Load the first failed soma for manual outlining
+            self._load_soma_for_outlining(queue_idx)
+            self.auto_outline_current_btn.setEnabled(True)
+
+        QMessageBox.information(
+            self, "Auto-Outline Complete",
+            f"Successfully outlined: {success_count}\n"
+            f"Failed (need manual): {fail_count}\n\n"
+            f"{'All somas outlined!' if fail_count == 0 else 'Please manually outline the remaining somas.'}"
+        )
+
+    def manual_override_outline(self):
+        """Discard current auto-outline and switch to manual mode"""
+        if not self.polygon_points:
+            self.log("No auto-outline to discard")
+            return
+
+        reply = QMessageBox.question(
+            self, 'Manual Override',
+            'Discard auto-outline and draw manually?',
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.No:
+            return
+
+        # Clear points and refresh display
+        self.polygon_points = []
+        self.processed_label.point_edit_mode = False
+        self.processed_label.selected_point_idx = None
+
+        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        if queue_idx < len(self.outlining_queue):
+            img_name, soma_idx = self.outlining_queue[queue_idx]
+            img_data = self.images[img_name]
+            soma = img_data['somas'][soma_idx]
+            soma_id = img_data['soma_ids'][soma_idx]
+            pixmap = self._get_outlining_pixmap(img_data)
+            self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=[])
+            self.nav_status_label.setText(
+                f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
+                f"Image: {img_name} | ID: {soma_id} | Manual Mode"
+            )
+
+        self.log("✏ Switched to manual outline mode")
+        self.manual_override_btn.setEnabled(False)
 
     def clear_all_masks(self):
         """Delete all generated masks and allow regeneration"""
@@ -2828,7 +3574,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def _finish_outlining(self):
         self.batch_mode = False
         self.processed_label.polygon_mode = False
+        self.processed_label.point_edit_mode = False
+        self.processed_label.selected_point_idx = None
         self.redo_outline_btn.setEnabled(False)  # Disable redo button when outlining complete
+
+        # Disable auto-outline buttons
+        self.auto_outline_current_btn.setEnabled(False)
+        self.auto_outline_all_btn.setEnabled(False)
+        self.manual_override_btn.setEnabled(False)
+
         for img_name, img_data in self.images.items():
             if img_data['selected'] and len(img_data['soma_outlines']) == len(img_data['somas']):
                 img_data['status'] = 'outlined'
