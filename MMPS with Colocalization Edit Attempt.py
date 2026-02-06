@@ -12,7 +12,8 @@ from PyQt5.QtWidgets import (
     QCheckBox, QComboBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QKeySequence
+from PyQt5.QtWidgets import QShortcut
 from PIL import Image
 import tifffile
 from skimage import restoration, color, measure
@@ -913,6 +914,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         screen = QDesktopWidget().screenGeometry()
         self.setGeometry(screen)
         self.showMaximized()  # Also maximize to be sure
+
+        # Global keyboard shortcuts (work regardless of focus)
+        self.shortcut_color = QShortcut(QKeySequence('C'), self)
+        self.shortcut_color.activated.connect(self.toggle_color_view)
+        self.shortcut_zoom_reset = QShortcut(QKeySequence('U'), self)
+        self.shortcut_zoom_reset.activated.connect(self._reset_current_zoom)
 
     def _create_left_panel(self):
         panel = QWidget()
