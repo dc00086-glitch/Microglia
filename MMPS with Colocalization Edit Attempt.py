@@ -45,6 +45,22 @@ def ensure_grayscale(img):
     return img
 
 
+def extract_channel(img, channel_idx):
+    """Extract a single channel from a color image as grayscale"""
+    if img is None:
+        return None
+    if img.ndim == 3 and img.shape[2] > channel_idx:
+        channel = img[:, :, channel_idx].astype(np.float32)
+        # Normalize to 0-255
+        c_min, c_max = channel.min(), channel.max()
+        if c_max > c_min:
+            channel = (channel - c_min) / (c_max - c_min) * 255
+        return channel.astype(np.uint8)
+    elif img.ndim == 2:
+        return img
+    return ensure_grayscale(img)
+
+
 
 
 class MorphologyCalculator:
@@ -1623,8 +1639,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
                             adjusted = self._apply_display_adjustments_color(raw_img)
                             pixmap = self._array_to_pixmap_color(adjusted)
                         else:
-                            raw_img = ensure_grayscale(raw_img)
-                            adjusted = self._apply_display_adjustments(raw_img)
+                            # Use selected channel for grayscale
+                            if raw_img.ndim == 3:
+                                gray_img = extract_channel(raw_img, self.grayscale_channel)
+                            else:
+                                gray_img = raw_img
+                            adjusted = self._apply_display_adjustments(gray_img)
                             pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         self.original_label.set_image(pixmap)
                 elif current_tab == 1:  # Preview
@@ -1642,7 +1662,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         else:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                     elif img_data['processed'] is not None:
-                        adjusted = self._apply_display_adjustments(img_data['processed'])
+                        # Use selected channel from color image if available
+                        if 'color_image' in img_data:
+                            gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
+                        else:
+                            gray_img = img_data['processed']
+                        adjusted = self._apply_display_adjustments(gray_img)
                         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         # Preserve soma markers if in soma picking mode
                         if self.soma_mode:
@@ -1920,7 +1945,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 pixmap = self._array_to_pixmap_color(adjusted)
                 self.original_label.set_image(pixmap)
             else:
-                raw_gray = ensure_grayscale(raw_img)
+                # Use only the selected channel for grayscale display
+                if raw_img.ndim == 3:
+                    raw_gray = extract_channel(raw_img, self.grayscale_channel)
+                else:
+                    raw_gray = raw_img
                 adjusted_raw = self._apply_display_adjustments(raw_gray)
                 pixmap = self._array_to_pixmap(adjusted_raw, skip_rescale=True)
                 self.original_label.set_image(pixmap)
@@ -1931,7 +1960,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     adjusted_proc = self._apply_display_adjustments_color(img_data['color_image'])
                     pixmap_proc = self._array_to_pixmap_color(adjusted_proc)
                 else:
-                    adjusted_proc = self._apply_display_adjustments(img_data['processed'])
+                    # Use selected channel from color image if available
+                    if 'color_image' in img_data:
+                        gray_proc = extract_channel(img_data['color_image'], self.grayscale_channel)
+                    else:
+                        gray_proc = img_data['processed']
+                    adjusted_proc = self._apply_display_adjustments(gray_proc)
                     pixmap_proc = self._array_to_pixmap(adjusted_proc, skip_rescale=True)
                 self.processed_label.set_image(pixmap_proc, centroids=img_data['somas'])
             else:
@@ -2136,7 +2170,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     adjusted = self._apply_display_adjustments_color(self.images[img_name]['color_image'])
                     pixmap = self._array_to_pixmap_color(adjusted)
                 else:
-                    adjusted = self._apply_display_adjustments(processed_data)
+                    # Use selected channel from color image if available
+                    if 'color_image' in self.images[img_name]:
+                        gray_img = extract_channel(self.images[img_name]['color_image'], self.grayscale_channel)
+                    else:
+                        gray_img = processed_data
+                    adjusted = self._apply_display_adjustments(gray_img)
                     pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                 self.processed_label.set_image(pixmap)
                 self.tabs.setCurrentIndex(2)
@@ -2248,7 +2287,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
             adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
         else:
-            adjusted = self._apply_display_adjustments(img_data['processed'])
+            # Use selected channel from color image if available
+            if 'color_image' in img_data:
+                gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
+            else:
+                gray_img = img_data['processed']
+            adjusted = self._apply_display_adjustments(gray_img)
             pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
 
         self.processed_label.set_image(pixmap, centroids=img_data['somas'])
@@ -2273,11 +2317,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
             adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
         else:
-            adjusted = self._apply_display_adjustments(img_data['processed'])
+            # Use selected channel from color image if available
+            if 'color_image' in img_data:
+                gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
+            else:
+                gray_img = img_data['processed']
+            adjusted = self._apply_display_adjustments(gray_img)
             pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
 
         self.processed_label.set_image(pixmap, centroids=img_data['somas'])
-        self.log(f"✓ {self.current_image_name}: Soma {len(img_data['somas'])} added | ID: {soma_id}")
+        self.log(f"Soma {len(img_data['somas'])} added to {self.current_image_name} | ID: {soma_id}")
         self._load_image_for_soma_picking()
 
     def undo_last_soma(self):
@@ -2298,7 +2347,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
             adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
         else:
-            adjusted = self._apply_display_adjustments(img_data['processed'])
+            # Use selected channel from color image if available
+            if 'color_image' in img_data:
+                gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
+            else:
+                gray_img = img_data['processed']
+            adjusted = self._apply_display_adjustments(gray_img)
             pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
 
         self.processed_label.set_image(pixmap, centroids=img_data['somas'])
