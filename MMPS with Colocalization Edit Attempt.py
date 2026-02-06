@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QListWidget, QSlider, QSpinBox,
     QGroupBox, QMessageBox, QTextEdit, QLineEdit, QFormLayout, QTabWidget,
     QProgressBar, QListWidgetItem, QDialog, QScrollArea, QTableWidget, QTableWidgetItem, QHeaderView,
-    QCheckBox
+    QCheckBox, QComboBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush
