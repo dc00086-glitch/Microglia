@@ -1688,8 +1688,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         self.preview_label.set_image(pixmap)
                 elif current_tab == 2:  # Processed
-                    # Show color image when color view is on (not during outlining)
-                    if use_color and not self.processed_label.polygon_mode and 'color_image' in img_data:
+                    # Show color image when color view is on
+                    if use_color and 'color_image' in img_data:
                         # Use processed channel in color composite if available
                         proc_color = self._build_processed_color_image(img_data)
                         if proc_color is not None:
@@ -1697,8 +1697,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         else:
                             adjusted = self._apply_display_adjustments_color(img_data['color_image'])
                         pixmap = self._array_to_pixmap_color(adjusted)
-                        if self.soma_mode or self.processed_label.soma_mode:
-                            self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+                        # Preserve polygon if in outlining mode
+                        if self.processed_label.polygon_mode:
+                            queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
+                            if queue_idx < len(self.outlining_queue):
+                                img_name, soma_idx = self.outlining_queue[queue_idx]
+                                if img_name == self.current_image_name:
+                                    soma = img_data['somas'][soma_idx]
+                                    self.processed_label.set_image(pixmap, centroids=[soma],
+                                                                   polygon_pts=self.polygon_points)
+                            else:
+                                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                         else:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                     elif img_data['processed'] is not None:
@@ -2566,7 +2575,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("=" * 50)
 
     def _get_outlining_pixmap(self, img_data):
-        """Get the appropriate grayscale pixmap for outlining with display adjustments"""
+        """Get the appropriate pixmap for outlining with display adjustments"""
+        # Support color view toggle during outlining
+        if self.show_color_view and 'color_image' in img_data:
+            # Use processed channel in color composite if available
+            proc_color = self._build_processed_color_image(img_data)
+            if proc_color is not None:
+                adjusted = self._apply_display_adjustments_color(proc_color)
+            else:
+                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
+            return self._array_to_pixmap_color(adjusted)
+
+        # Grayscale mode
         if self.colocalization_mode and 'color_image' in img_data:
             # Extract the selected channel from color image for grayscale display
             color_img = img_data['color_image']
