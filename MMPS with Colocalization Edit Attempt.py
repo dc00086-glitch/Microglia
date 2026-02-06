@@ -1597,7 +1597,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Refresh if color view is on and we have color data
         if self.show_color_view and 'color_image' in img_data:
-            adjusted = self._apply_display_adjustments_color(img_data['color_image'])
+            # Use processed channel in color composite if available
+            proc_color = self._build_processed_color_image(img_data)
+            if proc_color is not None:
+                adjusted = self._apply_display_adjustments_color(proc_color)
+            else:
+                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
             # Preserve markers
             if self.processed_label.soma_mode:
@@ -1613,7 +1618,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             else:
                 self.processed_label.set_image(pixmap, centroids=img_data['somas'])
 
-            # Also refresh original tab if viewing
+            # Also refresh original tab if viewing (original stays unprocessed)
             raw_img = load_tiff_image(img_data['raw_path'])
             if raw_img.ndim == 3:
                 adjusted_orig = self._apply_display_adjustments_color(raw_img)
@@ -1685,7 +1690,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 elif current_tab == 2:  # Processed
                     # Show color image when color view is on (not during outlining)
                     if use_color and not self.processed_label.polygon_mode and 'color_image' in img_data:
-                        adjusted = self._apply_display_adjustments_color(img_data['color_image'])
+                        # Use processed channel in color composite if available
+                        proc_color = self._build_processed_color_image(img_data)
+                        if proc_color is not None:
+                            adjusted = self._apply_display_adjustments_color(proc_color)
+                        else:
+                            adjusted = self._apply_display_adjustments_color(img_data['color_image'])
                         pixmap = self._array_to_pixmap_color(adjusted)
                         if self.soma_mode or self.processed_label.soma_mode:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
@@ -1818,6 +1828,36 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Clip and return
         adjusted = np.clip(adjusted, 0, 255)
         return adjusted.astype(np.uint8)
+
+    def _build_processed_color_image(self, img_data):
+        """Build a color composite with processed channel replacing the original channel"""
+        if 'color_image' not in img_data or img_data['processed'] is None:
+            return None
+
+        color_img = img_data['color_image']
+        processed = img_data['processed']
+
+        # Start with a copy of the original color image
+        if color_img.ndim != 3:
+            return None
+
+        # Build RGB composite
+        h, w = color_img.shape[:2]
+        c = min(color_img.shape[2], 3)
+        composite = np.zeros((h, w, 3), dtype=np.float32)
+
+        # Map channels: index 0=Green, 1=Red, 2=Blue in display
+        for i in range(c):
+            if i == self.grayscale_channel:
+                # Use the processed (cleaned) version for this channel
+                # Normalize processed to match original range for display
+                proc_norm = processed.astype(np.float32)
+                composite[:, :, i] = proc_norm
+            else:
+                # Use original channel
+                composite[:, :, i] = color_img[:, :, i].astype(np.float32)
+
+        return composite
 
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -1987,7 +2027,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
             if img_data['processed'] is not None:
                 # Processed images - show color or grayscale based on toggle
                 if self.show_color_view and 'color_image' in img_data:
-                    adjusted_proc = self._apply_display_adjustments_color(img_data['color_image'])
+                    # Build composite with processed channel replacing original
+                    proc_color = self._build_processed_color_image(img_data)
+                    if proc_color is not None:
+                        adjusted_proc = self._apply_display_adjustments_color(proc_color)
+                    else:
+                        adjusted_proc = self._apply_display_adjustments_color(img_data['color_image'])
                     pixmap_proc = self._array_to_pixmap_color(adjusted_proc)
                 else:
                     # Use selected channel from color image if available
@@ -2203,7 +2248,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self._update_file_list_item(img_name)
             if img_name == self.current_image_name:
                 if self.show_color_view and 'color_image' in self.images[img_name]:
-                    adjusted = self._apply_display_adjustments_color(self.images[img_name]['color_image'])
+                    # Use processed channel in color composite
+                    proc_color = self._build_processed_color_image(self.images[img_name])
+                    if proc_color is not None:
+                        adjusted = self._apply_display_adjustments_color(proc_color)
+                    else:
+                        adjusted = self._apply_display_adjustments_color(self.images[img_name]['color_image'])
                     pixmap = self._array_to_pixmap_color(adjusted)
                 else:
                     # Use selected channel from color image if available
@@ -2320,7 +2370,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Show color or grayscale based on toggle, with display adjustments
         if self.show_color_view and 'color_image' in img_data:
-            adjusted = self._apply_display_adjustments_color(img_data['color_image'])
+            # Use processed channel in color composite if available
+            proc_color = self._build_processed_color_image(img_data)
+            if proc_color is not None:
+                adjusted = self._apply_display_adjustments_color(proc_color)
+            else:
+                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
         else:
             # Use selected channel from color image if available
@@ -2350,7 +2405,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Show color or grayscale based on toggle, with display adjustments
         if self.show_color_view and 'color_image' in img_data:
-            adjusted = self._apply_display_adjustments_color(img_data['color_image'])
+            # Use processed channel in color composite if available
+            proc_color = self._build_processed_color_image(img_data)
+            if proc_color is not None:
+                adjusted = self._apply_display_adjustments_color(proc_color)
+            else:
+                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
         else:
             # Use selected channel from color image if available
@@ -2380,7 +2440,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Update the display with adjustments
         if self.show_color_view and 'color_image' in img_data:
-            adjusted = self._apply_display_adjustments_color(img_data['color_image'])
+            # Use processed channel in color composite if available
+            proc_color = self._build_processed_color_image(img_data)
+            if proc_color is not None:
+                adjusted = self._apply_display_adjustments_color(proc_color)
+            else:
+                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
         else:
             # Use selected channel from color image if available
