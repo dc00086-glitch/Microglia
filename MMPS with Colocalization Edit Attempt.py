@@ -1702,11 +1702,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         else:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                     elif img_data['processed'] is not None:
-                        # Use selected channel from color image if available
-                        if 'color_image' in img_data:
-                            gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
-                        else:
-                            gray_img = img_data['processed']
+                        # Always use the processed image for grayscale display
+                        gray_img = img_data['processed']
                         adjusted = self._apply_display_adjustments(gray_img)
                         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         # Preserve soma markers if in soma picking mode
@@ -2035,11 +2032,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         adjusted_proc = self._apply_display_adjustments_color(img_data['color_image'])
                     pixmap_proc = self._array_to_pixmap_color(adjusted_proc)
                 else:
-                    # Use selected channel from color image if available
-                    if 'color_image' in img_data:
-                        gray_proc = extract_channel(img_data['color_image'], self.grayscale_channel)
-                    else:
-                        gray_proc = img_data['processed']
+                    # Always use the processed image for grayscale display
+                    gray_proc = img_data['processed']
                     adjusted_proc = self._apply_display_adjustments(gray_proc)
                     pixmap_proc = self._array_to_pixmap(adjusted_proc, skip_rescale=True)
                 self.processed_label.set_image(pixmap_proc, centroids=img_data['somas'])
@@ -2378,8 +2372,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
         else:
-            # Use selected channel from color image if available
-            if 'color_image' in img_data:
+            # Use processed image if available, otherwise extract from color
+            if img_data['processed'] is not None:
+                gray_img = img_data['processed']
+            elif 'color_image' in img_data:
                 gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
             else:
                 gray_img = img_data['processed']
@@ -2413,8 +2409,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
         else:
-            # Use selected channel from color image if available
-            if 'color_image' in img_data:
+            # Use processed image if available, otherwise extract from color
+            if img_data['processed'] is not None:
+                gray_img = img_data['processed']
+            elif 'color_image' in img_data:
                 gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
             else:
                 gray_img = img_data['processed']
@@ -2448,8 +2446,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
         else:
-            # Use selected channel from color image if available
-            if 'color_image' in img_data:
+            # Use processed image if available, otherwise extract from color
+            if img_data['processed'] is not None:
+                gray_img = img_data['processed']
+            elif 'color_image' in img_data:
                 gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
             else:
                 gray_img = img_data['processed']
