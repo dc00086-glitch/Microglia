@@ -66,80 +66,134 @@ def extract_channel(img, channel_idx):
 # AUTO-OUTLINE ALGORITHMS
 # ============================================================================
 
-def auto_outline_threshold(image, centroid, sensitivity=50, region_size=150):
+def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
     """
-    Auto-outline using threshold + contour detection.
-    Fast and works well for high-contrast images.
+    Auto-outline using adaptive threshold + contour detection.
+    Works well for fluorescent microscopy images.
 
     Args:
         image: Grayscale image (2D numpy array)
         centroid: (row, col) tuple of soma center
-        sensitivity: 0-100, higher = larger outline (adjusts threshold)
+        sensitivity: 0-100, higher = larger outline
         region_size: Size of region around centroid to analyze
 
     Returns:
         List of (row, col) polygon points, or None if failed
     """
-    h, w = image.shape[:2]
-    cy, cx = int(centroid[0]), int(centroid[1])
+    try:
+        # Ensure image is 2D
+        if image is None:
+            return None
+        if image.ndim > 2:
+            image = image[:, :, 0] if image.shape[2] > 0 else image.squeeze()
 
-    # Extract region around centroid
-    half = region_size // 2
-    y1, y2 = max(0, cy - half), min(h, cy + half)
-    x1, x2 = max(0, cx - half), min(w, cx + half)
-    region = image[y1:y2, x1:x2].copy()
+        h, w = image.shape[:2]
+        cy, cx = int(centroid[0]), int(centroid[1])
 
-    if region.size == 0:
+        # Extract region around centroid
+        half = region_size // 2
+        y1, y2 = max(0, cy - half), min(h, cy + half)
+        x1, x2 = max(0, cx - half), min(w, cx + half)
+        region = image[y1:y2, x1:x2].copy()
+
+        if region.size == 0:
+            return None
+
+        # Normalize region to 0-255
+        region = region.astype(np.float64)
+        rmin, rmax = region.min(), region.max()
+        if rmax > rmin:
+            region = (region - rmin) / (rmax - rmin) * 255
+        region = region.astype(np.uint8)
+
+        # Apply Gaussian blur
+        region = cv2.GaussianBlur(region, (5, 5), 1.5)
+
+        # Get local centroid coordinates
+        local_cy, local_cx = cy - y1, cx - x1
+
+        # Use Otsu's method as base, adjust with sensitivity
+        otsu_thresh, _ = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Adjust threshold based on sensitivity (higher = lower threshold = more inclusive)
+        adjustment = (sensitivity - 50) / 100 * otsu_thresh * 0.8
+        thresh_val = max(5, min(250, int(otsu_thresh - adjustment)))
+
+        # Try threshold
+        _, binary = cv2.threshold(region, thresh_val, 255, cv2.THRESH_BINARY)
+
+        # Morphological operations to clean up
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+        # Find contours
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            # Try adaptive threshold as fallback
+            binary = cv2.adaptiveThreshold(region, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                           cv2.THRESH_BINARY, 21, -5)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            return None
+
+        # Find contour containing the centroid
+        best_contour = None
+        best_area = 0
+        for contour in contours:
+            if cv2.pointPolygonTest(contour, (local_cx, local_cy), False) >= 0:
+                area = cv2.contourArea(contour)
+                if area > best_area:
+                    best_contour = contour
+                    best_area = area
+
+        # If centroid not inside any contour, find nearest large contour
+        if best_contour is None:
+            min_dist = float('inf')
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 50:  # Skip tiny contours
+                    continue
+                M = cv2.moments(contour)
+                if M['m00'] > 0:
+                    cont_cx = M['m10'] / M['m00']
+                    cont_cy = M['m01'] / M['m00']
+                    dist = ((cont_cx - local_cx)**2 + (cont_cy - local_cy)**2)**0.5
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_contour = contour
+
+        if best_contour is None and contours:
+            best_contour = max(contours, key=cv2.contourArea)
+
+        if best_contour is None:
+            return None
+
+        # Check if contour is reasonable size
+        area = cv2.contourArea(best_contour)
+        if area < 20:
+            return None
+
+        # Simplify contour
+        epsilon = 0.02 * cv2.arcLength(best_contour, True)
+        approx = cv2.approxPolyDP(best_contour, epsilon, True)
+
+        # Convert back to image coordinates
+        points = []
+        for pt in approx:
+            px, py = pt[0]
+            img_x = px + x1
+            img_y = py + y1
+            points.append((img_y, img_x))  # (row, col) format
+
+        return points if len(points) >= 3 else None
+
+    except Exception as e:
+        print(f"Auto-outline threshold error: {e}")
         return None
-
-    # Normalize region
-    region = region.astype(np.float32)
-    if region.max() > region.min():
-        region = (region - region.min()) / (region.max() - region.min()) * 255
-    region = region.astype(np.uint8)
-
-    # Apply Gaussian blur to reduce noise
-    region = cv2.GaussianBlur(region, (5, 5), 0)
-
-    # Calculate threshold based on sensitivity
-    # Higher sensitivity = lower threshold = larger region
-    thresh_val = int(255 * (1 - sensitivity / 100) * 0.5 + region.mean() * 0.3)
-    thresh_val = max(10, min(245, thresh_val))
-
-    # Threshold
-    _, binary = cv2.threshold(region, thresh_val, 255, cv2.THRESH_BINARY)
-
-    # Find contours
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return None
-
-    # Find contour containing the centroid (in local coords)
-    local_cx, local_cy = cx - x1, cy - y1
-    best_contour = None
-    for contour in contours:
-        if cv2.pointPolygonTest(contour, (local_cx, local_cy), False) >= 0:
-            best_contour = contour
-            break
-
-    # If centroid not inside any contour, use largest
-    if best_contour is None:
-        best_contour = max(contours, key=cv2.contourArea)
-
-    # Simplify contour
-    epsilon = 0.01 * cv2.arcLength(best_contour, True)
-    approx = cv2.approxPolyDP(best_contour, epsilon, True)
-
-    # Convert back to image coordinates
-    points = []
-    for pt in approx:
-        px, py = pt[0]
-        img_x = px + x1
-        img_y = py + y1
-        points.append((img_y, img_x))  # (row, col) format
-
-    return points if len(points) >= 3 else None
 
 
 def auto_outline_region_growing(image, centroid, sensitivity=50, max_iterations=10000):
@@ -156,56 +210,79 @@ def auto_outline_region_growing(image, centroid, sensitivity=50, max_iterations=
     Returns:
         List of (row, col) polygon points, or None if failed
     """
-    h, w = image.shape[:2]
-    cy, cx = int(centroid[0]), int(centroid[1])
+    try:
+        if image is None:
+            return None
+        if image.ndim > 2:
+            image = image[:, :, 0] if image.shape[2] > 0 else image.squeeze()
 
-    if not (0 <= cy < h and 0 <= cx < w):
+        h, w = image.shape[:2]
+        cy, cx = int(centroid[0]), int(centroid[1])
+
+        if not (0 <= cy < h and 0 <= cx < w):
+            return None
+
+        # Normalize image for consistent comparison
+        img_norm = image.astype(np.float64)
+        imin, imax = img_norm.min(), img_norm.max()
+        if imax > imin:
+            img_norm = (img_norm - imin) / (imax - imin) * 255
+
+        # Get seed intensity
+        seed_val = float(img_norm[cy, cx])
+
+        # Tolerance based on sensitivity (higher = more tolerant)
+        tolerance = (sensitivity / 100) * 100 + 20  # Range: 20-120
+
+        # Region growing
+        visited = np.zeros((h, w), dtype=bool)
+        region = np.zeros((h, w), dtype=bool)
+        queue = [(cy, cx)]
+        visited[cy, cx] = True
+        region[cy, cx] = True
+
+        iterations = 0
+        while queue and iterations < max_iterations:
+            y, x = queue.pop(0)
+            iterations += 1
+
+            # Check 8-connected neighbors
+            for dy in [-1, 0, 1]:
+                for dx in [-1, 0, 1]:
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        pixel_val = float(img_norm[ny, nx])
+                        if abs(pixel_val - seed_val) <= tolerance:
+                            region[ny, nx] = True
+                            queue.append((ny, nx))
+
+        # Check if region is reasonable
+        if np.sum(region) < 20:
+            return None
+
+        # Find contour of region
+        region_uint8 = (region * 255).astype(np.uint8)
+        contours, _ = cv2.findContours(region_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            return None
+
+        # Get largest contour
+        contour = max(contours, key=cv2.contourArea)
+
+        # Simplify
+        epsilon = 0.02 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+
+        points = [(pt[0][1], pt[0][0]) for pt in approx]  # (row, col) format
+        return points if len(points) >= 3 else None
+
+    except Exception as e:
+        print(f"Auto-outline region growing error: {e}")
         return None
-
-    # Get seed intensity
-    seed_val = float(image[cy, cx])
-
-    # Tolerance based on sensitivity (higher = more tolerant)
-    tolerance = (sensitivity / 100) * 80 + 10  # Range: 10-90
-
-    # Region growing
-    visited = np.zeros((h, w), dtype=bool)
-    region = np.zeros((h, w), dtype=bool)
-    queue = [(cy, cx)]
-    visited[cy, cx] = True
-    region[cy, cx] = True
-
-    iterations = 0
-    while queue and iterations < max_iterations:
-        y, x = queue.pop(0)
-        iterations += 1
-
-        # Check 4-connected neighbors
-        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx]:
-                visited[ny, nx] = True
-                pixel_val = float(image[ny, nx])
-                if abs(pixel_val - seed_val) <= tolerance:
-                    region[ny, nx] = True
-                    queue.append((ny, nx))
-
-    # Find contour of region
-    region_uint8 = (region * 255).astype(np.uint8)
-    contours, _ = cv2.findContours(region_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return None
-
-    # Get largest contour
-    contour = max(contours, key=cv2.contourArea)
-
-    # Simplify
-    epsilon = 0.01 * cv2.arcLength(contour, True)
-    approx = cv2.approxPolyDP(contour, epsilon, True)
-
-    points = [(pt[0][1], pt[0][0]) for pt in approx]  # (row, col) format
-    return points if len(points) >= 3 else None
 
 
 def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
@@ -1499,73 +1576,71 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_pick_somas_btn.clicked.connect(self.start_batch_soma_picking)
         self.batch_pick_somas_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_pick_somas_btn)
-        self.batch_outline_btn = QPushButton("Outline Somas (Manual)")
+
+        # Outline Somas section
+        outline_group = QGroupBox("Soma Outlining")
+        outline_layout = QVBoxLayout()
+
+        # Main outline button
+        self.batch_outline_btn = QPushButton("Outline Somas")
         self.batch_outline_btn.clicked.connect(self.start_batch_outlining)
         self.batch_outline_btn.setEnabled(False)
-        batch_layout.addWidget(self.batch_outline_btn)
+        self.batch_outline_btn.setStyleSheet("font-weight: bold;")
+        outline_layout.addWidget(self.batch_outline_btn)
 
-        # Auto-outline controls
-        auto_outline_group = QGroupBox("Auto-Outline")
-        auto_outline_layout = QVBoxLayout()
-
-        # Method selector
-        method_layout = QHBoxLayout()
-        method_layout.addWidget(QLabel("Method:"))
+        # Auto-outline settings (compact)
+        auto_settings = QHBoxLayout()
+        auto_settings.addWidget(QLabel("Auto:"))
         self.auto_outline_method = QComboBox()
-        self.auto_outline_method.addItems([
-            "Threshold (Fast)",
-            "Region Growing",
-            "Watershed",
-            "Active Contours (Smooth)",
-            "Hybrid (Best)"
-        ])
+        self.auto_outline_method.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
         self.auto_outline_method.setCurrentIndex(0)
-        method_layout.addWidget(self.auto_outline_method)
-        auto_outline_layout.addLayout(method_layout)
-
-        # Sensitivity slider
-        sens_layout = QHBoxLayout()
-        sens_layout.addWidget(QLabel("Sensitivity:"))
+        self.auto_outline_method.setMaximumWidth(100)
+        auto_settings.addWidget(self.auto_outline_method)
+        auto_settings.addWidget(QLabel("Sens:"))
         self.auto_outline_sensitivity = QSlider(Qt.Horizontal)
         self.auto_outline_sensitivity.setRange(10, 90)
         self.auto_outline_sensitivity.setValue(50)
-        self.auto_outline_sensitivity.setTickPosition(QSlider.TicksBelow)
-        self.auto_outline_sensitivity.setTickInterval(20)
-        sens_layout.addWidget(self.auto_outline_sensitivity)
+        self.auto_outline_sensitivity.setMaximumWidth(60)
+        auto_settings.addWidget(self.auto_outline_sensitivity)
         self.sensitivity_label = QLabel("50")
         self.auto_outline_sensitivity.valueChanged.connect(
             lambda v: self.sensitivity_label.setText(str(v))
         )
-        sens_layout.addWidget(self.sensitivity_label)
-        auto_outline_layout.addLayout(sens_layout)
+        auto_settings.addWidget(self.sensitivity_label)
+        outline_layout.addLayout(auto_settings)
 
-        # Auto-outline buttons
-        auto_btn_layout = QHBoxLayout()
-        self.auto_outline_current_btn = QPushButton("Auto Current")
-        self.auto_outline_current_btn.clicked.connect(self.auto_outline_current_soma)
-        self.auto_outline_current_btn.setEnabled(False)
-        self.auto_outline_current_btn.setStyleSheet("background-color: #90EE90;")
-        auto_btn_layout.addWidget(self.auto_outline_current_btn)
+        # Outline action buttons (shown during outlining)
+        outline_btn_layout = QHBoxLayout()
+        self.auto_outline_btn = QPushButton("Auto")
+        self.auto_outline_btn.clicked.connect(self.auto_outline_current_soma)
+        self.auto_outline_btn.setEnabled(False)
+        self.auto_outline_btn.setStyleSheet("background-color: #90EE90;")
+        self.auto_outline_btn.setToolTip("Auto-detect outline for current soma")
+        outline_btn_layout.addWidget(self.auto_outline_btn)
 
-        self.auto_outline_all_btn = QPushButton("Auto All")
-        self.auto_outline_all_btn.clicked.connect(self.auto_outline_all_somas)
-        self.auto_outline_all_btn.setEnabled(False)
-        self.auto_outline_all_btn.setStyleSheet("background-color: #90EE90;")
-        auto_btn_layout.addWidget(self.auto_outline_all_btn)
-        auto_outline_layout.addLayout(auto_btn_layout)
+        self.manual_draw_btn = QPushButton("Manual")
+        self.manual_draw_btn.clicked.connect(self.start_manual_outline)
+        self.manual_draw_btn.setEnabled(False)
+        self.manual_draw_btn.setToolTip("Draw outline manually (click points)")
+        outline_btn_layout.addWidget(self.manual_draw_btn)
 
-        # Manual override button
-        self.manual_override_btn = QPushButton("✏ Manual Override")
-        self.manual_override_btn.clicked.connect(self.manual_override_outline)
-        self.manual_override_btn.setEnabled(False)
-        self.manual_override_btn.setToolTip("Discard auto-outline and draw manually")
-        auto_outline_layout.addWidget(self.manual_override_btn)
+        self.accept_outline_btn = QPushButton("Accept (Enter)")
+        self.accept_outline_btn.clicked.connect(self.accept_current_outline)
+        self.accept_outline_btn.setEnabled(False)
+        self.accept_outline_btn.setStyleSheet("background-color: #87CEEB;")
+        self.accept_outline_btn.setToolTip("Accept outline and move to next soma")
+        outline_btn_layout.addWidget(self.accept_outline_btn)
+        outline_layout.addLayout(outline_btn_layout)
 
-        auto_outline_group.setLayout(auto_outline_layout)
-        batch_layout.addWidget(auto_outline_group)
+        # Redo button
+        self.redo_outline_btn = QPushButton("↩ Redo Last")
+        self.redo_outline_btn.clicked.connect(self.redo_last_outline)
+        self.redo_outline_btn.setEnabled(False)
+        self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
+        outline_layout.addWidget(self.redo_outline_btn)
 
-        # Add Redo Last Outline button
-        self.redo_outline_btn = QPushButton("↩ Redo Last Outline")
+        outline_group.setLayout(outline_layout)
+        batch_layout.addWidget(outline_group)
         self.redo_outline_btn.clicked.connect(self.redo_last_outline)
         self.redo_outline_btn.setEnabled(False)
         self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
@@ -3082,19 +3157,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.next_btn.setEnabled(False)
         self.done_btn.setEnabled(False)
 
-        # Enable auto-outline buttons
-        self.auto_outline_current_btn.setEnabled(True)
-        self.auto_outline_all_btn.setEnabled(True)
-        self.manual_override_btn.setEnabled(False)
+        # Enable outline buttons
+        self.auto_outline_btn.setEnabled(True)
+        self.manual_draw_btn.setEnabled(True)
+        self.accept_outline_btn.setEnabled(False)  # Enable after outline is drawn
 
         self.log("=" * 50)
-        self.log(f"📐 BATCH OUTLINING MODE")
+        self.log(f"📐 SOMA OUTLINING MODE")
         if self.colocalization_mode:
             channel_name = self.channel_names.get(self.grayscale_channel, f'Channel {self.grayscale_channel + 1}')
-            self.log(f"Switched to grayscale ({channel_name}) for precise outlining")
+            self.log(f"Using {channel_name} for outlining")
         self.log(f"Total somas to outline: {len(self.outlining_queue)}")
-        self.log("Left-click to add points, right-click to finish outline")
-        self.log("Press 'Z' or Backspace to undo last point | 'Escape' to restart | 'Enter' to finish")
+        self.log("")
+        self.log("Click [Auto] to auto-detect outline, or [Manual] to draw")
+        self.log("Drag points to adjust | Press Enter or [Accept] when done")
         self.log("=" * 50)
 
     def _get_outlining_pixmap(self, img_data):
@@ -3164,6 +3240,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
             )
 
+        # Enable accept button when we have enough points
+        if len(self.polygon_points) >= 3:
+            self.accept_outline_btn.setEnabled(True)
+
     def undo_last_polygon_point(self):
         """Remove the last point added to the polygon"""
         if len(self.polygon_points) > 0:
@@ -3182,6 +3262,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
                     f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
                 )
+            # Update accept button state
+            self.accept_outline_btn.setEnabled(len(self.polygon_points) >= 3)
         else:
             self.log("⚠️ No points to undo")
 
@@ -3203,6 +3285,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
                     f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
                 )
+            # Disable accept button since no points
+            self.accept_outline_btn.setEnabled(False)
         else:
             self.log("⚠️ No points to clear")
 
@@ -3241,10 +3325,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.log(f"✓ {soma_id} outlined (soma area: {soma_area_um2:.1f} µm²)")
         self.polygon_points = []
-        
+
         # Enable Redo button after first outline is complete
         self.redo_outline_btn.setEnabled(True)
-        
+
+        # Reset accept button for next soma
+        self.accept_outline_btn.setEnabled(False)
+
         self._load_soma_for_outlining(queue_idx + 1)
 
     def redo_last_outline(self):
@@ -3371,10 +3458,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)} (Auto)"
         )
         self.log(f"✓ Auto-outlined {soma_id} with {len(self.polygon_points)} points")
-        self.log("  → Click points to adjust, right-click or Enter to accept")
+        self.log("  → Drag points to adjust, then press Enter or [Accept]")
 
-        # Enable manual override
-        self.manual_override_btn.setEnabled(True)
+        # Enable accept button for review
+        self.accept_outline_btn.setEnabled(True)
+        self.manual_draw_btn.setEnabled(True)  # Can still switch to manual
 
     def auto_outline_all_somas(self):
         """Auto-outline all remaining somas in the queue"""
@@ -3463,7 +3551,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         else:
             # Load the first failed soma for manual outlining
             self._load_soma_for_outlining(queue_idx)
-            self.auto_outline_current_btn.setEnabled(True)
+            self.auto_outline_btn.setEnabled(True)
+            self.manual_draw_btn.setEnabled(True)
 
         QMessageBox.information(
             self, "Auto-Outline Complete",
@@ -3472,25 +3561,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f"{'All somas outlined!' if fail_count == 0 else 'Please manually outline the remaining somas.'}"
         )
 
-    def manual_override_outline(self):
-        """Discard current auto-outline and switch to manual mode"""
-        if not self.polygon_points:
-            self.log("No auto-outline to discard")
-            return
-
-        reply = QMessageBox.question(
-            self, 'Manual Override',
-            'Discard auto-outline and draw manually?',
-            QMessageBox.Yes | QMessageBox.No
-        )
-
-        if reply == QMessageBox.No:
-            return
-
-        # Clear points and refresh display
+    def start_manual_outline(self):
+        """Switch to manual outline mode - clear any auto points and let user draw"""
+        # Clear any existing points
         self.polygon_points = []
-        self.processed_label.point_edit_mode = False
         self.processed_label.selected_point_idx = None
+        self.processed_label.dragging_point = False
 
         queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         if queue_idx < len(self.outlining_queue):
@@ -3505,8 +3581,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 f"Image: {img_name} | ID: {soma_id} | Manual Mode"
             )
 
-        self.log("✏ Switched to manual outline mode")
-        self.manual_override_btn.setEnabled(False)
+        self.log("✏ Manual mode - click to add points, right-click to complete")
+        self.accept_outline_btn.setEnabled(False)  # Re-enable after points are drawn
+
+    def accept_current_outline(self):
+        """Accept the current outline and move to next soma (same as finish_polygon)"""
+        if len(self.polygon_points) < 3:
+            QMessageBox.warning(self, "Warning", "Need at least 3 points to accept outline")
+            return
+        self.finish_polygon()
+
+    def manual_override_outline(self):
+        """Legacy function - redirects to start_manual_outline"""
+        self.start_manual_outline()
 
     def clear_all_masks(self):
         """Delete all generated masks and allow regeneration"""
@@ -3578,10 +3665,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.processed_label.selected_point_idx = None
         self.redo_outline_btn.setEnabled(False)  # Disable redo button when outlining complete
 
-        # Disable auto-outline buttons
-        self.auto_outline_current_btn.setEnabled(False)
-        self.auto_outline_all_btn.setEnabled(False)
-        self.manual_override_btn.setEnabled(False)
+        # Disable outline buttons
+        self.auto_outline_btn.setEnabled(False)
+        self.manual_draw_btn.setEnabled(False)
+        self.accept_outline_btn.setEnabled(False)
 
         for img_name, img_data in self.images.items():
             if img_data['selected'] and len(img_data['soma_outlines']) == len(img_data['somas']):
