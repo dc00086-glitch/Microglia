@@ -299,67 +299,87 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
     Returns:
         List of (row, col) polygon points, or None if failed
     """
-    h, w = image.shape[:2]
-    cy, cx = int(centroid[0]), int(centroid[1])
+    try:
+        if image is None:
+            return None
+        if image.ndim > 2:
+            image = image[:, :, 0] if image.shape[2] > 0 else image.squeeze()
 
-    # Extract region
-    half = region_size // 2
-    y1, y2 = max(0, cy - half), min(h, cy + half)
-    x1, x2 = max(0, cx - half), min(w, cx + half)
-    region = image[y1:y2, x1:x2].copy()
+        h, w = image.shape[:2]
+        cy, cx = int(centroid[0]), int(centroid[1])
 
-    if region.size == 0:
+        # Extract region
+        half = region_size // 2
+        y1, y2 = max(0, cy - half), min(h, cy + half)
+        x1, x2 = max(0, cx - half), min(w, cx + half)
+        region = image[y1:y2, x1:x2].copy()
+
+        if region.size == 0:
+            return None
+
+        # Normalize
+        region = region.astype(np.float64)
+        rmin, rmax = region.min(), region.max()
+        if rmax > rmin:
+            region = (region - rmin) / (rmax - rmin) * 255
+        region = region.astype(np.uint8)
+
+        # Apply blur
+        region = cv2.GaussianBlur(region, (5, 5), 0)
+
+        # Create markers - soma center is foreground marker
+        markers = np.zeros(region.shape, dtype=np.int32)
+        local_cx, local_cy = cx - x1, cy - y1
+
+        # Check bounds
+        if not (0 <= local_cx < region.shape[1] and 0 <= local_cy < region.shape[0]):
+            return None
+
+        # Foreground marker (soma) - small circle at centroid
+        marker_radius = max(3, int(5 + sensitivity / 20))
+        cv2.circle(markers, (local_cx, local_cy), marker_radius, 1, -1)
+
+        # Background marker - ring at edge
+        edge_mask = np.zeros(region.shape, dtype=np.uint8)
+        cv2.rectangle(edge_mask, (0, 0), (region.shape[1]-1, region.shape[0]-1), 255, 3)
+        markers[edge_mask > 0] = 2
+
+        # Convert to 3-channel for watershed
+        region_color = cv2.cvtColor(region, cv2.COLOR_GRAY2BGR)
+
+        # Apply watershed
+        cv2.watershed(region_color, markers)
+
+        # Extract soma region (marker == 1)
+        soma_mask = (markers == 1).astype(np.uint8) * 255
+
+        # Morphological cleanup
+        kernel = np.ones((3, 3), np.uint8)
+        soma_mask = cv2.morphologyEx(soma_mask, cv2.MORPH_CLOSE, kernel)
+        soma_mask = cv2.morphologyEx(soma_mask, cv2.MORPH_OPEN, kernel)
+
+        # Find contour
+        contours, _ = cv2.findContours(soma_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            return None
+
+        contour = max(contours, key=cv2.contourArea)
+
+        # Check area is reasonable
+        if cv2.contourArea(contour) < 20:
+            return None
+
+        epsilon = 0.02 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+
+        # Convert back to image coordinates
+        points = [(pt[0][1] + y1, pt[0][0] + x1) for pt in approx]
+        return points if len(points) >= 3 else None
+
+    except Exception as e:
+        print(f"Auto-outline watershed error: {e}")
         return None
-
-    # Normalize
-    region = region.astype(np.float32)
-    if region.max() > region.min():
-        region = (region - region.min()) / (region.max() - region.min()) * 255
-    region = region.astype(np.uint8)
-
-    # Apply blur
-    region = cv2.GaussianBlur(region, (5, 5), 0)
-
-    # Create markers - soma center is foreground marker
-    markers = np.zeros(region.shape, dtype=np.int32)
-    local_cx, local_cy = cx - x1, cy - y1
-
-    # Foreground marker (soma) - small circle at centroid
-    marker_radius = max(3, int(5 + sensitivity / 20))
-    cv2.circle(markers, (local_cx, local_cy), marker_radius, 1, -1)
-
-    # Background marker - ring at edge
-    edge_mask = np.zeros(region.shape, dtype=np.uint8)
-    cv2.rectangle(edge_mask, (0, 0), (region.shape[1]-1, region.shape[0]-1), 255, 3)
-    markers[edge_mask > 0] = 2
-
-    # Convert to 3-channel for watershed
-    region_color = cv2.cvtColor(region, cv2.COLOR_GRAY2BGR)
-
-    # Apply watershed
-    cv2.watershed(region_color, markers)
-
-    # Extract soma region (marker == 1)
-    soma_mask = (markers == 1).astype(np.uint8) * 255
-
-    # Morphological cleanup
-    kernel = np.ones((3, 3), np.uint8)
-    soma_mask = cv2.morphologyEx(soma_mask, cv2.MORPH_CLOSE, kernel)
-    soma_mask = cv2.morphologyEx(soma_mask, cv2.MORPH_OPEN, kernel)
-
-    # Find contour
-    contours, _ = cv2.findContours(soma_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return None
-
-    contour = max(contours, key=cv2.contourArea)
-    epsilon = 0.01 * cv2.arcLength(contour, True)
-    approx = cv2.approxPolyDP(contour, epsilon, True)
-
-    # Convert back to image coordinates
-    points = [(pt[0][1] + y1, pt[0][0] + x1) for pt in approx]
-    return points if len(points) >= 3 else None
 
 
 def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=150):
@@ -376,44 +396,55 @@ def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=15
     Returns:
         List of (row, col) polygon points, or None if failed
     """
-    from skimage.segmentation import active_contour
-    from skimage.filters import gaussian
-
-    h, w = image.shape[:2]
-    cy, cx = int(centroid[0]), int(centroid[1])
-
-    # Extract region
-    half = region_size // 2
-    y1, y2 = max(0, cy - half), min(h, cy + half)
-    x1, x2 = max(0, cx - half), min(w, cx + half)
-    region = image[y1:y2, x1:x2].copy().astype(np.float64)
-
-    if region.size == 0:
-        return None
-
-    # Normalize
-    if region.max() > region.min():
-        region = (region - region.min()) / (region.max() - region.min())
-
-    # Smooth image
-    region = gaussian(region, sigma=2)
-
-    # Initial circle
-    local_cx, local_cy = cx - x1, cy - y1
-    # Initial radius based on sensitivity
-    init_radius = 10 + sensitivity / 3  # Range: 10-43 pixels
-
-    # Create initial snake points (circle)
-    s = np.linspace(0, 2 * np.pi, 100)
-    init_x = local_cx + init_radius * np.cos(s)
-    init_y = local_cy + init_radius * np.sin(s)
-    init = np.array([init_x, init_y]).T
-
-    # Snake parameters based on sensitivity
-    alpha = 0.01 + (100 - sensitivity) / 5000  # Smoothness
-    beta = 0.1 + (100 - sensitivity) / 500     # Curvature
-
     try:
+        from skimage.segmentation import active_contour
+        from skimage.filters import gaussian
+
+        if image is None:
+            return None
+        if image.ndim > 2:
+            image = image[:, :, 0] if image.shape[2] > 0 else image.squeeze()
+
+        h, w = image.shape[:2]
+        cy, cx = int(centroid[0]), int(centroid[1])
+
+        # Extract region
+        half = region_size // 2
+        y1, y2 = max(0, cy - half), min(h, cy + half)
+        x1, x2 = max(0, cx - half), min(w, cx + half)
+        region = image[y1:y2, x1:x2].copy().astype(np.float64)
+
+        if region.size == 0:
+            return None
+
+        # Normalize
+        rmin, rmax = region.min(), region.max()
+        if rmax > rmin:
+            region = (region - rmin) / (rmax - rmin)
+
+        # Smooth image
+        region = gaussian(region, sigma=2)
+
+        # Initial circle
+        local_cx, local_cy = cx - x1, cy - y1
+
+        # Check bounds
+        if not (0 <= local_cx < region.shape[1] and 0 <= local_cy < region.shape[0]):
+            return None
+
+        # Initial radius based on sensitivity
+        init_radius = 10 + sensitivity / 3  # Range: 10-43 pixels
+
+        # Create initial snake points (circle)
+        s = np.linspace(0, 2 * np.pi, 100)
+        init_x = local_cx + init_radius * np.cos(s)
+        init_y = local_cy + init_radius * np.sin(s)
+        init = np.array([init_x, init_y]).T
+
+        # Snake parameters based on sensitivity
+        alpha = 0.01 + (100 - sensitivity) / 5000  # Smoothness
+        beta = 0.1 + (100 - sensitivity) / 500     # Curvature
+
         # Run active contour
         snake = active_contour(
             region, init,
@@ -423,7 +454,6 @@ def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=15
         )
 
         # Simplify snake to polygon
-        # Sample every few points
         step = max(1, len(snake) // 30)
         simplified = snake[::step]
 
@@ -431,14 +461,15 @@ def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=15
         points = [(pt[1] + y1, pt[0] + x1) for pt in simplified]
         return points if len(points) >= 3 else None
 
-    except Exception:
+    except Exception as e:
+        print(f"Auto-outline active contours error: {e}")
         return None
 
 
 def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
     """
-    Hybrid approach: Watershed for initial segmentation, then Active Contours to refine.
-    Best quality but slower.
+    Hybrid approach: Try multiple methods and use the best result.
+    Falls back through: Threshold -> Watershed -> Active Contours
 
     Args:
         image: Grayscale image (2D numpy array)
@@ -449,81 +480,68 @@ def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
     Returns:
         List of (row, col) polygon points, or None if failed
     """
-    # First, get watershed result
-    watershed_points = auto_outline_watershed(image, centroid, sensitivity, region_size)
-
-    if watershed_points is None or len(watershed_points) < 3:
-        # Fall back to threshold method
-        return auto_outline_threshold(image, centroid, sensitivity, region_size)
-
-    # Use watershed result to create initial contour for active contours
-    from skimage.segmentation import active_contour
-    from skimage.filters import gaussian
-
-    h, w = image.shape[:2]
-    cy, cx = int(centroid[0]), int(centroid[1])
-
-    # Extract region
-    half = region_size // 2
-    y1, y2 = max(0, cy - half), min(h, cy + half)
-    x1, x2 = max(0, cx - half), min(w, cx + half)
-    region = image[y1:y2, x1:x2].copy().astype(np.float64)
-
-    if region.size == 0:
-        return watershed_points
-
-    # Normalize
-    if region.max() > region.min():
-        region = (region - region.min()) / (region.max() - region.min())
-
-    region = gaussian(region, sigma=2)
-
-    # Convert watershed points to local coordinates
-    local_points = [(pt[0] - y1, pt[1] - x1) for pt in watershed_points]
-
-    # Create init array for active contour (need ~100 points)
-    # Interpolate watershed points
-    if len(local_points) < 100:
-        # Interpolate
-        from scipy import interpolate
-        pts = np.array(local_points)
-        # Close the polygon
-        pts = np.vstack([pts, pts[0]])
-
-        # Parametric interpolation
-        t = np.linspace(0, 1, len(pts))
-        t_new = np.linspace(0, 1, 100)
-
-        try:
-            fx = interpolate.interp1d(t, pts[:, 1], kind='linear')
-            fy = interpolate.interp1d(t, pts[:, 0], kind='linear')
-            init_x = fx(t_new)
-            init_y = fy(t_new)
-            init = np.array([init_x, init_y]).T
-        except Exception:
-            return watershed_points
-    else:
-        init = np.array([(pt[1], pt[0]) for pt in local_points[:100]])
-
     try:
-        # Run active contour with initial shape from watershed
-        snake = active_contour(
-            region, init,
-            alpha=0.01, beta=0.1,
-            gamma=0.01,
-            max_num_iter=150
-        )
+        if image is None:
+            return None
+        if image.ndim > 2:
+            image = image[:, :, 0] if image.shape[2] > 0 else image.squeeze()
 
-        # Simplify
-        step = max(1, len(snake) // 30)
-        simplified = snake[::step]
+        # Try threshold first (most reliable)
+        threshold_points = auto_outline_threshold(image, centroid, sensitivity, region_size)
 
-        # Convert back to image coordinates
-        points = [(pt[1] + y1, pt[0] + x1) for pt in simplified]
-        return points if len(points) >= 3 else None
+        # Try watershed
+        watershed_points = auto_outline_watershed(image, centroid, sensitivity, region_size)
 
-    except Exception:
-        return watershed_points
+        # Choose the better result based on some heuristics
+        best_points = None
+        best_score = 0
+
+        for points, name in [(threshold_points, 'threshold'), (watershed_points, 'watershed')]:
+            if points is None or len(points) < 3:
+                continue
+
+            # Score based on: number of points (more = smoother), area, and compactness
+            pts_array = np.array(points)
+
+            # Calculate area using shoelace formula
+            n = len(pts_array)
+            area = 0.5 * abs(sum(pts_array[i, 0] * pts_array[(i + 1) % n, 1] -
+                                 pts_array[(i + 1) % n, 0] * pts_array[i, 1]
+                                 for i in range(n)))
+
+            # Calculate perimeter
+            perimeter = sum(np.sqrt((pts_array[(i + 1) % n, 0] - pts_array[i, 0]) ** 2 +
+                                    (pts_array[(i + 1) % n, 1] - pts_array[i, 1]) ** 2)
+                           for i in range(n))
+
+            # Compactness (circularity) - closer to 1 is better for soma
+            if perimeter > 0:
+                compactness = 4 * np.pi * area / (perimeter ** 2)
+            else:
+                compactness = 0
+
+            # Score: prefer reasonable area and good compactness
+            if area > 50 and area < 50000:  # Reasonable soma size
+                score = compactness * 100 + min(area / 100, 50)
+                if score > best_score:
+                    best_score = score
+                    best_points = points
+
+        if best_points is not None:
+            return best_points
+
+        # If nothing worked, try active contours as last resort
+        active_points = auto_outline_active_contours(image, centroid, sensitivity, region_size)
+        if active_points is not None and len(active_points) >= 3:
+            return active_points
+
+        # Return whatever we have
+        return threshold_points or watershed_points
+
+    except Exception as e:
+        print(f"Auto-outline hybrid error: {e}")
+        # Try simple threshold as fallback
+        return auto_outline_threshold(image, centroid, sensitivity, region_size)
 
 
 class MorphologyCalculator:
@@ -3119,7 +3137,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # In colocalization mode, ask which channel to use for grayscale outlining
         if self.colocalization_mode:
-            # Get a sample color image to determine channel format
             sample_color_img = None
             for img_name, img_data in self.images.items():
                 if 'color_image' in img_data:
@@ -3140,9 +3157,55 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.log(f"Using Channel {self.grayscale_channel + 1} for grayscale outlining")
                 self.log(f"Colocalization: Channel {self.coloc_channel_1 + 1} vs Channel {self.coloc_channel_2 + 1}")
             else:
-                # User cancelled, abort outlining
                 return
 
+        # Ask user: Manual or Auto?
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Outline Method")
+        dialog.setModal(True)
+        layout = QVBoxLayout()
+
+        label = QLabel(f"<b>{len(self.outlining_queue)} somas to outline</b><br><br>Choose outline method:")
+        layout.addWidget(label)
+
+        manual_btn = QPushButton("Manual - Draw each outline by hand")
+        manual_btn.clicked.connect(lambda: dialog.done(1))
+        layout.addWidget(manual_btn)
+
+        auto_btn = QPushButton("Auto - Auto-detect all, then review/fix")
+        auto_btn.clicked.connect(lambda: dialog.done(2))
+        auto_btn.setStyleSheet("background-color: #90EE90; font-weight: bold;")
+        layout.addWidget(auto_btn)
+
+        # Auto settings
+        settings_layout = QHBoxLayout()
+        settings_layout.addWidget(QLabel("Method:"))
+        method_combo = QComboBox()
+        method_combo.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
+        method_combo.setCurrentIndex(self.auto_outline_method.currentIndex())
+        settings_layout.addWidget(method_combo)
+        settings_layout.addWidget(QLabel("Sens:"))
+        sens_spin = QSpinBox()
+        sens_spin.setRange(10, 90)
+        sens_spin.setValue(self.auto_outline_sensitivity.value())
+        settings_layout.addWidget(sens_spin)
+        layout.addLayout(settings_layout)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(lambda: dialog.done(0))
+        layout.addWidget(cancel_btn)
+
+        dialog.setLayout(layout)
+        result = dialog.exec_()
+
+        if result == 0:
+            return  # Cancelled
+
+        # Update auto settings from dialog
+        self.auto_outline_method.setCurrentIndex(method_combo.currentIndex())
+        self.auto_outline_sensitivity.setValue(sens_spin.value())
+
+        # Initialize outlining state
         self.batch_mode = True
         self.polygon_points = []
         self.processed_label.polygon_mode = True
@@ -3152,26 +3215,161 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.original_label.polygon_mode = False
         self.preview_label.polygon_mode = False
         self.mask_label.polygon_mode = False
-        self._load_soma_for_outlining(0)
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.done_btn.setEnabled(False)
 
-        # Enable outline buttons
+        # Store for review mode
+        self.auto_outlined_points = {}  # {queue_idx: points}
+        self.failed_auto_outlines = []  # List of queue_idx that failed
+        self.review_mode = False
+        self.current_review_idx = 0
+
+        if result == 1:
+            # Manual mode
+            self._start_manual_outlining()
+        else:
+            # Auto mode - outline all, then review
+            self._run_auto_outline_all()
+
+    def _start_manual_outlining(self):
+        """Start manual outlining mode - draw each soma one by one"""
+        self._load_soma_for_outlining(0)
+
         self.auto_outline_btn.setEnabled(True)
         self.manual_draw_btn.setEnabled(True)
-        self.accept_outline_btn.setEnabled(False)  # Enable after outline is drawn
+        self.accept_outline_btn.setEnabled(False)
 
         self.log("=" * 50)
-        self.log(f"📐 SOMA OUTLINING MODE")
-        if self.colocalization_mode:
-            channel_name = self.channel_names.get(self.grayscale_channel, f'Channel {self.grayscale_channel + 1}')
-            self.log(f"Using {channel_name} for outlining")
-        self.log(f"Total somas to outline: {len(self.outlining_queue)}")
+        self.log(f"📐 MANUAL OUTLINING MODE")
+        self.log(f"Total somas: {len(self.outlining_queue)}")
         self.log("")
-        self.log("Click [Auto] to auto-detect outline, or [Manual] to draw")
-        self.log("Drag points to adjust | Press Enter or [Accept] when done")
+        self.log("Click to add points, right-click to complete")
+        self.log("Press Enter or [Accept] to save and move to next")
         self.log("=" * 50)
+
+    def _run_auto_outline_all(self):
+        """Run auto-outline on all somas, then start review mode"""
+        method = self._get_auto_outline_method()
+        sensitivity = self.auto_outline_sensitivity.value()
+
+        self.log("=" * 50)
+        self.log(f"📐 AUTO-OUTLINING ALL SOMAS...")
+        self.log(f"Method: {self.auto_outline_method.currentText()}")
+        self.log(f"Sensitivity: {sensitivity}")
+        self.log("=" * 50)
+
+        success_count = 0
+        fail_count = 0
+        self.auto_outlined_points = {}
+        self.failed_auto_outlines = []
+
+        for i, (img_name, soma_idx) in enumerate(self.outlining_queue):
+            img_data = self.images[img_name]
+            soma = img_data['somas'][soma_idx]
+
+            # Get image for outlining
+            outline_img = self._get_image_for_outlining(img_data)
+            if outline_img is None:
+                fail_count += 1
+                self.failed_auto_outlines.append(i)
+                continue
+
+            try:
+                points = method(outline_img, soma, sensitivity)
+            except Exception as e:
+                self.log(f"Error on soma {i+1}: {e}")
+                points = None
+
+            if points is None or len(points) < 3:
+                fail_count += 1
+                self.failed_auto_outlines.append(i)
+            else:
+                self.auto_outlined_points[i] = list(points)
+                success_count += 1
+
+        self.log("")
+        self.log(f"✓ Auto-outlined: {success_count}/{len(self.outlining_queue)}")
+        if fail_count > 0:
+            self.log(f"⚠ Failed: {fail_count} (will need manual)")
+
+        # Check if too many failed
+        if fail_count > len(self.outlining_queue) * 0.5:
+            reply = QMessageBox.question(
+                self, "Many Failures",
+                f"{fail_count} out of {len(self.outlining_queue)} somas failed to auto-outline.\n\n"
+                f"Do you want to:\n"
+                f"• Yes - Continue and manually draw the failed ones\n"
+                f"• No - Restart with different settings",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                self.batch_mode = False
+                self.processed_label.polygon_mode = False
+                self.start_batch_outlining()  # Restart
+                return
+
+        # Start review mode
+        self._start_review_mode()
+
+    def _start_review_mode(self):
+        """Start reviewing auto-outlined somas one by one"""
+        self.review_mode = True
+        self.current_review_idx = 0
+
+        self.log("")
+        self.log("=" * 50)
+        self.log("📋 REVIEW MODE - Check each outline")
+        self.log("• Drag points to adjust")
+        self.log("• Press Enter or [Accept] to approve")
+        self.log("• Click [Manual] to redraw from scratch")
+        self.log("=" * 50)
+
+        self._load_review_soma(0)
+
+    def _load_review_soma(self, review_idx):
+        """Load a soma for review"""
+        if review_idx >= len(self.outlining_queue):
+            self._finish_review_mode()
+            return
+
+        self.current_review_idx = review_idx
+        img_name, soma_idx = self.outlining_queue[review_idx]
+        img_data = self.images[img_name]
+        soma = img_data['somas'][soma_idx]
+        soma_id = img_data['soma_ids'][soma_idx]
+
+        # Check if this soma has auto-outlined points or needs manual
+        if review_idx in self.auto_outlined_points:
+            self.polygon_points = self.auto_outlined_points[review_idx].copy()
+            status = "Auto - Review/Edit"
+        else:
+            self.polygon_points = []
+            status = "MANUAL NEEDED"
+
+        pixmap = self._get_outlining_pixmap(img_data)
+        self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+        self.tabs.setCurrentIndex(2)
+
+        self.nav_status_label.setText(
+            f"Review {review_idx + 1}/{len(self.outlining_queue)} | "
+            f"{img_name} | {soma_id} | {status}"
+        )
+
+        # Enable/disable buttons
+        self.auto_outline_btn.setEnabled(True)
+        self.manual_draw_btn.setEnabled(True)
+        self.accept_outline_btn.setEnabled(len(self.polygon_points) >= 3)
+
+        if review_idx in self.auto_outlined_points:
+            self.log(f"Reviewing {soma_id} - {len(self.polygon_points)} points")
+        else:
+            self.log(f"⚠ {soma_id} needs manual outline")
+
+    def _finish_review_mode(self):
+        """Finish review mode and complete outlining"""
+        self.review_mode = False
+        self._finish_outlining()
 
     def _get_outlining_pixmap(self, img_data):
         """Get the appropriate pixmap for outlining with display adjustments"""
@@ -3299,9 +3497,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if len(self.polygon_points) < 3:
             QMessageBox.warning(self, "Warning", "Need at least 3 points")
             return
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+
+        # In review mode, use current_review_idx; otherwise calculate from outlines
+        if hasattr(self, 'review_mode') and self.review_mode:
+            queue_idx = self.current_review_idx
+        else:
+            queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+
         if queue_idx >= len(self.outlining_queue):
             return
+
         img_name, soma_idx = self.outlining_queue[queue_idx]
         img_data = self.images[img_name]
         mask = self._polygon_to_mask(self.polygon_points, img_data['processed'].shape)
@@ -3317,13 +3522,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
             'centroid': img_data['somas'][soma_idx],
             'outline': mask,
             'polygon_points': self.polygon_points.copy(),
-            'soma_area_um2': soma_area_um2  # Store soma area
+            'soma_area_um2': soma_area_um2
         })
 
         # Export soma outline to file
         self._export_soma_outline(img_name, soma_id, mask, pixel_size, soma_area_um2)
 
-        self.log(f"✓ {soma_id} outlined (soma area: {soma_area_um2:.1f} µm²)")
+        self.log(f"✓ {soma_id} approved (soma area: {soma_area_um2:.1f} µm²)")
         self.polygon_points = []
 
         # Enable Redo button after first outline is complete
@@ -3332,7 +3537,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Reset accept button for next soma
         self.accept_outline_btn.setEnabled(False)
 
-        self._load_soma_for_outlining(queue_idx + 1)
+        # Move to next soma
+        if hasattr(self, 'review_mode') and self.review_mode:
+            self._load_review_soma(queue_idx + 1)
+        else:
+            self._load_soma_for_outlining(queue_idx + 1)
 
     def redo_last_outline(self):
         """Delete the last completed outline and go back to redo it"""
