@@ -146,12 +146,14 @@ class BatchProcessingThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, rb_enabled, denoise_enabled, denoise_size,
-                    sharpen_enabled, sharpen_amount) in enumerate(
+                    sharpen_enabled, sharpen_amount, process_channel) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
                     img = load_tiff_image(img_path)
-                    img = ensure_grayscale(img)
+                    # Extract only the selected channel for processing
+                    if img.ndim == 3:
+                        img = extract_channel(img, process_channel)
                     img_dtype = img.dtype
                     result = img.copy()
 
@@ -270,12 +272,14 @@ class BackgroundRemovalThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, rb_enabled, denoise_enabled, denoise_size,
-                    sharpen_enabled, sharpen_amount) in enumerate(
+                    sharpen_enabled, sharpen_amount, process_channel) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
                     img = load_tiff_image(img_path)
-                    img = ensure_grayscale(img)
+                    # Extract only the selected channel for processing
+                    if img.ndim == 3:
+                        img = extract_channel(img, process_channel)
                     img_dtype = img.dtype
                     result = img.copy()
 
@@ -946,7 +950,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         form_layout.addRow("Pixel size (μm/px):", self.pixel_size_input)
         param_layout.addLayout(form_layout)
 
-        
+        # Channel selection for processing
+        channel_layout = QHBoxLayout()
+        channel_layout.addWidget(QLabel("Process channel:"))
+        self.process_channel_combo = QComboBox()
+        self.process_channel_combo.addItems(["Channel 1", "Channel 2", "Channel 3"])
+        self.process_channel_combo.setCurrentIndex(0)
+        self.process_channel_combo.currentIndexChanged.connect(self._on_process_channel_changed)
+        channel_layout.addWidget(self.process_channel_combo)
+        channel_layout.addStretch()
+        param_layout.addLayout(channel_layout)
+
+
         self.use_imagej = False
 
         self.rb_check = QCheckBox("Apply Rolling Ball Background Subtraction")
@@ -1615,6 +1630,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.channel_select_btn.setVisible(False)
         self.update_display()
 
+    def _on_process_channel_changed(self, index):
+        """Update the grayscale channel when user changes the dropdown"""
+        self.grayscale_channel = index
+        self.log(f"Processing channel set to: Channel {index + 1}")
+        # Refresh display if not in color mode
+        if not self.show_color_view:
+            self.update_display()
+
     def _reset_current_zoom(self):
         """Reset zoom on all image labels"""
         for label in [self.original_label, self.preview_label, self.processed_label, self.mask_label]:
@@ -2058,16 +2081,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
             return
         img_data = self.images[self.current_image_name]
         raw_img = load_tiff_image(img_data['raw_path'])
-        raw_img = ensure_grayscale(raw_img)
-        result = raw_img.copy()
+        # Extract only the selected channel for processing
+        if raw_img.ndim == 3:
+            channel_img = extract_channel(raw_img, self.grayscale_channel)
+        else:
+            channel_img = raw_img
+        result = channel_img.copy()
 
         # Apply optional rolling ball background subtraction
         rb_enabled = self.rb_check.isChecked()
         if rb_enabled:
             radius = self.rb_slider.value()
-            background = restoration.rolling_ball(raw_img, radius=radius)
-            result = raw_img - background
-            result = np.clip(result, 0, raw_img.max())
+            background = restoration.rolling_ball(channel_img, radius=radius)
+            result = channel_img - background
+            result = np.clip(result, 0, channel_img.max())
 
         # Apply optional denoising
         if self.denoise_check.isChecked():
@@ -2080,7 +2107,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             blurred = ndimage.gaussian_filter(result.astype(np.float32), sigma=2)
             result_float = result.astype(np.float32)
             sharpened = result_float + sharpen_amount * (result_float - blurred)
-            result = np.clip(sharpened, 0, raw_img.max()).astype(result.dtype)
+            result = np.clip(sharpened, 0, channel_img.max()).astype(result.dtype)
 
         # Store the preview (without adjustments)
         img_data['preview'] = result
@@ -2089,15 +2116,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
         self.preview_label.set_image(pixmap)
         self.tabs.setCurrentIndex(1)
-        steps = []
+        steps = [f"Ch{self.grayscale_channel + 1}"]
         if rb_enabled:
             steps.append(f"RB={self.rb_slider.value()}")
         if self.denoise_check.isChecked():
             steps.append(f"Denoise={self.denoise_spin.value()}")
         if self.sharpen_check.isChecked():
             steps.append(f"Sharpen={self.sharpen_slider.value() / 10:.1f}")
-        if not steps:
-            steps.append("Grayscale only (no processing)")
+        if len(steps) == 1:
+            steps.append("no processing")
         self.log(f"Preview {self.current_image_name}: {', '.join(steps)}")
 
     def process_selected_images(self):
@@ -2116,22 +2143,24 @@ class MicrogliaAnalysisGUI(QMainWindow):
         sharpen_amount = self.sharpen_slider.value() / 10.0
 
         # Log what processing steps will be applied
-        steps = []
+        process_channel = self.grayscale_channel
+        steps = [f"Channel {process_channel + 1}"]
         if rb_enabled:
             steps.append(f"Rolling Ball (r={radius})")
         if denoise_enabled:
             steps.append(f"Denoise ({denoise_size})")
         if sharpen_enabled:
             steps.append(f"Sharpen ({sharpen_amount:.1f})")
-        if not steps:
-            self.log("No processing selected - saving grayscale images for later steps")
+        if len(steps) == 1:
+            self.log(f"Processing Channel {process_channel + 1} only - no additional processing")
         else:
             self.log(f"Processing with: {', '.join(steps)}")
 
         process_list = []
         for img_name, img_data in selected_images:
             process_list.append((img_data['raw_path'], img_name, radius, rb_enabled,
-                                 denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount))
+                                 denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount,
+                                 process_channel))
         self.thread = BackgroundRemovalThread(process_list, self.output_dir)
         self.thread.status_update.connect(self.log)
         self.thread.progress.connect(self._update_progress)
@@ -2140,10 +2169,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.thread.error_occurred.connect(lambda msg: self.log(f"ERROR: {msg}"))
         self.progress_bar.setVisible(True)
         self.progress_status_label.setVisible(True)
-        if steps:
-            self.progress_status_label.setText("Processing images...")
+        if len(steps) > 1:
+            self.progress_status_label.setText(f"Processing Channel {process_channel + 1}...")
         else:
-            self.progress_status_label.setText("Converting to grayscale...")
+            self.progress_status_label.setText(f"Extracting Channel {process_channel + 1}...")
         self.process_selected_btn.setEnabled(False)
         self.thread.start()
 
