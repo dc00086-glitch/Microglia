@@ -97,12 +97,17 @@ def populatePercentageMaskMetrics(nStatsSemiLog, nStatsLogLog):
 
 def addPolyFitToMaskMetrics(lStats, cal, maskMetrics, bestDegree):
     """Add polynomial fit metrics to the dictionary. Identical math to reference."""
-    trial = lStats.getPolynomialMaxima(0.0, 100.0, 50.0)
     critVals = list()
     critRadii = list()
-    for curr in trial.toArray():
-        critVals.append(curr.rawY(cal))
-        critRadii.append(curr.rawX(cal))
+    try:
+        trial = lStats.getPolynomialMaxima(0.0, 100.0, 50.0)
+        for curr in trial.toArray():
+            critVals.append(curr.rawY(cal))
+            critRadii.append(curr.rawX(cal))
+    except Exception:
+        # Low-degree polynomials (e.g. degree 1) have no maxima;
+        # the LaguerreSolver throws NoDataException. Leave as NaN.
+        pass
 
     maskMetrics['Kurtosis (fit)'] = lStats.getKurtosis(True)
     maskMetrics['Ramification Index (fit)'] = lStats.getRamificationIndex(True)
