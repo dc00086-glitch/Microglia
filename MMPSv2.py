@@ -1665,6 +1665,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
         outline_layout.addWidget(self.redo_outline_btn)
 
+        # Outline progress bar
+        self.outline_progress_bar = QProgressBar()
+        self.outline_progress_bar.setVisible(False)
+        self.outline_progress_bar.setMinimumHeight(20)
+        self.outline_progress_bar.setFormat("%v / %m somas outlined")
+        self.outline_progress_bar.setStyleSheet("""
+            QProgressBar { border: 1px solid #ccc; border-radius: 3px; text-align: center; background: #f0f0f0; }
+            QProgressBar::chunk { background-color: #4CAF50; }
+        """)
+        outline_layout.addWidget(self.outline_progress_bar)
+
         outline_group.setLayout(outline_layout)
         batch_layout.addWidget(outline_group)
         self.redo_outline_btn.clicked.connect(self.redo_last_outline)
@@ -3247,6 +3258,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.review_mode = False
         self.current_review_idx = 0
 
+        # Show outline progress bar
+        self._update_outline_progress()
+
         if result == 1:
             # Manual mode
             self._start_manual_outlining()
@@ -3553,6 +3567,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log(f"✓ {soma_id} approved (soma area: {soma_area_um2:.1f} µm²)")
         self.polygon_points = []
 
+        # Update outline progress
+        self._update_outline_progress()
+
         # Enable Redo button after first outline is complete
         self.redo_outline_btn.setEnabled(True)
 
@@ -3600,7 +3617,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 os.remove(soma_file)
         
         self.log(f"↩ Deleted outline for {last_outline_data['soma_id']} - ready to redo")
-        
+
+        # Update outline progress
+        self._update_outline_progress()
+
         # Go back to that soma for re-outlining
         queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         self.polygon_points = []
@@ -3775,6 +3795,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if fail_count > 0:
             self.log(f"⚠ Failed to auto-outline {fail_count} somas: {', '.join(failed_somas)}")
 
+        # Update outline progress
+        self._update_outline_progress()
+
         # Check if all done
         queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         if queue_idx >= len(self.outlining_queue):
@@ -3889,7 +3912,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         mask = path.contains_points(points).reshape(h, w)
         return mask.astype(np.uint8)
 
+    def _update_outline_progress(self):
+        """Update the outline progress bar with current completion count."""
+        if not hasattr(self, 'outlining_queue') or not self.outlining_queue:
+            return
+        completed = sum(len(data['soma_outlines']) for data in self.images.values())
+        total = len(self.outlining_queue)
+        self.outline_progress_bar.setMaximum(total)
+        self.outline_progress_bar.setValue(completed)
+        self.outline_progress_bar.setVisible(True)
+
     def _finish_outlining(self):
+        self.outline_progress_bar.setVisible(False)
         self.batch_mode = False
         self.processed_label.polygon_mode = False
         self.processed_label.point_edit_mode = False
