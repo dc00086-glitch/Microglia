@@ -820,7 +820,7 @@ class InteractiveImageLabel(QLabel):
         self.setMinimumSize(400, 400)
         # Don't use QLabel's auto-centering - we'll position the pixmap ourselves
         self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.setStyleSheet("border: 2px solid #cccccc; background-color: #f5f5f5;")
+        self.setStyleSheet("border: 2px solid palette(mid); background-color: palette(base);")
         # Allow label to expand
         from PyQt5.QtWidgets import QSizePolicy
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -843,6 +843,11 @@ class InteractiveImageLabel(QLabel):
         self.measure_mode = False
         self.measure_pt1 = None  # (row, col) image coords
         self.measure_pt2 = None
+        # Mask overlay opacity (0.0 - 1.0)
+        self.overlay_opacity = 0.4
+        # Centroid dragging
+        self.dragging_centroid = False
+        self.dragging_centroid_idx = None
 
     def set_image(self, qpix, centroids=None, mask_overlay=None, polygon_pts=None):
         self.pix_source = qpix
@@ -916,7 +921,7 @@ class InteractiveImageLabel(QLabel):
     def paintEvent(self, event):
         # Draw background first (from QLabel)
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(245, 245, 245))  # Match background color
+        painter.fillRect(self.rect(), self.palette().color(self.backgroundRole()))
 
         if not self.pix_source or not self.scaled_pixmap:
             painter.end()
@@ -970,10 +975,13 @@ class InteractiveImageLabel(QLabel):
 
         # Draw zoom indicator
         if self.zoom_level != 1.0:
-            painter.setPen(QPen(QColor(50, 50, 50)))
-            painter.setBrush(QColor(255, 255, 255, 200))
+            bg = self.palette().color(self.backgroundRole())
+            bg.setAlpha(200)
+            fg = self.palette().color(self.foregroundRole())
+            painter.setPen(QPen(fg))
+            painter.setBrush(bg)
             painter.drawRect(5, 5, 70, 20)
-            painter.setPen(QColor(0, 0, 0))
+            painter.setPen(fg)
             painter.drawText(10, 20, f"Zoom: {self.zoom_level:.1f}x")
 
         painter.end()
@@ -1019,6 +1027,21 @@ class InteractiveImageLabel(QLabel):
                 nearest_idx = i
         return nearest_idx
 
+    def _find_nearest_centroid(self, click_pos, threshold=15):
+        """Find the nearest centroid within threshold pixels for dragging"""
+        if not self.centroids:
+            return None
+        effective_threshold = max(threshold, threshold / max(self.zoom_level, 0.5))
+        min_dist = float('inf')
+        nearest_idx = None
+        for i, centroid in enumerate(self.centroids):
+            display_x, display_y = self._to_display_coords(centroid)
+            dist = ((click_pos.x() - display_x) ** 2 + (click_pos.y() - display_y) ** 2) ** 0.5
+            if dist < min_dist and dist < effective_threshold:
+                min_dist = dist
+                nearest_idx = i
+        return nearest_idx
+
     def mousePressEvent(self, event):
         # Check if Z key is held for zoom
         if self.parent_widget and hasattr(self.parent_widget, 'z_key_held') and self.parent_widget.z_key_held:
@@ -1048,6 +1071,13 @@ class InteractiveImageLabel(QLabel):
             return
 
         if self.soma_mode and self.parent_widget:
+            # Check if clicking near an existing centroid to drag it
+            if self.centroids and event.button() == Qt.LeftButton:
+                nearest_idx = self._find_nearest_centroid(event.pos())
+                if nearest_idx is not None:
+                    self.dragging_centroid = True
+                    self.dragging_centroid_idx = nearest_idx
+                    return
             self.parent_widget.add_soma(coords)
         elif self.polygon_mode and self.parent_widget:
             # Sync polygon points from parent before checking for drag
@@ -1070,7 +1100,19 @@ class InteractiveImageLabel(QLabel):
                 self.parent_widget.finish_polygon()
 
     def mouseMoveEvent(self, event):
-        """Handle mouse move for point dragging"""
+        """Handle mouse move for point/centroid dragging"""
+        # Centroid dragging
+        if self.dragging_centroid and self.dragging_centroid_idx is not None and self.parent_widget:
+            coords = self._to_image_coords(event.pos().x(), event.pos().y())
+            if coords and self.dragging_centroid_idx < len(self.centroids):
+                self.centroids[self.dragging_centroid_idx] = coords
+                # Update parent's somas list
+                img_data = self.parent_widget.images.get(self.parent_widget.current_image_name)
+                if img_data and self.dragging_centroid_idx < len(img_data['somas']):
+                    img_data['somas'][self.dragging_centroid_idx] = coords
+                self._update_display()
+            return
+
         if self.dragging_point and self.selected_point_idx is not None and self.parent_widget:
             coords = self._to_image_coords(event.pos().x(), event.pos().y())
             if coords:
@@ -1082,6 +1124,21 @@ class InteractiveImageLabel(QLabel):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release to finish dragging"""
+        # Centroid drag release
+        if self.dragging_centroid and event.button() == Qt.LeftButton:
+            self.dragging_centroid = False
+            idx = self.dragging_centroid_idx
+            self.dragging_centroid_idx = None
+            if self.parent_widget:
+                img_data = self.parent_widget.images.get(self.parent_widget.current_image_name)
+                if img_data and idx is not None and idx < len(img_data['somas']):
+                    new_coords = img_data['somas'][idx]
+                    # Update the soma_id to reflect new position
+                    img_data['soma_ids'][idx] = f"soma_{new_coords[0]}_{new_coords[1]}"
+                    self.parent_widget.log(f"  → Soma {idx + 1} repositioned")
+                self._update_display()
+            return
+
         if self.dragging_point and event.button() == Qt.LeftButton:
             self.dragging_point = False
             # Keep the point selected for visibility but stop dragging
@@ -1132,7 +1189,7 @@ class InteractiveImageLabel(QLabel):
             return
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(0, 255, 0))
-        painter.setOpacity(0.4)
+        painter.setOpacity(self.overlay_opacity)
         img_h, img_w = self.pix_source.height(), self.pix_source.width()
         pixmap_w = self.scaled_pixmap.width()
         pixmap_h = self.scaled_pixmap.height()
@@ -1715,7 +1772,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.auto_outline_btn = QPushButton("Auto")
         self.auto_outline_btn.clicked.connect(self.auto_outline_current_soma)
         self.auto_outline_btn.setEnabled(False)
-        self.auto_outline_btn.setStyleSheet("background-color: #90EE90;")
+        self.auto_outline_btn.setStyleSheet("border: 2px solid #4CAF50; font-weight: bold;")
         self.auto_outline_btn.setToolTip("Auto-detect outline for current soma")
         outline_btn_layout.addWidget(self.auto_outline_btn)
 
@@ -1728,7 +1785,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.accept_outline_btn = QPushButton("Accept (Enter)")
         self.accept_outline_btn.clicked.connect(self.accept_current_outline)
         self.accept_outline_btn.setEnabled(False)
-        self.accept_outline_btn.setStyleSheet("background-color: #87CEEB;")
+        self.accept_outline_btn.setStyleSheet("border: 2px solid #2196F3; font-weight: bold;")
         self.accept_outline_btn.setToolTip("Accept outline and move to next soma")
         outline_btn_layout.addWidget(self.accept_outline_btn)
         outline_layout.addLayout(outline_btn_layout)
@@ -1737,7 +1794,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.redo_outline_btn = QPushButton("↩ Redo Last")
         self.redo_outline_btn.clicked.connect(self.redo_last_outline)
         self.redo_outline_btn.setEnabled(False)
-        self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
+        self.redo_outline_btn.setStyleSheet("border: 2px solid #FF9800;")
         outline_layout.addWidget(self.redo_outline_btn)
 
         # Outline progress bar
@@ -1746,7 +1803,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.outline_progress_bar.setMinimumHeight(20)
         self.outline_progress_bar.setFormat("%v / %m somas outlined")
         self.outline_progress_bar.setStyleSheet("""
-            QProgressBar { border: 1px solid #ccc; border-radius: 3px; text-align: center; background: #f0f0f0; }
+            QProgressBar { border: 1px solid palette(mid); border-radius: 3px; text-align: center; }
             QProgressBar::chunk { background-color: #4CAF50; }
         """)
         outline_layout.addWidget(self.outline_progress_bar)
@@ -1755,7 +1812,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         batch_layout.addWidget(outline_group)
         self.redo_outline_btn.clicked.connect(self.redo_last_outline)
         self.redo_outline_btn.setEnabled(False)
-        self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
+        self.redo_outline_btn.setStyleSheet("border: 2px solid #FF9800;")
         batch_layout.addWidget(self.redo_outline_btn)
         
         self.batch_generate_masks_btn = QPushButton("Generate All Masks")
@@ -1767,7 +1824,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.clear_masks_btn = QPushButton("🗑 Clear All Masks")
         self.clear_masks_btn.clicked.connect(self.clear_all_masks)
         self.clear_masks_btn.setEnabled(False)
-        self.clear_masks_btn.setStyleSheet("background-color: #FFB6C1;")
+        self.clear_masks_btn.setStyleSheet("border: 2px solid #F44336;")
         batch_layout.addWidget(self.clear_masks_btn)
         self.batch_qa_btn = QPushButton("QA All Masks")
         self.batch_qa_btn.clicked.connect(self.start_batch_qa)
@@ -1878,15 +1935,32 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         layout.addLayout(display_btn_layout)
 
+        # Mask overlay opacity slider
+        opacity_layout = QHBoxLayout()
+        opacity_label = QLabel("Mask Opacity:")
+        opacity_label.setFixedWidth(85)
+        opacity_layout.addWidget(opacity_label)
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(40)
+        self.opacity_slider.setTickInterval(10)
+        self.opacity_slider.setFixedHeight(20)
+        self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        opacity_layout.addWidget(self.opacity_slider)
+        self.opacity_value_label = QLabel("40%")
+        self.opacity_value_label.setFixedWidth(35)
+        opacity_layout.addWidget(self.opacity_value_label)
+        layout.addLayout(opacity_layout)
+
         # Zoom hint row
         zoom_layout = QHBoxLayout()
         zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, U: reset, M: measure, F1: help")
-        zoom_hint.setStyleSheet("color: #666; font-size: 10px;")
+        zoom_hint.setStyleSheet("color: palette(dark); font-size: 10px;")
         zoom_layout.addWidget(zoom_hint)
         zoom_layout.addStretch()
         self.zoom_level_label = QLabel("1.0x")
         self.zoom_level_label.setFixedWidth(50)
-        self.zoom_level_label.setStyleSheet("color: #666; font-size: 10px;")
+        self.zoom_level_label.setStyleSheet("color: palette(dark); font-size: 10px;")
         zoom_layout.addWidget(self.zoom_level_label)
         layout.addLayout(zoom_layout)
 
@@ -1899,7 +1973,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.timer_label = QLabel("")
         self.timer_label.setVisible(False)
-        self.timer_label.setStyleSheet("font-family: monospace; font-size: 12pt; color: #333; padding: 0 10px;")
+        self.timer_label.setStyleSheet("font-family: monospace; font-size: 12pt; padding: 0 10px;")
         self.timer_label.setMinimumWidth(100)
         self.timer_label.setAlignment(Qt.AlignCenter)
         progress_container.addWidget(self.timer_label, stretch=0)
@@ -1908,7 +1982,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.progress_status_label = QLabel("")
         self.progress_status_label.setVisible(False)
-        self.progress_status_label.setStyleSheet("color: #666; font-style: italic;")
+        self.progress_status_label.setStyleSheet("font-style: italic;")
         layout.addWidget(self.progress_status_label, stretch=0)
 
         # Timer for tracking processing time
@@ -2156,7 +2230,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if mode == "Soma Picking":
             html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Soma Picking</b></td></tr>"
             shortcuts = [
-                ("Left-click", "Place soma centroid"),
+                ("Left-click", "Place soma / drag existing centroid"),
                 ("Backspace", "Remove last soma"),
                 ("Enter", "Done with current image"),
                 ("Escape", "Cancel soma picking"),
@@ -2200,6 +2274,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
     # ========================================================================
     # MEASUREMENT TOOL
     # ========================================================================
+
+    def _on_opacity_changed(self, value):
+        """Update mask overlay opacity on all labels"""
+        opacity = value / 100.0
+        self.opacity_value_label.setText(f"{value}%")
+        for label in [self.original_label, self.preview_label, self.processed_label, self.mask_label]:
+            label.overlay_opacity = opacity
+            label._update_display()
 
     def toggle_measure_mode(self):
         """Toggle the measurement tool on/off"""
@@ -4066,7 +4148,7 @@ Step 3: Import Results Back
 
         auto_btn = QPushButton("Auto - Auto-detect all, then review/fix")
         auto_btn.clicked.connect(lambda: dialog.done(2))
-        auto_btn.setStyleSheet("background-color: #90EE90; font-weight: bold;")
+        auto_btn.setStyleSheet("border: 2px solid #4CAF50; font-weight: bold;")
         layout.addWidget(auto_btn)
 
         # Auto settings
@@ -4859,7 +4941,7 @@ Step 3: Import Results Back
             "• 50% = Strict (exclude dimmer pixels)\n"
             "• 70%+ = Very strict (only bright pixels)"
         )
-        help_text.setStyleSheet("background-color: #f0f0f0; padding: 10px; border-radius: 5px;")
+        help_text.setStyleSheet("padding: 10px; border-radius: 5px; border: 1px solid palette(mid);")
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
 
@@ -4875,7 +4957,7 @@ Step 3: Import Results Back
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(dialog.accept)
         ok_btn.setStyleSheet(
-            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 5px; }")
+            "QPushButton { border: 2px solid #4CAF50; font-weight: bold; padding: 5px; }")
         button_layout.addWidget(ok_btn)
 
         layout.addLayout(button_layout)
