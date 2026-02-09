@@ -354,18 +354,8 @@ class InteractiveImageLabel(QLabel):
         self._refresh_display()
 
     def wheelEvent(self, event):
-        """Mouse scroll wheel adjusts zoom level"""
-        if not self.pix_source:
-            return
-        delta = event.angleDelta().y()
-        if delta > 0:
-            self.zoom_level = min(self.zoom_level * 1.25, 10.0)
-        else:
-            self.zoom_level = max(self.zoom_level / 1.25, 1.0)
-        if self.zoom_level <= 1.02:
-            self.zoom_level = 1.0
-            self.zoom_center = None
-        self._refresh_display()
+        """Mouse wheel disabled"""
+        event.ignore()
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -1547,8 +1537,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         soma_id = img_data['soma_ids'][soma_idx]
         pixmap = self._array_to_pixmap(img_data['processed'])
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
-        # Autozoom onto the soma for easier outlining
-        self.processed_label.set_zoom(center=soma, level=3.0)
+        # Reset zoom then autozoom 10x onto the soma for easier outlining
+        self.processed_label.reset_zoom()
+        self.processed_label.set_zoom(center=soma, level=10.0)
         self.tabs.setCurrentIndex(2)
         self.nav_status_label.setText(
             f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
