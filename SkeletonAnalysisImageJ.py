@@ -84,6 +84,17 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
     IJ.setThreshold(skel, 1, 255)
     IJ.run(skel, "Convert to Mask", "")
 
+    # Re-apply calibration (Convert to Mask can reset it)
+    if scaleFactor > 1:
+        scaledPixelSize = pixelSize / float(scaleFactor)
+    else:
+        scaledPixelSize = pixelSize
+    reappliedCal = Calibration(skel)
+    reappliedCal.pixelWidth = scaledPixelSize
+    reappliedCal.pixelHeight = scaledPixelSize
+    reappliedCal.setUnit("micron")
+    skel.setCalibration(reappliedCal)
+
     # Skeletonize
     IJ.run(skel, "Skeletonize (2D/3D)", "")
 
