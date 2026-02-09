@@ -291,9 +291,6 @@ class InteractiveImageLabel(QLabel):
         # Zoom state
         self.zoom_level = 1.0   # 1.0 = no zoom, higher = more zoom
         self.zoom_center = None  # (y, x) in image coordinates
-        # Pan state
-        self._panning = False
-        self._pan_start = None
         self.setMinimumSize(400, 400)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("border: 2px solid #cccccc; background-color: #f5f5f5;")
@@ -357,11 +354,9 @@ class InteractiveImageLabel(QLabel):
         self._refresh_display()
 
     def wheelEvent(self, event):
-        """Mouse scroll wheel adjusts zoom level, centered on cursor position"""
+        """Mouse scroll wheel adjusts zoom level"""
         if not self.pix_source:
             return
-        # Convert mouse position to image coordinates before zoom change
-        mouse_img = self._to_image_coords(event.pos().x(), event.pos().y())
         delta = event.angleDelta().y()
         if delta > 0:
             self.zoom_level = min(self.zoom_level * 1.25, 10.0)
@@ -370,9 +365,6 @@ class InteractiveImageLabel(QLabel):
         if self.zoom_level <= 1.02:
             self.zoom_level = 1.0
             self.zoom_center = None
-        elif mouse_img is not None:
-            # Center zoom on cursor position
-            self.zoom_center = mouse_img
         self._refresh_display()
 
     def paintEvent(self, event):
@@ -489,12 +481,6 @@ class InteractiveImageLabel(QLabel):
         return (img_y, img_x)
 
     def mousePressEvent(self, event):
-        # Middle-click starts panning
-        if event.button() == Qt.MiddleButton and self.zoom_level > 1.0:
-            self._panning = True
-            self._pan_start = event.pos()
-            self.setCursor(Qt.ClosedHandCursor)
-            return
         coords = self._to_image_coords(event.pos().x(), event.pos().y())
         if not coords:
             return
@@ -506,38 +492,6 @@ class InteractiveImageLabel(QLabel):
                 self.parent_widget.add_polygon_point(coords)
             elif event.button() == Qt.RightButton:
                 self.parent_widget.finish_polygon()
-
-    def mouseMoveEvent(self, event):
-        """Handle panning when middle mouse is held"""
-        if self._panning and self.zoom_center and self.pix_source:
-            delta = event.pos() - self._pan_start
-            self._pan_start = event.pos()
-            # Convert pixel drag to image coordinate shift
-            vp_x, vp_y, vp_w, vp_h = self._get_viewport()
-            current_pixmap = self.pixmap()
-            if current_pixmap:
-                pixmap_w = current_pixmap.width()
-                pixmap_h = current_pixmap.height()
-            else:
-                pixmap_w = int(vp_w)
-                pixmap_h = int(vp_h)
-            scale_x = vp_w / pixmap_w if pixmap_w > 0 else 1
-            scale_y = vp_h / pixmap_h if pixmap_h > 0 else 1
-            cy, cx = self.zoom_center
-            new_cx = cx - delta.x() * scale_x
-            new_cy = cy - delta.y() * scale_y
-            img_w = self.pix_source.width()
-            img_h = self.pix_source.height()
-            new_cx = max(0, min(new_cx, img_w))
-            new_cy = max(0, min(new_cy, img_h))
-            self.zoom_center = (new_cy, new_cx)
-            self._refresh_display()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MiddleButton and self._panning:
-            self._panning = False
-            self.setCursor(Qt.ArrowCursor)
-            return
 
     def mouseDoubleClickEvent(self, event):
         if self.polygon_mode and self.parent_widget:
@@ -1579,7 +1533,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log(f"Total somas to outline: {len(self.outlining_queue)}")
         self.log("Left-click to add points, right-click to finish outline")
         self.log("Press 'Z' or Backspace to undo last point | 'Escape' to restart | 'Enter' to finish")
-        self.log("Scroll wheel to adjust zoom | Middle-click drag to pan | Auto-zoomed on each soma")
+        self.log("Scroll wheel to adjust zoom | Auto-zoomed on each soma")
         self.log("=" * 50)
 
     def _load_soma_for_outlining(self, queue_idx):
@@ -1598,8 +1552,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.tabs.setCurrentIndex(2)
         self.nav_status_label.setText(
             f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
-            f"Image: {img_name} | ID: {soma_id} | "
-            f"Zoom: {self.processed_label.zoom_level:.1f}x"
+            f"Image: {img_name} | ID: {soma_id}"
         )
         self.log(f"Outlining {soma_id} ({queue_idx + 1}/{len(self.outlining_queue)})")
 
@@ -1611,18 +1564,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
             img_data = self.images[img_name]
             soma = img_data['somas'][soma_idx]
             soma_id = img_data['soma_ids'][soma_idx]
-            # Save current zoom state before set_image
-            saved_zoom = self.processed_label.zoom_level
-            saved_center = self.processed_label.zoom_center
             pixmap = self._array_to_pixmap(img_data['processed'])
             self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
-            # Restore zoom state (set_image preserves it, but be explicit)
-            if saved_zoom > 1.0:
-                self.processed_label.set_zoom(center=saved_center, level=saved_zoom)
+            # Update status to show point count
             self.nav_status_label.setText(
                 f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
-                f"Image: {img_name} | ID: {soma_id} | "
-                f"Points: {len(self.polygon_points)} | Zoom: {self.processed_label.zoom_level:.1f}x"
+                f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
             )
 
     def undo_last_polygon_point(self):
@@ -1630,23 +1577,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if len(self.polygon_points) > 0:
             self.polygon_points.pop()
             self.log(f"↩️ Undid last point ({len(self.polygon_points)} points remaining)")
-            # Refresh the display while preserving zoom
+            # Refresh the display
             queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
             if queue_idx < len(self.outlining_queue):
                 img_name, soma_idx = self.outlining_queue[queue_idx]
                 img_data = self.images[img_name]
                 soma = img_data['somas'][soma_idx]
                 soma_id = img_data['soma_ids'][soma_idx]
-                saved_zoom = self.processed_label.zoom_level
-                saved_center = self.processed_label.zoom_center
                 pixmap = self._array_to_pixmap(img_data['processed'])
                 self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
-                if saved_zoom > 1.0:
-                    self.processed_label.set_zoom(center=saved_center, level=saved_zoom)
                 self.nav_status_label.setText(
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
-                    f"Image: {img_name} | ID: {soma_id} | "
-                    f"Points: {len(self.polygon_points)} | Zoom: {self.processed_label.zoom_level:.1f}x"
+                    f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
                 )
         else:
             self.log("⚠️ No points to undo")
@@ -1656,23 +1598,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if len(self.polygon_points) > 0:
             self.polygon_points = []
             self.log("🔄 Restarted outline (all points cleared)")
-            # Refresh the display while preserving zoom
+            # Refresh the display
             queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
             if queue_idx < len(self.outlining_queue):
                 img_name, soma_idx = self.outlining_queue[queue_idx]
                 img_data = self.images[img_name]
                 soma = img_data['somas'][soma_idx]
                 soma_id = img_data['soma_ids'][soma_idx]
-                saved_zoom = self.processed_label.zoom_level
-                saved_center = self.processed_label.zoom_center
                 pixmap = self._array_to_pixmap(img_data['processed'])
                 self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
-                if saved_zoom > 1.0:
-                    self.processed_label.set_zoom(center=saved_center, level=saved_zoom)
                 self.nav_status_label.setText(
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
-                    f"Image: {img_name} | ID: {soma_id} | "
-                    f"Points: {len(self.polygon_points)} | Zoom: {self.processed_label.zoom_level:.1f}x"
+                    f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
                 )
         else:
             self.log("⚠️ No points to clear")
@@ -2205,7 +2142,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("🎯 BATCH MASK QA MODE")
         self.log(f"Total masks to review: {len(self.all_masks_flat)}")
         self.log("Keyboard: A=Approve, R=Reject, ←→=Navigate, Space=Approve&Next")
-        self.log("Scroll wheel to adjust zoom | Middle-click drag to pan | Auto-zoomed on each soma")
         self.log("=" * 50)
 
     def _show_current_mask(self):
@@ -2217,26 +2153,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         processed_img = flat_data['processed_img']
         img_name = flat_data['image_name']
 
-        # Update current image so _to_image_coords works for scroll zoom
-        self.current_image_name = img_name
-
         pixmap = self._array_to_pixmap(processed_img)
         self.mask_label.set_image(pixmap, mask_overlay=mask_data['mask'])
 
-        # Autozoom onto the soma for easier mask review
-        soma_idx = mask_data['soma_idx']
-        if img_name in self.images and soma_idx < len(self.images[img_name]['somas']):
-            soma = self.images[img_name]['somas'][soma_idx]
-            self.mask_label.set_zoom(center=soma, level=3.0)
-
         status = mask_data.get('approved')
         status_text = "✓ Approved" if status is True else "✗ Rejected" if status is False else "⏳ Not reviewed"
-        zoom_text = f" | Zoom: {self.mask_label.zoom_level:.1f}x"
 
         self.nav_status_label.setText(
             f"Mask {self.mask_qa_idx + 1}/{len(self.all_masks_flat)} | "
             f"{img_name} | {mask_data['soma_id']} | "
-            f"Area: {mask_data['area_um2']} µm² | {status_text}{zoom_text}"
+            f"Area: {mask_data['area_um2']} µm² | {status_text}"
         )
 
     def approve_current_mask(self):
@@ -2444,7 +2370,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         if all_reviewed:
             self.mask_qa_active = False
-            self.mask_label.reset_zoom()
             self.approve_mask_btn.setEnabled(False)
             self.reject_mask_btn.setEnabled(False)
             self.prev_btn.setEnabled(False)
