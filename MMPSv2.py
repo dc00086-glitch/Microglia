@@ -3275,7 +3275,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("")
         self.log("Click to add points, right-click to complete")
         self.log("Press Enter or [Accept] to save and move to next")
-        self.log("Middle-click drag to pan | Z+click to zoom | Auto-zoomed 5x on each soma")
+        self.log("Middle-click drag to pan | Z+click to zoom | Auto-zoomed 10x on each soma")
         self.log("=" * 50)
 
     def _run_auto_outline_all(self):
@@ -3444,7 +3444,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
         # Reset zoom then autozoom onto the soma for easier outlining
         self.processed_label.reset_zoom()
-        self.processed_label.set_zoom(5.0, center=soma)
+        self.processed_label.set_zoom(10.0, center=soma)
         self.tabs.setCurrentIndex(2)
         self.nav_status_label.setText(
             f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
@@ -4324,7 +4324,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("🎯 BATCH MASK QA MODE")
         self.log(f"Total masks to review: {len(self.all_masks_flat)}")
         self.log("Keyboard: A=Approve, R=Reject, ←→=Navigate, Space=Approve&Next")
-        self.log("Middle-click drag to pan | Z+click to zoom | Auto-zoomed 5x on each soma")
+        self.log("Middle-click drag to pan | Z+click to zoom | Auto-zoomed 10x on each soma")
         self.log("=" * 50)
 
     def _show_current_mask(self):
@@ -4348,7 +4348,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if img_name in self.images and soma_idx < len(self.images[img_name]['somas']):
             soma = self.images[img_name]['somas'][soma_idx]
             self.mask_label.reset_zoom()
-            self.mask_label.set_zoom(5.0, center=soma)
+            self.mask_label.set_zoom(10.0, center=soma)
 
         status = mask_data.get('approved')
         status_text = "✓ Approved" if status is True else "✗ Rejected" if status is False else "⏳ Not reviewed"
