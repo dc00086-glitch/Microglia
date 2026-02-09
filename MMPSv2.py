@@ -959,14 +959,19 @@ class InteractiveImageLabel(QLabel):
 
     def _find_nearest_point(self, click_pos, threshold=15):
         """Find the nearest polygon point within threshold pixels"""
+        # Sync from parent's authoritative list to avoid stale data
+        if self.parent_widget and hasattr(self.parent_widget, 'polygon_points'):
+            self.polygon_pts = self.parent_widget.polygon_points
         if not self.polygon_pts:
             return None
+        # Scale threshold with zoom so points are easier to grab when zoomed out
+        effective_threshold = max(threshold, threshold / max(self.zoom_level, 0.5))
         min_dist = float('inf')
         nearest_idx = None
         for i, pt in enumerate(self.polygon_pts):
             display_x, display_y = self._to_display_coords(pt)
             dist = ((click_pos.x() - display_x) ** 2 + (click_pos.y() - display_y) ** 2) ** 0.5
-            if dist < min_dist and dist < threshold:
+            if dist < min_dist and dist < effective_threshold:
                 min_dist = dist
                 nearest_idx = i
         return nearest_idx
@@ -988,6 +993,9 @@ class InteractiveImageLabel(QLabel):
         if self.soma_mode and self.parent_widget:
             self.parent_widget.add_soma(coords)
         elif self.polygon_mode and self.parent_widget:
+            # Sync polygon points from parent before checking for drag
+            if hasattr(self.parent_widget, 'polygon_points'):
+                self.polygon_pts = self.parent_widget.polygon_points
             # Check for point editing first (if there are existing points)
             if self.polygon_pts and event.button() == Qt.LeftButton:
                 nearest_idx = self._find_nearest_point(event.pos())
