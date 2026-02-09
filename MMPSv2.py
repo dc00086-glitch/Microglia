@@ -2284,8 +2284,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
             }
 
             for img_name, img_data in self.images.items():
+                # Build path to processed TIFF if it exists on disk
+                processed_path = None
+                if self.output_dir:
+                    candidate = os.path.join(
+                        self.output_dir,
+                        os.path.splitext(img_name)[0] + "_processed.tif"
+                    )
+                    if os.path.exists(candidate):
+                        processed_path = candidate
+
                 img_session = {
                     'raw_path': img_data['raw_path'],
+                    'processed_path': processed_path,
                     'status': img_data['status'],
                     'selected': img_data['selected'],
                     'animal_id': img_data.get('animal_id', ''),
@@ -2300,6 +2311,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     img_session['soma_outlines'].append(
                         [(float(pt[0]), float(pt[1])) for pt in outline]
                     )
+
+                # Record which masks exist on disk for this image
+                if self.masks_dir:
+                    prefix = os.path.splitext(img_name)[0]
+                    mask_files = [
+                        f for f in os.listdir(self.masks_dir)
+                        if f.startswith(prefix) and f.endswith('_mask.tif')
+                    ] if os.path.isdir(self.masks_dir) else []
+                    img_session['mask_files'] = mask_files
+                else:
+                    img_session['mask_files'] = []
 
                 session['images'][img_name] = img_session
 
@@ -2385,9 +2407,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 if img_name in missing:
                     continue
 
+                # Try to reload processed image from disk
+                processed_data = None
+                processed_path = img_session.get('processed_path')
+                if processed_path and os.path.exists(processed_path):
+                    try:
+                        processed_data = tifffile.imread(processed_path)
+                    except Exception:
+                        processed_data = None
+
                 self.images[img_name] = {
                     'raw_path': img_session['raw_path'],
-                    'processed': None,
+                    'processed': processed_data,
                     'rolling_ball_radius': img_session.get('rolling_ball_radius', 50),
                     'somas': [tuple(s) for s in img_session.get('somas', [])],
                     'soma_ids': img_session.get('soma_ids', []),
@@ -2402,7 +2433,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     'treatment': img_session.get('treatment', ''),
                 }
 
-                status = img_session.get('status', 'loaded')
+                # If processed image wasn't found, downgrade status
+                if processed_data is None and img_session.get('status') not in ('loaded',):
+                    self.images[img_name]['status'] = 'loaded'
+
+                status = self.images[img_name]['status']
                 status_colors = {
                     'loaded': ('#808080', '⚪'),
                     'processed': ('#009600', '🟢'),
@@ -2434,20 +2469,40 @@ class MicrogliaAnalysisGUI(QMainWindow):
             n_loaded = len(self.images)
             n_with_somas = sum(1 for d in self.images.values() if d['somas'])
             n_with_outlines = sum(1 for d in self.images.values() if d['soma_outlines'])
+            n_with_processed = sum(1 for d in self.images.values() if d['processed'] is not None)
+
+            # Count mask files found on disk
+            n_mask_files = 0
+            if self.masks_dir and os.path.isdir(self.masks_dir):
+                n_mask_files = len([f for f in os.listdir(self.masks_dir) if f.endswith('_mask.tif')])
+
             self.log("=" * 50)
             self.log(f"Session loaded: {n_loaded} images")
+            if n_with_processed:
+                self.log(f"  {n_with_processed} processed images restored from disk")
             if n_with_somas:
                 self.log(f"  {n_with_somas} images with somas picked")
             if n_with_outlines:
                 self.log(f"  {n_with_outlines} images with soma outlines")
+            if n_mask_files:
+                self.log(f"  {n_mask_files} exported masks found in {self.masks_dir}")
             self.log("=" * 50)
+
+            note = ""
+            if n_with_processed < n_loaded:
+                n_need = n_loaded - n_with_processed
+                note += f"\n{n_need} image(s) need re-processing (Run 'Process Selected Images')."
+            if n_mask_files > 0:
+                note += f"\n{n_mask_files} mask TIFFs found on disk (ready for ImageJ)."
 
             QMessageBox.information(self, "Session Loaded",
                 f"Session restored:\n\n"
                 f"Images: {n_loaded}\n"
+                f"Processed: {n_with_processed}\n"
                 f"With somas: {n_with_somas}\n"
-                f"With outlines: {n_with_outlines}\n\n"
-                f"Note: Processed images and masks need to be regenerated."
+                f"With outlines: {n_with_outlines}\n"
+                f"Mask files on disk: {n_mask_files}"
+                f"{note}"
             )
 
         except Exception as e:
@@ -2457,7 +2512,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def _update_buttons_after_session_load(self):
         """Enable appropriate buttons based on restored session state"""
         has_selected = any(d['selected'] for d in self.images.values())
-        has_processed = any(d['status'] != 'loaded' for d in self.images.values())
+        has_processed = any(d['processed'] is not None for d in self.images.values())
         has_somas = any(d['somas'] for d in self.images.values())
         has_outlines = any(d['soma_outlines'] for d in self.images.values())
 
