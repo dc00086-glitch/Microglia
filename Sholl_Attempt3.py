@@ -104,8 +104,9 @@ def addPolyFitToMaskMetrics(lStats, cal, maskMetrics, bestDegree):
         for curr in trial.toArray():
             critVals.append(curr.rawY(cal))
             critRadii.append(curr.rawX(cal))
-    except Exception:
-        # Low-degree polynomials (e.g. degree 1) have no maxima;
+    except:
+        # Java NoDataException is not caught by Python's 'except Exception'
+        # in Jython. Low-degree polynomials (e.g. degree 1) have no maxima;
         # the LaguerreSolver throws NoDataException. Leave as NaN.
         pass
 
