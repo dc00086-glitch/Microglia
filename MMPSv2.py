@@ -2315,13 +2315,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         pixmap = self._array_to_pixmap_color(adjusted)
                         # Preserve polygon if in outlining mode
                         if self.processed_label.polygon_mode:
-                            queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
+                            # Use review index in review mode, otherwise count completed outlines
+                            if hasattr(self, 'review_mode') and self.review_mode:
+                                queue_idx = self.current_review_idx
+                            else:
+                                queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
                             if queue_idx < len(self.outlining_queue):
                                 img_name, soma_idx = self.outlining_queue[queue_idx]
-                                if img_name == self.current_image_name:
-                                    soma = img_data['somas'][soma_idx]
+                                soma = img_data['somas'][soma_idx] if img_name == self.current_image_name else (img_data['somas'][0] if img_data['somas'] else None)
+                                if soma is not None:
                                     self.processed_label.set_image(pixmap, centroids=[soma],
                                                                    polygon_pts=self.polygon_points)
+                                else:
+                                    self.processed_label.set_image(pixmap, polygon_pts=self.polygon_points)
                             else:
                                 self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                         else:
@@ -2336,13 +2342,21 @@ class MicrogliaAnalysisGUI(QMainWindow):
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                         # Preserve polygon if in outlining mode
                         elif self.processed_label.polygon_mode:
-                            queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
+                            # Use review index in review mode, otherwise count completed outlines
+                            if hasattr(self, 'review_mode') and self.review_mode:
+                                queue_idx = self.current_review_idx
+                            else:
+                                queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
                             if queue_idx < len(self.outlining_queue):
                                 img_name, soma_idx = self.outlining_queue[queue_idx]
-                                if img_name == self.current_image_name:
-                                    soma = img_data['somas'][soma_idx]
+                                soma = img_data['somas'][soma_idx] if img_name == self.current_image_name else (img_data['somas'][0] if img_data['somas'] else None)
+                                if soma is not None:
                                     self.processed_label.set_image(pixmap, centroids=[soma],
                                                                    polygon_pts=self.polygon_points)
+                                else:
+                                    self.processed_label.set_image(pixmap, polygon_pts=self.polygon_points)
+                            else:
+                                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                         else:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
         except Exception as e:
