@@ -66,6 +66,21 @@ def extract_channel(img, channel_idx):
 # AUTO-OUTLINE ALGORITHMS
 # ============================================================================
 
+MIN_OUTLINE_POINTS = 10
+
+def _simplify_contour(contour, min_points=MIN_OUTLINE_POINTS):
+    """Simplify a contour with approxPolyDP, ensuring at least min_points.
+    Starts with epsilon=0.02*arcLength and halves it until enough points."""
+    arc_len = cv2.arcLength(contour, True)
+    epsilon = 0.02 * arc_len
+    for _ in range(6):
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        if len(approx) >= min_points:
+            return approx
+        epsilon *= 0.5
+    # Final attempt with very small epsilon
+    return cv2.approxPolyDP(contour, 0.001 * arc_len, True)
+
 def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
     """
     Auto-outline using adaptive threshold + contour detection.
@@ -177,9 +192,8 @@ def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
         if area < 20:
             return None
 
-        # Simplify contour
-        epsilon = 0.02 * cv2.arcLength(best_contour, True)
-        approx = cv2.approxPolyDP(best_contour, epsilon, True)
+        # Simplify contour ensuring minimum points
+        approx = _simplify_contour(best_contour)
 
         # Convert back to image coordinates
         points = []
@@ -189,7 +203,7 @@ def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
             img_y = py + y1
             points.append((img_y, img_x))  # (row, col) format
 
-        return points if len(points) >= 3 else None
+        return points if len(points) >= MIN_OUTLINE_POINTS else None
 
     except Exception as e:
         print(f"Auto-outline threshold error: {e}")
@@ -273,12 +287,11 @@ def auto_outline_region_growing(image, centroid, sensitivity=50, max_iterations=
         # Get largest contour
         contour = max(contours, key=cv2.contourArea)
 
-        # Simplify
-        epsilon = 0.02 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
+        # Simplify ensuring minimum points
+        approx = _simplify_contour(contour)
 
         points = [(pt[0][1], pt[0][0]) for pt in approx]  # (row, col) format
-        return points if len(points) >= 3 else None
+        return points if len(points) >= MIN_OUTLINE_POINTS else None
 
     except Exception as e:
         print(f"Auto-outline region growing error: {e}")
@@ -370,12 +383,11 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
         if cv2.contourArea(contour) < 20:
             return None
 
-        epsilon = 0.02 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
+        approx = _simplify_contour(contour)
 
         # Convert back to image coordinates
         points = [(pt[0][1] + y1, pt[0][0] + x1) for pt in approx]
-        return points if len(points) >= 3 else None
+        return points if len(points) >= MIN_OUTLINE_POINTS else None
 
     except Exception as e:
         print(f"Auto-outline watershed error: {e}")
@@ -453,13 +465,14 @@ def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=15
             max_num_iter=250
         )
 
-        # Simplify snake to polygon
-        step = max(1, len(snake) // 30)
+        # Simplify snake to polygon, ensuring at least MIN_OUTLINE_POINTS
+        target_pts = max(30, MIN_OUTLINE_POINTS)
+        step = max(1, len(snake) // target_pts)
         simplified = snake[::step]
 
         # Convert back to image coordinates
         points = [(pt[1] + y1, pt[0] + x1) for pt in simplified]
-        return points if len(points) >= 3 else None
+        return points if len(points) >= MIN_OUTLINE_POINTS else None
 
     except Exception as e:
         print(f"Auto-outline active contours error: {e}")
@@ -497,7 +510,7 @@ def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
         best_score = 0
 
         for points, name in [(threshold_points, 'threshold'), (watershed_points, 'watershed')]:
-            if points is None or len(points) < 3:
+            if points is None or len(points) < MIN_OUTLINE_POINTS:
                 continue
 
             # Score based on: number of points (more = smoother), area, and compactness
@@ -532,7 +545,7 @@ def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
 
         # If nothing worked, try active contours as last resort
         active_points = auto_outline_active_contours(image, centroid, sensitivity, region_size)
-        if active_points is not None and len(active_points) >= 3:
+        if active_points is not None and len(active_points) >= MIN_OUTLINE_POINTS:
             return active_points
 
         # Return whatever we have
@@ -959,14 +972,19 @@ class InteractiveImageLabel(QLabel):
 
     def _find_nearest_point(self, click_pos, threshold=15):
         """Find the nearest polygon point within threshold pixels"""
+        # Sync from parent's authoritative list to avoid stale data
+        if self.parent_widget and hasattr(self.parent_widget, 'polygon_points'):
+            self.polygon_pts = self.parent_widget.polygon_points
         if not self.polygon_pts:
             return None
+        # Scale threshold with zoom so points are easier to grab when zoomed out
+        effective_threshold = max(threshold, threshold / max(self.zoom_level, 0.5))
         min_dist = float('inf')
         nearest_idx = None
         for i, pt in enumerate(self.polygon_pts):
             display_x, display_y = self._to_display_coords(pt)
             dist = ((click_pos.x() - display_x) ** 2 + (click_pos.y() - display_y) ** 2) ** 0.5
-            if dist < min_dist and dist < threshold:
+            if dist < min_dist and dist < effective_threshold:
                 min_dist = dist
                 nearest_idx = i
         return nearest_idx
@@ -988,6 +1006,9 @@ class InteractiveImageLabel(QLabel):
         if self.soma_mode and self.parent_widget:
             self.parent_widget.add_soma(coords)
         elif self.polygon_mode and self.parent_widget:
+            # Sync polygon points from parent before checking for drag
+            if hasattr(self.parent_widget, 'polygon_points'):
+                self.polygon_pts = self.parent_widget.polygon_points
             # Check for point editing first (if there are existing points)
             if self.polygon_pts and event.button() == Qt.LeftButton:
                 nearest_idx = self._find_nearest_point(event.pos())
@@ -1657,6 +1678,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
         outline_layout.addWidget(self.redo_outline_btn)
 
+        # Outline progress bar
+        self.outline_progress_bar = QProgressBar()
+        self.outline_progress_bar.setVisible(False)
+        self.outline_progress_bar.setMinimumHeight(20)
+        self.outline_progress_bar.setFormat("%v / %m somas outlined")
+        self.outline_progress_bar.setStyleSheet("""
+            QProgressBar { border: 1px solid #ccc; border-radius: 3px; text-align: center; background: #f0f0f0; }
+            QProgressBar::chunk { background-color: #4CAF50; }
+        """)
+        outline_layout.addWidget(self.outline_progress_bar)
+
         outline_group.setLayout(outline_layout)
         batch_layout.addWidget(outline_group)
         self.redo_outline_btn.clicked.connect(self.redo_last_outline)
@@ -2307,13 +2339,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         pixmap = self._array_to_pixmap_color(adjusted)
                         # Preserve polygon if in outlining mode
                         if self.processed_label.polygon_mode:
-                            queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
+                            # Use review index in review mode, otherwise count completed outlines
+                            if hasattr(self, 'review_mode') and self.review_mode:
+                                queue_idx = self.current_review_idx
+                            else:
+                                queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
                             if queue_idx < len(self.outlining_queue):
                                 img_name, soma_idx = self.outlining_queue[queue_idx]
-                                if img_name == self.current_image_name:
-                                    soma = img_data['somas'][soma_idx]
+                                soma = img_data['somas'][soma_idx] if img_name == self.current_image_name else (img_data['somas'][0] if img_data['somas'] else None)
+                                if soma is not None:
                                     self.processed_label.set_image(pixmap, centroids=[soma],
                                                                    polygon_pts=self.polygon_points)
+                                else:
+                                    self.processed_label.set_image(pixmap, polygon_pts=self.polygon_points)
                             else:
                                 self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                         else:
@@ -2328,13 +2366,21 @@ class MicrogliaAnalysisGUI(QMainWindow):
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                         # Preserve polygon if in outlining mode
                         elif self.processed_label.polygon_mode:
-                            queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
+                            # Use review index in review mode, otherwise count completed outlines
+                            if hasattr(self, 'review_mode') and self.review_mode:
+                                queue_idx = self.current_review_idx
+                            else:
+                                queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
                             if queue_idx < len(self.outlining_queue):
                                 img_name, soma_idx = self.outlining_queue[queue_idx]
-                                if img_name == self.current_image_name:
-                                    soma = img_data['somas'][soma_idx]
+                                soma = img_data['somas'][soma_idx] if img_name == self.current_image_name else (img_data['somas'][0] if img_data['somas'] else None)
+                                if soma is not None:
                                     self.processed_label.set_image(pixmap, centroids=[soma],
                                                                    polygon_pts=self.polygon_points)
+                                else:
+                                    self.processed_label.set_image(pixmap, polygon_pts=self.polygon_points)
+                            else:
+                                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                         else:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
         except Exception as e:
@@ -3225,6 +3271,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.review_mode = False
         self.current_review_idx = 0
 
+        # Show outline progress bar
+        self._update_outline_progress()
+
         if result == 1:
             # Manual mode
             self._start_manual_outlining()
@@ -3531,6 +3580,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log(f"✓ {soma_id} approved (soma area: {soma_area_um2:.1f} µm²)")
         self.polygon_points = []
 
+        # Update outline progress
+        self._update_outline_progress()
+
         # Enable Redo button after first outline is complete
         self.redo_outline_btn.setEnabled(True)
 
@@ -3578,7 +3630,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 os.remove(soma_file)
         
         self.log(f"↩ Deleted outline for {last_outline_data['soma_id']} - ready to redo")
-        
+
+        # Update outline progress
+        self._update_outline_progress()
+
         # Go back to that soma for re-outlining
         queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         self.polygon_points = []
@@ -3753,6 +3808,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if fail_count > 0:
             self.log(f"⚠ Failed to auto-outline {fail_count} somas: {', '.join(failed_somas)}")
 
+        # Update outline progress
+        self._update_outline_progress()
+
         # Check if all done
         queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         if queue_idx >= len(self.outlining_queue):
@@ -3867,7 +3925,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         mask = path.contains_points(points).reshape(h, w)
         return mask.astype(np.uint8)
 
+    def _update_outline_progress(self):
+        """Update the outline progress bar with current completion count."""
+        if not hasattr(self, 'outlining_queue') or not self.outlining_queue:
+            return
+        completed = sum(len(data['soma_outlines']) for data in self.images.values())
+        total = len(self.outlining_queue)
+        self.outline_progress_bar.setMaximum(total)
+        self.outline_progress_bar.setValue(completed)
+        self.outline_progress_bar.setVisible(True)
+
     def _finish_outlining(self):
+        self.outline_progress_bar.setVisible(False)
         self.batch_mode = False
         self.processed_label.polygon_mode = False
         self.processed_label.point_edit_mode = False
