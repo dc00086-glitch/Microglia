@@ -66,6 +66,21 @@ def extract_channel(img, channel_idx):
 # AUTO-OUTLINE ALGORITHMS
 # ============================================================================
 
+MIN_OUTLINE_POINTS = 10
+
+def _simplify_contour(contour, min_points=MIN_OUTLINE_POINTS):
+    """Simplify a contour with approxPolyDP, ensuring at least min_points.
+    Starts with epsilon=0.02*arcLength and halves it until enough points."""
+    arc_len = cv2.arcLength(contour, True)
+    epsilon = 0.02 * arc_len
+    for _ in range(6):
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        if len(approx) >= min_points:
+            return approx
+        epsilon *= 0.5
+    # Final attempt with very small epsilon
+    return cv2.approxPolyDP(contour, 0.001 * arc_len, True)
+
 def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
     """
     Auto-outline using adaptive threshold + contour detection.
@@ -177,9 +192,8 @@ def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
         if area < 20:
             return None
 
-        # Simplify contour
-        epsilon = 0.02 * cv2.arcLength(best_contour, True)
-        approx = cv2.approxPolyDP(best_contour, epsilon, True)
+        # Simplify contour ensuring minimum points
+        approx = _simplify_contour(best_contour)
 
         # Convert back to image coordinates
         points = []
@@ -189,7 +203,7 @@ def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
             img_y = py + y1
             points.append((img_y, img_x))  # (row, col) format
 
-        return points if len(points) >= 3 else None
+        return points if len(points) >= MIN_OUTLINE_POINTS else None
 
     except Exception as e:
         print(f"Auto-outline threshold error: {e}")
@@ -273,12 +287,11 @@ def auto_outline_region_growing(image, centroid, sensitivity=50, max_iterations=
         # Get largest contour
         contour = max(contours, key=cv2.contourArea)
 
-        # Simplify
-        epsilon = 0.02 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
+        # Simplify ensuring minimum points
+        approx = _simplify_contour(contour)
 
         points = [(pt[0][1], pt[0][0]) for pt in approx]  # (row, col) format
-        return points if len(points) >= 3 else None
+        return points if len(points) >= MIN_OUTLINE_POINTS else None
 
     except Exception as e:
         print(f"Auto-outline region growing error: {e}")
@@ -370,12 +383,11 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
         if cv2.contourArea(contour) < 20:
             return None
 
-        epsilon = 0.02 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
+        approx = _simplify_contour(contour)
 
         # Convert back to image coordinates
         points = [(pt[0][1] + y1, pt[0][0] + x1) for pt in approx]
-        return points if len(points) >= 3 else None
+        return points if len(points) >= MIN_OUTLINE_POINTS else None
 
     except Exception as e:
         print(f"Auto-outline watershed error: {e}")
@@ -453,13 +465,14 @@ def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=15
             max_num_iter=250
         )
 
-        # Simplify snake to polygon
-        step = max(1, len(snake) // 30)
+        # Simplify snake to polygon, ensuring at least MIN_OUTLINE_POINTS
+        target_pts = max(30, MIN_OUTLINE_POINTS)
+        step = max(1, len(snake) // target_pts)
         simplified = snake[::step]
 
         # Convert back to image coordinates
         points = [(pt[1] + y1, pt[0] + x1) for pt in simplified]
-        return points if len(points) >= 3 else None
+        return points if len(points) >= MIN_OUTLINE_POINTS else None
 
     except Exception as e:
         print(f"Auto-outline active contours error: {e}")
@@ -497,7 +510,7 @@ def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
         best_score = 0
 
         for points, name in [(threshold_points, 'threshold'), (watershed_points, 'watershed')]:
-            if points is None or len(points) < 3:
+            if points is None or len(points) < MIN_OUTLINE_POINTS:
                 continue
 
             # Score based on: number of points (more = smoother), area, and compactness
@@ -532,7 +545,7 @@ def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
 
         # If nothing worked, try active contours as last resort
         active_points = auto_outline_active_contours(image, centroid, sensitivity, region_size)
-        if active_points is not None and len(active_points) >= 3:
+        if active_points is not None and len(active_points) >= MIN_OUTLINE_POINTS:
             return active_points
 
         # Return whatever we have
