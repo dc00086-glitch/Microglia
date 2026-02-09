@@ -1,35 +1,94 @@
 """
 Side-by-side comparison of Clarke et al. vs MMPS Sholl analysis on ONE mask.
 
-Usage:
-  1. Open your mask image in Fiji
-  2. Place a point ROI on the soma centroid
-  3. Run this script from Script Editor
-  4. A dialog asks for start radius, step size, pixel size
-  5. Both pipelines run on the same parsed profile
-  6. Results are printed to the Log window + saved to a comparison CSV
+Fully automatic - no manual ROI placement needed.
 
-This removes all file-structure complexity: one image, one ROI, one test.
+Usage:
+  1. Run this script from Fiji's Script Editor
+  2. A dialog asks for the cell mask file, soma mask file, and parameters
+  3. The centroid is computed automatically from the soma mask
+     (same method as Clarke's 6.Mask_Quantification.ijm: center of mass)
+  4. Both pipelines run on the same parsed profile
+  5. Results are printed to the Log window + saved to a comparison CSV
 """
 
 from ij import IJ
-from ij.measure import Calibration
-from ij.process import ImageProcessor
+from ij.measure import Calibration, Measurements
+from ij.process import ImageProcessor, ImageStatistics
 from sc.fiji.snt.analysis.sholl import Profile, ShollUtils
 from sc.fiji.snt.analysis.sholl.gui import ShollPlot
 from sc.fiji.snt.analysis.sholl.math import LinearProfileStats
 from sc.fiji.snt.analysis.sholl.math import NormalizedProfileStats
 from sc.fiji.snt.analysis.sholl.math import ShollStats
 from sc.fiji.snt.analysis.sholl.parsers import ImageParser2D
-from ij.gui import GenericDialog
+from ij.gui import GenericDialog, PointRoi
 import os
 import csv
+import math
 
 
 def checkCorrectMethodFlag(normProfileMethodFlag, assumedValue):
     if normProfileMethodFlag != assumedValue:
         print(str(normProfileMethodFlag))
         print('Problem with method flag')
+
+
+def computeSomaCentroid(somaPath):
+    """Compute center of mass from soma mask using ImageJ measurements.
+    This replicates Clarke's 6.Mask_Quantification.ijm approach:
+      List.setMeasurements -> XM, YM
+    Returns (cx, cy, somaAreaPixels) or None."""
+    somaImp = IJ.openImage(somaPath)
+    if somaImp is None:
+        IJ.log("ERROR: Could not open soma file: " + somaPath)
+        return None
+
+    # Set to pixel units like Clarke does:
+    #   run("Properties...", "unit=pixels pixel_width=1 pixel_height=1")
+    cal = Calibration(somaImp)
+    cal.pixelWidth = 1.0
+    cal.pixelHeight = 1.0
+    cal.setUnit("pixels")
+    somaImp.setCalibration(cal)
+
+    # Threshold so we measure only the soma foreground
+    somaImp.getProcessor().setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
+
+    # Get center of mass (XM, YM) - same as Clarke's List.setMeasurements
+    stats = ImageStatistics.getStatistics(
+        somaImp.getProcessor(),
+        Measurements.CENTER_OF_MASS | Measurements.AREA,
+        cal
+    )
+
+    cx = stats.xCenterOfMass
+    cy = stats.yCenterOfMass
+    # Area in pixels = number of foreground pixels (area / pixel area, but pixel area = 1)
+    # For binary: area from stats counts all non-zero pixels weighted by value,
+    # so we count foreground pixels directly
+    ip = somaImp.getProcessor()
+    fgCount = 0
+    for y in range(ip.getHeight()):
+        for x in range(ip.getWidth()):
+            if ip.getPixel(x, y) > 0:
+                fgCount += 1
+
+    somaImp.close()
+
+    if fgCount == 0:
+        IJ.log("ERROR: Soma mask is empty (no foreground pixels)")
+        return None
+
+    return (cx, cy, fgCount)
+
+
+def computeStartRadius(somaAreaPixels, pixelSize):
+    """Compute start radius from soma area using Clarke's formula:
+       startradius = 2 * (sqrt(somaArea) / PI)
+    where somaArea is in calibrated units (um^2)."""
+    somaAreaUm2 = somaAreaPixels * (pixelSize ** 2)
+    startRad = 2.0 * (math.sqrt(somaAreaUm2) / math.pi)
+    return startRad, somaAreaUm2
 
 
 def runShollAnalysis(imp, startRad, stepSize):
@@ -56,7 +115,7 @@ def runShollAnalysis(imp, startRad, stepSize):
 
 
 def clarkeAnalysis(profile, cal, maskName):
-    """Clarke et al. pipeline - original code, NO exception handling."""
+    """Clarke et al. pipeline."""
     lStats = LinearProfileStats(profile)
     nStatsSemiLog = NormalizedProfileStats(profile, ShollStats.AREA, 128)
     nStatsLogLog = NormalizedProfileStats(profile, ShollStats.AREA, 256)
@@ -118,7 +177,6 @@ def clarkeAnalysis(profile, cal, maskName):
             maskMetrics['Mean Value'] = lStats.getMean(True)
             maskMetrics['Polynomial Degree'] = bestDegree
         except:
-            # Same fix applied here for comparison purposes
             maskMetrics['Kurtosis (fit)'] = lStats.getKurtosis(True)
             maskMetrics['Ramification Index (fit)'] = lStats.getRamificationIndex(True)
             maskMetrics['Mean Value'] = lStats.getMean(True)
@@ -129,7 +187,7 @@ def clarkeAnalysis(profile, cal, maskName):
 
 
 def mmpsAnalysis(profile, cal, maskName):
-    """MMPS pipeline - your Sholl_Attempt3.py logic with the except fix."""
+    """MMPS pipeline - Sholl_Attempt3.py logic with the except fix."""
     lStats = LinearProfileStats(profile)
     nStatsSemiLog = NormalizedProfileStats(profile, ShollStats.AREA, 128)
     nStatsLogLog = NormalizedProfileStats(profile, ShollStats.AREA, 256)
@@ -198,29 +256,64 @@ def mmpsAnalysis(profile, cal, maskName):
 
 
 def main():
-    imp = IJ.getImage()
-    if imp is None:
-        IJ.error("No image open! Open a mask and place a point ROI on the soma centroid.")
-        return
-
-    roi = imp.getRoi()
-    if roi is None:
-        IJ.error("No ROI found! Place a point ROI on the soma centroid first.")
-        return
-
+    # --- Dialog: pick files and parameters ---
     gd = GenericDialog("Sholl Comparison Test")
+    gd.addFileField("Cell mask file", "")
+    gd.addFileField("Soma mask file", "")
     gd.addNumericField("Pixel Size (um/px)", 0.3, 3)
-    gd.addNumericField("Start Radius (um)", 0.0, 1)
     gd.addNumericField("Step Size (um) [0 = continuous]", 0.0, 1)
-    gd.addStringField("Save directory", os.path.join(os.path.expanduser("~"), "Desktop"))
+    gd.addCheckbox("Auto start radius from soma (Clarke formula)", True)
+    gd.addNumericField("Manual start radius (um) [if unchecked]", 5.0, 1)
+    gd.addStringField("Save directory", os.path.join(os.path.expanduser("~"), "Desktop"), 40)
     gd.showDialog()
     if gd.wasCanceled():
         return
 
+    maskPath = gd.getNextString()
+    somaPath = gd.getNextString()
     pixelSize = gd.getNextNumber()
-    startRad = gd.getNextNumber()
     stepSize = gd.getNextNumber()
+    autoStartRad = gd.getNextBoolean()
+    manualStartRad = gd.getNextNumber()
     saveDir = gd.getNextString()
+
+    if not os.path.exists(maskPath):
+        IJ.error("Cell mask file not found: " + maskPath)
+        return
+    if not os.path.exists(somaPath):
+        IJ.error("Soma mask file not found: " + somaPath)
+        return
+
+    # --- Compute soma centroid automatically ---
+    IJ.log("=" * 60)
+    IJ.log("SHOLL COMPARISON TEST (automatic centroid)")
+    IJ.log("=" * 60)
+    IJ.log("Cell mask: " + maskPath)
+    IJ.log("Soma mask: " + somaPath)
+
+    result = computeSomaCentroid(somaPath)
+    if result is None:
+        return
+    cx, cy, somaAreaPx = result
+
+    IJ.log("Soma centroid (XM, YM): (" + str(round(cx, 2)) + ", " + str(round(cy, 2)) + ")")
+    IJ.log("Soma area: " + str(somaAreaPx) + " pixels")
+
+    # --- Compute start radius ---
+    if autoStartRad:
+        startRad, somaAreaUm2 = computeStartRadius(somaAreaPx, pixelSize)
+        IJ.log("Start radius (Clarke formula): " + str(round(startRad, 3)) + " um")
+        IJ.log("Soma area: " + str(round(somaAreaUm2, 2)) + " um^2")
+    else:
+        startRad = manualStartRad
+        somaAreaUm2 = somaAreaPx * (pixelSize ** 2)
+        IJ.log("Start radius (manual): " + str(startRad) + " um")
+
+    # --- Open cell mask and set up ---
+    imp = IJ.openImage(maskPath)
+    if imp is None:
+        IJ.error("Could not open cell mask: " + maskPath)
+        return
 
     # Apply calibration
     cal = Calibration(imp)
@@ -229,24 +322,28 @@ def main():
     cal.setUnit("um")
     imp.setCalibration(cal)
 
-    # Threshold the binary mask
+    # Threshold binary mask
     imp.getProcessor().setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
 
-    maskName = imp.getTitle()
+    # Place Point ROI at soma centroid automatically
+    # (replicates Clarke's makePoint(somaCM[0], somaCM[1]))
+    roi = PointRoi(int(round(cx)), int(round(cy)))
+    imp.setRoi(roi)
+    imp.show()
 
-    # Parse once - shared by both pipelines
-    IJ.log("=" * 60)
-    IJ.log("SHOLL COMPARISON TEST")
-    IJ.log("Image: " + maskName)
-    IJ.log("=" * 60)
+    IJ.log("Point ROI placed at: (" + str(int(round(cx))) + ", " + str(int(round(cy))) + ")")
 
+    maskName = os.path.basename(maskPath)
+
+    # --- Parse once, shared by both pipelines ---
     profile, parser = runShollAnalysis(imp, startRad, stepSize)
     if profile is None:
+        imp.close()
         return
 
     cal = Calibration(imp)
 
-    # Run both pipelines
+    # --- Run both pipelines ---
     IJ.log("")
     IJ.log("Running Clarke et al. pipeline...")
     clarkeMetrics = clarkeAnalysis(profile, cal, maskName)
@@ -254,13 +351,12 @@ def main():
     IJ.log("Running MMPS pipeline...")
     mmpsMetrics = mmpsAnalysis(profile, cal, maskName)
 
-    # Compare shared metrics
+    # --- Compare ---
     IJ.log("")
     IJ.log("=" * 60)
     IJ.log("COMPARISON (Clarke vs MMPS)")
     IJ.log("=" * 60)
 
-    # Keys that exist in both (skip the renamed ones)
     sharedKeys = [
         'Primary Branches', 'Intersecting Radii', 'Sum of Intersections',
         'Mean of Intersections', 'Median of Intersections',
@@ -293,8 +389,10 @@ def main():
     else:
         IJ.log("SOME METRICS DIFFER - check above for MISMATCH lines")
 
-    # Save comparison CSV
+    # --- Save comparison CSV ---
     if saveDir:
+        if not os.path.exists(saveDir):
+            os.makedirs(saveDir)
         csvPath = os.path.join(saveDir, "ShollComparisonTest.csv")
         with open(csvPath, 'wb') as f:
             writer = csv.writer(f)
@@ -306,6 +404,7 @@ def main():
         IJ.log("Comparison CSV saved to: " + csvPath)
 
     IJ.log("=" * 60)
+    imp.close()
 
 
 main()
