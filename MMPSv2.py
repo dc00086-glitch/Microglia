@@ -3244,6 +3244,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.original_label.polygon_mode = False
         self.preview_label.polygon_mode = False
         self.mask_label.polygon_mode = False
+        self.redo_outline_btn.setEnabled(False)
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.done_btn.setEnabled(False)
@@ -3379,11 +3380,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+        # Reset zoom then autozoom onto the soma for easier review
+        self.processed_label.reset_zoom()
+        self.processed_label.set_zoom(10.0, center=soma)
         self.tabs.setCurrentIndex(2)
 
         self.nav_status_label.setText(
             f"Review {review_idx + 1}/{len(self.outlining_queue)} | "
-            f"{img_name} | {soma_id} | {status}"
+            f"{img_name} | {soma_id} | {status} | "
+            f"Zoom: {self.processed_label.zoom_level:.1f}x"
         )
 
         # Enable/disable buttons
@@ -3681,7 +3686,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "No somas in outlining queue")
             return
 
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        # Use correct index depending on mode
+        if hasattr(self, 'review_mode') and self.review_mode:
+            queue_idx = self.current_review_idx
+        else:
+            queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         if queue_idx >= len(self.outlining_queue):
             QMessageBox.warning(self, "Warning", "All somas already outlined")
             return
@@ -3723,6 +3732,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.polygon_points = list(points)
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+        # Autozoom onto the soma
+        self.processed_label.reset_zoom()
+        self.processed_label.set_zoom(10.0, center=soma)
 
         # Enable point editing mode
         self.processed_label.point_edit_mode = True
@@ -3730,7 +3742,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.nav_status_label.setText(
             f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
-            f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)} (Auto)"
+            f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)} (Auto) | "
+            f"Zoom: {self.processed_label.zoom_level:.1f}x"
         )
         self.log(f"✓ Auto-outlined {soma_id} with {len(self.polygon_points)} points")
         self.log("  → Drag points to adjust, then press Enter or [Accept]")
@@ -3843,7 +3856,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.processed_label.selected_point_idx = None
         self.processed_label.dragging_point = False
 
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        # Use correct index depending on mode
+        if hasattr(self, 'review_mode') and self.review_mode:
+            queue_idx = self.current_review_idx
+        else:
+            queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         if queue_idx < len(self.outlining_queue):
             img_name, soma_idx = self.outlining_queue[queue_idx]
             img_data = self.images[img_name]
@@ -3851,9 +3868,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
             soma_id = img_data['soma_ids'][soma_idx]
             pixmap = self._get_outlining_pixmap(img_data)
             self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=[])
+            # Autozoom onto the soma
+            self.processed_label.reset_zoom()
+            self.processed_label.set_zoom(10.0, center=soma)
             self.nav_status_label.setText(
                 f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
-                f"Image: {img_name} | ID: {soma_id} | Manual Mode"
+                f"Image: {img_name} | ID: {soma_id} | Manual Mode | "
+                f"Zoom: {self.processed_label.zoom_level:.1f}x"
             )
 
         self.log("✏ Manual mode - click to add points, right-click to complete")
