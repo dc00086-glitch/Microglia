@@ -21,6 +21,8 @@ from scipy import ndimage, stats
 from matplotlib.path import Path as mplPath
 import cv2
 import glob
+import json
+import math
 
 
 def load_tiff_image(filepath):
@@ -837,6 +839,10 @@ class InteractiveImageLabel(QLabel):
         self.selected_point_idx = None
         self.dragging_point = False
         self.setMouseTracking(True)  # Enable mouse tracking for hover effects
+        # Measurement tool
+        self.measure_mode = False
+        self.measure_pt1 = None  # (row, col) image coords
+        self.measure_pt2 = None
 
     def set_image(self, qpix, centroids=None, mask_overlay=None, polygon_pts=None):
         self.pix_source = qpix
@@ -938,6 +944,30 @@ class InteractiveImageLabel(QLabel):
         if self.polygon_mode and len(self.polygon_pts) > 0:
             self._draw_polygon(painter)
 
+        # Draw measurement overlay
+        if self.measure_mode and self.measure_pt1 is not None:
+            pen = QPen(QColor(255, 255, 0), 2, Qt.DashLine)
+            painter.setPen(pen)
+            x1, y1 = self._to_display_coords(self.measure_pt1)
+            # Draw first point marker
+            painter.setBrush(QColor(255, 255, 0, 150))
+            painter.drawEllipse(int(x1 - 5), int(y1 - 5), 10, 10)
+            if self.measure_pt2 is not None:
+                x2, y2 = self._to_display_coords(self.measure_pt2)
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+                painter.drawEllipse(int(x2 - 5), int(y2 - 5), 10, 10)
+                # Draw distance label at midpoint
+                mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                if self.parent_widget and hasattr(self.parent_widget, '_get_measure_text'):
+                    text = self.parent_widget._get_measure_text()
+                    painter.setPen(QColor(0, 0, 0))
+                    painter.setBrush(QColor(255, 255, 200, 220))
+                    fm = painter.fontMetrics()
+                    tw = fm.horizontalAdvance(text) + 8
+                    painter.drawRect(int(mx - tw / 2), int(my - 18), tw, 20)
+                    painter.setPen(QColor(0, 0, 0))
+                    painter.drawText(int(mx - tw / 2 + 4), int(my - 2), text)
+
         # Draw zoom indicator
         if self.zoom_level != 1.0:
             painter.setPen(QPen(QColor(50, 50, 50)))
@@ -1001,6 +1031,20 @@ class InteractiveImageLabel(QLabel):
 
         coords = self._to_image_coords(event.pos().x(), event.pos().y())
         if not coords:
+            return
+
+        # Measurement mode takes priority over other modes
+        if self.measure_mode and event.button() == Qt.LeftButton:
+            if self.measure_pt1 is None or self.measure_pt2 is not None:
+                # Start new measurement
+                self.measure_pt1 = coords
+                self.measure_pt2 = None
+            else:
+                # Complete measurement
+                self.measure_pt2 = coords
+                if self.parent_widget and hasattr(self.parent_widget, '_show_measurement'):
+                    self.parent_widget._show_measurement()
+            self._update_display()
             return
 
         if self.soma_mode and self.parent_widget:
@@ -1376,6 +1420,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.show_color_view = False
         # Z key tracking for zoom functionality
         self.z_key_held = False
+        # Measurement tool state
+        self.measure_mode = False
+        self.measure_point1 = None  # (row, col) image coords
+        self.measure_point2 = None
         self.init_ui()
 
     def keyPressEvent(self, event):
@@ -1385,6 +1433,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if key == Qt.Key_Z:
             self.z_key_held = True
             return  # Don't process further, Z is for zoom
+
+        # F1 shows help regardless of mode
+        if key == Qt.Key_F1:
+            self.show_shortcut_help()
+            return
+
+        # M key toggles measure tool (only when not in active input modes)
+        if key == Qt.Key_M and not self.processed_label.soma_mode and not self.processed_label.polygon_mode and not self.mask_qa_active:
+            self.toggle_measure_mode()
+            return
 
         # U key resets zoom on current view
         if key == Qt.Key_U:
@@ -1491,6 +1549,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.shortcut_color.activated.connect(self.toggle_color_view)
         self.shortcut_zoom_reset = QShortcut(QKeySequence('U'), self)
         self.shortcut_zoom_reset.activated.connect(self._reset_current_zoom)
+        self.shortcut_help = QShortcut(QKeySequence('F1'), self)
+        self.shortcut_help.activated.connect(self.show_shortcut_help)
+        self.shortcut_measure = QShortcut(QKeySequence('M'), self)
+        self.shortcut_measure.activated.connect(self.toggle_measure_mode)
 
     def _create_left_panel(self):
         panel = QWidget()
@@ -1715,6 +1777,33 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_calculate_btn.clicked.connect(self.batch_calculate_morphology)
         self.batch_calculate_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_calculate_btn)
+
+        # ImageJ integration buttons
+        imagej_layout = QHBoxLayout()
+        self.launch_imagej_btn = QPushButton("Generate ImageJ Scripts")
+        self.launch_imagej_btn.clicked.connect(self.generate_imagej_scripts)
+        self.launch_imagej_btn.setEnabled(False)
+        self.launch_imagej_btn.setToolTip("Generate Sholl & Skeleton analysis scripts for Fiji")
+        imagej_layout.addWidget(self.launch_imagej_btn)
+        self.import_imagej_btn = QPushButton("Import ImageJ Results")
+        self.import_imagej_btn.clicked.connect(self.import_imagej_results)
+        self.import_imagej_btn.setEnabled(False)
+        self.import_imagej_btn.setToolTip("Import Sholl & Skeleton CSVs and merge with morphology results")
+        imagej_layout.addWidget(self.import_imagej_btn)
+        batch_layout.addLayout(imagej_layout)
+
+        # Session save/restore buttons
+        session_layout = QHBoxLayout()
+        save_session_btn = QPushButton("Save Session")
+        save_session_btn.clicked.connect(self.save_session)
+        save_session_btn.setToolTip("Save current project state to resume later")
+        session_layout.addWidget(save_session_btn)
+        load_session_btn = QPushButton("Load Session")
+        load_session_btn.clicked.connect(self.load_session)
+        load_session_btn.setToolTip("Resume a previously saved session")
+        session_layout.addWidget(load_session_btn)
+        batch_layout.addLayout(session_layout)
+
         batch_group.setLayout(batch_layout)
         layout.addWidget(batch_group)
         log_group = QGroupBox("Log")
@@ -1773,11 +1862,25 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.channel_select_btn.setVisible(False)  # Hidden until color view is on
         display_btn_layout.addWidget(self.channel_select_btn)
 
+        # Measure tool button
+        self.measure_btn = QPushButton("Measure (M)")
+        self.measure_btn.clicked.connect(self.toggle_measure_mode)
+        self.measure_btn.setToolTip("Click two points to measure distance in microns")
+        self.measure_btn.setCheckable(True)
+        display_btn_layout.addWidget(self.measure_btn)
+
+        # Help button
+        help_btn = QPushButton("? (F1)")
+        help_btn.setFixedWidth(55)
+        help_btn.clicked.connect(self.show_shortcut_help)
+        help_btn.setToolTip("Show keyboard shortcuts for current mode")
+        display_btn_layout.addWidget(help_btn)
+
         layout.addLayout(display_btn_layout)
 
         # Zoom hint row
         zoom_layout = QHBoxLayout()
-        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, U: reset zoom")
+        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, U: reset, M: measure, F1: help")
         zoom_hint.setStyleSheet("color: #666; font-size: 10px;")
         zoom_layout.addWidget(zoom_hint)
         zoom_layout.addStretch()
@@ -2017,6 +2120,692 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def log(self, message):
         self.log_text.append(str(message))
+
+    # ========================================================================
+    # KEYBOARD SHORTCUT HELP
+    # ========================================================================
+
+    def show_shortcut_help(self):
+        """Show context-sensitive keyboard shortcuts overlay"""
+        # Determine current mode
+        mode = "General"
+        if self.mask_qa_active:
+            mode = "Mask QA"
+        elif hasattr(self, 'processed_label') and self.processed_label.polygon_mode:
+            mode = "Soma Outlining"
+        elif hasattr(self, 'processed_label') and self.processed_label.soma_mode:
+            mode = "Soma Picking"
+
+        html = "<h3>Keyboard Shortcuts</h3>"
+        html += f"<p><b>Current mode: {mode}</b></p>"
+        html += "<table cellpadding='4' style='border-collapse: collapse;'>"
+
+        # Always-available shortcuts
+        html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Always Available</b></td></tr>"
+        always = [
+            ("F1", "Show this help"),
+            ("C", "Toggle color / grayscale"),
+            ("U", "Reset zoom"),
+            ("Z + Left-click", "Zoom in"),
+            ("Z + Right-click", "Zoom out"),
+            ("M", "Toggle measure tool"),
+        ]
+        for key, desc in always:
+            html += f"<tr><td><code>{key}</code></td><td>{desc}</td></tr>"
+
+        if mode == "Soma Picking":
+            html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Soma Picking</b></td></tr>"
+            shortcuts = [
+                ("Left-click", "Place soma centroid"),
+                ("Backspace", "Remove last soma"),
+                ("Enter", "Done with current image"),
+                ("Escape", "Cancel soma picking"),
+            ]
+            for key, desc in shortcuts:
+                html += f"<tr><td><code>{key}</code></td><td>{desc}</td></tr>"
+
+        elif mode == "Soma Outlining":
+            html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Soma Outlining</b></td></tr>"
+            shortcuts = [
+                ("Left-click", "Place outline point / drag existing point"),
+                ("Right-click", "Finish outline"),
+                ("Double-click", "Finish outline"),
+                ("Backspace", "Remove last point"),
+                ("Escape", "Restart current outline"),
+                ("Enter", "Accept outline"),
+            ]
+            for key, desc in shortcuts:
+                html += f"<tr><td><code>{key}</code></td><td>{desc}</td></tr>"
+
+        elif mode == "Mask QA":
+            html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Mask QA Review</b></td></tr>"
+            shortcuts = [
+                ("A / Space", "Approve current mask"),
+                ("R", "Reject current mask"),
+                ("Left arrow", "Previous mask"),
+                ("Right arrow", "Next mask"),
+            ]
+            for key, desc in shortcuts:
+                html += f"<tr><td><code>{key}</code></td><td>{desc}</td></tr>"
+
+        html += "</table>"
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Keyboard Shortcuts")
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setText(html)
+        dialog.setTextFormat(Qt.RichText)
+        dialog.exec_()
+
+    # ========================================================================
+    # MEASUREMENT TOOL
+    # ========================================================================
+
+    def toggle_measure_mode(self):
+        """Toggle the measurement tool on/off"""
+        self.measure_mode = not self.measure_mode
+        self.measure_btn.setChecked(self.measure_mode)
+
+        # Set mode on the active display label
+        for label in [self.original_label, self.preview_label, self.processed_label, self.mask_label]:
+            label.measure_mode = self.measure_mode
+            if not self.measure_mode:
+                label.measure_pt1 = None
+                label.measure_pt2 = None
+                label._update_display()
+
+        if self.measure_mode:
+            self.log("Measure tool ON - click two points to measure distance")
+        else:
+            self.log("Measure tool OFF")
+
+    def _get_measure_text(self):
+        """Get formatted measurement text for display overlay"""
+        label = self._get_active_label()
+        if not label or label.measure_pt1 is None or label.measure_pt2 is None:
+            return ""
+        try:
+            pixel_size = float(self.pixel_size_input.text())
+        except (ValueError, AttributeError):
+            pixel_size = 0.316
+
+        pt1 = label.measure_pt1
+        pt2 = label.measure_pt2
+        dx = (pt2[1] - pt1[1])
+        dy = (pt2[0] - pt1[0])
+        dist_px = math.sqrt(dx * dx + dy * dy)
+        dist_um = dist_px * pixel_size
+        return f"{dist_um:.2f} um ({dist_px:.0f} px)"
+
+    def _show_measurement(self):
+        """Log the measurement result"""
+        text = self._get_measure_text()
+        if text:
+            self.log(f"Measurement: {text}")
+
+    def _get_active_label(self):
+        """Return the InteractiveImageLabel in the currently visible tab"""
+        idx = self.tabs.currentIndex()
+        labels = [self.original_label, self.preview_label, self.processed_label, self.mask_label]
+        if 0 <= idx < len(labels):
+            return labels[idx]
+        return self.processed_label
+
+    # ========================================================================
+    # SESSION SAVE / RESTORE
+    # ========================================================================
+
+    def save_session(self):
+        """Save the entire project state to a JSON file"""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Session", "", "Session Files (*.mmps_session);;All Files (*)",
+            options=QFileDialog.DontUseNativeDialog
+        )
+        if not path:
+            return
+
+        if not path.endswith('.mmps_session'):
+            path += '.mmps_session'
+
+        try:
+            session = {
+                'version': 2,
+                'output_dir': self.output_dir,
+                'masks_dir': self.masks_dir,
+                'colocalization_mode': self.colocalization_mode,
+                'pixel_size': self.pixel_size_input.text(),
+                'rolling_ball_radius': self.default_rolling_ball_radius,
+                'use_min_intensity': self.use_min_intensity,
+                'min_intensity_percent': self.min_intensity_percent,
+                'coloc_channel_1': self.coloc_channel_1,
+                'coloc_channel_2': self.coloc_channel_2,
+                'grayscale_channel': self.grayscale_channel,
+                'images': {}
+            }
+
+            for img_name, img_data in self.images.items():
+                img_session = {
+                    'raw_path': img_data['raw_path'],
+                    'status': img_data['status'],
+                    'selected': img_data['selected'],
+                    'animal_id': img_data.get('animal_id', ''),
+                    'treatment': img_data.get('treatment', ''),
+                    'rolling_ball_radius': img_data.get('rolling_ball_radius', 50),
+                    'somas': [(float(s[0]), float(s[1])) for s in img_data.get('somas', [])],
+                    'soma_ids': img_data.get('soma_ids', []),
+                    'soma_outlines': [],
+                }
+                # Save soma outlines (list of list of (row, col) tuples)
+                for outline in img_data.get('soma_outlines', []):
+                    img_session['soma_outlines'].append(
+                        [(float(pt[0]), float(pt[1])) for pt in outline]
+                    )
+
+                session['images'][img_name] = img_session
+
+            with open(path, 'w') as f:
+                json.dump(session, f, indent=2)
+
+            self.log(f"Session saved to: {path}")
+            QMessageBox.information(self, "Session Saved", f"Session saved to:\n{path}")
+
+        except Exception as e:
+            self.log(f"ERROR saving session: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save session:\n{e}")
+
+    def load_session(self):
+        """Restore a previously saved session"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Session", "", "Session Files (*.mmps_session);;All Files (*)",
+            options=QFileDialog.DontUseNativeDialog
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, 'r') as f:
+                session = json.load(f)
+
+            if session.get('version', 1) < 2:
+                QMessageBox.warning(self, "Warning", "Incompatible session file version.")
+                return
+
+            # Verify image files still exist
+            missing = []
+            for img_name, img_session in session['images'].items():
+                if not os.path.exists(img_session['raw_path']):
+                    missing.append(img_name)
+
+            if missing:
+                reply = QMessageBox.question(
+                    self, "Missing Files",
+                    f"{len(missing)} image(s) not found at original paths:\n\n" +
+                    "\n".join(missing[:5]) +
+                    ("\n..." if len(missing) > 5 else "") +
+                    "\n\nContinue loading available images?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    return
+
+            # Restore settings
+            self.output_dir = session.get('output_dir')
+            self.masks_dir = session.get('masks_dir')
+            self.colocalization_mode = session.get('colocalization_mode', False)
+            self.use_min_intensity = session.get('use_min_intensity', True)
+            self.min_intensity_percent = session.get('min_intensity_percent', 30)
+            self.coloc_channel_1 = session.get('coloc_channel_1', 0)
+            self.coloc_channel_2 = session.get('coloc_channel_2', 1)
+            self.grayscale_channel = session.get('grayscale_channel', 0)
+
+            pixel_size = session.get('pixel_size', '0.316')
+            self.pixel_size_input.setText(str(pixel_size))
+            self.default_rolling_ball_radius = session.get('rolling_ball_radius', 50)
+
+            if self.colocalization_mode:
+                self.show_color_view = True
+                self.color_toggle_btn.setText("Show Grayscale (C)")
+                self.channel_select_btn.setVisible(True)
+
+            # Ensure output dirs exist
+            if self.output_dir:
+                os.makedirs(self.output_dir, exist_ok=True)
+            if self.masks_dir:
+                os.makedirs(self.masks_dir, exist_ok=True)
+                self.somas_dir = os.path.join(self.output_dir, "somas") if self.output_dir else None
+                if self.somas_dir:
+                    os.makedirs(self.somas_dir, exist_ok=True)
+
+            # Restore images
+            from PyQt5.QtGui import QColor, QBrush
+            self.images = {}
+            self.file_list.clear()
+
+            for img_name, img_session in session['images'].items():
+                if img_name in missing:
+                    continue
+
+                self.images[img_name] = {
+                    'raw_path': img_session['raw_path'],
+                    'processed': None,
+                    'rolling_ball_radius': img_session.get('rolling_ball_radius', 50),
+                    'somas': [tuple(s) for s in img_session.get('somas', [])],
+                    'soma_ids': img_session.get('soma_ids', []),
+                    'soma_outlines': [
+                        [tuple(pt) for pt in outline]
+                        for outline in img_session.get('soma_outlines', [])
+                    ],
+                    'masks': [],
+                    'status': img_session.get('status', 'loaded'),
+                    'selected': img_session.get('selected', False),
+                    'animal_id': img_session.get('animal_id', ''),
+                    'treatment': img_session.get('treatment', ''),
+                }
+
+                status = img_session.get('status', 'loaded')
+                status_colors = {
+                    'loaded': ('#808080', '⚪'),
+                    'processed': ('#009600', '🟢'),
+                    'somas_picked': ('#0064C8', '🔵'),
+                    'outlined': ('#C89600', '🟡'),
+                    'masks_generated': ('#FF8C00', '🟠'),
+                    'qa_complete': ('#800080', '🟣'),
+                    'analyzed': ('#00B400', '✅'),
+                }
+                color_hex, icon = status_colors.get(status, ('#808080', '⚪'))
+                check_icon = "☑" if img_session.get('selected') else "☐"
+                item = QListWidgetItem(f"{check_icon} {icon} {img_name} [{status}]")
+                item.setData(Qt.UserRole, img_name)
+                item.setCheckState(Qt.Checked if img_session.get('selected') else Qt.Unchecked)
+                item.setForeground(QBrush(QColor(color_hex)))
+                self.file_list.addItem(item)
+
+            # Load and display first image
+            if self.images:
+                first_name = sorted(self.images.keys())[0]
+                self.current_image_name = first_name
+                self._display_current_image()
+                self.file_list.setCurrentRow(0)
+                self.process_selected_btn.setEnabled(True)
+
+            # Enable buttons based on restored state
+            self._update_buttons_after_session_load()
+
+            n_loaded = len(self.images)
+            n_with_somas = sum(1 for d in self.images.values() if d['somas'])
+            n_with_outlines = sum(1 for d in self.images.values() if d['soma_outlines'])
+            self.log("=" * 50)
+            self.log(f"Session loaded: {n_loaded} images")
+            if n_with_somas:
+                self.log(f"  {n_with_somas} images with somas picked")
+            if n_with_outlines:
+                self.log(f"  {n_with_outlines} images with soma outlines")
+            self.log("=" * 50)
+
+            QMessageBox.information(self, "Session Loaded",
+                f"Session restored:\n\n"
+                f"Images: {n_loaded}\n"
+                f"With somas: {n_with_somas}\n"
+                f"With outlines: {n_with_outlines}\n\n"
+                f"Note: Processed images and masks need to be regenerated."
+            )
+
+        except Exception as e:
+            self.log(f"ERROR loading session: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to load session:\n{e}")
+
+    def _update_buttons_after_session_load(self):
+        """Enable appropriate buttons based on restored session state"""
+        has_selected = any(d['selected'] for d in self.images.values())
+        has_processed = any(d['status'] != 'loaded' for d in self.images.values())
+        has_somas = any(d['somas'] for d in self.images.values())
+        has_outlines = any(d['soma_outlines'] for d in self.images.values())
+
+        self.process_selected_btn.setEnabled(has_selected)
+        if has_processed:
+            self.batch_pick_somas_btn.setEnabled(True)
+        if has_somas:
+            self.batch_outline_btn.setEnabled(True)
+        if has_outlines:
+            self.batch_generate_masks_btn.setEnabled(True)
+        if self.output_dir:
+            self.launch_imagej_btn.setEnabled(True)
+            self.import_imagej_btn.setEnabled(True)
+
+    # ========================================================================
+    # IMAGEJ SCRIPT GENERATION
+    # ========================================================================
+
+    def generate_imagej_scripts(self):
+        """Generate Fiji/ImageJ scripts for Sholl and Skeleton analysis"""
+        if not self.masks_dir or not self.output_dir:
+            QMessageBox.warning(self, "Warning",
+                "Please set an output folder and export masks first.")
+            return
+
+        try:
+            pixel_size = float(self.pixel_size_input.text())
+        except ValueError:
+            pixel_size = 0.316
+
+        masks_path = self.masks_dir.replace("\\", "/")
+        output_path = self.output_dir.replace("\\", "/")
+        somas_path = os.path.join(self.output_dir, "somas").replace("\\", "/")
+
+        # Determine scale factor from pixel size
+        scale_factor = 2 if pixel_size > 0.2 else 1
+
+        # Generate Sholl analysis script
+        sholl_script = f'''// Sholl Analysis - Auto-generated by MMPS
+// Run this in Fiji with the SNT plugin installed
+// Masks dir: {masks_path}
+// Output dir: {output_path}
+
+#@File(label="Masks Directory", style="directory", value="{masks_path}") masksDir
+#@File(label="Somas Directory", style="directory", value="{somas_path}") somasDir
+#@File(label="Output Directory", style="directory", value="{output_path}") outputDir
+#@Float(label="Pixel Size (um/pixel)", value={pixel_size}) pixelSize
+
+// This script requires Sholl_Attempt3.py to be run in Fiji's script editor.
+// 1. Open Fiji
+// 2. File > Open... > select Sholl_Attempt3.py
+// 3. Click Run
+// 4. Set the directories when prompted
+
+print("=== Sholl Analysis ===");
+print("Masks: " + masksDir);
+print("Somas: " + somasDir);
+print("Output: " + outputDir);
+print("Pixel size: " + pixelSize + " um/px");
+'''
+
+        # Generate Skeleton analysis script
+        skeleton_script = f'''// Skeleton Analysis - Auto-generated by MMPS
+// Run this in Fiji
+// Masks dir: {masks_path}
+// Output dir: {output_path}
+
+#@File(label="Masks Directory", style="directory", value="{masks_path}") masksDir
+#@File(label="Output Directory", style="directory", value="{output_path}") outputDir
+#@Float(label="Pixel Size (um/pixel)", value={pixel_size}) pixelSize
+#@Integer(label="Upscale Factor (2 for 20x, 1 for 40x)", value={scale_factor}) scaleFactor
+
+// This script requires SkeletonAnalysisImageJ.py to be run in Fiji's script editor.
+// 1. Open Fiji
+// 2. File > Open... > select SkeletonAnalysisImageJ.py
+// 3. Click Run
+// 4. Set the directories when prompted
+
+print("=== Skeleton Analysis ===");
+print("Masks: " + masksDir);
+print("Output: " + outputDir);
+print("Pixel size: " + pixelSize + " um/px");
+print("Scale factor: " + scaleFactor + "x");
+'''
+
+        # Generate a combined batch runner script
+        script_dir = self.output_dir
+
+        # Write instructions file
+        instructions = f"""MMPS ImageJ Analysis Instructions
+===================================
+
+Your masks are in: {masks_path}
+Your soma files are in: {somas_path}
+Output goes to: {output_path}
+Pixel size: {pixel_size} um/pixel
+Upscale factor: {scale_factor}x
+
+Step 1: Sholl Analysis
+-----------------------
+1. Open Fiji/ImageJ
+2. File > Open > select "Sholl_Attempt3.py" from your Microglia folder
+3. Click "Run" in the script editor
+4. When prompted, set:
+   - Masks Directory: {masks_path}
+   - Somas Directory: {somas_path}
+   - Output Directory: {output_path}
+   - Pixel Size: {pixel_size}
+
+Step 2: Skeleton Analysis
+--------------------------
+1. In Fiji, File > Open > select "SkeletonAnalysisImageJ.py"
+2. Click "Run" in the script editor
+3. When prompted, set:
+   - Masks Directory: {masks_path}
+   - Output Directory: {output_path}
+   - Pixel Size: {pixel_size}
+   - Upscale Factor: {scale_factor}
+
+Step 3: Import Results Back
+----------------------------
+1. Return to MMPS
+2. Click "Import ImageJ Results"
+3. Select the output folder
+4. The Sholl and Skeleton results will be merged with your morphology CSV
+"""
+
+        instructions_path = os.path.join(script_dir, "ImageJ_Analysis_Instructions.txt")
+        with open(instructions_path, 'w') as f:
+            f.write(instructions)
+
+        # Write parameter file that Sholl/Skeleton scripts can read
+        params = {
+            'masks_dir': masks_path,
+            'somas_dir': somas_path,
+            'output_dir': output_path,
+            'pixel_size': pixel_size,
+            'scale_factor': scale_factor,
+        }
+        params_path = os.path.join(script_dir, "imagej_params.json")
+        with open(params_path, 'w') as f:
+            json.dump(params, f, indent=2)
+
+        self.log("=" * 50)
+        self.log("ImageJ analysis files generated:")
+        self.log(f"  Instructions: {instructions_path}")
+        self.log(f"  Parameters: {params_path}")
+        self.log("")
+        self.log("To run analysis:")
+        self.log("  1. Open Fiji/ImageJ")
+        self.log(f"  2. Open Sholl_Attempt3.py and run with masks dir: {masks_path}")
+        self.log(f"  3. Open SkeletonAnalysisImageJ.py and run with masks dir: {masks_path}")
+        self.log("  4. Return here and click 'Import ImageJ Results'")
+        self.log("=" * 50)
+
+        QMessageBox.information(self, "ImageJ Scripts Generated",
+            f"Analysis files saved to:\n{script_dir}\n\n"
+            f"See ImageJ_Analysis_Instructions.txt for step-by-step guide.\n\n"
+            f"Directories pre-configured:\n"
+            f"  Masks: {masks_path}\n"
+            f"  Somas: {somas_path}\n"
+            f"  Output: {output_path}\n"
+            f"  Pixel size: {pixel_size} um/px"
+        )
+
+    # ========================================================================
+    # IMPORT IMAGEJ RESULTS
+    # ========================================================================
+
+    def import_imagej_results(self):
+        """Import Sholl and Skeleton CSVs from ImageJ and merge with morphology results"""
+        if not self.output_dir:
+            QMessageBox.warning(self, "Warning", "Please set an output folder first.")
+            return
+
+        import csv
+
+        # Look for ImageJ output files
+        sholl_path = os.path.join(self.output_dir, "Sholl_Combined_Results.csv")
+        skeleton_path = os.path.join(self.output_dir, "Skeleton_Analysis_Results.csv")
+        morphology_path = os.path.join(self.output_dir, "combined_morphology_results.csv")
+
+        # Allow user to locate files if not found in expected location
+        found_sholl = os.path.exists(sholl_path)
+        found_skeleton = os.path.exists(skeleton_path)
+        found_morphology = os.path.exists(morphology_path)
+
+        if not found_sholl and not found_skeleton:
+            reply = QMessageBox.question(
+                self, "Files Not Found",
+                "No Sholl or Skeleton results found in the output folder.\n\n"
+                "Would you like to browse for them?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+            # Browse for Sholl results
+            sholl_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Sholl Results CSV (or Cancel to skip)", self.output_dir,
+                "CSV Files (*.csv);;All Files (*)",
+                options=QFileDialog.DontUseNativeDialog
+            )
+            found_sholl = bool(sholl_path) and os.path.exists(sholl_path)
+
+            # Browse for Skeleton results
+            skeleton_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Skeleton Results CSV (or Cancel to skip)", self.output_dir,
+                "CSV Files (*.csv);;All Files (*)",
+                options=QFileDialog.DontUseNativeDialog
+            )
+            found_skeleton = bool(skeleton_path) and os.path.exists(skeleton_path)
+
+        if not found_sholl and not found_skeleton:
+            QMessageBox.information(self, "No Files", "No ImageJ results to import.")
+            return
+
+        self.log("=" * 50)
+        self.log("Importing ImageJ results...")
+
+        # Read Sholl results
+        sholl_data = {}
+        if found_sholl:
+            try:
+                with open(sholl_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        # Match by cell_name which corresponds to mask filename pattern
+                        cell_name = row.get('Cell', row.get('cell_name', ''))
+                        if cell_name:
+                            sholl_data[cell_name] = {f"sholl_{k}": v for k, v in row.items() if k != 'Cell' and k != 'cell_name'}
+                self.log(f"  Sholl: loaded {len(sholl_data)} cells from {os.path.basename(sholl_path)}")
+            except Exception as e:
+                self.log(f"  ERROR reading Sholl results: {e}")
+
+        # Read Skeleton results
+        skeleton_data = {}
+        if found_skeleton:
+            try:
+                with open(skeleton_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        cell_name = row.get('cell_name', '')
+                        if cell_name:
+                            skeleton_data[cell_name] = {f"skel_{k}": v for k, v in row.items() if k != 'cell_name'}
+                self.log(f"  Skeleton: loaded {len(skeleton_data)} cells from {os.path.basename(skeleton_path)}")
+            except Exception as e:
+                self.log(f"  ERROR reading Skeleton results: {e}")
+
+        # Read existing morphology results
+        morphology_rows = []
+        morph_fieldnames = []
+        if found_morphology:
+            try:
+                with open(morphology_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    morph_fieldnames = list(reader.fieldnames)
+                    morphology_rows = list(reader)
+                self.log(f"  Morphology: loaded {len(morphology_rows)} cells")
+            except Exception as e:
+                self.log(f"  ERROR reading morphology results: {e}")
+
+        if not morphology_rows:
+            self.log("  No morphology results to merge with. Saving ImageJ results separately.")
+            # Save a combined ImageJ-only file
+            all_ij_data = {}
+            for cell_name, data in sholl_data.items():
+                all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(data)
+            for cell_name, data in skeleton_data.items():
+                all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(data)
+
+            if all_ij_data:
+                combined_ij_path = os.path.join(self.output_dir, "imagej_combined_results.csv")
+                all_keys = set()
+                for d in all_ij_data.values():
+                    all_keys.update(d.keys())
+                ordered = ['cell_name'] + sorted(k for k in all_keys if k != 'cell_name')
+                with open(combined_ij_path, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=ordered)
+                    writer.writeheader()
+                    writer.writerows(all_ij_data.values())
+                self.log(f"  Saved ImageJ results to: {combined_ij_path}")
+        else:
+            # Merge with morphology results
+            matched_sholl = 0
+            matched_skel = 0
+
+            new_sholl_keys = set()
+            new_skel_keys = set()
+            for d in sholl_data.values():
+                new_sholl_keys.update(d.keys())
+            for d in skeleton_data.values():
+                new_skel_keys.update(d.keys())
+
+            for row in morphology_rows:
+                img_name = row.get('image_name', '')
+                soma_id = row.get('soma_id', '')
+                # Build possible cell name patterns to match against
+                cell_key = f"{img_name}_{soma_id}" if img_name and soma_id else ''
+
+                # Try to match Sholl data
+                for key in [cell_key] + [k for k in sholl_data.keys() if cell_key and cell_key in k]:
+                    if key in sholl_data:
+                        row.update(sholl_data[key])
+                        matched_sholl += 1
+                        break
+
+                # Try to match Skeleton data
+                for key in [cell_key] + [k for k in skeleton_data.keys() if cell_key and cell_key in k]:
+                    if key in skeleton_data:
+                        row.update(skeleton_data[key])
+                        matched_skel += 1
+                        break
+
+            # Write merged results
+            all_keys = morph_fieldnames + sorted(new_sholl_keys) + sorted(new_skel_keys)
+            # Remove duplicates while preserving order
+            seen = set()
+            ordered_keys = []
+            for k in all_keys:
+                if k not in seen:
+                    seen.add(k)
+                    ordered_keys.append(k)
+
+            merged_path = os.path.join(self.output_dir, "combined_all_results.csv")
+            with open(merged_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=ordered_keys, extrasaction='ignore')
+                writer.writeheader()
+                writer.writerows(morphology_rows)
+
+            self.log(f"  Matched Sholl data: {matched_sholl}/{len(morphology_rows)} cells")
+            self.log(f"  Matched Skeleton data: {matched_skel}/{len(morphology_rows)} cells")
+            self.log(f"  Merged results saved to: {merged_path}")
+
+        self.log("=" * 50)
+
+        summary = "ImageJ Results Import Complete\n\n"
+        if found_sholl:
+            summary += f"Sholl: {len(sholl_data)} cells\n"
+        if found_skeleton:
+            summary += f"Skeleton: {len(skeleton_data)} cells\n"
+        if morphology_rows:
+            summary += f"\nMerged with {len(morphology_rows)} morphology results\n"
+            summary += f"Output: combined_all_results.csv"
+        else:
+            summary += "\nSaved as: imagej_combined_results.csv"
+
+        QMessageBox.information(self, "Import Complete", summary)
 
     def show_legend(self):
         """Display a popup dialog with the workflow status legend"""
@@ -2621,6 +3410,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.log(f"Output folder: {folder}")
             self.log(f"Masks will be saved to: {self.masks_dir}")
             self.log(f"Somas will be saved to: {self.somas_dir}")
+            self.launch_imagej_btn.setEnabled(True)
+            self.import_imagej_btn.setEnabled(True)
 
     def select_all_images(self):
         """Select all images and check all checkboxes"""
