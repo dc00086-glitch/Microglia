@@ -1692,11 +1692,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         outline_group.setLayout(outline_layout)
         batch_layout.addWidget(outline_group)
-        self.redo_outline_btn.clicked.connect(self.redo_last_outline)
-        self.redo_outline_btn.setEnabled(False)
-        self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
-        batch_layout.addWidget(self.redo_outline_btn)
-        
+
         self.batch_generate_masks_btn = QPushButton("Generate All Masks")
         self.batch_generate_masks_btn.clicked.connect(self.batch_generate_masks)
         self.batch_generate_masks_btn.setEnabled(False)
@@ -3637,9 +3633,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.images[last_outline_img]['soma_outlines'].pop()
         
         # Delete the exported soma file if it exists
-        if self.masks_dir:
+        if hasattr(self, 'somas_dir') and self.somas_dir:
             soma_id = last_outline_data['soma_id']
-            soma_file = os.path.join(self.masks_dir, f"{os.path.splitext(last_outline_img)[0]}_{soma_id}_soma.tif")
+            soma_file = os.path.join(self.somas_dir, f"{os.path.splitext(last_outline_img)[0]}_{soma_id}_soma.tif")
             if os.path.exists(soma_file):
                 os.remove(soma_file)
         
@@ -3648,12 +3644,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Go back to that soma for re-outlining
         queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         self.polygon_points = []
-        
+
         # If no more outlines left, disable the redo button
         if queue_idx == 0:
             self.redo_outline_btn.setEnabled(False)
 
-        self._load_soma_for_outlining(queue_idx)
+        if hasattr(self, 'review_mode') and self.review_mode:
+            self.current_review_idx = queue_idx
+            self._load_review_soma(queue_idx)
+        else:
+            self._load_soma_for_outlining(queue_idx)
 
     def _get_auto_outline_method(self):
         """Get the selected auto-outline method function"""
