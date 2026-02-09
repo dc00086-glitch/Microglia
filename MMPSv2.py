@@ -1735,39 +1735,60 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_pick_somas_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_pick_somas_btn)
 
-        # Outline Somas section
-        outline_group = QGroupBox("Soma Outlining")
-        outline_layout = QVBoxLayout()
-
-        # Main outline button
+        # Outline Somas - single button, controls hidden until outlining starts
         self.batch_outline_btn = QPushButton("Outline Somas")
         self.batch_outline_btn.clicked.connect(self.start_batch_outlining)
         self.batch_outline_btn.setEnabled(False)
         self.batch_outline_btn.setStyleSheet("font-weight: bold;")
-        outline_layout.addWidget(self.batch_outline_btn)
+        batch_layout.addWidget(self.batch_outline_btn)
 
-        # Auto-outline settings (compact)
-        auto_settings = QHBoxLayout()
-        auto_settings.addWidget(QLabel("Auto:"))
+        # Hidden auto-outline settings (store state but not shown in panel)
         self.auto_outline_method = QComboBox()
         self.auto_outline_method.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
         self.auto_outline_method.setCurrentIndex(0)
-        self.auto_outline_method.setMaximumWidth(100)
-        auto_settings.addWidget(self.auto_outline_method)
-        auto_settings.addWidget(QLabel("Sens:"))
+        self.auto_outline_method.setVisible(False)
         self.auto_outline_sensitivity = QSlider(Qt.Horizontal)
         self.auto_outline_sensitivity.setRange(10, 90)
         self.auto_outline_sensitivity.setValue(50)
-        self.auto_outline_sensitivity.setMaximumWidth(60)
-        auto_settings.addWidget(self.auto_outline_sensitivity)
+        self.auto_outline_sensitivity.setVisible(False)
         self.sensitivity_label = QLabel("50")
         self.auto_outline_sensitivity.valueChanged.connect(
             lambda v: self.sensitivity_label.setText(str(v))
         )
-        auto_settings.addWidget(self.sensitivity_label)
-        outline_layout.addLayout(auto_settings)
 
-        # Outline action buttons (shown during outlining)
+        # Outline controls container - shown only during active outlining
+        self.outline_controls_widget = QWidget()
+        outline_controls_layout = QVBoxLayout(self.outline_controls_widget)
+        outline_controls_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Auto-outline settings row (visible during outlining)
+        auto_settings = QHBoxLayout()
+        auto_settings.addWidget(QLabel("Method:"))
+        self.outline_method_display = QComboBox()
+        self.outline_method_display.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
+        self.outline_method_display.setCurrentIndex(0)
+        self.outline_method_display.setMaximumWidth(110)
+        self.outline_method_display.currentIndexChanged.connect(
+            lambda idx: self.auto_outline_method.setCurrentIndex(idx)
+        )
+        auto_settings.addWidget(self.outline_method_display)
+        auto_settings.addWidget(QLabel("Sens:"))
+        self.outline_sens_display = QSlider(Qt.Horizontal)
+        self.outline_sens_display.setRange(10, 90)
+        self.outline_sens_display.setValue(50)
+        self.outline_sens_display.setMaximumWidth(60)
+        self.outline_sens_display.valueChanged.connect(
+            lambda v: self.auto_outline_sensitivity.setValue(v)
+        )
+        auto_settings.addWidget(self.outline_sens_display)
+        self.outline_sens_label = QLabel("50")
+        self.outline_sens_display.valueChanged.connect(
+            lambda v: self.outline_sens_label.setText(str(v))
+        )
+        auto_settings.addWidget(self.outline_sens_label)
+        outline_controls_layout.addLayout(auto_settings)
+
+        # Action buttons row
         outline_btn_layout = QHBoxLayout()
         self.auto_outline_btn = QPushButton("Auto")
         self.auto_outline_btn.clicked.connect(self.auto_outline_current_soma)
@@ -1788,14 +1809,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.accept_outline_btn.setStyleSheet("border: 2px solid #2196F3; font-weight: bold;")
         self.accept_outline_btn.setToolTip("Accept outline and move to next soma")
         outline_btn_layout.addWidget(self.accept_outline_btn)
-        outline_layout.addLayout(outline_btn_layout)
+        outline_controls_layout.addLayout(outline_btn_layout)
 
         # Redo button
         self.redo_outline_btn = QPushButton("↩ Redo Last")
         self.redo_outline_btn.clicked.connect(self.redo_last_outline)
         self.redo_outline_btn.setEnabled(False)
         self.redo_outline_btn.setStyleSheet("border: 2px solid #FF9800;")
-        outline_layout.addWidget(self.redo_outline_btn)
+        outline_controls_layout.addWidget(self.redo_outline_btn)
 
         # Outline progress bar
         self.outline_progress_bar = QProgressBar()
@@ -1806,14 +1827,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QProgressBar { border: 1px solid palette(mid); border-radius: 3px; text-align: center; }
             QProgressBar::chunk { background-color: #4CAF50; }
         """)
-        outline_layout.addWidget(self.outline_progress_bar)
+        outline_controls_layout.addWidget(self.outline_progress_bar)
 
-        outline_group.setLayout(outline_layout)
-        batch_layout.addWidget(outline_group)
-        self.redo_outline_btn.clicked.connect(self.redo_last_outline)
-        self.redo_outline_btn.setEnabled(False)
-        self.redo_outline_btn.setStyleSheet("border: 2px solid #FF9800;")
-        batch_layout.addWidget(self.redo_outline_btn)
+        self.outline_controls_widget.setVisible(False)
+        batch_layout.addWidget(self.outline_controls_widget)
         
         self.batch_generate_masks_btn = QPushButton("Generate All Masks")
         self.batch_generate_masks_btn.clicked.connect(self.batch_generate_masks)
@@ -4199,7 +4216,10 @@ Step 3: Import Results Back
         self.review_mode = False
         self.current_review_idx = 0
 
-        # Show outline progress bar
+        # Show outline controls and progress bar
+        self.outline_controls_widget.setVisible(True)
+        self.outline_method_display.setCurrentIndex(self.auto_outline_method.currentIndex())
+        self.outline_sens_display.setValue(self.auto_outline_sensitivity.value())
         self._update_outline_progress()
 
         if result == 1:
@@ -4865,6 +4885,7 @@ Step 3: Import Results Back
 
     def _finish_outlining(self):
         self.outline_progress_bar.setVisible(False)
+        self.outline_controls_widget.setVisible(False)
         self.batch_mode = False
         self.processed_label.polygon_mode = False
         self.processed_label.point_edit_mode = False
