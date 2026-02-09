@@ -1632,63 +1632,60 @@ class MicrogliaAnalysisGUI(QMainWindow):
         outline_group = QGroupBox("Soma Outlining")
         outline_layout = QVBoxLayout()
 
-        # Main outline button
+        # Main outline button - single entry point
         self.batch_outline_btn = QPushButton("Outline Somas")
         self.batch_outline_btn.clicked.connect(self.start_batch_outlining)
         self.batch_outline_btn.setEnabled(False)
         self.batch_outline_btn.setStyleSheet("font-weight: bold;")
         outline_layout.addWidget(self.batch_outline_btn)
 
-        # Auto-outline settings (compact)
-        auto_settings = QHBoxLayout()
-        auto_settings.addWidget(QLabel("Auto:"))
+        # Internal auto-outline settings (not shown in sidebar, used by dialog)
         self.auto_outline_method = QComboBox()
         self.auto_outline_method.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
         self.auto_outline_method.setCurrentIndex(0)
-        self.auto_outline_method.setMaximumWidth(100)
-        auto_settings.addWidget(self.auto_outline_method)
-        auto_settings.addWidget(QLabel("Sens:"))
+        self.auto_outline_method.setVisible(False)
         self.auto_outline_sensitivity = QSlider(Qt.Horizontal)
         self.auto_outline_sensitivity.setRange(10, 90)
         self.auto_outline_sensitivity.setValue(50)
-        self.auto_outline_sensitivity.setMaximumWidth(60)
-        auto_settings.addWidget(self.auto_outline_sensitivity)
-        self.sensitivity_label = QLabel("50")
-        self.auto_outline_sensitivity.valueChanged.connect(
-            lambda v: self.sensitivity_label.setText(str(v))
-        )
-        auto_settings.addWidget(self.sensitivity_label)
-        outline_layout.addLayout(auto_settings)
+        self.auto_outline_sensitivity.setVisible(False)
 
-        # Outline action buttons (shown during outlining)
-        outline_btn_layout = QHBoxLayout()
+        # Outline action buttons (hidden until outlining starts)
+        self.outline_action_widget = QWidget()
+        outline_btn_layout = QVBoxLayout()
+        outline_btn_layout.setContentsMargins(0, 0, 0, 0)
+
+        action_row = QHBoxLayout()
         self.auto_outline_btn = QPushButton("Auto")
         self.auto_outline_btn.clicked.connect(self.auto_outline_current_soma)
         self.auto_outline_btn.setEnabled(False)
         self.auto_outline_btn.setStyleSheet("background-color: #90EE90;")
         self.auto_outline_btn.setToolTip("Auto-detect outline for current soma")
-        outline_btn_layout.addWidget(self.auto_outline_btn)
+        action_row.addWidget(self.auto_outline_btn)
 
         self.manual_draw_btn = QPushButton("Manual")
         self.manual_draw_btn.clicked.connect(self.start_manual_outline)
         self.manual_draw_btn.setEnabled(False)
         self.manual_draw_btn.setToolTip("Draw outline manually (click points)")
-        outline_btn_layout.addWidget(self.manual_draw_btn)
+        action_row.addWidget(self.manual_draw_btn)
 
         self.accept_outline_btn = QPushButton("Accept (Enter)")
         self.accept_outline_btn.clicked.connect(self.accept_current_outline)
         self.accept_outline_btn.setEnabled(False)
         self.accept_outline_btn.setStyleSheet("background-color: #87CEEB;")
         self.accept_outline_btn.setToolTip("Accept outline and move to next soma")
-        outline_btn_layout.addWidget(self.accept_outline_btn)
-        outline_layout.addLayout(outline_btn_layout)
+        action_row.addWidget(self.accept_outline_btn)
+        outline_btn_layout.addLayout(action_row)
 
         # Redo button
         self.redo_outline_btn = QPushButton("↩ Redo Last")
         self.redo_outline_btn.clicked.connect(self.redo_last_outline)
         self.redo_outline_btn.setEnabled(False)
         self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
-        outline_layout.addWidget(self.redo_outline_btn)
+        outline_btn_layout.addWidget(self.redo_outline_btn)
+
+        self.outline_action_widget.setLayout(outline_btn_layout)
+        self.outline_action_widget.setVisible(False)
+        outline_layout.addWidget(self.outline_action_widget)
 
         outline_group.setLayout(outline_layout)
         batch_layout.addWidget(outline_group)
@@ -2515,9 +2512,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         reply = QMessageBox.question(
             self, 'Colocalization Analysis',
             'Do you want to perform colocalization analysis?\n\n'
-            'If YES: Images will be displayed in color showing all channels.\n'
-            'Colocalization metrics will be calculated for selected cells.\n\n'
-            'If NO: Images will be converted to grayscale for standard analysis.',
+            'If YES: Colocalization metrics will be calculated for selected cells.\n\n'
+            'If NO: Standard morphology analysis only.',
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -2526,19 +2522,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if self.colocalization_mode:
             self.log("=" * 50)
             self.log("COLOCALIZATION MODE ENABLED")
-            self.log("Images will be displayed in color")
-            self.log("Use 'Channel Display' button to select which channels to show")
-            self.log("Press C to toggle between color and grayscale")
-            self.log("Grayscale conversion will occur when outlining begins")
+            self.log("Colocalization metrics will be calculated")
             self.log("=" * 50)
-            # Auto-enable color view in colocalization mode
-            self.show_color_view = True
-            self.color_toggle_btn.setText("Show Grayscale (C)")
-            self.channel_select_btn.setVisible(True)
-        else:
-            self.show_color_view = False
-            self.color_toggle_btn.setText("Show Color (C)")
-            self.channel_select_btn.setVisible(False)
+
+        # Always load images in color, with grayscale toggle available
+        self.show_color_view = True
+        self.color_toggle_btn.setText("Show Grayscale (C)")
+        self.channel_select_btn.setVisible(True)
+        self.log("Images loaded in color | Press C to toggle grayscale")
 
         # Include both lowercase and uppercase extensions for macOS compatibility
         exts = ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg',
@@ -3153,10 +3144,37 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f"Soma picking complete!\n\nTotal somas marked: {total_somas}\n\nReady to outline."
         )
 
+    def _reset_all_outlines(self):
+        """Clear all existing outlines and exported soma files"""
+        for img_name, img_data in self.images.items():
+            if img_data['soma_outlines']:
+                img_data['soma_outlines'] = []
+            # Reset status back to somas_picked if it was further along
+            if img_data['status'] in ('outlined', 'masks_generated', 'qa_complete', 'morphology_calculated'):
+                if len(img_data['somas']) > 0:
+                    img_data['status'] = 'somas_picked'
+                    self._update_file_list_item(img_name)
+                # Also clear masks since outlines are gone
+                img_data['masks'] = []
+        # Delete exported soma files
+        if hasattr(self, 'somas_dir') and self.somas_dir and os.path.exists(self.somas_dir):
+            soma_files = glob.glob(os.path.join(self.somas_dir, "*_soma.tif"))
+            for sf in soma_files:
+                try:
+                    os.remove(sf)
+                except Exception:
+                    pass
+        self.log("All previous outlines cleared")
+
     def start_batch_outlining(self):
+        # Build queue from images that have somas picked (or were further along)
         self.outlining_queue = []
         for img_name, img_data in self.images.items():
-            if not img_data['selected'] or img_data['status'] != 'somas_picked':
+            if not img_data['selected']:
+                continue
+            if img_data['status'] not in ('somas_picked', 'outlined', 'masks_generated', 'qa_complete', 'morphology_calculated'):
+                continue
+            if len(img_data['somas']) == 0:
                 continue
             for soma_idx in range(len(img_data['somas'])):
                 self.outlining_queue.append((img_name, soma_idx))
@@ -3164,71 +3182,117 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "No somas to outline")
             return
 
-        # In colocalization mode, ask which channel to use for grayscale outlining
-        if self.colocalization_mode:
-            sample_color_img = None
-            for img_name, img_data in self.images.items():
-                if 'color_image' in img_data:
-                    sample_color_img = img_data['color_image']
-                    break
+        # Reset any existing outlines so user starts fresh
+        has_existing = any(len(d['soma_outlines']) > 0 for d in self.images.values())
+        if has_existing:
+            self._reset_all_outlines()
 
-            dialog = GrayscaleChannelDialog(
-                self,
-                channel_names=self.channel_names,
-                color_image=sample_color_img,
-                current_coloc_ch1=self.coloc_channel_1,
-                current_coloc_ch2=self.coloc_channel_2
-            )
-            if dialog.exec_() == QDialog.Accepted:
-                self.grayscale_channel = dialog.get_selected_channel()
-                self.coloc_channel_1, self.coloc_channel_2 = dialog.get_coloc_channels()
-                channel_name = self.channel_names.get(self.grayscale_channel, f'Channel {self.grayscale_channel + 1}')
-                self.log(f"Using Channel {self.grayscale_channel + 1} for grayscale outlining")
-                self.log(f"Colocalization: Channel {self.coloc_channel_1 + 1} vs Channel {self.coloc_channel_2 + 1}")
-            else:
-                return
-
-        # Ask user: Manual or Auto?
+        # --- Build the unified Outline Setup dialog ---
         dialog = QDialog(self)
-        dialog.setWindowTitle("Outline Method")
+        dialog.setWindowTitle("Outline Setup")
         dialog.setModal(True)
-        layout = QVBoxLayout()
+        dlg_layout = QVBoxLayout()
 
-        label = QLabel(f"<b>{len(self.outlining_queue)} somas to outline</b><br><br>Choose outline method:")
-        layout.addWidget(label)
+        dlg_layout.addWidget(QLabel(f"<b>{len(self.outlining_queue)} somas to outline</b>"))
+        dlg_layout.addSpacing(5)
 
+        # --- Channel selection (for any multi-channel image) ---
+        sample_color_img = None
+        for img_name, img_data in self.images.items():
+            if img_data.get('color_image') is not None and img_data['color_image'].ndim == 3:
+                sample_color_img = img_data['color_image']
+                break
+
+        channel_group = None
+        if sample_color_img is not None:
+            num_ch = min(sample_color_img.shape[2], 3)
+            channel_group = QGroupBox("Grayscale Channel for Outlining")
+            ch_layout = QVBoxLayout()
+            from PyQt5.QtWidgets import QRadioButton, QButtonGroup
+            ch_btn_group = QButtonGroup(dialog)
+            for i in range(num_ch):
+                name = self.channel_names.get(i, f'Channel {i+1}')
+                radio = QRadioButton(f"Channel {i+1}" + (f" ({name})" if name != f'Channel {i+1}' else ""))
+                if i == self.grayscale_channel:
+                    radio.setChecked(True)
+                ch_btn_group.addButton(radio, i)
+                ch_layout.addWidget(radio)
+            channel_group.setLayout(ch_layout)
+            dlg_layout.addWidget(channel_group)
+
+        # --- Colocalization channels (only if coloc mode) ---
+        coloc_ch1_combo = None
+        coloc_ch2_combo = None
+        if self.colocalization_mode and sample_color_img is not None:
+            num_ch = min(sample_color_img.shape[2], 3)
+            coloc_group = QGroupBox("Colocalization Channels")
+            coloc_layout = QVBoxLayout()
+            ch1_row = QHBoxLayout()
+            ch1_row.addWidget(QLabel("Channel 1:"))
+            coloc_ch1_combo = QComboBox()
+            for i in range(num_ch):
+                coloc_ch1_combo.addItem(f"Channel {i+1}", i)
+            coloc_ch1_combo.setCurrentIndex(self.coloc_channel_1)
+            ch1_row.addWidget(coloc_ch1_combo)
+            coloc_layout.addLayout(ch1_row)
+            ch2_row = QHBoxLayout()
+            ch2_row.addWidget(QLabel("Channel 2:"))
+            coloc_ch2_combo = QComboBox()
+            for i in range(num_ch):
+                coloc_ch2_combo.addItem(f"Channel {i+1}", i)
+            coloc_ch2_combo.setCurrentIndex(min(self.coloc_channel_2, num_ch - 1))
+            ch2_row.addWidget(coloc_ch2_combo)
+            coloc_layout.addLayout(ch2_row)
+            coloc_group.setLayout(coloc_layout)
+            dlg_layout.addWidget(coloc_group)
+
+        dlg_layout.addSpacing(10)
+        dlg_layout.addWidget(QLabel("<b>Choose outline method:</b>"))
+
+        # --- Manual button ---
         manual_btn = QPushButton("Manual - Draw each outline by hand")
         manual_btn.clicked.connect(lambda: dialog.done(1))
-        layout.addWidget(manual_btn)
+        dlg_layout.addWidget(manual_btn)
 
+        # --- Auto button ---
         auto_btn = QPushButton("Auto - Auto-detect all, then review/fix")
         auto_btn.clicked.connect(lambda: dialog.done(2))
         auto_btn.setStyleSheet("background-color: #90EE90; font-weight: bold;")
-        layout.addWidget(auto_btn)
+        dlg_layout.addWidget(auto_btn)
 
-        # Auto settings
-        settings_layout = QHBoxLayout()
-        settings_layout.addWidget(QLabel("Method:"))
+        # Auto settings row
+        auto_settings_layout = QHBoxLayout()
+        auto_settings_layout.addWidget(QLabel("Method:"))
         method_combo = QComboBox()
         method_combo.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
         method_combo.setCurrentIndex(self.auto_outline_method.currentIndex())
-        settings_layout.addWidget(method_combo)
-        settings_layout.addWidget(QLabel("Sens:"))
+        auto_settings_layout.addWidget(method_combo)
+        auto_settings_layout.addWidget(QLabel("Sens:"))
         sens_spin = QSpinBox()
         sens_spin.setRange(10, 90)
         sens_spin.setValue(self.auto_outline_sensitivity.value())
-        settings_layout.addWidget(sens_spin)
-        layout.addLayout(settings_layout)
+        auto_settings_layout.addWidget(sens_spin)
+        dlg_layout.addLayout(auto_settings_layout)
 
+        dlg_layout.addSpacing(10)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(lambda: dialog.done(0))
-        layout.addWidget(cancel_btn)
+        dlg_layout.addWidget(cancel_btn)
 
-        dialog.setLayout(layout)
+        dialog.setLayout(dlg_layout)
         result = dialog.exec_()
 
         if result == 0:
             return  # Cancelled
+
+        # Apply channel selections
+        if channel_group is not None:
+            self.grayscale_channel = ch_btn_group.checkedId()
+            self.log(f"Using Channel {self.grayscale_channel + 1} for grayscale outlining")
+        if coloc_ch1_combo is not None:
+            self.coloc_channel_1 = coloc_ch1_combo.currentData()
+            self.coloc_channel_2 = coloc_ch2_combo.currentData()
+            self.log(f"Colocalization: Channel {self.coloc_channel_1 + 1} vs Channel {self.coloc_channel_2 + 1}")
 
         # Update auto settings from dialog
         self.auto_outline_method.setCurrentIndex(method_combo.currentIndex())
@@ -3248,6 +3312,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.done_btn.setEnabled(False)
+
+        # Show outline action buttons
+        self.outline_action_widget.setVisible(True)
 
         # Store for review mode
         self.auto_outlined_points = {}  # {queue_idx: points}
@@ -3960,9 +4027,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.processed_label.point_edit_mode = False
         self.processed_label.selected_point_idx = None
         self.processed_label.reset_zoom()
-        self.redo_outline_btn.setEnabled(False)  # Disable redo button when outlining complete
 
-        # Disable outline buttons
+        # Hide outline action buttons
+        self.outline_action_widget.setVisible(False)
+        self.redo_outline_btn.setEnabled(False)
         self.auto_outline_btn.setEnabled(False)
         self.manual_draw_btn.setEnabled(False)
         self.accept_outline_btn.setEnabled(False)
