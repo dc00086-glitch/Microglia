@@ -288,6 +288,9 @@ class InteractiveImageLabel(QLabel):
         self.polygon_pts = []
         self.soma_mode = False
         self.polygon_mode = False
+        # Zoom state
+        self.zoom_level = 1.0   # 1.0 = no zoom, higher = more zoom
+        self.zoom_center = None  # (y, x) in image coordinates
         self.setMinimumSize(400, 400)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("border: 2px solid #cccccc; background-color: #f5f5f5;")
@@ -301,17 +304,68 @@ class InteractiveImageLabel(QLabel):
         self.centroids = centroids or []
         self.mask_overlay = mask_overlay
         self.polygon_pts = polygon_pts or []
-        if qpix is not None:
-            # Scale the pixmap to fit the label while maintaining aspect ratio
-            label_size = self.size()
-            scaled_pix = qpix.scaled(
-                label_size.width(),
-                label_size.height(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            super().setPixmap(scaled_pix)
+        self._refresh_display()
+
+    def _get_viewport(self):
+        """Get the visible region of the image: (x_start, y_start, width, height) in image pixels"""
+        if not self.pix_source:
+            return 0, 0, 1, 1
+        img_w = self.pix_source.width()
+        img_h = self.pix_source.height()
+        if self.zoom_level <= 1.0:
+            return 0, 0, img_w, img_h
+        vp_w = img_w / self.zoom_level
+        vp_h = img_h / self.zoom_level
+        if self.zoom_center:
+            cy, cx = self.zoom_center
+        else:
+            cy, cx = img_h / 2, img_w / 2
+        x_start = cx - vp_w / 2
+        y_start = cy - vp_h / 2
+        # Clamp to image bounds
+        x_start = max(0, min(x_start, img_w - vp_w))
+        y_start = max(0, min(y_start, img_h - vp_h))
+        return x_start, y_start, vp_w, vp_h
+
+    def _refresh_display(self):
+        """Redraw the display applying current zoom viewport"""
+        if self.pix_source is None:
+            return
+        vp_x, vp_y, vp_w, vp_h = self._get_viewport()
+        cropped = self.pix_source.copy(int(vp_x), int(vp_y), max(1, int(vp_w)), max(1, int(vp_h)))
+        label_size = self.size()
+        scaled = cropped.scaled(
+            label_size.width(), label_size.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        super().setPixmap(scaled)
         self.repaint()
+
+    def set_zoom(self, center, level=3.0):
+        """Programmatically set zoom center and level"""
+        self.zoom_center = center
+        self.zoom_level = level
+        self._refresh_display()
+
+    def reset_zoom(self):
+        """Reset to full image view"""
+        self.zoom_level = 1.0
+        self.zoom_center = None
+        self._refresh_display()
+
+    def wheelEvent(self, event):
+        """Mouse scroll wheel adjusts zoom level"""
+        if not self.pix_source:
+            return
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self.zoom_level = min(self.zoom_level * 1.25, 10.0)
+        else:
+            self.zoom_level = max(self.zoom_level / 1.25, 1.0)
+        if self.zoom_level <= 1.02:
+            self.zoom_level = 1.0
+            self.zoom_center = None
+        self._refresh_display()
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -334,16 +388,7 @@ class InteractiveImageLabel(QLabel):
         """Re-scale the image when the label is resized"""
         super().resizeEvent(event)
         if self.pix_source is not None:
-            # Re-scale the image to fit the new size
-            label_size = self.size()
-            scaled_pix = self.pix_source.scaled(
-                label_size.width(),
-                label_size.height(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            super().setPixmap(scaled_pix)
-            self.repaint()
+            self._refresh_display()
 
     def _draw_mask_overlay(self, painter):
         if self.mask_overlay is None:
@@ -357,16 +402,16 @@ class InteractiveImageLabel(QLabel):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(0, 255, 0))
         painter.setOpacity(0.4)
-        img_h, img_w = self.pix_source.height(), self.pix_source.width()
+        vp_x, vp_y, vp_w, vp_h = self._get_viewport()
         current_pixmap = self.pixmap()
         if current_pixmap:
             pixmap_w = current_pixmap.width()
             pixmap_h = current_pixmap.height()
         else:
-            pixmap_w = img_w
-            pixmap_h = img_h
-        scale_x = pixmap_w / img_w
-        scale_y = pixmap_h / img_h
+            pixmap_w = int(vp_w)
+            pixmap_h = int(vp_h)
+        scale_x = pixmap_w / vp_w if vp_w > 0 else 1
+        scale_y = pixmap_h / vp_h if vp_h > 0 else 1
         rect_w = max(1, int(scale_x))
         rect_h = max(1, int(scale_y))
         for coord in mask_coords:
@@ -392,21 +437,21 @@ class InteractiveImageLabel(QLabel):
     def _to_display_coords(self, img_coords):
         if not self.pix_source:
             return 0, 0
-        img_h, img_w = self.pix_source.height(), self.pix_source.width()
+        vp_x, vp_y, vp_w, vp_h = self._get_viewport()
         label_w, label_h = self.size().width(), self.size().height()
         current_pixmap = self.pixmap()
         if current_pixmap:
             pixmap_w = current_pixmap.width()
             pixmap_h = current_pixmap.height()
         else:
-            pixmap_w = img_w
-            pixmap_h = img_h
+            pixmap_w = int(vp_w)
+            pixmap_h = int(vp_h)
         offset_x = (label_w - pixmap_w) / 2
         offset_y = (label_h - pixmap_h) / 2
-        scale_x = pixmap_w / img_w
-        scale_y = pixmap_h / img_h
-        x = img_coords[1] * scale_x + offset_x
-        y = img_coords[0] * scale_y + offset_y
+        scale_x = pixmap_w / vp_w if vp_w > 0 else 1
+        scale_y = pixmap_h / vp_h if vp_h > 0 else 1
+        x = (img_coords[1] - vp_x) * scale_x + offset_x
+        y = (img_coords[0] - vp_y) * scale_y + offset_y
         return x, y
 
     def _to_image_coords(self, display_x, display_y):
@@ -415,22 +460,24 @@ class InteractiveImageLabel(QLabel):
         current_img = self.parent_widget.get_current_processed_image()
         if current_img is None:
             return None
-        img_shape = current_img.shape
-        img_h, img_w = img_shape[:2]
+        img_h, img_w = current_img.shape[:2]
+        vp_x, vp_y, vp_w, vp_h = self._get_viewport()
         label_w, label_h = self.size().width(), self.size().height()
         current_pixmap = self.pixmap()
         if current_pixmap:
             pixmap_w = current_pixmap.width()
             pixmap_h = current_pixmap.height()
         else:
-            pixmap_w = img_w
-            pixmap_h = img_h
+            pixmap_w = int(vp_w)
+            pixmap_h = int(vp_h)
         offset_x = (label_w - pixmap_w) / 2
         offset_y = (label_h - pixmap_h) / 2
-        scale_x = img_w / pixmap_w
-        scale_y = img_h / pixmap_h
-        img_x = round((display_x - offset_x) * scale_x)
-        img_y = round((display_y - offset_y) * scale_y)
+        scale_x = vp_w / pixmap_w if pixmap_w > 0 else 1
+        scale_y = vp_h / pixmap_h if pixmap_h > 0 else 1
+        img_x = round((display_x - offset_x) * scale_x + vp_x)
+        img_y = round((display_y - offset_y) * scale_y + vp_y)
+        img_x = max(0, min(img_x, img_w - 1))
+        img_y = max(0, min(img_y, img_h - 1))
         return (img_y, img_x)
 
     def mousePressEvent(self, event):
@@ -1486,6 +1533,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log(f"Total somas to outline: {len(self.outlining_queue)}")
         self.log("Left-click to add points, right-click to finish outline")
         self.log("Press 'Z' or Backspace to undo last point | 'Escape' to restart | 'Enter' to finish")
+        self.log("Scroll wheel to adjust zoom | Auto-zoomed on each soma")
         self.log("=" * 50)
 
     def _load_soma_for_outlining(self, queue_idx):
@@ -1499,6 +1547,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         soma_id = img_data['soma_ids'][soma_idx]
         pixmap = self._array_to_pixmap(img_data['processed'])
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+        # Autozoom onto the soma for easier outlining
+        self.processed_label.set_zoom(center=soma, level=3.0)
         self.tabs.setCurrentIndex(2)
         self.nav_status_label.setText(
             f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
@@ -1712,6 +1762,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def _finish_outlining(self):
         self.batch_mode = False
         self.processed_label.polygon_mode = False
+        self.processed_label.reset_zoom()
         self.redo_outline_btn.setEnabled(False)  # Disable redo button when outlining complete
         for img_name, img_data in self.images.items():
             if img_data['selected'] and len(img_data['soma_outlines']) == len(img_data['somas']):
