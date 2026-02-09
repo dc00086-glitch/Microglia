@@ -3461,7 +3461,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Enable/disable buttons
         self.auto_outline_btn.setEnabled(True)
         self.manual_draw_btn.setEnabled(True)
-        self.accept_outline_btn.setEnabled(len(self.polygon_points) >= 3)
+        self.accept_outline_btn.setEnabled(len(self.polygon_points) >= self._min_outline_points())
 
         if review_idx in self.auto_outlined_points:
             self.log(f"Reviewing {soma_id} - {len(self.polygon_points)} points")
@@ -3555,7 +3555,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             )
 
         # Enable accept button when we have enough points
-        if len(self.polygon_points) >= 3:
+        if len(self.polygon_points) >= self._min_outline_points():
             self.accept_outline_btn.setEnabled(True)
 
     def undo_last_polygon_point(self):
@@ -3586,7 +3586,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     f"Points: {len(self.polygon_points)} | Zoom: {self.processed_label.zoom_level:.1f}x"
                 )
             # Update accept button state
-            self.accept_outline_btn.setEnabled(len(self.polygon_points) >= 3)
+            self.accept_outline_btn.setEnabled(len(self.polygon_points) >= self._min_outline_points())
         else:
             self.log("⚠️ No points to undo")
 
@@ -3628,8 +3628,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.processed_label.selected_point_idx = None
         self.processed_label.dragging_point = False
 
-        if len(self.polygon_points) < 3:
-            QMessageBox.warning(self, "Warning", "Need at least 3 points")
+        min_pts = self._min_outline_points()
+        if len(self.polygon_points) < min_pts:
+            QMessageBox.warning(self, "Warning", f"Need at least {min_pts} points")
             return
 
         # In review mode, use current_review_idx; otherwise calculate from outlines
@@ -3949,8 +3950,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def accept_current_outline(self):
         """Accept the current outline and move to next soma (same as finish_polygon)"""
-        if len(self.polygon_points) < 3:
-            QMessageBox.warning(self, "Warning", "Need at least 3 points to accept outline")
+        min_pts = self._min_outline_points()
+        if len(self.polygon_points) < min_pts:
+            QMessageBox.warning(self, "Warning", f"Need at least {min_pts} points to accept outline")
             return
         self.finish_polygon()
 
@@ -4020,6 +4022,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         path = mplPath(poly_array)
         mask = path.contains_points(points).reshape(h, w)
         return mask.astype(np.uint8)
+
+    def _min_outline_points(self):
+        """Minimum points required: 10 for auto outlines, 3 for manual"""
+        if self.processed_label.point_edit_mode:
+            return 10
+        return 3
 
     def _finish_outlining(self):
         self.batch_mode = False
