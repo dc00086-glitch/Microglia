@@ -1,21 +1,4 @@
 
-New chat
-
-"""Install appropriate packages if not already installed""" import sys import os import time import numpy as np from PyQt5.QtWidgets import ( QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog, QListWidget, QSlider, QSpinBox, QGroupBo
-
-pasted
-
-here is my code. can you add an autozoom feature onto each microglia when it comes to outlining the soma and make it so i can scroll off the zoom
-
-
-Architecting autozoom functionality and scroll-based zoom adjustment.
-10s
-
-
-
-
-
-
 
 """Install appropriate packages if not already installed"""
 
