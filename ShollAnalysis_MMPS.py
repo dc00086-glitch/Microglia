@@ -1,5 +1,3 @@
-#@LogService log
-
 """
 Batch Sholl Analysis for MMPS-exported masks and soma outlines.
 
@@ -206,7 +204,7 @@ def analyzeOneMask(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, m
     # Open the mask image
     imp = IJ.openImage(maskPath)
     if imp is None:
-        log.error("Could not open: " + maskPath)
+        IJ.log("ERROR: Could not open: " + maskPath)
         return None
 
     # Apply calibration from pixel size
@@ -235,7 +233,7 @@ def analyzeOneMask(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, m
     # Parse the image
     parser.parse()
     if not parser.successful():
-        log.error(maskName + " could not be parsed!")
+        IJ.log("ERROR: " + maskName + " could not be parsed!")
         imp.close()
         return None
 
@@ -247,7 +245,7 @@ def analyzeOneMask(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, m
     # Get the Sholl profile
     profile = parser.getProfile()
     if profile.isEmpty():
-        log.error(maskName + ": All intersection counts were zero!")
+        IJ.log("ERROR: " + maskName + ": All intersection counts were zero!")
         imp.close()
         return None
 
