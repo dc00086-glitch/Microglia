@@ -173,8 +173,8 @@ def getSomaRadius(somaPath, centroid, pixelSize):
 
 
 def findSomaFile(somasDir, maskFilename):
-    """Given a mask filename like 'image1_soma1_area400_mask.tif',
-    find the corresponding soma file 'image1_soma1_soma.tif' in somasDir."""
+    """Given a mask filename like 'Image_soma_586_510_area400_mask.tif',
+    find the corresponding soma file 'Image_soma_586_510_soma.tif' in somasDir."""
     # Strip '_area{N}_mask.tif' to get the base 'image1_soma1'
     base = re.sub(r'_area\d+_mask\.tif$', '', maskFilename)
     somaFilename = base + '_soma.tif'
@@ -186,8 +186,9 @@ def findSomaFile(somasDir, maskFilename):
 
 def parseMaskInfo(maskFilename):
     """Extract image name, soma ID, and area from mask filename.
-    e.g. 'image1_soma1_area400_mask.tif' -> ('image1', 'soma1', 400)"""
-    m = re.match(r'^(.+?)_(soma\d+)_area(\d+)_mask\.tif$', maskFilename)
+    e.g. 'ImageProcessing.FastMaxProjectionFilter_soma_586_510_area400_mask.tif'
+      -> ('ImageProcessing.FastMaxProjectionFilter', 'soma_586_510', 400)"""
+    m = re.match(r'^(.+?)_(soma_\d+_\d+)_area(\d+)_mask\.tif$', maskFilename)
     if m:
         return m.group(1), m.group(2), int(m.group(3))
     return maskFilename, 'unknown', 0
