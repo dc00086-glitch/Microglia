@@ -2757,6 +2757,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.batch_outline_btn.setEnabled(True)
         if has_outlines:
             self.batch_generate_masks_btn.setEnabled(True)
+
+        # Enable QA and calculate buttons based on image statuses
+        has_masks = any(d['status'] in ('masks_generated', 'qa_complete', 'analyzed') for d in self.images.values())
+        has_qa_complete = any(d['status'] in ('qa_complete', 'analyzed') for d in self.images.values())
+        if has_masks:
+            self.batch_qa_btn.setEnabled(True)
+        if has_qa_complete:
+            self.batch_calculate_btn.setEnabled(True)
+
         if self.output_dir:
             self.launch_imagej_btn.setEnabled(True)
             self.import_imagej_btn.setEnabled(True)
