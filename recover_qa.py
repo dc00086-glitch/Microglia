@@ -228,23 +228,20 @@ class MaskQAWindow(QMainWindow):
             entry = self.mask_entries[self.current_idx]
             entry['approved'] = False
 
-            # Auto-reject all smaller masks for the same soma
+            # Jump to next smaller mask for the same soma
             img_name = entry['img_name']
             soma_id = entry['soma_id']
-            rejected_area = entry['area_um2']
-            auto_count = 0
-            for other in self.mask_entries:
+            for i, other in enumerate(self.mask_entries):
                 if (other is not entry
                         and other['img_name'] == img_name
                         and other['soma_id'] == soma_id
-                        and other['area_um2'] < rejected_area
+                        and other['area_um2'] < entry['area_um2']
                         and other['approved'] is None):
-                    other['approved'] = False
-                    auto_count += 1
+                    self.current_idx = i
+                    self._show_current()
+                    return
 
-            if auto_count > 0:
-                print(f"Auto-rejected {auto_count} smaller mask(s) for {img_name} {soma_id}")
-
+            # No smaller mask for this soma — advance normally
             self._advance()
 
     def _advance(self):
