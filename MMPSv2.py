@@ -948,6 +948,20 @@ class InteractiveImageLabel(QLabel):
         self.zoom_level = max(self.min_zoom, min(self.max_zoom, level))
         self._update_display()
 
+    def zoom_to_point(self, img_row, img_col, zoom_level=3.0):
+        """Center the view on a specific image coordinate and zoom in."""
+        if self.pix_source is None:
+            return
+        img_h = self.pix_source.height()
+        img_w = self.pix_source.width()
+        if img_w > 0 and img_h > 0:
+            self.view_center_x = img_col / img_w
+            self.view_center_y = img_row / img_h
+            self.zoom_level = max(self.min_zoom, min(self.max_zoom, zoom_level))
+            self._update_display()
+            if self.parent_widget and hasattr(self.parent_widget, 'zoom_level_label'):
+                self.parent_widget.zoom_level_label.setText(f"{self.zoom_level:.1f}x")
+
     def _get_pan_offset(self):
         """Calculate pan offset based on view center"""
         if not self.pix_source or not self.scaled_pixmap:
@@ -4417,6 +4431,7 @@ Step 3: Import Results Back
 
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+        self.processed_label.zoom_to_point(soma[0], soma[1], zoom_level=3.0)
         self.tabs.setCurrentIndex(2)
 
         self.nav_status_label.setText(
@@ -4480,6 +4495,7 @@ Step 3: Import Results Back
         soma_id = img_data['soma_ids'][soma_idx]
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+        self.processed_label.zoom_to_point(soma[0], soma[1], zoom_level=3.0)
         self.tabs.setCurrentIndex(2)
         self.nav_status_label.setText(
             f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
@@ -5319,10 +5335,6 @@ Step 3: Import Results Back
         The result is always a subset of parent_mask - pixels outside the parent
         can never appear in the output.
         """
-        # Mask the ROI so only parent pixels are considered
-        masked_roi = roi.copy()
-        masked_roi[parent_mask == 0] = 0
-
         parent_area = np.sum(parent_mask > 0)
 
         # If target is already >= parent area, just return the parent
@@ -5343,7 +5355,9 @@ Step 3: Import Results Back
         if min_intensity is not None:
             current_thresh = max(current_thresh, min_intensity)
 
-        cy, cx = int(centroid[0]), int(centroid[1])
+        floor = min_intensity if min_intensity is not None else float(parent_values.min())
+        ceiling = float(parent_values.max())
+
         best_mask = None
         best_diff = float('inf')
 
@@ -5351,32 +5365,37 @@ Step 3: Import Results Back
             # Threshold only within the parent region
             binary = (roi > current_thresh) & (parent_mask > 0)
 
+            if not np.any(binary):
+                # Threshold too high - lower it
+                current_thresh = (current_thresh + floor) / 2
+                if current_thresh <= floor + 0.1:
+                    break
+                continue
+
             # Select the connected component at or nearest the centroid
             mask = self._select_centroid_region(binary.astype(np.uint8), centroid)
 
             current_area = np.sum(mask)
-            area_diff = abs(current_area - target_area)
 
-            if area_diff < best_diff:
-                best_diff = area_diff
-                best_mask = mask.copy()
+            if current_area > 0:
+                area_diff = abs(current_area - target_area)
 
-            if area_diff <= 100:  # tolerance
-                return mask
+                if area_diff < best_diff:
+                    best_diff = area_diff
+                    best_mask = mask.copy()
 
-            if current_area == 0 or target_area == 0:
-                break
+                if area_diff <= 100:  # tolerance
+                    return mask
 
-            adjustment = current_thresh * (current_area - target_area) / (iteration + 1) / target_area
-            current_thresh += adjustment
-
-            # Clip within the parent's intensity range
-            if min_intensity is not None:
-                current_thresh = np.clip(current_thresh, min_intensity, parent_values.max())
+                adjustment = current_thresh * (current_area - target_area) / (iteration + 1) / target_area
+                current_thresh += adjustment
             else:
-                current_thresh = np.clip(current_thresh, parent_values.min(), parent_values.max())
+                # Region selection found nothing at centroid - lower threshold
+                current_thresh = (current_thresh + floor) / 2
 
-            if abs(adjustment) < 0.1:
+            current_thresh = np.clip(current_thresh, floor, ceiling)
+
+            if abs(current_thresh - floor) < 0.1 or abs(current_thresh - ceiling) < 0.1:
                 break
 
         return best_mask if best_mask is not None else np.zeros_like(roi, dtype=np.uint8)
@@ -5394,39 +5413,45 @@ Step 3: Import Results Back
         if min_intensity is not None:
             current_thresh = max(current_thresh, min_intensity)
 
-        cy, cx = int(centroid[0]), int(centroid[1])
-
         best_mask = None
         best_diff = float('inf')
+        floor = min_intensity if min_intensity is not None else float(roi.min())
+        ceiling = float(roi.max())
 
         for iteration in range(max_iterations):
             binary = roi > current_thresh
+
+            if not np.any(binary):
+                # Threshold too high - nothing passes, lower it
+                current_thresh = (current_thresh + floor) / 2
+                if current_thresh <= floor + 0.1:
+                    break
+                continue
 
             # Select the connected component at or nearest the centroid
             mask = self._select_centroid_region(binary.astype(np.uint8), centroid)
 
             current_area = np.sum(mask)
-            area_diff = abs(current_area - target_area)
 
-            if area_diff < best_diff:
-                best_diff = area_diff
-                best_mask = mask.copy()
+            if current_area > 0:
+                area_diff = abs(current_area - target_area)
 
-            if area_diff <= tolerance:
-                return mask
+                if area_diff < best_diff:
+                    best_diff = area_diff
+                    best_mask = mask.copy()
 
-            if current_area == 0 or target_area == 0:
-                break
+                if area_diff <= tolerance:
+                    return mask
 
-            adjustment = current_thresh * (current_area - target_area) / (iteration + 1) / target_area
-            current_thresh += adjustment
-
-            if min_intensity is not None:
-                current_thresh = np.clip(current_thresh, min_intensity, roi.max())
+                adjustment = current_thresh * (current_area - target_area) / (iteration + 1) / target_area
+                current_thresh += adjustment
             else:
-                current_thresh = np.clip(current_thresh, roi.min(), roi.max())
+                # Region selection found nothing at centroid - lower threshold
+                current_thresh = (current_thresh + floor) / 2
 
-            if abs(adjustment) < 0.1:
+            current_thresh = np.clip(current_thresh, floor, ceiling)
+
+            if abs(current_thresh - floor) < 0.1 or abs(current_thresh - ceiling) < 0.1:
                 break
 
         return best_mask if best_mask is not None else np.zeros_like(roi, dtype=np.uint8)
@@ -5480,6 +5505,13 @@ Step 3: Import Results Back
         adjusted = self._apply_display_adjustments(processed_img)
         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
         self.mask_label.set_image(pixmap, mask_overlay=mask_data['mask'])
+
+        # Auto-zoom to mask center
+        mask_coords = np.argwhere(mask_data['mask'] > 0)
+        if len(mask_coords) > 0:
+            center_row = float(np.mean(mask_coords[:, 0]))
+            center_col = float(np.mean(mask_coords[:, 1]))
+            self.mask_label.zoom_to_point(center_row, center_col, zoom_level=3.0)
 
         status = mask_data.get('approved')
         status_text = "✓ Approved" if status is True else "✗ Rejected" if status is False else "⏳ Not reviewed"
