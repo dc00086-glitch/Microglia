@@ -2,6 +2,7 @@
 
 import sys
 import os
+import re
 import time
 import numpy as np
 from PyQt5.QtWidgets import (
@@ -2671,7 +2672,41 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 if processed_data is None and img_session.get('status') not in ('loaded',):
                     self.images[img_name]['status'] = 'loaded'
 
+                # Load mask TIFFs from disk for qa_complete/analyzed images
                 status = self.images[img_name]['status']
+                if status in ('qa_complete', 'analyzed') and self.masks_dir and os.path.isdir(self.masks_dir):
+                    img_basename = os.path.splitext(img_name)[0]
+                    mask_pattern = re.compile(
+                        re.escape(img_basename) + r'_(soma_\d+_\d+)_area(\d+)_mask\.tif$'
+                    )
+                    # Build a lookup of soma outlines for soma_area_um2
+                    outline_lookup = {}
+                    for ol in restored_outlines:
+                        outline_lookup[ol.get('soma_id', '')] = ol.get('soma_area_um2', 0)
+
+                    for mf in sorted(os.listdir(self.masks_dir)):
+                        m = mask_pattern.match(mf)
+                        if not m:
+                            continue
+                        soma_id = m.group(1)
+                        area_um2 = int(m.group(2))
+                        mask_path = os.path.join(self.masks_dir, mf)
+                        try:
+                            mask_arr = tifffile.imread(mask_path)
+                            # Find soma_idx from soma_ids list
+                            soma_ids_list = self.images[img_name]['soma_ids']
+                            soma_idx = soma_ids_list.index(soma_id) if soma_id in soma_ids_list else 0
+                            self.images[img_name]['masks'].append({
+                                'image_name': img_name,
+                                'soma_idx': soma_idx,
+                                'soma_id': soma_id,
+                                'area_um2': area_um2,
+                                'mask': mask_arr,
+                                'approved': True,
+                                'soma_area_um2': outline_lookup.get(soma_id, 0),
+                            })
+                        except Exception as e:
+                            print(f"Warning: Could not load mask {mf}: {e}")
                 status_colors = {
                     'loaded': ('#808080', '⚪'),
                     'processed': ('#009600', '🟢'),
@@ -2696,6 +2731,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self._display_current_image()
                 self.file_list.setCurrentRow(0)
                 self.process_selected_btn.setEnabled(True)
+
+            # Rebuild all_masks_flat from loaded masks
+            self.all_masks_flat = []
+            for iname, idata in self.images.items():
+                if not idata['selected']:
+                    continue
+                for mask_data in idata['masks']:
+                    self.all_masks_flat.append({
+                        'image_name': iname,
+                        'mask_data': mask_data,
+                        'processed_img': idata['processed'],
+                    })
 
             # Enable buttons based on restored state
             self._update_buttons_after_session_load()
