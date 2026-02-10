@@ -2556,10 +2556,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 QMessageBox.warning(self, "Warning", "Incompatible session file version.")
                 return
 
-            # Verify image files still exist
+            # Verify image files still exist (check both raw and processed)
             missing = []
             for img_name, img_session in session['images'].items():
-                if not os.path.exists(img_session['raw_path']):
+                raw_exists = os.path.exists(img_session['raw_path'])
+                proc_exists = img_session.get('processed_path') and os.path.exists(img_session['processed_path'])
+                if not raw_exists and not proc_exists:
                     missing.append(img_name)
 
             if missing:
@@ -2669,12 +2671,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 }
 
                 # If processed image wasn't found, downgrade status
-                if processed_data is None and img_session.get('status') not in ('loaded',):
+                # But don't downgrade qa_complete — masks on disk are still valid
+                if processed_data is None and img_session.get('status') not in ('loaded', 'qa_complete', 'analyzed'):
                     self.images[img_name]['status'] = 'loaded'
 
                 # Load mask TIFFs from disk for qa_complete/analyzed images
-                status = self.images[img_name]['status']
-                if status in ('qa_complete', 'analyzed') and self.masks_dir and os.path.isdir(self.masks_dir):
+                orig_status = img_session.get('status', 'loaded')
+                if orig_status in ('qa_complete', 'analyzed') and self.masks_dir and os.path.isdir(self.masks_dir):
                     img_basename = os.path.splitext(img_name)[0]
                     mask_pattern = re.compile(
                         re.escape(img_basename) + r'_(soma_\d+_\d+)_area(\d+)_mask\.tif$'
@@ -2707,6 +2710,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
                             })
                         except Exception as e:
                             print(f"Warning: Could not load mask {mf}: {e}")
+                    n_loaded_masks = len(self.images[img_name]['masks'])
+                    if n_loaded_masks > 0:
+                        print(f"Loaded {n_loaded_masks} masks from disk for {img_name}")
+                    else:
+                        print(f"Warning: No masks found on disk for {img_name} in {self.masks_dir}")
+
+                status = self.images[img_name]['status']
                 status_colors = {
                     'loaded': ('#808080', '⚪'),
                     'processed': ('#009600', '🟢'),
@@ -5808,11 +5818,23 @@ Step 3: Import Results Back
             # No ImageJ required for simple characteristics
             # Complex analysis (Sholl, Skeleton) will be done separately in ImageJ
 
+            self.log(f"all_masks_flat has {len(self.all_masks_flat)} entries")
             approved_masks = [flat for flat in self.all_masks_flat if flat['mask_data']['approved']]
             total = len(approved_masks)
 
             if total == 0:
-                QMessageBox.warning(self, "Warning", "No approved masks to analyze")
+                self.log(f"DEBUG: all_masks_flat count = {len(self.all_masks_flat)}")
+                for i, flat in enumerate(self.all_masks_flat[:5]):
+                    self.log(f"  mask {i}: approved={flat['mask_data'].get('approved')}, "
+                             f"soma_id={flat['mask_data'].get('soma_id')}, "
+                             f"area={flat['mask_data'].get('area_um2')}")
+                # Also check images directly
+                for iname, idata in self.images.items():
+                    self.log(f"  image '{iname}': status={idata['status']}, "
+                             f"selected={idata['selected']}, masks={len(idata['masks'])}")
+                QMessageBox.warning(self, "Warning", "No approved masks to analyze.\n\n"
+                    f"Check the log for details.\n"
+                    f"all_masks_flat: {len(self.all_masks_flat)} entries")
                 return
 
             self.log("=" * 50)
