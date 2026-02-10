@@ -5345,7 +5345,15 @@ Step 3: Import Results Back
         masks = []
         cy, cx = int(centroid[0]), int(centroid[1])
 
-        roi_size = 200
+        # Convert all target areas to pixels and find the largest
+        sorted_areas = sorted(area_list_um2, reverse=True)
+        largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
+
+        # Size the ROI to guarantee enough room for the largest mask
+        # Use radius of equivalent circle * 3 for safety (processes extend far)
+        min_roi_radius = int(np.sqrt(largest_target_px / np.pi) * 3)
+        roi_size = max(200, min_roi_radius)
+
         y_min = max(0, cy - roi_size)
         y_max = min(processed_img.shape[0], cy + roi_size)
         x_min = max(0, cx - roi_size)
@@ -5358,10 +5366,6 @@ Step 3: Import Results Back
         # Clamp centroid to ROI bounds
         cy_roi = max(0, min(h - 1, cy_roi))
         cx_roi = max(0, min(w - 1, cx_roi))
-
-        # Convert all target areas to pixels and find the largest
-        sorted_areas = sorted(area_list_um2, reverse=True)
-        largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
 
         # Priority region growing: grow from centroid, brightest neighbor first
         # Use a max-heap (negate intensity for min-heap)
@@ -5386,6 +5390,8 @@ Step 3: Import Results Back
                     visited[nr, nc] = True
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
+        print(f"  {soma_id}: grew {len(growth_order)} pixels (target largest: {largest_target_px})")
+
         # Build masks for each target area from the growth order
         # Largest first (matches QA presentation order)
         for target_area_um2 in sorted_areas:
@@ -5398,6 +5404,9 @@ Step 3: Import Results Back
 
             full_mask = np.zeros(processed_img.shape, dtype=np.uint8)
             full_mask[y_min:y_max, x_min:x_max] = mask_roi
+
+            actual_area_um2 = n_pixels * (pixel_size_um ** 2)
+            print(f"    {target_area_um2} um²: {n_pixels} px = {actual_area_um2:.1f} um² actual")
 
             masks.append({
                 'image_name': img_name,
