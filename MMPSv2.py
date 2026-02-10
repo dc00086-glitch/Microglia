@@ -5363,15 +5363,10 @@ Step 3: Import Results Back
         sorted_areas = sorted(area_list_um2, reverse=True)
         largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
 
-        # Calculate minimum intensity floor if enabled
-        min_intensity = 0.0
-        if self.use_min_intensity:
-            roi_max = roi.max()
-            if roi_max > 0:
-                min_intensity = (self.min_intensity_percent / 100.0) * roi_max * 0.3
-
         # Priority region growing: grow from centroid, brightest neighbor first
         # Use a max-heap (negate intensity for min-heap)
+        # The heap ordering ensures bright cell pixels are added first,
+        # so smaller masks = bright core, larger masks extend outward naturally.
         visited = np.zeros((h, w), dtype=bool)
         growth_order = []  # list of (row, col) in the order pixels were added
 
@@ -5381,11 +5376,6 @@ Step 3: Import Results Back
 
         while heap and len(growth_order) < largest_target_px:
             neg_intensity, r, c = heapq.heappop(heap)
-            intensity = -neg_intensity
-
-            # Skip if below minimum intensity floor
-            if intensity < min_intensity:
-                continue
 
             growth_order.append((r, c))
 
