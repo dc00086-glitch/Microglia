@@ -5212,9 +5212,13 @@ Step 3: Import Results Back
 
     def _create_annulus_masks(self, centroid, area_list_um2, pixel_size_um, soma_idx, soma_id, processed_img, img_name,
                               soma_area_um2):
-        """Create nested cell masks where each smaller mask is a strict subset of the larger one."""
-        from skimage.filters import threshold_otsu
-        from skimage.measure import label
+        """Create nested cell masks using priority region growing from the centroid.
+
+        Grows outward from the soma centroid, always adding the brightest
+        neighboring pixel next. Each smaller mask is automatically a strict
+        subset of the larger one because they share the same growth order.
+        """
+        import heapq
 
         masks = []
         cy, cx = int(centroid[0]), int(centroid[1])
@@ -5225,58 +5229,63 @@ Step 3: Import Results Back
         x_min = max(0, cx - roi_size)
         x_max = min(processed_img.shape[1], cx + roi_size)
 
-        roi = processed_img[y_min:y_max, x_min:x_max].copy()
-        centroid_in_roi = (cy - y_min, cx - x_min)
+        roi = processed_img[y_min:y_max, x_min:x_max].astype(np.float64)
+        cy_roi, cx_roi = cy - y_min, cx - x_min
+        h, w = roi.shape
 
-        # Sort largest first so we build masks from outside in
-        reversed_area_list = sorted(area_list_um2, reverse=True)
+        # Clamp centroid to ROI bounds
+        cy_roi = max(0, min(h - 1, cy_roi))
+        cx_roi = max(0, min(w - 1, cx_roi))
 
-        # Step 1: Generate the largest mask using full ROI thresholding
-        parent_mask_roi = None
+        # Convert all target areas to pixels and find the largest
+        sorted_areas = sorted(area_list_um2, reverse=True)
+        largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
 
-        # Use actual min/max from the area list for intensity scaling
-        actual_smallest = min(reversed_area_list)
-        actual_largest = max(reversed_area_list)
+        # Calculate minimum intensity floor if enabled
+        min_intensity = 0.0
+        if self.use_min_intensity:
+            roi_max = roi.max()
+            if roi_max > 0:
+                min_intensity = (self.min_intensity_percent / 100.0) * roi_max * 0.3
 
-        for i, target_area_um2 in enumerate(reversed_area_list):
-            target_area_px = target_area_um2 / (pixel_size_um ** 2)
+        # Priority region growing: grow from centroid, brightest neighbor first
+        # Use a max-heap (negate intensity for min-heap)
+        visited = np.zeros((h, w), dtype=bool)
+        growth_order = []  # list of (row, col) in the order pixels were added
 
-            # Calculate minimum intensity threshold if enabled
-            # Scale: smallest mask uses full minimum, largest uses 30%
-            min_intensity = None
-            if self.use_min_intensity:
-                roi_max = roi.max()
-                base_min_intensity = (self.min_intensity_percent / 100.0) * roi_max
-                if actual_smallest == actual_largest:
-                    scale_factor = 1.0
-                elif target_area_um2 <= actual_smallest:
-                    scale_factor = 1.0
-                elif target_area_um2 >= actual_largest:
-                    scale_factor = 0.3
-                else:
-                    scale_factor = 1.0 - (0.7 * (target_area_um2 - actual_smallest) / (actual_largest - actual_smallest))
-                min_intensity = base_min_intensity * scale_factor
+        # Seed with the centroid
+        heap = [(-roi[cy_roi, cx_roi], cy_roi, cx_roi)]
+        visited[cy_roi, cx_roi] = True
 
-            if parent_mask_roi is None:
-                # First (largest) mask: threshold the full ROI
-                mask = self._iterative_threshold_mask(
-                    roi, centroid_in_roi, target_area_px, max_iterations=30, min_intensity=min_intensity
-                )
-                # Select the connected region containing (or nearest to) the centroid
-                mask = self._select_centroid_region(mask, centroid_in_roi)
-            else:
-                # Subsequent (smaller) masks: threshold WITHIN the parent mask only
-                mask = self._iterative_threshold_within_parent(
-                    roi, centroid_in_roi, parent_mask_roi, target_area_px,
-                    max_iterations=30, min_intensity=min_intensity
-                )
+        while heap and len(growth_order) < largest_target_px:
+            neg_intensity, r, c = heapq.heappop(heap)
+            intensity = -neg_intensity
 
-            # Update parent for next iteration (smaller masks nest inside this one)
-            if np.any(mask):
-                parent_mask_roi = mask.copy()
+            # Skip if below minimum intensity floor
+            if intensity < min_intensity:
+                continue
+
+            growth_order.append((r, c))
+
+            # Add 4-connected neighbors to the heap
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                    visited[nr, nc] = True
+                    heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+
+        # Build masks for each target area from the growth order
+        # Largest first (matches QA presentation order)
+        for target_area_um2 in sorted_areas:
+            target_px = int(target_area_um2 / (pixel_size_um ** 2))
+            n_pixels = min(target_px, len(growth_order))
+
+            mask_roi = np.zeros((h, w), dtype=np.uint8)
+            for r, c in growth_order[:n_pixels]:
+                mask_roi[r, c] = 1
 
             full_mask = np.zeros(processed_img.shape, dtype=np.uint8)
-            full_mask[y_min:y_max, x_min:x_max] = mask
+            full_mask[y_min:y_max, x_min:x_max] = mask_roi
 
             masks.append({
                 'image_name': img_name,
@@ -5289,172 +5298,6 @@ Step 3: Import Results Back
             })
 
         return masks
-
-    def _select_centroid_region(self, mask, centroid_in_roi):
-        """From a binary mask, select the connected component containing or nearest to the centroid."""
-        from skimage.measure import label
-
-        if not np.any(mask):
-            return mask
-
-        labeled_mask = label(mask)
-        if labeled_mask.max() == 0:
-            return mask
-
-        cy_roi, cx_roi = int(centroid_in_roi[0]), int(centroid_in_roi[1])
-
-        # Check if centroid falls directly on a region
-        if (0 <= cy_roi < labeled_mask.shape[0] and
-                0 <= cx_roi < labeled_mask.shape[1] and
-                labeled_mask[cy_roi, cx_roi] > 0):
-            target_label = labeled_mask[cy_roi, cx_roi]
-            return (labeled_mask == target_label).astype(np.uint8)
-
-        # Otherwise find the closest region to the centroid
-        best_region = None
-        min_dist = float('inf')
-
-        for region_id in range(1, labeled_mask.max() + 1):
-            region_coords = np.argwhere(labeled_mask == region_id)
-            distances = np.sqrt(np.sum((region_coords - np.array(centroid_in_roi)) ** 2, axis=1))
-            closest_dist = np.min(distances)
-
-            if closest_dist < min_dist:
-                min_dist = closest_dist
-                best_region = region_id
-
-        if best_region is not None:
-            return (labeled_mask == best_region).astype(np.uint8)
-
-        return mask
-
-    def _iterative_threshold_within_parent(self, roi, centroid, parent_mask, target_area,
-                                            max_iterations=30, min_intensity=None):
-        """Threshold within the parent mask to create a smaller nested mask.
-
-        The result is always a subset of parent_mask - pixels outside the parent
-        can never appear in the output.
-        """
-        parent_area = np.sum(parent_mask > 0)
-
-        # If target is already >= parent area, just return the parent
-        if target_area >= parent_area:
-            return parent_mask.copy()
-
-        # Get intensity values within the parent mask for threshold range
-        parent_values = roi[parent_mask > 0]
-        if len(parent_values) == 0:
-            return np.zeros_like(roi, dtype=np.uint8)
-
-        try:
-            from skimage.filters import threshold_otsu
-            current_thresh = threshold_otsu(parent_values)
-        except:
-            current_thresh = np.percentile(parent_values, 50)
-
-        if min_intensity is not None:
-            current_thresh = max(current_thresh, min_intensity)
-
-        floor = min_intensity if min_intensity is not None else float(parent_values.min())
-        ceiling = float(parent_values.max())
-
-        best_mask = None
-        best_diff = float('inf')
-
-        for iteration in range(max_iterations):
-            # Threshold only within the parent region
-            binary = (roi > current_thresh) & (parent_mask > 0)
-
-            if not np.any(binary):
-                # Threshold too high - lower it
-                current_thresh = (current_thresh + floor) / 2
-                if current_thresh <= floor + 0.1:
-                    break
-                continue
-
-            # Select the connected component at or nearest the centroid
-            mask = self._select_centroid_region(binary.astype(np.uint8), centroid)
-
-            current_area = np.sum(mask)
-
-            if current_area > 0:
-                area_diff = abs(current_area - target_area)
-
-                if area_diff < best_diff:
-                    best_diff = area_diff
-                    best_mask = mask.copy()
-
-                if area_diff <= 100:  # tolerance
-                    return mask
-
-                adjustment = current_thresh * (current_area - target_area) / (iteration + 1) / target_area
-                current_thresh += adjustment
-            else:
-                # Region selection found nothing at centroid - lower threshold
-                current_thresh = (current_thresh + floor) / 2
-
-            current_thresh = np.clip(current_thresh, floor, ceiling)
-
-            if abs(current_thresh - floor) < 0.1 or abs(current_thresh - ceiling) < 0.1:
-                break
-
-        return best_mask if best_mask is not None else np.zeros_like(roi, dtype=np.uint8)
-
-    def _iterative_threshold_mask(self, roi, centroid, target_area, max_iterations=30, tolerance=100,
-                                  min_intensity=None):
-        """Use iterative thresholding to create a mask of target area"""
-        from skimage.filters import threshold_otsu
-
-        try:
-            current_thresh = threshold_otsu(roi)
-        except:
-            current_thresh = np.percentile(roi, 50)
-
-        if min_intensity is not None:
-            current_thresh = max(current_thresh, min_intensity)
-
-        best_mask = None
-        best_diff = float('inf')
-        floor = min_intensity if min_intensity is not None else float(roi.min())
-        ceiling = float(roi.max())
-
-        for iteration in range(max_iterations):
-            binary = roi > current_thresh
-
-            if not np.any(binary):
-                # Threshold too high - nothing passes, lower it
-                current_thresh = (current_thresh + floor) / 2
-                if current_thresh <= floor + 0.1:
-                    break
-                continue
-
-            # Select the connected component at or nearest the centroid
-            mask = self._select_centroid_region(binary.astype(np.uint8), centroid)
-
-            current_area = np.sum(mask)
-
-            if current_area > 0:
-                area_diff = abs(current_area - target_area)
-
-                if area_diff < best_diff:
-                    best_diff = area_diff
-                    best_mask = mask.copy()
-
-                if area_diff <= tolerance:
-                    return mask
-
-                adjustment = current_thresh * (current_area - target_area) / (iteration + 1) / target_area
-                current_thresh += adjustment
-            else:
-                # Region selection found nothing at centroid - lower threshold
-                current_thresh = (current_thresh + floor) / 2
-
-            current_thresh = np.clip(current_thresh, floor, ceiling)
-
-            if abs(current_thresh - floor) < 0.1 or abs(current_thresh - ceiling) < 0.1:
-                break
-
-        return best_mask if best_mask is not None else np.zeros_like(roi, dtype=np.uint8)
 
     def start_batch_qa(self):
         # Flatten all masks from all images
