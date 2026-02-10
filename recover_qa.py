@@ -278,6 +278,8 @@ class MaskQAWindow(QMainWindow):
             self._show_current()
 
     def keyPressEvent(self, event):
+        if event.isAutoRepeat():
+            return
         key = event.key()
         if key == Qt.Key_A:
             self.approve_current()
