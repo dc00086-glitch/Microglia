@@ -2433,6 +2433,75 @@ class MicrogliaAnalysisGUI(QMainWindow):
     # SESSION SAVE / RESTORE
     # ========================================================================
 
+    def _build_session_dict(self):
+        """Build a serializable session dictionary from current state."""
+        session = {
+            'version': 2,
+            'output_dir': self.output_dir,
+            'masks_dir': self.masks_dir,
+            'colocalization_mode': self.colocalization_mode,
+            'pixel_size': self.pixel_size_input.text(),
+            'rolling_ball_radius': self.default_rolling_ball_radius,
+            'use_min_intensity': self.use_min_intensity,
+            'min_intensity_percent': self.min_intensity_percent,
+            'mask_min_area': self.mask_min_area,
+            'mask_max_area': self.mask_max_area,
+            'mask_step_size': self.mask_step_size,
+            'coloc_channel_1': self.coloc_channel_1,
+            'coloc_channel_2': self.coloc_channel_2,
+            'grayscale_channel': self.grayscale_channel,
+            'images': {}
+        }
+
+        for img_name, img_data in self.images.items():
+            # Build path to processed TIFF if it exists on disk
+            processed_path = None
+            if self.output_dir:
+                candidate = os.path.join(
+                    self.output_dir,
+                    os.path.splitext(img_name)[0] + "_processed.tif"
+                )
+                if os.path.exists(candidate):
+                    processed_path = candidate
+
+            img_session = {
+                'raw_path': img_data['raw_path'],
+                'processed_path': processed_path,
+                'status': img_data['status'],
+                'selected': img_data['selected'],
+                'animal_id': img_data.get('animal_id', ''),
+                'treatment': img_data.get('treatment', ''),
+                'rolling_ball_radius': img_data.get('rolling_ball_radius', 50),
+                'somas': [(float(s[0]), float(s[1])) for s in img_data.get('somas', [])],
+                'soma_ids': img_data.get('soma_ids', []),
+                'soma_outlines': [],
+            }
+            # Save soma outlines with full metadata
+            for outline in img_data.get('soma_outlines', []):
+                outline_data = {
+                    'soma_idx': outline.get('soma_idx', 0),
+                    'soma_id': outline.get('soma_id', ''),
+                    'centroid': [float(outline['centroid'][0]), float(outline['centroid'][1])] if 'centroid' in outline else None,
+                    'soma_area_um2': outline.get('soma_area_um2', 0),
+                    'polygon_points': [(float(pt[0]), float(pt[1])) for pt in outline.get('polygon_points', [])],
+                }
+                img_session['soma_outlines'].append(outline_data)
+
+            # Record which masks exist on disk for this image
+            if self.masks_dir:
+                prefix = os.path.splitext(img_name)[0]
+                mask_files = [
+                    f for f in os.listdir(self.masks_dir)
+                    if f.startswith(prefix) and f.endswith('_mask.tif')
+                ] if os.path.isdir(self.masks_dir) else []
+                img_session['mask_files'] = mask_files
+            else:
+                img_session['mask_files'] = []
+
+            session['images'][img_name] = img_session
+
+        return session
+
     def save_session(self):
         """Save the entire project state to a JSON file"""
         path, _ = QFileDialog.getSaveFileName(
@@ -2446,66 +2515,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             path += '.mmps_session'
 
         try:
-            session = {
-                'version': 2,
-                'output_dir': self.output_dir,
-                'masks_dir': self.masks_dir,
-                'colocalization_mode': self.colocalization_mode,
-                'pixel_size': self.pixel_size_input.text(),
-                'rolling_ball_radius': self.default_rolling_ball_radius,
-                'use_min_intensity': self.use_min_intensity,
-                'min_intensity_percent': self.min_intensity_percent,
-                'mask_min_area': self.mask_min_area,
-                'mask_max_area': self.mask_max_area,
-                'mask_step_size': self.mask_step_size,
-                'coloc_channel_1': self.coloc_channel_1,
-                'coloc_channel_2': self.coloc_channel_2,
-                'grayscale_channel': self.grayscale_channel,
-                'images': {}
-            }
-
-            for img_name, img_data in self.images.items():
-                # Build path to processed TIFF if it exists on disk
-                processed_path = None
-                if self.output_dir:
-                    candidate = os.path.join(
-                        self.output_dir,
-                        os.path.splitext(img_name)[0] + "_processed.tif"
-                    )
-                    if os.path.exists(candidate):
-                        processed_path = candidate
-
-                img_session = {
-                    'raw_path': img_data['raw_path'],
-                    'processed_path': processed_path,
-                    'status': img_data['status'],
-                    'selected': img_data['selected'],
-                    'animal_id': img_data.get('animal_id', ''),
-                    'treatment': img_data.get('treatment', ''),
-                    'rolling_ball_radius': img_data.get('rolling_ball_radius', 50),
-                    'somas': [(float(s[0]), float(s[1])) for s in img_data.get('somas', [])],
-                    'soma_ids': img_data.get('soma_ids', []),
-                    'soma_outlines': [],
-                }
-                # Save soma outlines (list of list of (row, col) tuples)
-                for outline in img_data.get('soma_outlines', []):
-                    img_session['soma_outlines'].append(
-                        [(float(pt[0]), float(pt[1])) for pt in outline]
-                    )
-
-                # Record which masks exist on disk for this image
-                if self.masks_dir:
-                    prefix = os.path.splitext(img_name)[0]
-                    mask_files = [
-                        f for f in os.listdir(self.masks_dir)
-                        if f.startswith(prefix) and f.endswith('_mask.tif')
-                    ] if os.path.isdir(self.masks_dir) else []
-                    img_session['mask_files'] = mask_files
-                else:
-                    img_session['mask_files'] = []
-
-                session['images'][img_name] = img_session
-
+            session = self._build_session_dict()
             with open(path, 'w') as f:
                 json.dump(session, f, indent=2)
 
@@ -2515,6 +2525,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         except Exception as e:
             self.log(f"ERROR saving session: {e}")
             QMessageBox.critical(self, "Error", f"Failed to save session:\n{e}")
+
+    def _auto_save(self):
+        """Silently auto-save the session to the output directory."""
+        if not self.output_dir or not self.images:
+            return
+        try:
+            path = os.path.join(self.output_dir, "autosave.mmps_session")
+            session = self._build_session_dict()
+            with open(path, 'w') as f:
+                json.dump(session, f, indent=2)
+        except Exception:
+            pass  # Silent - never interrupt the user's workflow
 
     def load_session(self):
         """Restore a previously saved session"""
@@ -2600,16 +2622,44 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     except Exception:
                         processed_data = None
 
+                # Reconstruct soma outlines with full metadata
+                restored_outlines = []
+                for outline_data in img_session.get('soma_outlines', []):
+                    if isinstance(outline_data, dict) and 'soma_idx' in outline_data:
+                        # New format: full outline dict
+                        polygon_pts = [tuple(pt) for pt in outline_data.get('polygon_points', [])]
+                        centroid = tuple(outline_data['centroid']) if outline_data.get('centroid') else None
+                        # Reconstruct the outline mask from polygon points if we have the processed image
+                        outline_mask = None
+                        if polygon_pts and len(polygon_pts) >= 3 and processed_data is not None:
+                            outline_mask = self._polygon_to_mask(polygon_pts, processed_data.shape)
+                        restored_outlines.append({
+                            'soma_idx': outline_data['soma_idx'],
+                            'soma_id': outline_data['soma_id'],
+                            'centroid': centroid,
+                            'outline': outline_mask,
+                            'polygon_points': polygon_pts,
+                            'soma_area_um2': outline_data.get('soma_area_um2', 0),
+                        })
+                    else:
+                        # Legacy format: flat list of points
+                        polygon_pts = [tuple(pt) for pt in outline_data]
+                        restored_outlines.append({
+                            'soma_idx': len(restored_outlines),
+                            'soma_id': '',
+                            'centroid': None,
+                            'outline': None,
+                            'polygon_points': polygon_pts,
+                            'soma_area_um2': 0,
+                        })
+
                 self.images[img_name] = {
                     'raw_path': img_session['raw_path'],
                     'processed': processed_data,
                     'rolling_ball_radius': img_session.get('rolling_ball_radius', 50),
                     'somas': [tuple(s) for s in img_session.get('somas', [])],
                     'soma_ids': img_session.get('soma_ids', []),
-                    'soma_outlines': [
-                        [tuple(pt) for pt in outline]
-                        for outline in img_session.get('soma_outlines', [])
-                    ],
+                    'soma_outlines': restored_outlines,
                     'masks': [],
                     'status': img_session.get('status', 'loaded'),
                     'selected': img_session.get('selected', False),
@@ -4003,7 +4053,7 @@ Step 3: Import Results Back
         self.log("✓ Background removal complete!")
         self.log("✓ Ready for batch soma picking")
         self.log("=" * 50)
-        # self.update_workflow_status()
+        self._auto_save()
         QMessageBox.information(
             self, "Complete",
             "All selected images processed!\n\nYou can now pick somas."
@@ -4195,6 +4245,7 @@ Step 3: Import Results Back
         self.log(f"✓ Soma picking complete! Total somas: {total_somas}")
         self.log("✓ Ready for outlining")
         self.log("=" * 50)
+        self._auto_save()
         QMessageBox.information(
             self, "Complete",
             f"Soma picking complete!\n\nTotal somas marked: {total_somas}\n\nReady to outline."
@@ -4618,6 +4669,9 @@ Step 3: Import Results Back
         # Update outline progress
         self._update_outline_progress()
 
+        # Auto-save after each outline
+        self._auto_save()
+
         # Enable Redo button after first outline is complete
         self.redo_outline_btn.setEnabled(True)
 
@@ -4994,6 +5048,7 @@ Step 3: Import Results Back
         self.log("✓ All somas outlined!")
         self.log("✓ Ready to generate masks")
         self.log("=" * 50)
+        self._auto_save()
         QMessageBox.information(self, "Complete", "All somas outlined!\n\nReady to generate masks.")
 
     def batch_generate_masks(self):
@@ -5196,6 +5251,7 @@ Step 3: Import Results Back
                 self.log(f"✓ Used minimum intensity: {self.min_intensity_percent}%")
             self.log("✓ Ready for QA")
             self.log("=" * 50)
+            self._auto_save()
 
             QMessageBox.information(
                 self, "Success",
@@ -5408,6 +5464,10 @@ Step 3: Import Results Back
             for mask_num, area in auto_approved:
                 self.log(f"      Mask #{mask_num} ({area} µm²)")
 
+        # Auto-save every 5 QA decisions
+        if len(self.last_qa_decisions) % 5 == 0:
+            self._auto_save()
+
         # Move to next unreviewed mask
         self._advance_to_next_unreviewed()
 
@@ -5599,6 +5659,7 @@ Step 3: Import Results Back
             self.log(f"✓ QA Complete!")
             self.log(f"Approved: {approved_count}, Rejected: {rejected_count}")
             self.log("=" * 50)
+            self._auto_save()
 
             QMessageBox.information(
                 self, "QA Complete",
@@ -5793,6 +5854,7 @@ Step 3: Import Results Back
         self.log("  2. Run imagej_batch_analysis.ijm macro")
         self.log("  3. Select the masks folder when prompted")
         self.log("=" * 50)
+        self._auto_save()
 
         # Build success message
         success_msg = f"Simple characteristics calculated for {len(all_results)} cells!\n\n"
