@@ -1505,6 +1505,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.all_masks_flat = []
         self.mask_qa_idx = 0
         self.mask_qa_active = False
+        self.last_qa_decisions = []
         self.soma_mode = False  # Initialize soma_mode to prevent crashes
         # Initialize display adjustment values
         self.brightness_value = 0
@@ -1896,10 +1897,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.clear_masks_btn.setEnabled(False)
         self.clear_masks_btn.setStyleSheet("border: 2px solid #F44336;")
         batch_layout.addWidget(self.clear_masks_btn)
+        qa_row = QHBoxLayout()
         self.batch_qa_btn = QPushButton("QA All Masks")
         self.batch_qa_btn.clicked.connect(self.start_batch_qa)
         self.batch_qa_btn.setEnabled(False)
-        batch_layout.addWidget(self.batch_qa_btn)
+        qa_row.addWidget(self.batch_qa_btn)
+        self.undo_qa_btn = QPushButton("Undo QA")
+        self.undo_qa_btn.clicked.connect(self.undo_last_qa)
+        self.undo_qa_btn.setEnabled(False)
+        self.undo_qa_btn.setToolTip("Reset all mask approvals and restart QA")
+        self.undo_qa_btn.setStyleSheet("border: 2px solid #FF9800;")
+        qa_row.addWidget(self.undo_qa_btn)
+        batch_layout.addLayout(qa_row)
         self.batch_calculate_btn = QPushButton("Calculate Simple Characteristics")
         self.batch_calculate_btn.clicked.connect(self.batch_calculate_morphology)
         self.batch_calculate_btn.setEnabled(False)
@@ -5314,12 +5323,14 @@ Step 3: Import Results Back
 
         self.mask_qa_active = True
         self.mask_qa_idx = 0
+        self.last_qa_decisions = []
 
         self.approve_mask_btn.setEnabled(True)
         self.reject_mask_btn.setEnabled(True)
         self.prev_btn.setEnabled(True)
         self.next_btn.setEnabled(True)
         self.done_btn.setEnabled(False)
+        self.undo_qa_btn.setEnabled(True)
 
         self._show_current_mask()
         self.tabs.setCurrentIndex(3)
@@ -5366,6 +5377,9 @@ Step 3: Import Results Back
 
         self.log(f"✅ APPROVED | {current_img} | {current_soma_id} | Area: {current_area} µm²")
 
+        # Record decision for undo
+        self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': True})
+
         # Export mask immediately upon approval
         self._export_approved_mask(flat_data)
 
@@ -5382,6 +5396,8 @@ Step 3: Import Results Back
                     other_mask['approved'] is None):
                 other_mask['approved'] = True
                 auto_approved.append((i + 1, other_mask['area_um2']))
+                # Record auto-approval for undo
+                self.last_qa_decisions.append({'flat_data': other_flat, 'was_approved': True})
                 # Export auto-approved masks too
                 self._export_approved_mask(other_flat)
 
@@ -5530,6 +5546,9 @@ Step 3: Import Results Back
         mask_data = flat_data['mask_data']
         mask_data['approved'] = False
 
+        # Record decision for undo
+        self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': False})
+
         self.log(f"✗ Rejected: {mask_data['soma_id']} ({mask_data['area_um2']} µm²)")
 
         if self.mask_qa_idx < len(self.all_masks_flat) - 1:
@@ -5569,7 +5588,7 @@ Step 3: Import Results Back
                     self._update_file_list_item(img_name)
 
             self.batch_calculate_btn.setEnabled(True)
-            # self.update_workflow_status()
+            self.undo_qa_btn.setEnabled(True)
 
             approved_count = sum(1 for flat in self.all_masks_flat if flat['mask_data']['approved'])
             rejected_count = len(self.all_masks_flat) - approved_count
@@ -5583,6 +5602,85 @@ Step 3: Import Results Back
                 self, "QA Complete",
                 f"QA Complete!\n\nApproved: {approved_count}\nRejected: {rejected_count}"
             )
+
+    def undo_last_qa(self):
+        """Reset only the last QA session's approvals, delete its exported files, and revert statuses."""
+        if not hasattr(self, 'last_qa_decisions') or not self.last_qa_decisions:
+            QMessageBox.warning(self, "Nothing to Undo", "No recent QA decisions to undo.")
+            return
+
+        n_decisions = len(self.last_qa_decisions)
+        n_approved = sum(1 for d in self.last_qa_decisions if d['was_approved'])
+        n_rejected = n_decisions - n_approved
+
+        reply = QMessageBox.question(
+            self, "Undo Last QA",
+            f"This will undo the last QA session:\n\n"
+            f"  {n_approved} approved masks → reset to unreviewed\n"
+            f"  {n_rejected} rejected masks → reset to unreviewed\n"
+            f"  Exported mask files will be deleted\n\n"
+            f"Continue?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Delete exported mask TIFFs and reset approval states
+        deleted_count = 0
+        reset_count = 0
+        affected_images = set()
+
+        for decision in self.last_qa_decisions:
+            flat_data = decision['flat_data']
+            mask_data = flat_data['mask_data']
+            affected_images.add(flat_data['image_name'])
+
+            # Delete exported file if it was approved
+            if decision['was_approved'] and self.masks_dir and os.path.isdir(self.masks_dir):
+                img_basename = os.path.splitext(flat_data['image_name'])[0]
+                soma_id = mask_data['soma_id']
+                area_um2 = mask_data.get('area_um2', 0)
+                mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+                mask_path = os.path.join(self.masks_dir, mask_filename)
+                if os.path.exists(mask_path):
+                    os.remove(mask_path)
+                    deleted_count += 1
+
+            # Reset approval state
+            mask_data['approved'] = None
+            reset_count += 1
+
+        # Revert affected image statuses back to masks_generated
+        for img_name in affected_images:
+            if img_name in self.images:
+                img_data = self.images[img_name]
+                if img_data['status'] in ('qa_complete', 'analyzed'):
+                    img_data['status'] = 'masks_generated'
+                    self._update_file_list_item(img_name)
+
+        # Clear the undo history
+        self.last_qa_decisions = []
+
+        # Update button states
+        self.batch_qa_btn.setEnabled(True)
+        self.batch_calculate_btn.setEnabled(False)
+        self.undo_qa_btn.setEnabled(False)
+        self.mask_qa_active = False
+        self.approve_mask_btn.setEnabled(False)
+        self.reject_mask_btn.setEnabled(False)
+
+        self.log("=" * 50)
+        self.log(f"↩ Last QA undone: {reset_count} masks reset, {deleted_count} exported files removed")
+        self.log("You can now re-run QA All Masks.")
+        self.log("=" * 50)
+
+        QMessageBox.information(
+            self, "QA Undone",
+            f"Last QA session has been reset.\n\n"
+            f"Masks reset: {reset_count}\n"
+            f"Exported files deleted: {deleted_count}\n\n"
+            f"You can now re-run QA."
+        )
 
     def batch_calculate_morphology(self):
         try:
