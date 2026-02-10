@@ -1515,6 +1515,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Mask generation settings (defaults)
         self.use_min_intensity = True
         self.min_intensity_percent = 30
+        self.mask_min_area = 300
+        self.mask_max_area = 800
+        self.mask_step_size = 120
         self.use_imagej = False
         # Colocalization mode - show images in color
         self.colocalization_mode = False
@@ -2438,6 +2441,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 'rolling_ball_radius': self.default_rolling_ball_radius,
                 'use_min_intensity': self.use_min_intensity,
                 'min_intensity_percent': self.min_intensity_percent,
+                'mask_min_area': self.mask_min_area,
+                'mask_max_area': self.mask_max_area,
+                'mask_step_size': self.mask_step_size,
                 'coloc_channel_1': self.coloc_channel_1,
                 'coloc_channel_2': self.coloc_channel_2,
                 'grayscale_channel': self.grayscale_channel,
@@ -2537,6 +2543,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.colocalization_mode = session.get('colocalization_mode', False)
             self.use_min_intensity = session.get('use_min_intensity', True)
             self.min_intensity_percent = session.get('min_intensity_percent', 30)
+            self.mask_min_area = session.get('mask_min_area', 300)
+            self.mask_max_area = session.get('mask_max_area', 800)
+            self.mask_step_size = session.get('mask_step_size', 120)
             self.coloc_channel_1 = session.get('coloc_channel_1', 0)
             self.coloc_channel_2 = session.get('coloc_channel_2', 1)
             self.grayscale_channel = session.get('grayscale_channel', 0)
@@ -4987,12 +4996,66 @@ Step 3: Import Results Back
         title.setFont(title_font)
         layout.addWidget(title)
 
-        # Description
-        desc = QLabel("Adjust settings to prevent dim background from being included in masks:")
-        desc.setWordWrap(True)
-        layout.addWidget(desc)
+        # --- Mask Size Settings ---
+        size_group = QLabel("<b>Mask Sizes (µm²)</b>")
+        layout.addWidget(size_group)
+
+        size_grid = QHBoxLayout()
+
+        size_grid.addWidget(QLabel("Min:"))
+        min_area_spin = QSpinBox()
+        min_area_spin.setRange(100, 2000)
+        min_area_spin.setSingleStep(50)
+        min_area_spin.setValue(self.mask_min_area)
+        min_area_spin.setSuffix(" µm²")
+        size_grid.addWidget(min_area_spin)
+
+        size_grid.addWidget(QLabel("Max:"))
+        max_area_spin = QSpinBox()
+        max_area_spin.setRange(200, 5000)
+        max_area_spin.setSingleStep(50)
+        max_area_spin.setValue(self.mask_max_area)
+        max_area_spin.setSuffix(" µm²")
+        size_grid.addWidget(max_area_spin)
+
+        size_grid.addWidget(QLabel("Step:"))
+        step_spin = QSpinBox()
+        step_spin.setRange(10, 500)
+        step_spin.setSingleStep(10)
+        step_spin.setValue(self.mask_step_size)
+        step_spin.setSuffix(" µm²")
+        size_grid.addWidget(step_spin)
+
+        layout.addLayout(size_grid)
+
+        # Preview of mask sizes that will be generated
+        preview_label = QLabel("")
+        preview_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+        preview_label.setWordWrap(True)
+        layout.addWidget(preview_label)
+
+        def update_size_preview():
+            mn = min_area_spin.value()
+            mx = max_area_spin.value()
+            st = step_spin.value()
+            if mn > mx:
+                preview_label.setText("⚠ Min must be ≤ Max")
+                return
+            sizes = list(range(mn, mx + 1, st))
+            if sizes[-1] != mx:
+                sizes.append(mx)
+            preview_label.setText(f"Masks: {', '.join(str(s) for s in sizes)} µm²  ({len(sizes)} masks per cell)")
+
+        min_area_spin.valueChanged.connect(lambda: update_size_preview())
+        max_area_spin.valueChanged.connect(lambda: update_size_preview())
+        step_spin.valueChanged.connect(lambda: update_size_preview())
+        update_size_preview()
 
         layout.addSpacing(10)
+
+        # --- Intensity Settings ---
+        intensity_group = QLabel("<b>Intensity Filtering</b>")
+        layout.addWidget(intensity_group)
 
         # Minimum intensity threshold checkbox
         min_intensity_check = QCheckBox("Use minimum intensity threshold")
@@ -5055,11 +5118,18 @@ Step 3: Import Results Back
         # Save settings
         self.use_min_intensity = min_intensity_check.isChecked()
         self.min_intensity_percent = min_intensity_slider.value()
+        self.mask_min_area = min_area_spin.value()
+        self.mask_max_area = max_area_spin.value()
+        self.mask_step_size = step_spin.value()
 
         # Now proceed with mask generation
         try:
             pixel_size = float(self.pixel_size_input.text())
-            area_list = [200, 300, 400, 500, 600, 700, 800]
+
+            # Build area list from user settings
+            area_list = list(range(self.mask_min_area, self.mask_max_area + 1, self.mask_step_size))
+            if area_list[-1] != self.mask_max_area:
+                area_list.append(self.mask_max_area)
 
             self.progress_bar.setVisible(True)
             self.progress_status_label.setVisible(True)
@@ -5105,6 +5175,7 @@ Step 3: Import Results Back
 
             self.log("=" * 50)
             self.log(f"✓ Generated {total_masks} masks total")
+            self.log(f"✓ Mask sizes: {', '.join(str(a) for a in area_list)} µm²")
             if self.use_min_intensity:
                 self.log(f"✓ Used minimum intensity: {self.min_intensity_percent}%")
             self.log("✓ Ready for QA")
@@ -5147,25 +5218,27 @@ Step 3: Import Results Back
         # Step 1: Generate the largest mask using full ROI thresholding
         parent_mask_roi = None
 
-        for i, target_area_um2 in enumerate(reversed_area_list):
-            if target_area_um2 == 200:
-                continue
+        # Use actual min/max from the area list for intensity scaling
+        actual_smallest = min(reversed_area_list)
+        actual_largest = max(reversed_area_list)
 
+        for i, target_area_um2 in enumerate(reversed_area_list):
             target_area_px = target_area_um2 / (pixel_size_um ** 2)
 
             # Calculate minimum intensity threshold if enabled
+            # Scale: smallest mask uses full minimum, largest uses 30%
             min_intensity = None
             if self.use_min_intensity:
                 roi_max = roi.max()
                 base_min_intensity = (self.min_intensity_percent / 100.0) * roi_max
-                smallest_area = 300
-                largest_area = 800
-                if target_area_um2 <= smallest_area:
+                if actual_smallest == actual_largest:
                     scale_factor = 1.0
-                elif target_area_um2 >= largest_area:
+                elif target_area_um2 <= actual_smallest:
+                    scale_factor = 1.0
+                elif target_area_um2 >= actual_largest:
                     scale_factor = 0.3
                 else:
-                    scale_factor = 1.0 - (0.7 * (target_area_um2 - smallest_area) / (largest_area - smallest_area))
+                    scale_factor = 1.0 - (0.7 * (target_area_um2 - actual_smallest) / (actual_largest - actual_smallest))
                 min_intensity = base_min_intensity * scale_factor
 
             if parent_mask_roi is None:
