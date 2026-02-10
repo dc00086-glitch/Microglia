@@ -563,8 +563,9 @@ class MorphologyCalculator:
     """
     Calculate morphological parameters for microglia.
 
-    Calculates 6 basic metrics: roundness, eccentricity, soma area,
-    mask area, perimeter, and cell spread.
+    Calculates 10 basic metrics: roundness, eccentricity, soma area,
+    mask area, perimeter, cell spread, polarity index, principal angle,
+    major axis length, and minor axis length.
     """
 
     def __init__(self, image, pixel_size_um, use_imagej=False):
@@ -619,9 +620,61 @@ class MorphologyCalculator:
                 params['soma_area'] = soma_area_um2
             else:
                 params['soma_area'] = props.area * 0.1 * (self.pixel_size ** 2)
+
+            # Directional polarity via PCA on mask coordinates
+            params.update(self._calculate_polarity(coords, centroid))
         else:
             params = {k: 0 for k in ['perimeter', 'mask_area', 'eccentricity',
-                                     'roundness', 'cell_spread', 'soma_area']}
+                                     'roundness', 'cell_spread', 'soma_area',
+                                     'polarity_index', 'principal_angle',
+                                     'major_axis_um', 'minor_axis_um']}
+        return params
+
+    def _calculate_polarity(self, coords, centroid):
+        """Calculate directional polarity from PCA on mask pixel coordinates.
+
+        Returns:
+            dict with polarity_index (0=isotropic, 1=fully polarized),
+            principal_angle (0-180 degrees), major_axis_um, minor_axis_um.
+        """
+        params = {}
+        # Center coordinates on the centroid
+        centered = coords - centroid
+
+        if len(centered) < 3:
+            params['polarity_index'] = 0
+            params['principal_angle'] = 0
+            params['major_axis_um'] = 0
+            params['minor_axis_um'] = 0
+            return params
+
+        # Covariance matrix of (row, col) positions
+        cov = np.cov(centered.T)
+
+        # Eigenvalues = variance along principal axes
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+
+        # eigh returns ascending order; major axis is the last one
+        major_val = eigenvalues[-1]
+        minor_val = eigenvalues[0]
+        major_vec = eigenvectors[:, -1]
+
+        # Polarity index: 0 = circle, 1 = line
+        if major_val > 0:
+            params['polarity_index'] = round(1.0 - (minor_val / major_val), 4)
+        else:
+            params['polarity_index'] = 0
+
+        # Principal direction angle (0-180 degrees, 0=horizontal)
+        # major_vec is (row, col) so angle from horizontal = atan2(row, col)
+        angle_rad = np.arctan2(major_vec[0], major_vec[1])
+        angle_deg = np.degrees(angle_rad) % 180  # Map to 0-180 range
+        params['principal_angle'] = round(angle_deg, 2)
+
+        # Axis extents in microns (2 * sqrt(eigenvalue) gives the std dev extent)
+        params['major_axis_um'] = round(2 * np.sqrt(major_val) * self.pixel_size, 4)
+        params['minor_axis_um'] = round(2 * np.sqrt(max(minor_val, 0)) * self.pixel_size, 4)
+
         return params
 
 
@@ -5887,7 +5940,8 @@ Step 3: Import Results Back
             writer.writerow(['mask_filename', 'soma_filename', 'image_name', 'soma_id', 'soma_idx',
                              'soma_x', 'soma_y', 'soma_area_um2', 'cell_area_um2',
                              'pixel_size_um', 'perimeter', 'eccentricity', 'roundness',
-                             'cell_spread', 'animal_id', 'treatment'])
+                             'cell_spread', 'polarity_index', 'principal_angle',
+                             'major_axis_um', 'minor_axis_um', 'animal_id', 'treatment'])
 
             for result in results:
                 img_name = result['image_name']
@@ -5915,11 +5969,15 @@ Step 3: Import Results Back
                     f"{soma_y:.2f}",
                     result.get('soma_area', 0),
                     result.get('area_um2', 0),
-                    result.get('mask_area', 0),  # This should be in the results
+                    result.get('mask_area', 0),
                     result.get('perimeter', 0),
                     result.get('eccentricity', 0),
                     result.get('roundness', 0),
                     result.get('cell_spread', 0),
+                    result.get('polarity_index', 0),
+                    result.get('principal_angle', 0),
+                    result.get('major_axis_um', 0),
+                    result.get('minor_axis_um', 0),
                     result.get('animal_id', ''),
                     result.get('treatment', '')
                 ])
