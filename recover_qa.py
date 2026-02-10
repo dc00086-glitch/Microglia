@@ -201,12 +201,50 @@ class MaskQAWindow(QMainWindow):
 
     def approve_current(self):
         if self.current_idx < len(self.mask_entries):
-            self.mask_entries[self.current_idx]['approved'] = True
+            entry = self.mask_entries[self.current_idx]
+            entry['approved'] = True
+
+            # Auto-approve all smaller masks for the same soma
+            img_name = entry['img_name']
+            soma_id = entry['soma_id']
+            approved_area = entry['area_um2']
+            auto_count = 0
+            for other in self.mask_entries:
+                if (other is not entry
+                        and other['img_name'] == img_name
+                        and other['soma_id'] == soma_id
+                        and other['area_um2'] < approved_area
+                        and other['approved'] is None):
+                    other['approved'] = True
+                    auto_count += 1
+
+            if auto_count > 0:
+                print(f"Auto-approved {auto_count} smaller mask(s) for {img_name} {soma_id}")
+
             self._advance()
 
     def reject_current(self):
         if self.current_idx < len(self.mask_entries):
-            self.mask_entries[self.current_idx]['approved'] = False
+            entry = self.mask_entries[self.current_idx]
+            entry['approved'] = False
+
+            # Auto-reject all smaller masks for the same soma
+            img_name = entry['img_name']
+            soma_id = entry['soma_id']
+            rejected_area = entry['area_um2']
+            auto_count = 0
+            for other in self.mask_entries:
+                if (other is not entry
+                        and other['img_name'] == img_name
+                        and other['soma_id'] == soma_id
+                        and other['area_um2'] < rejected_area
+                        and other['approved'] is None):
+                    other['approved'] = False
+                    auto_count += 1
+
+            if auto_count > 0:
+                print(f"Auto-rejected {auto_count} smaller mask(s) for {img_name} {soma_id}")
+
             self._advance()
 
     def _advance(self):
