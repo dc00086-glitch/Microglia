@@ -1908,7 +1908,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_generate_masks_btn.clicked.connect(self.batch_generate_masks)
         self.batch_generate_masks_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_generate_masks_btn)
-        
+
+        self.regen_masks_btn = QPushButton("Regenerate Masks (Current Image)")
+        self.regen_masks_btn.clicked.connect(self.regenerate_masks_current_image)
+        self.regen_masks_btn.setEnabled(False)
+        self.regen_masks_btn.setToolTip("Regenerate masks for just the currently selected image with custom settings")
+        batch_layout.addWidget(self.regen_masks_btn)
+
         # Add Clear All Masks button
         self.clear_masks_btn = QPushButton("🗑 Clear All Masks")
         self.clear_masks_btn.clicked.connect(self.clear_all_masks)
@@ -2822,6 +2828,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.batch_qa_btn.setEnabled(True)
         if has_qa_complete:
             self.batch_calculate_btn.setEnabled(True)
+
+        self._update_regen_btn()
 
         if self.output_dir:
             self.launch_imagej_btn.setEnabled(True)
@@ -3802,6 +3810,7 @@ Step 3: Import Results Back
         self.images[img_name]['selected'] = is_checked
         self.current_image_name = img_name
         self._display_current_image()
+        self._update_regen_btn()
         # self.update_workflow_status()
 
     def _display_current_image(self):
@@ -5305,7 +5314,8 @@ Step 3: Import Results Back
             self.progress_status_label.setVisible(False)
 
             self.batch_qa_btn.setEnabled(True)
-            self.clear_masks_btn.setEnabled(True)  # Enable clear masks button
+            self.clear_masks_btn.setEnabled(True)
+            self._update_regen_btn()
             # self.update_workflow_status()
 
             total_masks = sum(len(data['masks']) for data in self.images.values() if data['selected'])
@@ -5331,6 +5341,202 @@ Step 3: Import Results Back
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Failed: {e}")
+
+    def _update_regen_btn(self):
+        """Enable/disable the regenerate masks button based on current image state."""
+        if not self.current_image_name or self.current_image_name not in self.images:
+            self.regen_masks_btn.setEnabled(False)
+            return
+        status = self.images[self.current_image_name]['status']
+        self.regen_masks_btn.setEnabled(status in ('outlined', 'masks_generated', 'qa_complete'))
+
+    def regenerate_masks_current_image(self):
+        """Regenerate masks for only the currently selected image with custom settings."""
+        if not self.current_image_name or self.current_image_name not in self.images:
+            QMessageBox.warning(self, "Warning", "No image selected.")
+            return
+
+        img_name = self.current_image_name
+        img_data = self.images[img_name]
+
+        if img_data['status'] not in ('outlined', 'masks_generated', 'qa_complete'):
+            QMessageBox.warning(self, "Warning",
+                f"{img_name} is not ready for mask generation.\n"
+                f"Current status: {img_data['status']}")
+            return
+
+        if not img_data.get('soma_outlines'):
+            QMessageBox.warning(self, "Warning", f"{img_name} has no soma outlines.")
+            return
+
+        # Show settings dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Mask Settings — {img_name}")
+        dialog.setModal(True)
+
+        layout = QVBoxLayout()
+
+        title = QLabel(f"<b>Regenerate Masks for:</b> {img_name}")
+        layout.addWidget(title)
+
+        layout.addSpacing(5)
+
+        # Mask Size Settings
+        size_group = QLabel("<b>Mask Sizes (µm²)</b>")
+        layout.addWidget(size_group)
+
+        size_grid = QHBoxLayout()
+
+        size_grid.addWidget(QLabel("Min:"))
+        min_area_spin = QSpinBox()
+        min_area_spin.setRange(100, 2000)
+        min_area_spin.setSingleStep(50)
+        min_area_spin.setValue(self.mask_min_area)
+        min_area_spin.setSuffix(" µm²")
+        size_grid.addWidget(min_area_spin)
+
+        size_grid.addWidget(QLabel("Max:"))
+        max_area_spin = QSpinBox()
+        max_area_spin.setRange(200, 5000)
+        max_area_spin.setSingleStep(50)
+        max_area_spin.setValue(self.mask_max_area)
+        max_area_spin.setSuffix(" µm²")
+        size_grid.addWidget(max_area_spin)
+
+        size_grid.addWidget(QLabel("Step:"))
+        step_spin = QSpinBox()
+        step_spin.setRange(10, 500)
+        step_spin.setSingleStep(10)
+        step_spin.setValue(self.mask_step_size)
+        step_spin.setSuffix(" µm²")
+        size_grid.addWidget(step_spin)
+
+        layout.addLayout(size_grid)
+
+        # Preview
+        preview_label = QLabel("")
+        preview_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+        preview_label.setWordWrap(True)
+        layout.addWidget(preview_label)
+
+        def update_size_preview():
+            mn = min_area_spin.value()
+            mx = max_area_spin.value()
+            st = step_spin.value()
+            if mn > mx:
+                preview_label.setText("⚠ Min must be ≤ Max")
+                return
+            sizes = list(range(mn, mx + 1, st))
+            if sizes[-1] != mx:
+                sizes.append(mx)
+            preview_label.setText(f"Masks: {', '.join(str(s) for s in sizes)} µm²  ({len(sizes)} masks per cell)")
+
+        min_area_spin.valueChanged.connect(lambda: update_size_preview())
+        max_area_spin.valueChanged.connect(lambda: update_size_preview())
+        step_spin.valueChanged.connect(lambda: update_size_preview())
+        update_size_preview()
+
+        layout.addSpacing(10)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_btn)
+
+        ok_btn = QPushButton("Regenerate Masks")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(dialog.accept)
+        ok_btn.setStyleSheet(
+            "QPushButton { border: 2px solid #4CAF50; font-weight: bold; padding: 5px; }")
+        button_layout.addWidget(ok_btn)
+
+        layout.addLayout(button_layout)
+        dialog.setLayout(layout)
+        dialog.setMinimumWidth(400)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        # Build area list from dialog settings
+        regen_min = min_area_spin.value()
+        regen_max = max_area_spin.value()
+        regen_step = step_spin.value()
+
+        if regen_min > regen_max:
+            QMessageBox.warning(self, "Warning", "Min area must be ≤ Max area.")
+            return
+
+        area_list = list(range(regen_min, regen_max + 1, regen_step))
+        if area_list[-1] != regen_max:
+            area_list.append(regen_max)
+
+        try:
+            pixel_size = float(self.pixel_size_input.text())
+        except ValueError:
+            pixel_size = 0.316
+
+        # Delete old mask files from disk for this image
+        if self.masks_dir and os.path.isdir(self.masks_dir):
+            img_basename = os.path.splitext(img_name)[0]
+            for f in os.listdir(self.masks_dir):
+                if f.startswith(img_basename + "_") and f.endswith("_mask.tif"):
+                    try:
+                        os.remove(os.path.join(self.masks_dir, f))
+                    except Exception:
+                        pass
+
+        # Remove old masks from all_masks_flat
+        self.all_masks_flat = [flat for flat in self.all_masks_flat
+                               if flat['image_name'] != img_name]
+
+        # Clear existing masks for this image
+        img_data['masks'] = []
+
+        # Generate new masks
+        self.log("=" * 50)
+        self.log(f"Regenerating masks for {img_name}...")
+        self.log(f"Settings: {regen_min}-{regen_max} µm², step {regen_step}")
+        self.log(f"Sizes: {', '.join(str(a) for a in area_list)} µm²")
+
+        for soma_data in img_data['soma_outlines']:
+            centroid = soma_data['centroid']
+            soma_idx = soma_data['soma_idx']
+            soma_id = soma_data['soma_id']
+            soma_area_um2 = soma_data.get('soma_area_um2', 0)
+
+            masks = self._create_annulus_masks(
+                centroid, area_list, pixel_size, soma_idx, soma_id,
+                img_data['processed'], img_name, soma_area_um2
+            )
+            img_data['masks'].extend(masks)
+
+        # Update status back to masks_generated (need re-QA)
+        img_data['status'] = 'masks_generated'
+        self._update_file_list_item(img_name)
+
+        # Rebuild all_masks_flat for this image
+        if img_data['selected']:
+            for mask_data in img_data['masks']:
+                self.all_masks_flat.append({
+                    'image_name': img_name,
+                    'mask_data': mask_data,
+                    'processed_img': img_data['processed'],
+                })
+
+        self.batch_qa_btn.setEnabled(True)
+        self._update_regen_btn()
+
+        total = len(img_data['masks'])
+        self.log(f"✓ Generated {total} masks for {img_name}")
+        self.log("✓ Ready for QA")
+        self.log("=" * 50)
+        self._auto_save()
+
+        QMessageBox.information(self, "Success",
+            f"Regenerated {total} masks for {img_name}.\n\n"
+            f"Sizes: {', '.join(str(a) for a in area_list)} µm²\n\n"
+            f"Ready for QA.")
 
     def _create_annulus_masks(self, centroid, area_list_um2, pixel_size_um, soma_idx, soma_id, processed_img, img_name,
                               soma_area_um2):
