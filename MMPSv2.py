@@ -1780,7 +1780,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         sharpen_layout = QHBoxLayout()
         sharpen_layout.addWidget(QLabel("  Sharpen amount:"))
         self.sharpen_slider = QSlider(Qt.Horizontal)
-        self.sharpen_slider.setRange(10, 20)
+        self.sharpen_slider.setRange(10, 50)
         self.sharpen_slider.setValue(13)
         sharpen_layout.addWidget(self.sharpen_slider)
         self.sharpen_label = QLabel("1.3")
