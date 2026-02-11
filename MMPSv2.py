@@ -4263,7 +4263,7 @@ Step 3: Import Results Back
             pixel_size = float(self.pixel_size_input.text())
         except (ValueError, AttributeError):
             pixel_size = 0.3
-        radius_px = max(1, int(round(5.0 / pixel_size)))
+        radius_px = max(1, int(round(2.0 / pixel_size)))
         row, col = int(coords[0]), int(coords[1])
         h, w = gray.shape[:2]
         r_min = max(0, row - radius_px)
