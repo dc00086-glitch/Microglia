@@ -3355,12 +3355,17 @@ Step 3: Import Results Back
             )
             return
 
-        # Get a sample color image to detect channel format
+        # Use the current image to detect channel count
         sample_color_img = None
-        for img_name, img_data in self.images.items():
+        if self.current_image_name and self.current_image_name in self.images:
+            img_data = self.images[self.current_image_name]
             if 'color_image' in img_data:
                 sample_color_img = img_data['color_image']
-                break
+        if sample_color_img is None:
+            for img_data in self.images.values():
+                if 'color_image' in img_data:
+                    sample_color_img = img_data['color_image']
+                    break
 
         dialog = ChannelSelectDialog(
             self,
@@ -3823,6 +3828,7 @@ Step 3: Import Results Back
             # Always store color image for toggle functionality
             if raw_img.ndim == 3:
                 img_data['color_image'] = raw_img.copy()
+                img_data['num_channels'] = raw_img.shape[2]
 
             # Display in color or grayscale based on toggle, with adjustments
             if self.show_color_view and raw_img.ndim == 3:
@@ -3890,43 +3896,70 @@ Step 3: Import Results Back
         img = img.copy()
         return QPixmap.fromImage(img)
 
-    def _array_to_pixmap_color(self, arr):
-        """Convert a color (RGB) numpy array to QPixmap, respecting channel selection"""
+    def _array_to_pixmap_color(self, arr, num_source_channels=None):
+        """Convert a color (RGB) numpy array to QPixmap, respecting channel selection.
+
+        num_source_channels: how many channels the original image actually has.
+            If provided, channels beyond this count are treated as empty.
+        """
         if arr is None:
             return self._create_blank_pixmap()
+
+        # Track which RGB slots have real data
+        real_channels = {0: True, 1: True, 2: True}
 
         # Handle different array shapes
         if arr.ndim == 2:
             # Grayscale - convert to RGB
             arr = np.stack([arr, arr, arr], axis=-1)
+            real_channels = {0: True, 1: False, 2: False}
         elif arr.ndim == 3:
-            if arr.shape[2] == 4:
+            n_ch = arr.shape[2]
+            if n_ch == 4:
                 # RGBA - take RGB only
                 arr = arr[:, :, :3]
-            elif arr.shape[2] != 3:
-                # Multi-channel (e.g., 2 channels) - create RGB composite
-                if arr.shape[2] >= 2:
-                    # Channel 1 = Green, Channel 2 = Red
-                    h, w, c = arr.shape
-                    rgb = np.zeros((h, w, 3), dtype=arr.dtype)
-                    rgb[:, :, 1] = arr[:, :, 0]  # Green channel
-                    rgb[:, :, 0] = arr[:, :, 1]  # Red channel
-                    if c >= 3:
-                        rgb[:, :, 2] = arr[:, :, 2]  # Blue channel
-                    arr = rgb
+            elif n_ch < 3:
+                # Fewer than 3 channels — map to RGB, mark missing as empty
+                h, w, c = arr.shape
+                rgb = np.zeros((h, w, 3), dtype=arr.dtype)
+                if c >= 1:
+                    rgb[:, :, 1] = arr[:, :, 0]  # Ch1 -> Green
+                if c >= 2:
+                    rgb[:, :, 0] = arr[:, :, 1]  # Ch2 -> Red
+                # Mark channels that don't exist
+                if c < 3:
+                    real_channels[2] = False  # No blue
+                if c < 2:
+                    real_channels[0] = False  # No red
+                if c < 1:
+                    real_channels[1] = False  # No green
+                arr = rgb
 
-        # Apply channel selection mask (using channel indices)
+        # Determine real source channel count — from parameter, or from current image
+        if num_source_channels is None and self.current_image_name and self.current_image_name in self.images:
+            num_source_channels = self.images[self.current_image_name].get('num_channels')
+
+        # Apply source channel limit (handles pre-expanded 3-channel arrays from composites)
+        if num_source_channels is not None and num_source_channels < 3:
+            # Ch1->Green(1), Ch2->Red(0), Ch3->Blue(2) mapping
+            if num_source_channels < 3:
+                real_channels[2] = False  # No blue
+            if num_source_channels < 2:
+                real_channels[0] = False  # No red
+            if num_source_channels < 1:
+                real_channels[1] = False  # No green
+
+        # Apply channel selection mask — zero out disabled or missing channels
         arr_display = arr.copy()
         for i in range(min(3, arr_display.shape[2])):
-            if not self.display_channels.get(i, True):
+            if not real_channels.get(i, False) or not self.display_channels.get(i, True):
                 arr_display[:, :, i] = 0
 
-        # Normalize to 0-255
+        # Normalize to 0-255 — only for real, enabled channels
         arr_float = arr_display.astype(np.float32)
         for i in range(arr_display.shape[2]):
-            channel = arr_float[:, :, i]
-            # Only normalize if channel is enabled
-            if self.display_channels.get(i, True):
+            if real_channels.get(i, False) and self.display_channels.get(i, True):
+                channel = arr_float[:, :, i]
                 c_min, c_max = channel.min(), channel.max()
                 if c_max > c_min:
                     arr_float[:, :, i] = (channel - c_min) / (c_max - c_min) * 255
