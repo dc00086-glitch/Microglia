@@ -3541,6 +3541,10 @@ Step 3: Import Results Back
                                 self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                         else:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+                elif current_tab == 3:  # Masks
+                    # Re-render the current mask with updated color settings
+                    if self.mask_qa_active:
+                        self._show_current_mask()
         except Exception as e:
             self.log(f"ERROR updating display: {str(e)}")
             import traceback
@@ -5720,8 +5724,18 @@ Step 3: Import Results Back
         processed_img = flat_data['processed_img']
         img_name = flat_data['image_name']
 
-        adjusted = self._apply_display_adjustments(processed_img)
-        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+        # Display in color or grayscale based on toggle
+        img_data = self.images.get(img_name, {})
+        if self.show_color_view and 'color_image' in img_data:
+            proc_color = self._build_processed_color_image(img_data)
+            if proc_color is not None:
+                adjusted = self._apply_display_adjustments_color(proc_color)
+            else:
+                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
+            pixmap = self._array_to_pixmap_color(adjusted)
+        else:
+            adjusted = self._apply_display_adjustments(processed_img)
+            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
         self.mask_label.set_image(pixmap, mask_overlay=mask_data['mask'])
 
         # Auto-zoom to mask center
