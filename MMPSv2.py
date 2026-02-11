@@ -1822,9 +1822,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.auto_outline_method.setVisible(False)
         self.auto_outline_sensitivity = QSlider(Qt.Horizontal)
         self.auto_outline_sensitivity.setRange(10, 90)
-        self.auto_outline_sensitivity.setValue(50)
+        self.auto_outline_sensitivity.setValue(20)
         self.auto_outline_sensitivity.setVisible(False)
-        self.sensitivity_label = QLabel("50")
+        self.sensitivity_label = QLabel("20")
         self.auto_outline_sensitivity.valueChanged.connect(
             lambda v: self.sensitivity_label.setText(str(v))
         )
