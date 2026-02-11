@@ -1192,7 +1192,7 @@ class InteractiveImageLabel(QLabel):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release to finish dragging"""
-        # Centroid drag release
+        # Centroid drag release - snap to brightest pixel within 5 µm
         if self.dragging_centroid and event.button() == Qt.LeftButton:
             self.dragging_centroid = False
             idx = self.dragging_centroid_idx
@@ -1200,10 +1200,11 @@ class InteractiveImageLabel(QLabel):
             if self.parent_widget:
                 img_data = self.parent_widget.images.get(self.parent_widget.current_image_name)
                 if img_data and idx is not None and idx < len(img_data['somas']):
-                    new_coords = img_data['somas'][idx]
-                    # Update the soma_id to reflect new position
-                    img_data['soma_ids'][idx] = f"soma_{new_coords[0]}_{new_coords[1]}"
-                    self.parent_widget.log(f"  → Soma {idx + 1} repositioned")
+                    snapped = self.parent_widget._snap_to_brightest(img_data['somas'][idx])
+                    img_data['somas'][idx] = snapped
+                    self.centroids[idx] = snapped
+                    img_data['soma_ids'][idx] = f"soma_{snapped[0]}_{snapped[1]}"
+                    self.parent_widget.log(f"  → Soma {idx + 1} repositioned (snapped to brightest)")
                 self._update_display()
             return
 
@@ -4246,10 +4247,45 @@ Step 3: Import Results Back
             f"Somas: {len(img_data['somas'])}"
         )
 
+    def _snap_to_brightest(self, coords):
+        """Snap coords to the brightest pixel within 5 µm radius."""
+        if not self.current_image_name:
+            return coords
+        img_data = self.images[self.current_image_name]
+        # Get the grayscale image to search
+        if img_data['processed'] is not None:
+            gray = img_data['processed']
+        elif 'color_image' in img_data:
+            gray = extract_channel(img_data['color_image'], self.grayscale_channel)
+        else:
+            return coords
+        try:
+            pixel_size = float(self.pixel_size_input.text())
+        except (ValueError, AttributeError):
+            pixel_size = 0.3
+        radius_px = max(1, int(round(5.0 / pixel_size)))
+        row, col = int(coords[0]), int(coords[1])
+        h, w = gray.shape[:2]
+        r_min = max(0, row - radius_px)
+        r_max = min(h, row + radius_px + 1)
+        c_min = max(0, col - radius_px)
+        c_max = min(w, col + radius_px + 1)
+        best_val = -1
+        best_r, best_c = row, col
+        for r in range(r_min, r_max):
+            for c in range(c_min, c_max):
+                if (r - row) ** 2 + (c - col) ** 2 <= radius_px ** 2:
+                    val = float(gray[r, c])
+                    if val > best_val:
+                        best_val = val
+                        best_r, best_c = r, c
+        return (best_r, best_c)
+
     def add_soma(self, coords):
         if not self.current_image_name:
             return
         img_data = self.images[self.current_image_name]
+        coords = self._snap_to_brightest(coords)
         img_data['somas'].append(coords)
         soma_id = f"soma_{coords[0]}_{coords[1]}"
         img_data['soma_ids'].append(soma_id)
