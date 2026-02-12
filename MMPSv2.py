@@ -3850,6 +3850,9 @@ Step 3: Import Results Back
             self.images[img_name]['selected'] = is_checked
 
     def on_image_selected(self, item):
+        # During outlining or QA, don't switch images from file list clicks
+        if self.processed_label.polygon_mode or self.mask_qa_active:
+            return
         img_name = item.data(Qt.UserRole)
         is_checked = item.checkState() == Qt.Checked
         self.images[img_name]['selected'] = is_checked
@@ -4677,7 +4680,19 @@ Step 3: Import Results Back
         self.current_review_idx = review_idx
         self.current_outline_idx = review_idx
         img_name, soma_idx = self.outlining_queue[review_idx]
+        self.current_image_name = img_name
         img_data = self.images[img_name]
+
+        # Ensure color_image is loaded for color toggle support
+        if 'color_image' not in img_data and 'raw_path' in img_data:
+            try:
+                raw_img = load_tiff_image(img_data['raw_path'])
+                if raw_img is not None and raw_img.ndim == 3:
+                    img_data['color_image'] = raw_img.copy()
+                    img_data['num_channels'] = raw_img.shape[2]
+            except Exception:
+                pass
+
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
 
@@ -4752,6 +4767,17 @@ Step 3: Import Results Back
         img_name, soma_idx = self.outlining_queue[queue_idx]
         self.current_image_name = img_name
         img_data = self.images[img_name]
+
+        # Ensure color_image is loaded for color toggle support
+        if 'color_image' not in img_data and 'raw_path' in img_data:
+            try:
+                raw_img = load_tiff_image(img_data['raw_path'])
+                if raw_img is not None and raw_img.ndim == 3:
+                    img_data['color_image'] = raw_img.copy()
+                    img_data['num_channels'] = raw_img.shape[2]
+            except Exception:
+                pass
+
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
         pixmap = self._get_outlining_pixmap(img_data)
@@ -5857,6 +5883,15 @@ Step 3: Import Results Back
 
         # Display in color or grayscale based on toggle
         img_data = self.images.get(img_name, {})
+        # Ensure color_image is loaded for color toggle
+        if 'color_image' not in img_data and 'raw_path' in img_data:
+            try:
+                raw_img = load_tiff_image(img_data['raw_path'])
+                if raw_img is not None and raw_img.ndim == 3:
+                    img_data['color_image'] = raw_img.copy()
+                    img_data['num_channels'] = raw_img.shape[2]
+            except Exception:
+                pass
         if self.show_color_view and 'color_image' in img_data:
             proc_color = self._build_processed_color_image(img_data)
             if proc_color is not None:
