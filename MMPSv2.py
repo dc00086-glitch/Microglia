@@ -3463,16 +3463,17 @@ Step 3: Import Results Back
                 adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
             # Preserve markers
-            if self.processed_label.soma_mode:
-                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
-            elif self.processed_label.polygon_mode:
+            if self.processed_label.polygon_mode and hasattr(self, 'outlining_queue') and self.outlining_queue:
                 queue_idx = getattr(self, 'current_outline_idx', 0)
                 if queue_idx < len(self.outlining_queue):
-                    img_name, soma_idx = self.outlining_queue[queue_idx]
-                    if img_name == self.current_image_name:
-                        soma = img_data['somas'][soma_idx]
-                        self.processed_label.set_image(pixmap, centroids=[soma],
-                                                       polygon_pts=self.polygon_points)
+                    q_img_name, q_soma_idx = self.outlining_queue[queue_idx]
+                    q_img_data = self.images[q_img_name]
+                    soma = q_img_data['somas'][q_soma_idx]
+                    pixmap = self._get_outlining_pixmap(q_img_data)
+                    self.processed_label.set_image(pixmap, centroids=[soma],
+                                                   polygon_pts=self.polygon_points)
+            elif self.processed_label.soma_mode:
+                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
             else:
                 self.processed_label.set_image(pixmap, centroids=img_data['somas'])
 
@@ -3546,8 +3547,17 @@ Step 3: Import Results Back
                         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         self.preview_label.set_image(pixmap)
                 elif current_tab == 2:  # Processed
-                    # Show color image when color view is on
-                    if use_color and 'color_image' in img_data:
+                    # In outlining mode, use the queue's image, not current_image_name
+                    if self.processed_label.polygon_mode and hasattr(self, 'outlining_queue') and self.outlining_queue:
+                        queue_idx = getattr(self, 'current_outline_idx', 0)
+                        if queue_idx < len(self.outlining_queue):
+                            q_img_name, q_soma_idx = self.outlining_queue[queue_idx]
+                            q_img_data = self.images[q_img_name]
+                            soma = q_img_data['somas'][q_soma_idx]
+                            pixmap = self._get_outlining_pixmap(q_img_data)
+                            self.processed_label.set_image(pixmap, centroids=[soma],
+                                                           polygon_pts=self.polygon_points)
+                    elif use_color and 'color_image' in img_data:
                         # Use processed channel in color composite if available
                         proc_color = self._build_processed_color_image(img_data)
                         if proc_color is not None:
@@ -3555,21 +3565,7 @@ Step 3: Import Results Back
                         else:
                             adjusted = self._apply_display_adjustments_color(img_data['color_image'])
                         pixmap = self._array_to_pixmap_color(adjusted)
-                        # Preserve polygon if in outlining mode
-                        if self.processed_label.polygon_mode:
-                            queue_idx = getattr(self, 'current_outline_idx', 0)
-                            if queue_idx < len(self.outlining_queue):
-                                img_name, soma_idx = self.outlining_queue[queue_idx]
-                                soma = img_data['somas'][soma_idx] if img_name == self.current_image_name else (img_data['somas'][0] if img_data['somas'] else None)
-                                if soma is not None:
-                                    self.processed_label.set_image(pixmap, centroids=[soma],
-                                                                   polygon_pts=self.polygon_points)
-                                else:
-                                    self.processed_label.set_image(pixmap, polygon_pts=self.polygon_points)
-                            else:
-                                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
-                        else:
-                            self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+                        self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                     elif img_data['processed'] is not None:
                         # Always use the processed image for grayscale display
                         gray_img = img_data['processed']
@@ -3578,19 +3574,6 @@ Step 3: Import Results Back
                         # Preserve soma markers if in soma picking mode
                         if self.soma_mode:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
-                        # Preserve polygon if in outlining mode
-                        elif self.processed_label.polygon_mode:
-                            queue_idx = getattr(self, 'current_outline_idx', 0)
-                            if queue_idx < len(self.outlining_queue):
-                                img_name, soma_idx = self.outlining_queue[queue_idx]
-                                soma = img_data['somas'][soma_idx] if img_name == self.current_image_name else (img_data['somas'][0] if img_data['somas'] else None)
-                                if soma is not None:
-                                    self.processed_label.set_image(pixmap, centroids=[soma],
-                                                                   polygon_pts=self.polygon_points)
-                                else:
-                                    self.processed_label.set_image(pixmap, polygon_pts=self.polygon_points)
-                            else:
-                                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                         else:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                 elif current_tab == 3:  # Masks
