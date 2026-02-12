@@ -71,6 +71,211 @@ def extract_channel(img, channel_idx):
 
 MIN_OUTLINE_POINTS = 10
 
+
+def _remove_branch_juts(points, centroid, max_iterations=3):
+    """Remove narrow branch-like protrusions from a soma outline.
+
+    Uses convexity defect analysis to detect pairs of deep concavities
+    that indicate a branch root, then cuts them off with a chord.
+    Also applies morphological opening on the filled mask to erode
+    thin structures before re-extracting the contour.
+
+    Args:
+        points: list of (row, col) tuples - the polygon outline
+        centroid: (row, col) of the soma center
+        max_iterations: max rounds of defect removal
+
+    Returns:
+        list of (row, col) tuples - cleaned polygon outline
+    """
+    if points is None or len(points) < MIN_OUTLINE_POINTS:
+        return points
+
+    pts = np.array(points, dtype=np.float64)
+    cy, cx = float(centroid[0]), float(centroid[1])
+
+    # --- Phase 1: morphological opening on filled mask ---
+    # Build a tight bounding box around the outline
+    rows, cols = pts[:, 0], pts[:, 1]
+    pad = 10
+    r_min, r_max = int(rows.min()) - pad, int(rows.max()) + pad
+    c_min, c_max = int(cols.min()) - pad, int(cols.max()) + pad
+
+    # Create local-coordinate contour for cv2 (x, y format)
+    local_pts = np.array([[[int(c - c_min), int(r - r_min)]]
+                          for r, c in points], dtype=np.int32)
+    h = r_max - r_min
+    w = c_max - c_min
+    if h <= 0 or w <= 0:
+        return points
+
+    # Draw filled polygon into a mask
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [local_pts.reshape(-1, 1, 2)], 255)
+
+    # Estimate soma radius from mask area to scale the opening kernel
+    area_px = cv2.countNonZero(mask)
+    equiv_radius = max(3, int(np.sqrt(area_px / np.pi) * 0.45))
+
+    # Morphological opening with circular kernel removes thin branches
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                       (equiv_radius, equiv_radius))
+    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    # Make sure the centroid is still inside; if opening erased too much, relax
+    local_cy = int(cy - r_min)
+    local_cx = int(cx - c_min)
+    if (0 <= local_cy < h and 0 <= local_cx < w
+            and opened[local_cy, local_cx] == 0):
+        # Opening was too aggressive — try a smaller kernel
+        smaller = max(3, equiv_radius // 2)
+        kernel_sm = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                               (smaller, smaller))
+        opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_sm)
+        if (0 <= local_cy < h and 0 <= local_cx < w
+                and opened[local_cy, local_cx] == 0):
+            # Even smaller kernel lost the centroid; skip opening
+            opened = mask
+
+    # Re-extract contour from opened mask
+    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return points
+
+    # Pick contour nearest centroid
+    best_contour = None
+    best_dist = float('inf')
+    for cnt in contours:
+        M = cv2.moments(cnt)
+        if M['m00'] < 20:
+            continue
+        mcx = M['m10'] / M['m00']
+        mcy = M['m01'] / M['m00']
+        d = (mcx - local_cx) ** 2 + (mcy - local_cy) ** 2
+        if d < best_dist:
+            best_dist = d
+            best_contour = cnt
+
+    if best_contour is None:
+        best_contour = max(contours, key=cv2.contourArea)
+
+    # --- Phase 2: convexity defect pruning ---
+    for _ in range(max_iterations):
+        if len(best_contour) < 5:
+            break
+        hull_idx = cv2.convexHull(best_contour, returnPoints=False)
+        if hull_idx is None or len(hull_idx) < 3:
+            break
+
+        # Sort hull indices for convexityDefects (must be ascending)
+        hull_idx = np.sort(hull_idx, axis=0)
+        try:
+            defects = cv2.convexityDefects(best_contour, hull_idx)
+        except cv2.error:
+            break
+
+        if defects is None or len(defects) == 0:
+            break
+
+        # Contour perimeter for relative depth threshold
+        perimeter = cv2.arcLength(best_contour, True)
+        depth_threshold = perimeter * 0.03  # defect must be >3% of perimeter
+
+        # Collect deep defects sorted by depth (deepest first)
+        deep = []
+        for i in range(defects.shape[0]):
+            s, e, f, d = defects[i, 0]
+            depth = d / 256.0
+            if depth > depth_threshold:
+                deep.append((s, e, f, depth))
+
+        if len(deep) < 2:
+            break
+
+        deep.sort(key=lambda x: -x[3])
+
+        # Try to find pairs of defects that form a narrow jut
+        pruned = False
+        used = set()
+        for i in range(len(deep)):
+            if i in used:
+                continue
+            s1, e1, f1, d1 = deep[i]
+            start1 = tuple(best_contour[s1][0])
+            end1 = tuple(best_contour[e1][0])
+            far1 = tuple(best_contour[f1][0])
+
+            for j in range(i + 1, len(deep)):
+                if j in used:
+                    continue
+                s2, e2, f2, d2 = deep[j]
+                start2 = tuple(best_contour[s2][0])
+                end2 = tuple(best_contour[e2][0])
+                far2 = tuple(best_contour[f2][0])
+
+                # Check if the two defects' far points are close to each
+                # other relative to their depth — that means a narrow jut
+                # sits between them
+                gap = np.sqrt((far1[0] - far2[0]) ** 2 +
+                              (far1[1] - far2[1]) ** 2)
+                avg_depth = (d1 + d2) / 2
+
+                # Narrow jut: the gap between defect bases is small
+                # relative to how deep they are
+                if gap < avg_depth * 2.5:
+                    # Cut the jut: connect the two far points, removing
+                    # the contour segment between them
+                    idx1, idx2 = sorted([f1, f2])
+                    n = len(best_contour)
+
+                    # Determine which arc to keep (the one containing
+                    # the centroid)
+                    arc_a = list(range(idx2, n)) + list(range(0, idx1 + 1))
+                    arc_b = list(range(idx1, idx2 + 1))
+
+                    # Check which arc contains points closer to centroid
+                    def arc_centroid_dist(arc):
+                        if not arc:
+                            return float('inf')
+                        apts = best_contour[arc].reshape(-1, 2)
+                        dists = (apts[:, 0] - local_cx) ** 2 + \
+                                (apts[:, 1] - local_cy) ** 2
+                        return float(np.min(dists))
+
+                    if arc_centroid_dist(arc_a) <= arc_centroid_dist(arc_b):
+                        keep = arc_a
+                    else:
+                        keep = arc_b
+
+                    if len(keep) >= MIN_OUTLINE_POINTS:
+                        best_contour = best_contour[keep]
+                        pruned = True
+                        used.add(i)
+                        used.add(j)
+                        break  # restart defect analysis on new contour
+
+            if pruned:
+                break
+
+        if not pruned:
+            break
+
+    # --- Convert back to (row, col) image coordinates ---
+    approx = _simplify_contour(best_contour)
+    result = []
+    for pt in approx:
+        px, py = pt[0]
+        img_col = px + c_min
+        img_row = py + r_min
+        result.append((img_row, img_col))
+
+    if len(result) < MIN_OUTLINE_POINTS:
+        return points
+
+    return result
+
+
 def _simplify_contour(contour, min_points=MIN_OUTLINE_POINTS):
     """Simplify a contour with approxPolyDP, ensuring at least min_points.
     Starts with epsilon=0.02*arcLength and halves it until enough points."""
@@ -4630,6 +4835,8 @@ Step 3: Import Results Back
                 fail_count += 1
                 self.failed_auto_outlines.append(i)
             else:
+                # Remove branch juts from auto outline
+                points = _remove_branch_juts(points, soma)
                 self.auto_outlined_points[i] = list(points)
                 success_count += 1
 
@@ -5036,6 +5243,9 @@ Step 3: Import Results Back
             )
             return
 
+        # Remove branch juts from auto outline
+        points = _remove_branch_juts(points, soma)
+
         # Set the polygon points and display
         self.polygon_points = list(points)
         pixmap = self._get_outlining_pixmap(img_data)
@@ -5114,6 +5324,9 @@ Step 3: Import Results Back
                 fail_count += 1
                 failed_somas.append(soma_id)
                 continue
+
+            # Remove branch juts from auto outline
+            points = _remove_branch_juts(points, soma)
 
             # Create mask from points
             mask = self._polygon_to_mask(points, outline_img.shape)
