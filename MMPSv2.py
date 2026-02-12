@@ -2836,6 +2836,22 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.launch_imagej_btn.setEnabled(True)
             self.import_imagej_btn.setEnabled(True)
 
+        # Check for partially-outlined session and offer to resume
+        if has_somas and has_outlines:
+            total_somas = sum(len(d['somas']) for d in self.images.values()
+                              if d['selected'] and d['status'] in ('somas_picked', 'outlined'))
+            total_outlines = sum(len(d['soma_outlines']) for d in self.images.values()
+                                 if d['selected'] and d['status'] in ('somas_picked', 'outlined'))
+            if 0 < total_outlines < total_somas:
+                reply = QMessageBox.question(
+                    self, 'Resume Outlining',
+                    f"Found {total_outlines}/{total_somas} soma outlines completed.\n\n"
+                    f"Resume outlining the remaining {total_somas - total_outlines} somas?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    self.start_batch_outlining()
+
     # ========================================================================
     # IMAGEJ SCRIPT GENERATION
     # ========================================================================
@@ -4397,16 +4413,20 @@ Step 3: Import Results Back
                 continue
             if img_data['status'] not in ('somas_picked', 'outlined'):
                 continue
-            # Build a set of soma indices that already have outlines
-            outlined_idxs = set()
-            for ol in img_data['soma_outlines']:
-                outlined_idxs.add(ol['soma_idx'])
             for soma_idx in range(len(img_data['somas'])):
-                if soma_idx not in outlined_idxs:
-                    self.outlining_queue.append((img_name, soma_idx))
+                self.outlining_queue.append((img_name, soma_idx))
         if not self.outlining_queue:
             QMessageBox.warning(self, "Warning", "No somas to outline")
             return
+
+        # Find first unoutlined soma
+        first_unoutlined = self._find_next_unoutlined_idx()
+        if first_unoutlined is None:
+            QMessageBox.information(self, "Complete", "All somas are already outlined!")
+            return
+
+        already_done = first_unoutlined
+        remaining = len(self.outlining_queue) - already_done
 
         # In colocalization mode, ask which channel to use for grayscale outlining
         if self.colocalization_mode:
@@ -4438,7 +4458,13 @@ Step 3: Import Results Back
         dialog.setModal(True)
         layout = QVBoxLayout()
 
-        label = QLabel(f"<b>{len(self.outlining_queue)} somas to outline</b><br><br>Choose outline method:")
+        if already_done > 0:
+            label = QLabel(
+                f"<b>{remaining} somas remaining</b> ({already_done}/{len(self.outlining_queue)} already done)"
+                f"<br><br>Choose outline method for remaining somas:"
+            )
+        else:
+            label = QLabel(f"<b>{len(self.outlining_queue)} somas to outline</b><br><br>Choose outline method:")
         layout.addWidget(label)
 
         manual_btn = QPushButton("Manual - Draw each outline by hand")
@@ -4514,7 +4540,11 @@ Step 3: Import Results Back
 
     def _start_manual_outlining(self):
         """Start manual outlining mode - draw each soma one by one"""
-        self._load_soma_for_outlining(0)
+        start_idx = self._find_next_unoutlined_idx()
+        if start_idx is None:
+            self._finish_outlining()
+            return
+        self._load_soma_for_outlining(start_idx)
 
         self.auto_outline_btn.setEnabled(True)
         self.manual_draw_btn.setEnabled(True)
@@ -4545,6 +4575,10 @@ Step 3: Import Results Back
         self.failed_auto_outlines = []
 
         for i, (img_name, soma_idx) in enumerate(self.outlining_queue):
+            # Skip already-outlined somas
+            if self._soma_has_outline(img_name, soma_idx):
+                continue
+
             img_data = self.images[img_name]
             soma = img_data['somas'][soma_idx]
 
@@ -4823,11 +4857,14 @@ Step 3: Import Results Back
         # Reset accept button for next soma
         self.accept_outline_btn.setEnabled(False)
 
-        # Move to next soma
-        if hasattr(self, 'review_mode') and self.review_mode:
-            self._load_review_soma(queue_idx + 1)
+        # Move to next unoutlined soma
+        next_idx = self._find_next_unoutlined_idx(start_from=queue_idx + 1)
+        if next_idx is None:
+            self._finish_outlining()
+        elif hasattr(self, 'review_mode') and self.review_mode:
+            self._load_review_soma(next_idx)
         else:
-            self._load_soma_for_outlining(queue_idx + 1)
+            self._load_soma_for_outlining(next_idx)
 
     def redo_last_outline(self):
         """Delete the last completed outline and go back to redo it"""
@@ -4874,9 +4911,7 @@ Step 3: Import Results Back
 
         # If no more outlines left in this session, disable the redo button
         has_outlines_in_queue = any(
-            any(ol['soma_idx'] == si and ol['soma_id'] == self.images[in_]['soma_ids'][si]
-                for ol in self.images[in_]['soma_outlines'])
-            for in_, si in self.outlining_queue
+            self._soma_has_outline(in_, si) for in_, si in self.outlining_queue
         )
         if not has_outlines_in_queue:
             self.redo_outline_btn.setEnabled(False)
@@ -5003,6 +5038,9 @@ Step 3: Import Results Back
 
         for i in range(queue_idx, len(self.outlining_queue)):
             img_name, soma_idx = self.outlining_queue[i]
+            # Skip already-outlined somas
+            if self._soma_has_outline(img_name, soma_idx):
+                continue
             img_data = self.images[img_name]
             soma = img_data['somas'][soma_idx]
             soma_id = img_data['soma_ids'][soma_idx]
@@ -5164,16 +5202,20 @@ Step 3: Import Results Back
         mask = path.contains_points(points).reshape(h, w)
         return mask.astype(np.uint8)
 
-    def _find_next_unoutlined_idx(self):
+    def _soma_has_outline(self, img_name, soma_idx):
+        """Check if a soma already has a completed outline."""
+        img_data = self.images[img_name]
+        soma_id = img_data['soma_ids'][soma_idx]
+        return any(
+            ol['soma_idx'] == soma_idx and ol['soma_id'] == soma_id
+            for ol in img_data['soma_outlines']
+        )
+
+    def _find_next_unoutlined_idx(self, start_from=0):
         """Find the first queue entry that doesn't have an outline yet."""
-        for qi, (img_name, soma_idx) in enumerate(self.outlining_queue):
-            img_data = self.images[img_name]
-            soma_id = img_data['soma_ids'][soma_idx]
-            has_outline = any(
-                ol['soma_idx'] == soma_idx and ol['soma_id'] == soma_id
-                for ol in img_data['soma_outlines']
-            )
-            if not has_outline:
+        for qi in range(start_from, len(self.outlining_queue)):
+            img_name, soma_idx = self.outlining_queue[qi]
+            if not self._soma_has_outline(img_name, soma_idx):
                 return qi
         return None  # All done
 
@@ -5181,14 +5223,7 @@ Step 3: Import Results Back
         """Update the outline progress bar with current completion count."""
         if not hasattr(self, 'outlining_queue') or not self.outlining_queue:
             return
-        # Count how many queue entries have outlines completed
-        completed = 0
-        for img_name, soma_idx in self.outlining_queue:
-            img_data = self.images[img_name]
-            soma_id = img_data['soma_ids'][soma_idx]
-            if any(ol['soma_idx'] == soma_idx and ol['soma_id'] == soma_id
-                   for ol in img_data['soma_outlines']):
-                completed += 1
+        completed = sum(1 for in_, si in self.outlining_queue if self._soma_has_outline(in_, si))
         total = len(self.outlining_queue)
         self.outline_progress_bar.setMaximum(total)
         self.outline_progress_bar.setValue(completed)
