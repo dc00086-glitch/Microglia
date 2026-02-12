@@ -1513,6 +1513,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_mode = False
         self.soma_picking_queue = []
         self.outlining_queue = []
+        self.current_outline_idx = 0
         self.polygon_points = []
         self.output_dir = None
         self.masks_dir = None
@@ -3405,7 +3406,9 @@ Step 3: Import Results Back
             if self.processed_label.soma_mode:
                 self.processed_label.set_image(pixmap, centroids=img_data['somas'])
             elif self.processed_label.polygon_mode:
-                queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
+                queue_idx = getattr(self, 'current_outline_idx', 0)
+                if hasattr(self, 'review_mode') and self.review_mode:
+                    queue_idx = self.current_review_idx
                 if queue_idx < len(self.outlining_queue):
                     img_name, soma_idx = self.outlining_queue[queue_idx]
                     if img_name == self.current_image_name:
@@ -3496,11 +3499,11 @@ Step 3: Import Results Back
                         pixmap = self._array_to_pixmap_color(adjusted)
                         # Preserve polygon if in outlining mode
                         if self.processed_label.polygon_mode:
-                            # Use review index in review mode, otherwise count completed outlines
+                            # Use review index in review mode, otherwise use tracked index
                             if hasattr(self, 'review_mode') and self.review_mode:
                                 queue_idx = self.current_review_idx
                             else:
-                                queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
+                                queue_idx = getattr(self, 'current_outline_idx', 0)
                             if queue_idx < len(self.outlining_queue):
                                 img_name, soma_idx = self.outlining_queue[queue_idx]
                                 soma = img_data['somas'][soma_idx] if img_name == self.current_image_name else (img_data['somas'][0] if img_data['somas'] else None)
@@ -3523,11 +3526,11 @@ Step 3: Import Results Back
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                         # Preserve polygon if in outlining mode
                         elif self.processed_label.polygon_mode:
-                            # Use review index in review mode, otherwise count completed outlines
+                            # Use review index in review mode, otherwise use tracked index
                             if hasattr(self, 'review_mode') and self.review_mode:
                                 queue_idx = self.current_review_idx
                             else:
-                                queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
+                                queue_idx = getattr(self, 'current_outline_idx', 0)
                             if queue_idx < len(self.outlining_queue):
                                 img_name, soma_idx = self.outlining_queue[queue_idx]
                                 soma = img_data['somas'][soma_idx] if img_name == self.current_image_name else (img_data['somas'][0] if img_data['somas'] else None)
@@ -4400,10 +4403,17 @@ Step 3: Import Results Back
     def start_batch_outlining(self):
         self.outlining_queue = []
         for img_name, img_data in self.images.items():
-            if not img_data['selected'] or img_data['status'] != 'somas_picked':
+            if not img_data['selected']:
                 continue
+            if img_data['status'] not in ('somas_picked', 'outlined'):
+                continue
+            # Build a set of soma indices that already have outlines
+            outlined_idxs = set()
+            for ol in img_data['soma_outlines']:
+                outlined_idxs.add(ol['soma_idx'])
             for soma_idx in range(len(img_data['somas'])):
-                self.outlining_queue.append((img_name, soma_idx))
+                if soma_idx not in outlined_idxs:
+                    self.outlining_queue.append((img_name, soma_idx))
         if not self.outlining_queue:
             QMessageBox.warning(self, "Warning", "No somas to outline")
             return
@@ -4497,6 +4507,7 @@ Step 3: Import Results Back
         self.failed_auto_outlines = []  # List of queue_idx that failed
         self.review_mode = False
         self.current_review_idx = 0
+        self.current_outline_idx = 0
 
         # Show outline controls and progress bar
         self.outline_controls_widget.setVisible(True)
@@ -4685,6 +4696,7 @@ Step 3: Import Results Back
         if queue_idx >= len(self.outlining_queue):
             self._finish_outlining()
             return
+        self.current_outline_idx = queue_idx
         img_name, soma_idx = self.outlining_queue[queue_idx]
         self.current_image_name = img_name
         img_data = self.images[img_name]
@@ -4705,7 +4717,7 @@ Step 3: Import Results Back
         self.z_key_held = False
 
         self.polygon_points.append(coords)
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        queue_idx = getattr(self, 'current_outline_idx', 0)
         if queue_idx < len(self.outlining_queue):
             img_name, soma_idx = self.outlining_queue[queue_idx]
             img_data = self.images[img_name]
@@ -4729,7 +4741,7 @@ Step 3: Import Results Back
             self.polygon_points.pop()
             self.log(f"↩️ Undid last point ({len(self.polygon_points)} points remaining)")
             # Refresh the display
-            queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+            queue_idx = getattr(self, 'current_outline_idx', 0)
             if queue_idx < len(self.outlining_queue):
                 img_name, soma_idx = self.outlining_queue[queue_idx]
                 img_data = self.images[img_name]
@@ -4752,7 +4764,7 @@ Step 3: Import Results Back
             self.polygon_points = []
             self.log("🔄 Restarted outline (all points cleared)")
             # Refresh the display
-            queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+            queue_idx = getattr(self, 'current_outline_idx', 0)
             if queue_idx < len(self.outlining_queue):
                 img_name, soma_idx = self.outlining_queue[queue_idx]
                 img_data = self.images[img_name]
@@ -4779,11 +4791,11 @@ Step 3: Import Results Back
             QMessageBox.warning(self, "Warning", "Need at least 3 points")
             return
 
-        # In review mode, use current_review_idx; otherwise calculate from outlines
+        # In review mode, use current_review_idx; otherwise use tracked index
         if hasattr(self, 'review_mode') and self.review_mode:
             queue_idx = self.current_review_idx
         else:
-            queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+            queue_idx = getattr(self, 'current_outline_idx', 0)
 
         if queue_idx >= len(self.outlining_queue):
             return
@@ -4871,14 +4883,18 @@ Step 3: Import Results Back
         self._update_outline_progress()
 
         # Go back to that soma for re-outlining
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         self.polygon_points = []
 
-        # If no more outlines left, disable the redo button
-        if queue_idx == 0:
+        # If no more outlines left in this session, disable the redo button
+        has_outlines_in_queue = any(
+            any(ol['soma_idx'] == si and ol['soma_id'] == self.images[in_]['soma_ids'][si]
+                for ol in self.images[in_]['soma_outlines'])
+            for in_, si in self.outlining_queue
+        )
+        if not has_outlines_in_queue:
             self.redo_outline_btn.setEnabled(False)
 
-        self._load_soma_for_outlining(queue_idx)
+        self._load_soma_for_outlining(last_queue_idx)
 
     def _get_auto_outline_method(self):
         """Get the selected auto-outline method function"""
@@ -4906,7 +4922,7 @@ Step 3: Import Results Back
             QMessageBox.warning(self, "Warning", "No somas in outlining queue")
             return
 
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        queue_idx = getattr(self, 'current_outline_idx', 0)
         if queue_idx >= len(self.outlining_queue):
             QMessageBox.warning(self, "Warning", "All somas already outlined")
             return
@@ -4970,7 +4986,7 @@ Step 3: Import Results Back
             QMessageBox.warning(self, "Warning", "No somas in outlining queue")
             return
 
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        queue_idx = getattr(self, 'current_outline_idx', 0)
         remaining = len(self.outlining_queue) - queue_idx
 
         if remaining <= 0:
@@ -5047,13 +5063,13 @@ Step 3: Import Results Back
         # Update outline progress
         self._update_outline_progress()
 
-        # Check if all done
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
-        if queue_idx >= len(self.outlining_queue):
+        # Check if all done — find first queue entry without an outline
+        next_idx = self._find_next_unoutlined_idx()
+        if next_idx is None:
             self._finish_outlining()
         else:
             # Load the first failed soma for manual outlining
-            self._load_soma_for_outlining(queue_idx)
+            self._load_soma_for_outlining(next_idx)
             self.auto_outline_btn.setEnabled(True)
             self.manual_draw_btn.setEnabled(True)
 
@@ -5071,7 +5087,7 @@ Step 3: Import Results Back
         self.processed_label.selected_point_idx = None
         self.processed_label.dragging_point = False
 
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        queue_idx = getattr(self, 'current_outline_idx', 0)
         if queue_idx < len(self.outlining_queue):
             img_name, soma_idx = self.outlining_queue[queue_idx]
             img_data = self.images[img_name]
@@ -5161,11 +5177,31 @@ Step 3: Import Results Back
         mask = path.contains_points(points).reshape(h, w)
         return mask.astype(np.uint8)
 
+    def _find_next_unoutlined_idx(self):
+        """Find the first queue entry that doesn't have an outline yet."""
+        for qi, (img_name, soma_idx) in enumerate(self.outlining_queue):
+            img_data = self.images[img_name]
+            soma_id = img_data['soma_ids'][soma_idx]
+            has_outline = any(
+                ol['soma_idx'] == soma_idx and ol['soma_id'] == soma_id
+                for ol in img_data['soma_outlines']
+            )
+            if not has_outline:
+                return qi
+        return None  # All done
+
     def _update_outline_progress(self):
         """Update the outline progress bar with current completion count."""
         if not hasattr(self, 'outlining_queue') or not self.outlining_queue:
             return
-        completed = sum(len(data['soma_outlines']) for data in self.images.values())
+        # Count how many queue entries have outlines completed
+        completed = 0
+        for img_name, soma_idx in self.outlining_queue:
+            img_data = self.images[img_name]
+            soma_id = img_data['soma_ids'][soma_idx]
+            if any(ol['soma_idx'] == soma_idx and ol['soma_id'] == soma_id
+                   for ol in img_data['soma_outlines']):
+                completed += 1
         total = len(self.outlining_queue)
         self.outline_progress_bar.setMaximum(total)
         self.outline_progress_bar.setValue(completed)
