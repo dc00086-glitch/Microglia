@@ -2497,7 +2497,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 }
                 img_session['soma_outlines'].append(outline_data)
 
-            # Record which masks exist on disk for this image
+            # Record which masks exist on disk and their approval state
+            mask_qa_state = []
+            for mask in img_data.get('masks', []):
+                mask_qa_state.append({
+                    'soma_id': mask.get('soma_id', ''),
+                    'area_um2': mask.get('area_um2', 0),
+                    'approved': mask.get('approved'),
+                })
+            img_session['mask_qa_state'] = mask_qa_state
+
             if self.masks_dir:
                 prefix = os.path.splitext(img_name)[0]
                 mask_files = [
@@ -2681,12 +2690,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
                 # If processed image wasn't found, downgrade status
                 # But don't downgrade qa_complete — masks on disk are still valid
-                if processed_data is None and img_session.get('status') not in ('loaded', 'qa_complete', 'analyzed'):
+                if processed_data is None and img_session.get('status') not in ('loaded', 'masks_generated', 'qa_complete', 'analyzed'):
                     self.images[img_name]['status'] = 'loaded'
 
-                # Load mask TIFFs from disk for qa_complete/analyzed images
+                # Load mask TIFFs from disk for masks_generated/qa_complete/analyzed images
                 orig_status = img_session.get('status', 'loaded')
-                if orig_status in ('qa_complete', 'analyzed') and self.masks_dir and os.path.isdir(self.masks_dir):
+                if orig_status in ('masks_generated', 'qa_complete', 'analyzed') and self.masks_dir and os.path.isdir(self.masks_dir):
                     img_basename = os.path.splitext(img_name)[0]
                     mask_pattern = re.compile(
                         re.escape(img_basename) + r'_(soma_\d+_\d+)_area(\d+)_mask\.tif$'
@@ -2695,6 +2704,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     outline_lookup = {}
                     for ol in restored_outlines:
                         outline_lookup[ol.get('soma_id', '')] = ol.get('soma_area_um2', 0)
+
+                    # Build approval state lookup from session
+                    qa_state_lookup = {}
+                    for qs in img_session.get('mask_qa_state', []):
+                        key = (qs.get('soma_id', ''), qs.get('area_um2', 0))
+                        qa_state_lookup[key] = qs.get('approved')
 
                     for mf in sorted(os.listdir(self.masks_dir)):
                         m = mask_pattern.match(mf)
@@ -2708,13 +2723,22 @@ class MicrogliaAnalysisGUI(QMainWindow):
                             # Find soma_idx from soma_ids list
                             soma_ids_list = self.images[img_name]['soma_ids']
                             soma_idx = soma_ids_list.index(soma_id) if soma_id in soma_ids_list else 0
+                            # Restore approval state: use saved state if available,
+                            # default to True for qa_complete/analyzed, None for masks_generated
+                            saved_approval = qa_state_lookup.get((soma_id, area_um2))
+                            if saved_approval is not None:
+                                approval = saved_approval
+                            elif orig_status in ('qa_complete', 'analyzed'):
+                                approval = True
+                            else:
+                                approval = None
                             self.images[img_name]['masks'].append({
                                 'image_name': img_name,
                                 'soma_idx': soma_idx,
                                 'soma_id': soma_id,
                                 'area_um2': area_um2,
                                 'mask': mask_arr,
-                                'approved': True,
+                                'approved': approval,
                                 'soma_area_um2': outline_lookup.get(soma_id, 0),
                             })
                         except Exception as e:
@@ -2851,6 +2875,26 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 )
                 if reply == QMessageBox.Yes:
                     self.start_batch_outlining()
+                    return  # Don't check QA if resuming outlining
+
+        # Check for partially-QA'd masks and offer to resume
+        if has_masks:
+            total_masks = sum(len(d['masks']) for d in self.images.values()
+                              if d['selected'] and d['status'] in ('masks_generated', 'qa_complete', 'analyzed'))
+            reviewed_masks = sum(
+                1 for d in self.images.values()
+                if d['selected'] and d['status'] in ('masks_generated', 'qa_complete', 'analyzed')
+                for m in d['masks'] if m.get('approved') is not None
+            )
+            if total_masks > 0 and 0 < reviewed_masks < total_masks:
+                reply = QMessageBox.question(
+                    self, 'Resume Mask QA',
+                    f"Found {reviewed_masks}/{total_masks} masks reviewed.\n\n"
+                    f"Resume QA for the remaining {total_masks - reviewed_masks} masks?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    self.start_batch_qa()
 
     # ========================================================================
     # IMAGEJ SCRIPT GENERATION
@@ -5788,8 +5832,16 @@ Step 3: Import Results Back
             return
 
         self.mask_qa_active = True
-        self.mask_qa_idx = 0
         self.last_qa_decisions = []
+
+        # Find first unreviewed mask to resume from
+        reviewed_count = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
+        first_unreviewed = 0
+        for i, flat in enumerate(self.all_masks_flat):
+            if flat['mask_data'].get('approved') is None:
+                first_unreviewed = i
+                break
+        self.mask_qa_idx = first_unreviewed
 
         self.approve_mask_btn.setEnabled(True)
         self.reject_mask_btn.setEnabled(True)
@@ -5804,7 +5856,10 @@ Step 3: Import Results Back
 
         self.log("=" * 50)
         self.log("🎯 BATCH MASK QA MODE")
-        self.log(f"Total masks to review: {len(self.all_masks_flat)}")
+        if reviewed_count > 0:
+            self.log(f"Resuming: {reviewed_count}/{len(self.all_masks_flat)} already reviewed")
+        else:
+            self.log(f"Total masks to review: {len(self.all_masks_flat)}")
         self.log("Keyboard: A=Approve, R=Reject, ←→=Navigate, Space=Approve&Next")
         self.log("=" * 50)
 
@@ -5840,9 +5895,11 @@ Step 3: Import Results Back
 
         status = mask_data.get('approved')
         status_text = "✓ Approved" if status is True else "✗ Rejected" if status is False else "⏳ Not reviewed"
+        reviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
 
         self.nav_status_label.setText(
             f"Mask {self.mask_qa_idx + 1}/{len(self.all_masks_flat)} | "
+            f"Reviewed: {reviewed}/{len(self.all_masks_flat)} | "
             f"{img_name} | {mask_data['soma_id']} | "
             f"Area: {mask_data['area_um2']} µm² | {status_text}"
         )
