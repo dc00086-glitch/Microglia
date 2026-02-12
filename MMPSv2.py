@@ -1095,11 +1095,11 @@ class InteractiveImageLabel(QLabel):
                 nearest_idx = i
         return nearest_idx
 
-    def _find_nearest_centroid(self, click_pos, threshold=15):
+    def _find_nearest_centroid(self, click_pos, threshold=6):
         """Find the nearest centroid within threshold pixels for dragging"""
         if not self.centroids:
             return None
-        effective_threshold = max(threshold, threshold / max(self.zoom_level, 0.5))
+        effective_threshold = threshold / max(self.zoom_level, 0.5)
         min_dist = float('inf')
         nearest_idx = None
         for i, centroid in enumerate(self.centroids):
