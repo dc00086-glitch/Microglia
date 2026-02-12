@@ -1610,19 +1610,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.done_with_current()
                 return
             elif key == Qt.Key_Escape:
-                # Cancel soma picking
-                if self.batch_mode and self.soma_picking_queue:
-                    reply = QMessageBox.question(
-                        self, 'Cancel Soma Picking',
-                        'Cancel soma picking for remaining images?',
-                        QMessageBox.Yes | QMessageBox.No
-                    )
-                    if reply == QMessageBox.Yes:
-                        self.soma_picking_queue = []
-                        self.batch_mode = False
-                        self.processed_label.soma_mode = False
-                        self.done_btn.setEnabled(False)
-                        self.log("✗ Soma picking cancelled")
+                # Clear all somas on current image (undo all placed centroids)
+                if self.current_image_name:
+                    img_data = self.images[self.current_image_name]
+                    if img_data['somas']:
+                        count = len(img_data['somas'])
+                        img_data['somas'].clear()
+                        img_data['soma_ids'].clear()
+                        self.log(f"↩ Cleared {count} soma(s) on {self.current_image_name}")
+                        self._load_image_for_soma_picking()
+                    else:
+                        self.log("No somas to clear on this image")
                 return
 
         # Handle mask QA mode shortcuts
@@ -4834,39 +4832,40 @@ Step 3: Import Results Back
 
     def redo_last_outline(self):
         """Delete the last completed outline and go back to redo it"""
-        # Find the last outline across all images
+        # Find the last outline by walking the outlining_queue in reverse
+        # and checking which ones still have outlines saved
         last_outline_img = None
         last_outline_data = None
-        
-        for img_name, img_data in self.images.items():
-            if img_data['soma_outlines']:
-                last_outline_img = img_name
-                last_outline_data = img_data['soma_outlines'][-1]
-        
+        last_queue_idx = None
+
+        # Count outlines in queue order to find the last completed one
+        outline_count = 0
+        for qi, (img_name, soma_idx) in enumerate(self.outlining_queue):
+            img_data = self.images[img_name]
+            soma_id = img_data['soma_ids'][soma_idx]
+            # Check if this queue entry has a matching outline
+            for ol in img_data['soma_outlines']:
+                if ol['soma_idx'] == soma_idx and ol['soma_id'] == soma_id:
+                    last_outline_img = img_name
+                    last_outline_data = ol
+                    last_queue_idx = qi
+                    break
+
         if not last_outline_data:
             QMessageBox.warning(self, "Warning", "No outlines to redo")
             return
-        
-        reply = QMessageBox.question(
-            self, 'Redo Last Outline',
-            f"Delete outline for {last_outline_data['soma_id']} and redo it?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        
-        if reply == QMessageBox.No:
-            return
-        
-        # Remove the last outline
-        self.images[last_outline_img]['soma_outlines'].pop()
-        
+
+        # Remove the outline
+        self.images[last_outline_img]['soma_outlines'].remove(last_outline_data)
+
         # Delete the exported soma file if it exists
         if self.masks_dir:
             soma_id = last_outline_data['soma_id']
             soma_file = os.path.join(self.masks_dir, f"{os.path.splitext(last_outline_img)[0]}_{soma_id}_soma.tif")
             if os.path.exists(soma_file):
                 os.remove(soma_file)
-        
-        self.log(f"↩ Deleted outline for {last_outline_data['soma_id']} - ready to redo")
+
+        self.log(f"↩ Undid outline for {last_outline_data['soma_id']} - ready to redo")
 
         # Update outline progress
         self._update_outline_progress()
@@ -4874,7 +4873,7 @@ Step 3: Import Results Back
         # Go back to that soma for re-outlining
         queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         self.polygon_points = []
-        
+
         # If no more outlines left, disable the redo button
         if queue_idx == 0:
             self.redo_outline_btn.setEnabled(False)
