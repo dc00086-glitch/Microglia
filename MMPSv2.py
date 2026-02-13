@@ -6053,10 +6053,6 @@ Step 3: Import Results Back
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
-        natural_limit_um2 = natural_limit * (pixel_size_um ** 2)
-        print(f"  {soma_id}: soma={soma_seed_count}px, grew to {len(growth_order)}px, "
-              f"natural limit={natural_limit}px ({natural_limit_um2:.0f} µm²)")
-
         # Compute the natural growth limit for each target area.
         # Like the reference ImageJ plugin, the mask should not be forced
         # to reach the target — it should stop where intensity stabilises.
@@ -6080,6 +6076,10 @@ Step 3: Import Results Back
             below = np.where(rolling < otsu_thresh)[0]
             if len(below) > 0:
                 natural_limit = soma_seed_count + int(below[0])
+
+        natural_limit_um2 = natural_limit * (pixel_size_um ** 2)
+        print(f"  {soma_id}: soma={soma_seed_count}px, grew to {len(growth_order)}px, "
+              f"natural limit={natural_limit}px ({natural_limit_um2:.0f} µm²)")
 
         # Build masks for each target area from the growth order
         # Largest first (matches QA presentation order)
