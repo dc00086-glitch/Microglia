@@ -2335,6 +2335,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.reject_mask_btn.setEnabled(False)
         self.reject_mask_btn.setVisible(False)
 
+        # Mask QA progress bar
+        self.mask_qa_progress_bar = QProgressBar()
+        self.mask_qa_progress_bar.setVisible(False)
+        self.mask_qa_progress_bar.setMinimumHeight(20)
+        self.mask_qa_progress_bar.setFormat("%v / %m masks reviewed")
+        self.mask_qa_progress_bar.setStyleSheet("""
+            QProgressBar { text-align: center; font-weight: bold; }
+        """)
+        layout.addWidget(self.mask_qa_progress_bar)
+
         return panel
 
     def update_timer_display(self):
@@ -6126,6 +6136,11 @@ Step 3: Import Results Back
         self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
         self.regen_masks_btn.setVisible(True)
 
+        # Show and init progress bar
+        self.mask_qa_progress_bar.setMaximum(len(self.all_masks_flat))
+        self.mask_qa_progress_bar.setValue(reviewed_count)
+        self.mask_qa_progress_bar.setVisible(True)
+
         self._show_current_mask()
         self.tabs.setCurrentIndex(3)
 
@@ -6187,6 +6202,9 @@ Step 3: Import Results Back
             f"{img_name} | {mask_data['soma_id']} | "
             f"Area: {mask_data['area_um2']} µm² | {status_text}"
         )
+
+        # Update progress bar
+        self.mask_qa_progress_bar.setValue(reviewed)
 
     def approve_current_mask(self):
         if not self.mask_qa_active or self.mask_qa_idx >= len(self.all_masks_flat):
@@ -6410,6 +6428,7 @@ Step 3: Import Results Back
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
             self.regen_masks_btn.setVisible(False)
+            self.mask_qa_progress_bar.setVisible(False)
 
             # Update image statuses
             for img_name, img_data in self.images.items():
