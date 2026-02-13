@@ -5511,7 +5511,7 @@ Step 3: Import Results Back
         self.accept_outline_btn.setEnabled(False)
 
         for img_name, img_data in self.images.items():
-            if img_data['selected'] and len(img_data['soma_outlines']) == len(img_data['somas']):
+            if img_data['selected'] and img_data['soma_outlines']:
                 img_data['status'] = 'outlined'
                 self._update_file_list_item(img_name)
         self.batch_generate_masks_btn.setEnabled(True)
@@ -5677,11 +5677,12 @@ Step 3: Import Results Back
             self.progress_bar.setVisible(True)
             self.progress_status_label.setVisible(True)
 
-            total_outlines = sum(len(data['soma_outlines']) for data in self.images.values() if data['selected'])
+            total_outlines = sum(len(data['soma_outlines']) for data in self.images.values()
+                                 if data['selected'] and data['soma_outlines'])
             current_count = 0
 
             for img_name, img_data in self.images.items():
-                if not img_data['selected'] or img_data['status'] != 'outlined':
+                if not img_data['selected'] or not img_data['soma_outlines']:
                     continue
 
                 self.log(f"Generating masks for {img_name}...")
