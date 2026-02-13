@@ -1722,7 +1722,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.polygon_points = []
         self.output_dir = None
         self.masks_dir = None
-        self.pixel_size = 0.3
+        self.pixel_size = 0.316
         self.default_rolling_ball_radius = 50
         self.all_masks_flat = []
         self.mask_qa_idx = 0
@@ -1888,6 +1888,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.shortcut_help.activated.connect(self.show_shortcut_help)
         self.shortcut_measure = QShortcut(QKeySequence('M'), self)
         self.shortcut_measure.activated.connect(self.toggle_measure_mode)
+        self.shortcut_undo_qa = QShortcut(QKeySequence('B'), self)
+        self.shortcut_undo_qa.activated.connect(self.undo_last_qa)
 
     def _create_left_panel(self):
         panel = QWidget()
@@ -2568,6 +2570,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             shortcuts = [
                 ("A / Space", "Approve current mask"),
                 ("R", "Reject current mask"),
+                ("B", "Undo last QA decision"),
                 ("Left arrow", "Previous mask"),
                 ("Right arrow", "Next mask"),
             ]
