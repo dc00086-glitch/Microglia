@@ -2,6 +2,7 @@
 
 import sys
 import os
+import re
 import time
 import numpy as np
 from PyQt5.QtWidgets import (
@@ -21,6 +22,8 @@ from scipy import ndimage, stats
 from matplotlib.path import Path as mplPath
 import cv2
 import glob
+import json
+import math
 
 
 def load_tiff_image(filepath):
@@ -67,6 +70,211 @@ def extract_channel(img, channel_idx):
 # ============================================================================
 
 MIN_OUTLINE_POINTS = 10
+
+
+def _remove_branch_juts(points, centroid, max_iterations=3):
+    """Remove narrow branch-like protrusions from a soma outline.
+
+    Uses convexity defect analysis to detect pairs of deep concavities
+    that indicate a branch root, then cuts them off with a chord.
+    Also applies morphological opening on the filled mask to erode
+    thin structures before re-extracting the contour.
+
+    Args:
+        points: list of (row, col) tuples - the polygon outline
+        centroid: (row, col) of the soma center
+        max_iterations: max rounds of defect removal
+
+    Returns:
+        list of (row, col) tuples - cleaned polygon outline
+    """
+    if points is None or len(points) < MIN_OUTLINE_POINTS:
+        return points
+
+    pts = np.array(points, dtype=np.float64)
+    cy, cx = float(centroid[0]), float(centroid[1])
+
+    # --- Phase 1: morphological opening on filled mask ---
+    # Build a tight bounding box around the outline
+    rows, cols = pts[:, 0], pts[:, 1]
+    pad = 10
+    r_min, r_max = int(rows.min()) - pad, int(rows.max()) + pad
+    c_min, c_max = int(cols.min()) - pad, int(cols.max()) + pad
+
+    # Create local-coordinate contour for cv2 (x, y format)
+    local_pts = np.array([[[int(c - c_min), int(r - r_min)]]
+                          for r, c in points], dtype=np.int32)
+    h = r_max - r_min
+    w = c_max - c_min
+    if h <= 0 or w <= 0:
+        return points
+
+    # Draw filled polygon into a mask
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [local_pts.reshape(-1, 1, 2)], 255)
+
+    # Estimate soma radius from mask area to scale the opening kernel
+    area_px = cv2.countNonZero(mask)
+    equiv_radius = max(3, int(np.sqrt(area_px / np.pi) * 0.45))
+
+    # Morphological opening with circular kernel removes thin branches
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                       (equiv_radius, equiv_radius))
+    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    # Make sure the centroid is still inside; if opening erased too much, relax
+    local_cy = int(cy - r_min)
+    local_cx = int(cx - c_min)
+    if (0 <= local_cy < h and 0 <= local_cx < w
+            and opened[local_cy, local_cx] == 0):
+        # Opening was too aggressive — try a smaller kernel
+        smaller = max(3, equiv_radius // 2)
+        kernel_sm = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                               (smaller, smaller))
+        opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_sm)
+        if (0 <= local_cy < h and 0 <= local_cx < w
+                and opened[local_cy, local_cx] == 0):
+            # Even smaller kernel lost the centroid; skip opening
+            opened = mask
+
+    # Re-extract contour from opened mask
+    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return points
+
+    # Pick contour nearest centroid
+    best_contour = None
+    best_dist = float('inf')
+    for cnt in contours:
+        M = cv2.moments(cnt)
+        if M['m00'] < 20:
+            continue
+        mcx = M['m10'] / M['m00']
+        mcy = M['m01'] / M['m00']
+        d = (mcx - local_cx) ** 2 + (mcy - local_cy) ** 2
+        if d < best_dist:
+            best_dist = d
+            best_contour = cnt
+
+    if best_contour is None:
+        best_contour = max(contours, key=cv2.contourArea)
+
+    # --- Phase 2: convexity defect pruning ---
+    for _ in range(max_iterations):
+        if len(best_contour) < 5:
+            break
+        hull_idx = cv2.convexHull(best_contour, returnPoints=False)
+        if hull_idx is None or len(hull_idx) < 3:
+            break
+
+        # Sort hull indices for convexityDefects (must be ascending)
+        hull_idx = np.sort(hull_idx, axis=0)
+        try:
+            defects = cv2.convexityDefects(best_contour, hull_idx)
+        except cv2.error:
+            break
+
+        if defects is None or len(defects) == 0:
+            break
+
+        # Contour perimeter for relative depth threshold
+        perimeter = cv2.arcLength(best_contour, True)
+        depth_threshold = perimeter * 0.03  # defect must be >3% of perimeter
+
+        # Collect deep defects sorted by depth (deepest first)
+        deep = []
+        for i in range(defects.shape[0]):
+            s, e, f, d = defects[i, 0]
+            depth = d / 256.0
+            if depth > depth_threshold:
+                deep.append((s, e, f, depth))
+
+        if len(deep) < 2:
+            break
+
+        deep.sort(key=lambda x: -x[3])
+
+        # Try to find pairs of defects that form a narrow jut
+        pruned = False
+        used = set()
+        for i in range(len(deep)):
+            if i in used:
+                continue
+            s1, e1, f1, d1 = deep[i]
+            start1 = tuple(best_contour[s1][0])
+            end1 = tuple(best_contour[e1][0])
+            far1 = tuple(best_contour[f1][0])
+
+            for j in range(i + 1, len(deep)):
+                if j in used:
+                    continue
+                s2, e2, f2, d2 = deep[j]
+                start2 = tuple(best_contour[s2][0])
+                end2 = tuple(best_contour[e2][0])
+                far2 = tuple(best_contour[f2][0])
+
+                # Check if the two defects' far points are close to each
+                # other relative to their depth — that means a narrow jut
+                # sits between them
+                gap = np.sqrt((far1[0] - far2[0]) ** 2 +
+                              (far1[1] - far2[1]) ** 2)
+                avg_depth = (d1 + d2) / 2
+
+                # Narrow jut: the gap between defect bases is small
+                # relative to how deep they are
+                if gap < avg_depth * 2.5:
+                    # Cut the jut: connect the two far points, removing
+                    # the contour segment between them
+                    idx1, idx2 = sorted([f1, f2])
+                    n = len(best_contour)
+
+                    # Determine which arc to keep (the one containing
+                    # the centroid)
+                    arc_a = list(range(idx2, n)) + list(range(0, idx1 + 1))
+                    arc_b = list(range(idx1, idx2 + 1))
+
+                    # Check which arc contains points closer to centroid
+                    def arc_centroid_dist(arc):
+                        if not arc:
+                            return float('inf')
+                        apts = best_contour[arc].reshape(-1, 2)
+                        dists = (apts[:, 0] - local_cx) ** 2 + \
+                                (apts[:, 1] - local_cy) ** 2
+                        return float(np.min(dists))
+
+                    if arc_centroid_dist(arc_a) <= arc_centroid_dist(arc_b):
+                        keep = arc_a
+                    else:
+                        keep = arc_b
+
+                    if len(keep) >= MIN_OUTLINE_POINTS:
+                        best_contour = best_contour[keep]
+                        pruned = True
+                        used.add(i)
+                        used.add(j)
+                        break  # restart defect analysis on new contour
+
+            if pruned:
+                break
+
+        if not pruned:
+            break
+
+    # --- Convert back to (row, col) image coordinates ---
+    approx = _simplify_contour(best_contour)
+    result = []
+    for pt in approx:
+        px, py = pt[0]
+        img_col = px + c_min
+        img_row = py + r_min
+        result.append((img_row, img_col))
+
+    if len(result) < MIN_OUTLINE_POINTS:
+        return points
+
+    return result
+
 
 def _simplify_contour(contour, min_points=MIN_OUTLINE_POINTS):
     """Simplify a contour with approxPolyDP, ensuring at least min_points.
@@ -561,8 +769,9 @@ class MorphologyCalculator:
     """
     Calculate morphological parameters for microglia.
 
-    Calculates 6 basic metrics: roundness, eccentricity, soma area,
-    mask area, perimeter, and cell spread.
+    Calculates 10 basic metrics: roundness, eccentricity, soma area,
+    mask area, perimeter, cell spread, polarity index, principal angle,
+    major axis length, and minor axis length.
     """
 
     def __init__(self, image, pixel_size_um, use_imagej=False):
@@ -617,9 +826,61 @@ class MorphologyCalculator:
                 params['soma_area'] = soma_area_um2
             else:
                 params['soma_area'] = props.area * 0.1 * (self.pixel_size ** 2)
+
+            # Directional polarity via PCA on mask coordinates
+            params.update(self._calculate_polarity(coords, centroid))
         else:
             params = {k: 0 for k in ['perimeter', 'mask_area', 'eccentricity',
-                                     'roundness', 'cell_spread', 'soma_area']}
+                                     'roundness', 'cell_spread', 'soma_area',
+                                     'polarity_index', 'principal_angle',
+                                     'major_axis_um', 'minor_axis_um']}
+        return params
+
+    def _calculate_polarity(self, coords, centroid):
+        """Calculate directional polarity from PCA on mask pixel coordinates.
+
+        Returns:
+            dict with polarity_index (0=isotropic, 1=fully polarized),
+            principal_angle (0-180 degrees), major_axis_um, minor_axis_um.
+        """
+        params = {}
+        # Center coordinates on the centroid
+        centered = coords - centroid
+
+        if len(centered) < 3:
+            params['polarity_index'] = 0
+            params['principal_angle'] = 0
+            params['major_axis_um'] = 0
+            params['minor_axis_um'] = 0
+            return params
+
+        # Covariance matrix of (row, col) positions
+        cov = np.cov(centered.T)
+
+        # Eigenvalues = variance along principal axes
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+
+        # eigh returns ascending order; major axis is the last one
+        major_val = eigenvalues[-1]
+        minor_val = eigenvalues[0]
+        major_vec = eigenvectors[:, -1]
+
+        # Polarity index: 0 = circle, 1 = line
+        if major_val > 0:
+            params['polarity_index'] = round(1.0 - (minor_val / major_val), 4)
+        else:
+            params['polarity_index'] = 0
+
+        # Principal direction angle (0-180 degrees, 0=horizontal)
+        # major_vec is (row, col) so angle from horizontal = atan2(row, col)
+        angle_rad = np.arctan2(major_vec[0], major_vec[1])
+        angle_deg = np.degrees(angle_rad) % 180  # Map to 0-180 range
+        params['principal_angle'] = round(angle_deg, 2)
+
+        # Axis extents in microns (2 * sqrt(eigenvalue) gives the std dev extent)
+        params['major_axis_um'] = round(2 * np.sqrt(major_val) * self.pixel_size, 4)
+        params['minor_axis_um'] = round(2 * np.sqrt(max(minor_val, 0)) * self.pixel_size, 4)
+
         return params
 
 
@@ -818,7 +1079,7 @@ class InteractiveImageLabel(QLabel):
         self.setMinimumSize(400, 400)
         # Don't use QLabel's auto-centering - we'll position the pixmap ourselves
         self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.setStyleSheet("border: 2px solid #cccccc; background-color: #f5f5f5;")
+        self.setStyleSheet("border: 2px solid palette(mid); background-color: palette(base);")
         # Allow label to expand
         from PyQt5.QtWidgets import QSizePolicy
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -837,6 +1098,15 @@ class InteractiveImageLabel(QLabel):
         self.selected_point_idx = None
         self.dragging_point = False
         self.setMouseTracking(True)  # Enable mouse tracking for hover effects
+        # Measurement tool
+        self.measure_mode = False
+        self.measure_pt1 = None  # (row, col) image coords
+        self.measure_pt2 = None
+        # Mask overlay opacity (0.0 - 1.0)
+        self.overlay_opacity = 0.4
+        # Centroid dragging
+        self.dragging_centroid = False
+        self.dragging_centroid_idx = None
 
     def set_image(self, qpix, centroids=None, mask_overlay=None, polygon_pts=None):
         self.pix_source = qpix
@@ -884,6 +1154,20 @@ class InteractiveImageLabel(QLabel):
         self.zoom_level = max(self.min_zoom, min(self.max_zoom, level))
         self._update_display()
 
+    def zoom_to_point(self, img_row, img_col, zoom_level=3.0):
+        """Center the view on a specific image coordinate and zoom in."""
+        if self.pix_source is None:
+            return
+        img_h = self.pix_source.height()
+        img_w = self.pix_source.width()
+        if img_w > 0 and img_h > 0:
+            self.view_center_x = img_col / img_w
+            self.view_center_y = img_row / img_h
+            self.zoom_level = max(self.min_zoom, min(self.max_zoom, zoom_level))
+            self._update_display()
+            if self.parent_widget and hasattr(self.parent_widget, 'zoom_level_label'):
+                self.parent_widget.zoom_level_label.setText(f"{self.zoom_level:.1f}x")
+
     def _get_pan_offset(self):
         """Calculate pan offset based on view center"""
         if not self.pix_source or not self.scaled_pixmap:
@@ -910,7 +1194,7 @@ class InteractiveImageLabel(QLabel):
     def paintEvent(self, event):
         # Draw background first (from QLabel)
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(245, 245, 245))  # Match background color
+        painter.fillRect(self.rect(), self.palette().color(self.backgroundRole()))
 
         if not self.pix_source or not self.scaled_pixmap:
             painter.end()
@@ -938,12 +1222,39 @@ class InteractiveImageLabel(QLabel):
         if self.polygon_mode and len(self.polygon_pts) > 0:
             self._draw_polygon(painter)
 
+        # Draw measurement overlay
+        if self.measure_mode and self.measure_pt1 is not None:
+            pen = QPen(QColor(255, 255, 0), 2, Qt.DashLine)
+            painter.setPen(pen)
+            x1, y1 = self._to_display_coords(self.measure_pt1)
+            # Draw first point marker
+            painter.setBrush(QColor(255, 255, 0, 150))
+            painter.drawEllipse(int(x1 - 5), int(y1 - 5), 10, 10)
+            if self.measure_pt2 is not None:
+                x2, y2 = self._to_display_coords(self.measure_pt2)
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+                painter.drawEllipse(int(x2 - 5), int(y2 - 5), 10, 10)
+                # Draw distance label at midpoint
+                mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                if self.parent_widget and hasattr(self.parent_widget, '_get_measure_text'):
+                    text = self.parent_widget._get_measure_text()
+                    painter.setPen(QColor(0, 0, 0))
+                    painter.setBrush(QColor(255, 255, 200, 220))
+                    fm = painter.fontMetrics()
+                    tw = fm.horizontalAdvance(text) + 8
+                    painter.drawRect(int(mx - tw / 2), int(my - 18), tw, 20)
+                    painter.setPen(QColor(0, 0, 0))
+                    painter.drawText(int(mx - tw / 2 + 4), int(my - 2), text)
+
         # Draw zoom indicator
         if self.zoom_level != 1.0:
-            painter.setPen(QPen(QColor(50, 50, 50)))
-            painter.setBrush(QColor(255, 255, 255, 200))
+            bg = self.palette().color(self.backgroundRole())
+            bg.setAlpha(200)
+            fg = self.palette().color(self.foregroundRole())
+            painter.setPen(QPen(fg))
+            painter.setBrush(bg)
             painter.drawRect(5, 5, 70, 20)
-            painter.setPen(QColor(0, 0, 0))
+            painter.setPen(fg)
             painter.drawText(10, 20, f"Zoom: {self.zoom_level:.1f}x")
 
         painter.end()
@@ -989,6 +1300,21 @@ class InteractiveImageLabel(QLabel):
                 nearest_idx = i
         return nearest_idx
 
+    def _find_nearest_centroid(self, click_pos, threshold=6):
+        """Find the nearest centroid within threshold pixels for dragging"""
+        if not self.centroids:
+            return None
+        effective_threshold = threshold / max(self.zoom_level, 0.5)
+        min_dist = float('inf')
+        nearest_idx = None
+        for i, centroid in enumerate(self.centroids):
+            display_x, display_y = self._to_display_coords(centroid)
+            dist = ((click_pos.x() - display_x) ** 2 + (click_pos.y() - display_y) ** 2) ** 0.5
+            if dist < min_dist and dist < effective_threshold:
+                min_dist = dist
+                nearest_idx = i
+        return nearest_idx
+
     def mousePressEvent(self, event):
         # Check if Z key is held for zoom
         if self.parent_widget and hasattr(self.parent_widget, 'z_key_held') and self.parent_widget.z_key_held:
@@ -1003,7 +1329,28 @@ class InteractiveImageLabel(QLabel):
         if not coords:
             return
 
+        # Measurement mode takes priority over other modes
+        if self.measure_mode and event.button() == Qt.LeftButton:
+            if self.measure_pt1 is None or self.measure_pt2 is not None:
+                # Start new measurement
+                self.measure_pt1 = coords
+                self.measure_pt2 = None
+            else:
+                # Complete measurement
+                self.measure_pt2 = coords
+                if self.parent_widget and hasattr(self.parent_widget, '_show_measurement'):
+                    self.parent_widget._show_measurement()
+            self._update_display()
+            return
+
         if self.soma_mode and self.parent_widget:
+            # Check if clicking near an existing centroid to drag it
+            if self.centroids and event.button() == Qt.LeftButton:
+                nearest_idx = self._find_nearest_centroid(event.pos())
+                if nearest_idx is not None:
+                    self.dragging_centroid = True
+                    self.dragging_centroid_idx = nearest_idx
+                    return
             self.parent_widget.add_soma(coords)
         elif self.polygon_mode and self.parent_widget:
             # Sync polygon points from parent before checking for drag
@@ -1026,7 +1373,19 @@ class InteractiveImageLabel(QLabel):
                 self.parent_widget.finish_polygon()
 
     def mouseMoveEvent(self, event):
-        """Handle mouse move for point dragging"""
+        """Handle mouse move for point/centroid dragging"""
+        # Centroid dragging
+        if self.dragging_centroid and self.dragging_centroid_idx is not None and self.parent_widget:
+            coords = self._to_image_coords(event.pos().x(), event.pos().y())
+            if coords and self.dragging_centroid_idx < len(self.centroids):
+                self.centroids[self.dragging_centroid_idx] = coords
+                # Update parent's somas list
+                img_data = self.parent_widget.images.get(self.parent_widget.current_image_name)
+                if img_data and self.dragging_centroid_idx < len(img_data['somas']):
+                    img_data['somas'][self.dragging_centroid_idx] = coords
+                self._update_display()
+            return
+
         if self.dragging_point and self.selected_point_idx is not None and self.parent_widget:
             coords = self._to_image_coords(event.pos().x(), event.pos().y())
             if coords:
@@ -1038,6 +1397,22 @@ class InteractiveImageLabel(QLabel):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release to finish dragging"""
+        # Centroid drag release - snap to brightest pixel within 5 µm
+        if self.dragging_centroid and event.button() == Qt.LeftButton:
+            self.dragging_centroid = False
+            idx = self.dragging_centroid_idx
+            self.dragging_centroid_idx = None
+            if self.parent_widget:
+                img_data = self.parent_widget.images.get(self.parent_widget.current_image_name)
+                if img_data and idx is not None and idx < len(img_data['somas']):
+                    snapped = self.parent_widget._snap_to_brightest(img_data['somas'][idx])
+                    img_data['somas'][idx] = snapped
+                    self.centroids[idx] = snapped
+                    img_data['soma_ids'][idx] = f"soma_{snapped[0]}_{snapped[1]}"
+                    self.parent_widget.log(f"  → Soma {idx + 1} repositioned (snapped to brightest)")
+                self._update_display()
+            return
+
         if self.dragging_point and event.button() == Qt.LeftButton:
             self.dragging_point = False
             # Keep the point selected for visibility but stop dragging
@@ -1088,7 +1463,7 @@ class InteractiveImageLabel(QLabel):
             return
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(0, 255, 0))
-        painter.setOpacity(0.4)
+        painter.setOpacity(self.overlay_opacity)
         img_h, img_w = self.pix_source.height(), self.pix_source.width()
         pixmap_w = self.scaled_pixmap.width()
         pixmap_h = self.scaled_pixmap.height()
@@ -1343,6 +1718,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_mode = False
         self.soma_picking_queue = []
         self.outlining_queue = []
+        self.current_outline_idx = 0
         self.polygon_points = []
         self.output_dir = None
         self.masks_dir = None
@@ -1351,6 +1727,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.all_masks_flat = []
         self.mask_qa_idx = 0
         self.mask_qa_active = False
+        self.last_qa_decisions = []
         self.soma_mode = False  # Initialize soma_mode to prevent crashes
         # Initialize display adjustment values
         self.brightness_value = 0
@@ -1359,7 +1736,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.channel_brightness = {'R': 0, 'G': 0, 'B': 0}
         # Mask generation settings (defaults)
         self.use_min_intensity = True
-        self.min_intensity_percent = 30
+        self.min_intensity_percent = 5
+        self.mask_min_area = 100
+        self.mask_max_area = 800
+        self.mask_step_size = 100
         self.use_imagej = False
         # Colocalization mode - show images in color
         self.colocalization_mode = False
@@ -1376,6 +1756,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.show_color_view = False
         # Z key tracking for zoom functionality
         self.z_key_held = False
+        # Measurement tool state
+        self.measure_mode = False
+        self.measure_point1 = None  # (row, col) image coords
+        self.measure_point2 = None
         self.init_ui()
 
     def keyPressEvent(self, event):
@@ -1385,6 +1769,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if key == Qt.Key_Z:
             self.z_key_held = True
             return  # Don't process further, Z is for zoom
+
+        # F1 shows help regardless of mode
+        if key == Qt.Key_F1:
+            self.show_shortcut_help()
+            return
+
+        # M key toggles measure tool (only when not in active input modes)
+        if key == Qt.Key_M and not self.processed_label.soma_mode and not self.processed_label.polygon_mode and not self.mask_qa_active:
+            self.toggle_measure_mode()
+            return
 
         # U key resets zoom on current view
         if key == Qt.Key_U:
@@ -1422,19 +1816,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.done_with_current()
                 return
             elif key == Qt.Key_Escape:
-                # Cancel soma picking
-                if self.batch_mode and self.soma_picking_queue:
-                    reply = QMessageBox.question(
-                        self, 'Cancel Soma Picking',
-                        'Cancel soma picking for remaining images?',
-                        QMessageBox.Yes | QMessageBox.No
-                    )
-                    if reply == QMessageBox.Yes:
-                        self.soma_picking_queue = []
-                        self.batch_mode = False
-                        self.processed_label.soma_mode = False
-                        self.done_btn.setEnabled(False)
-                        self.log("✗ Soma picking cancelled")
+                # Clear all somas on current image (undo all placed centroids)
+                if self.current_image_name:
+                    img_data = self.images[self.current_image_name]
+                    if img_data['somas']:
+                        count = len(img_data['somas'])
+                        img_data['somas'].clear()
+                        img_data['soma_ids'].clear()
+                        self.log(f"↩ Cleared {count} soma(s) on {self.current_image_name}")
+                        self._load_image_for_soma_picking()
+                    else:
+                        self.log("No somas to clear on this image")
                 return
 
         # Handle mask QA mode shortcuts
@@ -1491,6 +1883,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.shortcut_color.activated.connect(self.toggle_color_view)
         self.shortcut_zoom_reset = QShortcut(QKeySequence('U'), self)
         self.shortcut_zoom_reset.activated.connect(self._reset_current_zoom)
+        self.shortcut_help = QShortcut(QKeySequence(Qt.Key_F1), self)
+        self.shortcut_help.setContext(Qt.ApplicationShortcut)
+        self.shortcut_help.activated.connect(self.show_shortcut_help)
+        self.shortcut_measure = QShortcut(QKeySequence('M'), self)
+        self.shortcut_measure.activated.connect(self.toggle_measure_mode)
 
     def _create_left_panel(self):
         panel = QWidget()
@@ -1589,7 +1986,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         sharpen_layout = QHBoxLayout()
         sharpen_layout.addWidget(QLabel("  Sharpen amount:"))
         self.sharpen_slider = QSlider(Qt.Horizontal)
-        self.sharpen_slider.setRange(10, 20)
+        self.sharpen_slider.setRange(10, 50)
         self.sharpen_slider.setValue(13)
         sharpen_layout.addWidget(self.sharpen_slider)
         self.sharpen_label = QLabel("1.3")
@@ -1616,44 +2013,65 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_pick_somas_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_pick_somas_btn)
 
-        # Outline Somas section
-        outline_group = QGroupBox("Soma Outlining")
-        outline_layout = QVBoxLayout()
-
-        # Main outline button
+        # Outline Somas - single button, controls hidden until outlining starts
         self.batch_outline_btn = QPushButton("Outline Somas")
         self.batch_outline_btn.clicked.connect(self.start_batch_outlining)
         self.batch_outline_btn.setEnabled(False)
         self.batch_outline_btn.setStyleSheet("font-weight: bold;")
-        outline_layout.addWidget(self.batch_outline_btn)
+        batch_layout.addWidget(self.batch_outline_btn)
 
-        # Auto-outline settings (compact)
-        auto_settings = QHBoxLayout()
-        auto_settings.addWidget(QLabel("Auto:"))
+        # Hidden auto-outline settings (store state but not shown in panel)
         self.auto_outline_method = QComboBox()
         self.auto_outline_method.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
         self.auto_outline_method.setCurrentIndex(0)
-        self.auto_outline_method.setMaximumWidth(100)
-        auto_settings.addWidget(self.auto_outline_method)
-        auto_settings.addWidget(QLabel("Sens:"))
+        self.auto_outline_method.setVisible(False)
         self.auto_outline_sensitivity = QSlider(Qt.Horizontal)
         self.auto_outline_sensitivity.setRange(10, 90)
-        self.auto_outline_sensitivity.setValue(50)
-        self.auto_outline_sensitivity.setMaximumWidth(60)
-        auto_settings.addWidget(self.auto_outline_sensitivity)
-        self.sensitivity_label = QLabel("50")
+        self.auto_outline_sensitivity.setValue(20)
+        self.auto_outline_sensitivity.setVisible(False)
+        self.sensitivity_label = QLabel("20")
         self.auto_outline_sensitivity.valueChanged.connect(
             lambda v: self.sensitivity_label.setText(str(v))
         )
-        auto_settings.addWidget(self.sensitivity_label)
-        outline_layout.addLayout(auto_settings)
 
-        # Outline action buttons (shown during outlining)
+        # Outline controls container - shown only during active outlining
+        self.outline_controls_widget = QWidget()
+        outline_controls_layout = QVBoxLayout(self.outline_controls_widget)
+        outline_controls_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Auto-outline settings row (visible during outlining)
+        auto_settings = QHBoxLayout()
+        auto_settings.addWidget(QLabel("Method:"))
+        self.outline_method_display = QComboBox()
+        self.outline_method_display.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
+        self.outline_method_display.setCurrentIndex(0)
+        self.outline_method_display.setMaximumWidth(110)
+        self.outline_method_display.currentIndexChanged.connect(
+            lambda idx: self.auto_outline_method.setCurrentIndex(idx)
+        )
+        auto_settings.addWidget(self.outline_method_display)
+        auto_settings.addWidget(QLabel("Sens:"))
+        self.outline_sens_display = QSlider(Qt.Horizontal)
+        self.outline_sens_display.setRange(10, 90)
+        self.outline_sens_display.setValue(50)
+        self.outline_sens_display.setMaximumWidth(60)
+        self.outline_sens_display.valueChanged.connect(
+            lambda v: self.auto_outline_sensitivity.setValue(v)
+        )
+        auto_settings.addWidget(self.outline_sens_display)
+        self.outline_sens_label = QLabel("50")
+        self.outline_sens_display.valueChanged.connect(
+            lambda v: self.outline_sens_label.setText(str(v))
+        )
+        auto_settings.addWidget(self.outline_sens_label)
+        outline_controls_layout.addLayout(auto_settings)
+
+        # Action buttons row
         outline_btn_layout = QHBoxLayout()
         self.auto_outline_btn = QPushButton("Auto")
         self.auto_outline_btn.clicked.connect(self.auto_outline_current_soma)
         self.auto_outline_btn.setEnabled(False)
-        self.auto_outline_btn.setStyleSheet("background-color: #90EE90;")
+        self.auto_outline_btn.setStyleSheet("border: 2px solid #4CAF50; font-weight: bold;")
         self.auto_outline_btn.setToolTip("Auto-detect outline for current soma")
         outline_btn_layout.addWidget(self.auto_outline_btn)
 
@@ -1666,17 +2084,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.accept_outline_btn = QPushButton("Accept (Enter)")
         self.accept_outline_btn.clicked.connect(self.accept_current_outline)
         self.accept_outline_btn.setEnabled(False)
-        self.accept_outline_btn.setStyleSheet("background-color: #87CEEB;")
+        self.accept_outline_btn.setStyleSheet("border: 2px solid #2196F3; font-weight: bold;")
         self.accept_outline_btn.setToolTip("Accept outline and move to next soma")
         outline_btn_layout.addWidget(self.accept_outline_btn)
-        outline_layout.addLayout(outline_btn_layout)
+        outline_controls_layout.addLayout(outline_btn_layout)
 
         # Redo button
         self.redo_outline_btn = QPushButton("↩ Redo Last")
         self.redo_outline_btn.clicked.connect(self.redo_last_outline)
         self.redo_outline_btn.setEnabled(False)
-        self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
-        outline_layout.addWidget(self.redo_outline_btn)
+        self.redo_outline_btn.setStyleSheet("border: 2px solid #FF9800;")
+        outline_controls_layout.addWidget(self.redo_outline_btn)
 
         # Outline progress bar
         self.outline_progress_bar = QProgressBar()
@@ -1684,37 +2102,68 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.outline_progress_bar.setMinimumHeight(20)
         self.outline_progress_bar.setFormat("%v / %m somas outlined")
         self.outline_progress_bar.setStyleSheet("""
-            QProgressBar { border: 1px solid #ccc; border-radius: 3px; text-align: center; background: #f0f0f0; }
+            QProgressBar { border: 1px solid palette(mid); border-radius: 3px; text-align: center; }
             QProgressBar::chunk { background-color: #4CAF50; }
         """)
-        outline_layout.addWidget(self.outline_progress_bar)
+        outline_controls_layout.addWidget(self.outline_progress_bar)
 
-        outline_group.setLayout(outline_layout)
-        batch_layout.addWidget(outline_group)
-        self.redo_outline_btn.clicked.connect(self.redo_last_outline)
-        self.redo_outline_btn.setEnabled(False)
-        self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
-        batch_layout.addWidget(self.redo_outline_btn)
+        self.outline_controls_widget.setVisible(False)
+        batch_layout.addWidget(self.outline_controls_widget)
         
         self.batch_generate_masks_btn = QPushButton("Generate All Masks")
         self.batch_generate_masks_btn.clicked.connect(self.batch_generate_masks)
         self.batch_generate_masks_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_generate_masks_btn)
-        
+
         # Add Clear All Masks button
         self.clear_masks_btn = QPushButton("🗑 Clear All Masks")
         self.clear_masks_btn.clicked.connect(self.clear_all_masks)
         self.clear_masks_btn.setEnabled(False)
-        self.clear_masks_btn.setStyleSheet("background-color: #FFB6C1;")
+        self.clear_masks_btn.setStyleSheet("border: 2px solid #F44336;")
         batch_layout.addWidget(self.clear_masks_btn)
+        qa_row = QHBoxLayout()
         self.batch_qa_btn = QPushButton("QA All Masks")
         self.batch_qa_btn.clicked.connect(self.start_batch_qa)
         self.batch_qa_btn.setEnabled(False)
-        batch_layout.addWidget(self.batch_qa_btn)
+        qa_row.addWidget(self.batch_qa_btn)
+        self.undo_qa_btn = QPushButton("Undo QA")
+        self.undo_qa_btn.clicked.connect(self.undo_last_qa)
+        self.undo_qa_btn.setEnabled(False)
+        self.undo_qa_btn.setToolTip("Reset all mask approvals and restart QA")
+        self.undo_qa_btn.setStyleSheet("border: 2px solid #FF9800;")
+        qa_row.addWidget(self.undo_qa_btn)
+        batch_layout.addLayout(qa_row)
         self.batch_calculate_btn = QPushButton("Calculate Simple Characteristics")
         self.batch_calculate_btn.clicked.connect(self.batch_calculate_morphology)
         self.batch_calculate_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_calculate_btn)
+
+        # ImageJ integration buttons
+        imagej_layout = QHBoxLayout()
+        self.launch_imagej_btn = QPushButton("Generate ImageJ Scripts")
+        self.launch_imagej_btn.clicked.connect(self.generate_imagej_scripts)
+        self.launch_imagej_btn.setEnabled(False)
+        self.launch_imagej_btn.setToolTip("Generate Sholl & Skeleton analysis scripts for Fiji")
+        imagej_layout.addWidget(self.launch_imagej_btn)
+        self.import_imagej_btn = QPushButton("Import ImageJ Results")
+        self.import_imagej_btn.clicked.connect(self.import_imagej_results)
+        self.import_imagej_btn.setEnabled(False)
+        self.import_imagej_btn.setToolTip("Import Sholl & Skeleton CSVs and merge with morphology results")
+        imagej_layout.addWidget(self.import_imagej_btn)
+        batch_layout.addLayout(imagej_layout)
+
+        # Session save/restore buttons
+        session_layout = QHBoxLayout()
+        save_session_btn = QPushButton("Save Session")
+        save_session_btn.clicked.connect(self.save_session)
+        save_session_btn.setToolTip("Save current project state to resume later")
+        session_layout.addWidget(save_session_btn)
+        load_session_btn = QPushButton("Load Session")
+        load_session_btn.clicked.connect(self.load_session)
+        load_session_btn.setToolTip("Resume a previously saved session")
+        session_layout.addWidget(load_session_btn)
+        batch_layout.addLayout(session_layout)
+
         batch_group.setLayout(batch_layout)
         layout.addWidget(batch_group)
         log_group = QGroupBox("Log")
@@ -1773,17 +2222,57 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.channel_select_btn.setVisible(False)  # Hidden until color view is on
         display_btn_layout.addWidget(self.channel_select_btn)
 
+        # Measure tool button
+        self.measure_btn = QPushButton("Measure (M)")
+        self.measure_btn.clicked.connect(self.toggle_measure_mode)
+        self.measure_btn.setToolTip("Click two points to measure distance in microns")
+        self.measure_btn.setCheckable(True)
+        display_btn_layout.addWidget(self.measure_btn)
+
+        # Help button
+        help_btn = QPushButton("? (F1)")
+        help_btn.setFixedWidth(55)
+        help_btn.clicked.connect(self.show_shortcut_help)
+        help_btn.setToolTip("Show keyboard shortcuts for current mode")
+        display_btn_layout.addWidget(help_btn)
+
         layout.addLayout(display_btn_layout)
+
+        # Mask overlay opacity slider
+        opacity_layout = QHBoxLayout()
+        opacity_label = QLabel("Mask Opacity:")
+        opacity_label.setFixedWidth(85)
+        opacity_layout.addWidget(opacity_label)
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(40)
+        self.opacity_slider.setTickInterval(10)
+        self.opacity_slider.setFixedHeight(20)
+        self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        opacity_layout.addWidget(self.opacity_slider)
+        self.opacity_value_label = QLabel("40%")
+        self.opacity_value_label.setFixedWidth(35)
+        opacity_layout.addWidget(self.opacity_value_label)
+        layout.addLayout(opacity_layout)
 
         # Zoom hint row
         zoom_layout = QHBoxLayout()
-        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, U: reset zoom")
-        zoom_hint.setStyleSheet("color: #666; font-size: 10px;")
+        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, U: reset, M: measure, F1: help")
+        zoom_hint.setStyleSheet("color: palette(dark); font-size: 10px;")
         zoom_layout.addWidget(zoom_hint)
         zoom_layout.addStretch()
+
+        # Redo masks button — bottom right, only visible during QA
+        self.regen_masks_btn = QPushButton("Redo Masks (This Image)")
+        self.regen_masks_btn.clicked.connect(self.regenerate_masks_current_image)
+        self.regen_masks_btn.setVisible(False)
+        self.regen_masks_btn.setStyleSheet("border: 2px solid #FF9800; font-weight: bold; padding: 4px 10px;")
+        self.regen_masks_btn.setToolTip("Regenerate masks for this image with different settings")
+        zoom_layout.addWidget(self.regen_masks_btn)
+
         self.zoom_level_label = QLabel("1.0x")
         self.zoom_level_label.setFixedWidth(50)
-        self.zoom_level_label.setStyleSheet("color: #666; font-size: 10px;")
+        self.zoom_level_label.setStyleSheet("color: palette(dark); font-size: 10px;")
         zoom_layout.addWidget(self.zoom_level_label)
         layout.addLayout(zoom_layout)
 
@@ -1796,7 +2285,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.timer_label = QLabel("")
         self.timer_label.setVisible(False)
-        self.timer_label.setStyleSheet("font-family: monospace; font-size: 12pt; color: #333; padding: 0 10px;")
+        self.timer_label.setStyleSheet("font-family: monospace; font-size: 12pt; padding: 0 10px;")
         self.timer_label.setMinimumWidth(100)
         self.timer_label.setAlignment(Qt.AlignCenter)
         progress_container.addWidget(self.timer_label, stretch=0)
@@ -1805,7 +2294,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.progress_status_label = QLabel("")
         self.progress_status_label.setVisible(False)
-        self.progress_status_label.setStyleSheet("color: #666; font-style: italic;")
+        self.progress_status_label.setStyleSheet("font-style: italic;")
         layout.addWidget(self.progress_status_label, stretch=0)
 
         # Timer for tracking processing time
@@ -2018,6 +2507,936 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def log(self, message):
         self.log_text.append(str(message))
 
+    # ========================================================================
+    # KEYBOARD SHORTCUT HELP
+    # ========================================================================
+
+    def show_shortcut_help(self):
+        """Show context-sensitive keyboard shortcuts overlay"""
+        # Determine current mode
+        mode = "General"
+        if self.mask_qa_active:
+            mode = "Mask QA"
+        elif hasattr(self, 'processed_label') and self.processed_label.polygon_mode:
+            mode = "Soma Outlining"
+        elif hasattr(self, 'processed_label') and self.processed_label.soma_mode:
+            mode = "Soma Picking"
+
+        html = "<h3>Keyboard Shortcuts</h3>"
+        html += f"<p><b>Current mode: {mode}</b></p>"
+        html += "<table cellpadding='4' style='border-collapse: collapse;'>"
+
+        # Always-available shortcuts
+        html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Always Available</b></td></tr>"
+        always = [
+            ("F1", "Show this help"),
+            ("C", "Toggle color / grayscale"),
+            ("U", "Reset zoom"),
+            ("Z + Left-click", "Zoom in"),
+            ("Z + Right-click", "Zoom out"),
+            ("M", "Toggle measure tool"),
+        ]
+        for key, desc in always:
+            html += f"<tr><td><code>{key}</code></td><td>{desc}</td></tr>"
+
+        if mode == "Soma Picking":
+            html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Soma Picking</b></td></tr>"
+            shortcuts = [
+                ("Left-click", "Place soma / drag existing centroid"),
+                ("Backspace", "Remove last soma"),
+                ("Enter", "Done with current image"),
+                ("Escape", "Cancel soma picking"),
+            ]
+            for key, desc in shortcuts:
+                html += f"<tr><td><code>{key}</code></td><td>{desc}</td></tr>"
+
+        elif mode == "Soma Outlining":
+            html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Soma Outlining</b></td></tr>"
+            shortcuts = [
+                ("Left-click", "Place outline point / drag existing point"),
+                ("Right-click", "Finish outline"),
+                ("Double-click", "Finish outline"),
+                ("Backspace", "Remove last point"),
+                ("Escape", "Restart current outline"),
+                ("Enter", "Accept outline"),
+            ]
+            for key, desc in shortcuts:
+                html += f"<tr><td><code>{key}</code></td><td>{desc}</td></tr>"
+
+        elif mode == "Mask QA":
+            html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Mask QA Review</b></td></tr>"
+            shortcuts = [
+                ("A / Space", "Approve current mask"),
+                ("R", "Reject current mask"),
+                ("Left arrow", "Previous mask"),
+                ("Right arrow", "Next mask"),
+            ]
+            for key, desc in shortcuts:
+                html += f"<tr><td><code>{key}</code></td><td>{desc}</td></tr>"
+
+        html += "</table>"
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Keyboard Shortcuts")
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setText(html)
+        dialog.setTextFormat(Qt.RichText)
+        dialog.exec_()
+
+    # ========================================================================
+    # MEASUREMENT TOOL
+    # ========================================================================
+
+    def _on_opacity_changed(self, value):
+        """Update mask overlay opacity on all labels"""
+        opacity = value / 100.0
+        self.opacity_value_label.setText(f"{value}%")
+        for label in [self.original_label, self.preview_label, self.processed_label, self.mask_label]:
+            label.overlay_opacity = opacity
+            label._update_display()
+
+    def toggle_measure_mode(self):
+        """Toggle the measurement tool on/off"""
+        self.measure_mode = not self.measure_mode
+        self.measure_btn.setChecked(self.measure_mode)
+
+        # Set mode on the active display label
+        for label in [self.original_label, self.preview_label, self.processed_label, self.mask_label]:
+            label.measure_mode = self.measure_mode
+            if not self.measure_mode:
+                label.measure_pt1 = None
+                label.measure_pt2 = None
+                label._update_display()
+
+        if self.measure_mode:
+            self.log("Measure tool ON - click two points to measure distance")
+        else:
+            self.log("Measure tool OFF")
+
+    def _get_measure_text(self):
+        """Get formatted measurement text for display overlay"""
+        label = self._get_active_label()
+        if not label or label.measure_pt1 is None or label.measure_pt2 is None:
+            return ""
+        try:
+            pixel_size = float(self.pixel_size_input.text())
+        except (ValueError, AttributeError):
+            pixel_size = 0.316
+
+        pt1 = label.measure_pt1
+        pt2 = label.measure_pt2
+        dx = (pt2[1] - pt1[1])
+        dy = (pt2[0] - pt1[0])
+        dist_px = math.sqrt(dx * dx + dy * dy)
+        dist_um = dist_px * pixel_size
+        return f"{dist_um:.2f} um ({dist_px:.0f} px)"
+
+    def _show_measurement(self):
+        """Log the measurement result"""
+        text = self._get_measure_text()
+        if text:
+            self.log(f"Measurement: {text}")
+
+    def _get_active_label(self):
+        """Return the InteractiveImageLabel in the currently visible tab"""
+        idx = self.tabs.currentIndex()
+        labels = [self.original_label, self.preview_label, self.processed_label, self.mask_label]
+        if 0 <= idx < len(labels):
+            return labels[idx]
+        return self.processed_label
+
+    # ========================================================================
+    # SESSION SAVE / RESTORE
+    # ========================================================================
+
+    def _build_session_dict(self):
+        """Build a serializable session dictionary from current state."""
+        session = {
+            'version': 2,
+            'output_dir': self.output_dir,
+            'masks_dir': self.masks_dir,
+            'colocalization_mode': self.colocalization_mode,
+            'pixel_size': self.pixel_size_input.text(),
+            'rolling_ball_radius': self.default_rolling_ball_radius,
+            'use_min_intensity': self.use_min_intensity,
+            'min_intensity_percent': self.min_intensity_percent,
+            'mask_min_area': self.mask_min_area,
+            'mask_max_area': self.mask_max_area,
+            'mask_step_size': self.mask_step_size,
+            'coloc_channel_1': self.coloc_channel_1,
+            'coloc_channel_2': self.coloc_channel_2,
+            'grayscale_channel': self.grayscale_channel,
+            'images': {}
+        }
+
+        for img_name, img_data in self.images.items():
+            # Build path to processed TIFF if it exists on disk
+            processed_path = None
+            if self.output_dir:
+                candidate = os.path.join(
+                    self.output_dir,
+                    os.path.splitext(img_name)[0] + "_processed.tif"
+                )
+                if os.path.exists(candidate):
+                    processed_path = candidate
+
+            img_session = {
+                'raw_path': img_data['raw_path'],
+                'processed_path': processed_path,
+                'status': img_data['status'],
+                'selected': img_data['selected'],
+                'animal_id': img_data.get('animal_id', ''),
+                'treatment': img_data.get('treatment', ''),
+                'rolling_ball_radius': img_data.get('rolling_ball_radius', 50),
+                'somas': [(float(s[0]), float(s[1])) for s in img_data.get('somas', [])],
+                'soma_ids': img_data.get('soma_ids', []),
+                'soma_outlines': [],
+            }
+            # Save soma outlines with full metadata
+            for outline in img_data.get('soma_outlines', []):
+                outline_data = {
+                    'soma_idx': outline.get('soma_idx', 0),
+                    'soma_id': outline.get('soma_id', ''),
+                    'centroid': [float(outline['centroid'][0]), float(outline['centroid'][1])] if 'centroid' in outline else None,
+                    'soma_area_um2': outline.get('soma_area_um2', 0),
+                    'polygon_points': [(float(pt[0]), float(pt[1])) for pt in outline.get('polygon_points', [])],
+                }
+                img_session['soma_outlines'].append(outline_data)
+
+            # Record which masks exist on disk and their approval state
+            mask_qa_state = []
+            for mask in img_data.get('masks', []):
+                mask_qa_state.append({
+                    'soma_id': mask.get('soma_id', ''),
+                    'area_um2': mask.get('area_um2', 0),
+                    'approved': mask.get('approved'),
+                })
+            img_session['mask_qa_state'] = mask_qa_state
+
+            if self.masks_dir:
+                prefix = os.path.splitext(img_name)[0]
+                mask_files = [
+                    f for f in os.listdir(self.masks_dir)
+                    if f.startswith(prefix) and f.endswith('_mask.tif')
+                ] if os.path.isdir(self.masks_dir) else []
+                img_session['mask_files'] = mask_files
+            else:
+                img_session['mask_files'] = []
+
+            session['images'][img_name] = img_session
+
+        return session
+
+    def save_session(self):
+        """Save the entire project state to a JSON file"""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Session", "", "Session Files (*.mmps_session);;All Files (*)",
+            options=QFileDialog.DontUseNativeDialog
+        )
+        if not path:
+            return
+
+        if not path.endswith('.mmps_session'):
+            path += '.mmps_session'
+
+        try:
+            session = self._build_session_dict()
+            with open(path, 'w') as f:
+                json.dump(session, f, indent=2)
+
+            self.log(f"Session saved to: {path}")
+            QMessageBox.information(self, "Session Saved", f"Session saved to:\n{path}")
+
+        except Exception as e:
+            self.log(f"ERROR saving session: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save session:\n{e}")
+
+    def _auto_save(self):
+        """Silently auto-save the session to the output directory."""
+        if not self.output_dir or not self.images:
+            return
+        try:
+            path = os.path.join(self.output_dir, "autosave.mmps_session")
+            session = self._build_session_dict()
+            with open(path, 'w') as f:
+                json.dump(session, f, indent=2)
+        except Exception:
+            pass  # Silent - never interrupt the user's workflow
+
+    def load_session(self):
+        """Restore a previously saved session"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Session", "", "Session Files (*.mmps_session);;All Files (*)",
+            options=QFileDialog.DontUseNativeDialog
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, 'r') as f:
+                session = json.load(f)
+
+            if session.get('version', 1) < 2:
+                QMessageBox.warning(self, "Warning", "Incompatible session file version.")
+                return
+
+            # Verify image files still exist (check both raw and processed)
+            missing = []
+            for img_name, img_session in session['images'].items():
+                raw_exists = os.path.exists(img_session['raw_path'])
+                proc_exists = img_session.get('processed_path') and os.path.exists(img_session['processed_path'])
+                if not raw_exists and not proc_exists:
+                    missing.append(img_name)
+
+            if missing:
+                reply = QMessageBox.question(
+                    self, "Missing Files",
+                    f"{len(missing)} image(s) not found at original paths:\n\n" +
+                    "\n".join(missing[:5]) +
+                    ("\n..." if len(missing) > 5 else "") +
+                    "\n\nContinue loading available images?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    return
+
+            # Restore settings
+            self.output_dir = session.get('output_dir')
+            self.masks_dir = session.get('masks_dir')
+            self.colocalization_mode = session.get('colocalization_mode', False)
+            self.use_min_intensity = session.get('use_min_intensity', True)
+            self.min_intensity_percent = session.get('min_intensity_percent', 5)
+            self.mask_min_area = session.get('mask_min_area', 100)
+            self.mask_max_area = session.get('mask_max_area', 800)
+            self.mask_step_size = session.get('mask_step_size', 100)
+            self.coloc_channel_1 = session.get('coloc_channel_1', 0)
+            self.coloc_channel_2 = session.get('coloc_channel_2', 1)
+            self.grayscale_channel = session.get('grayscale_channel', 0)
+
+            pixel_size = session.get('pixel_size', '0.316')
+            self.pixel_size_input.setText(str(pixel_size))
+            self.default_rolling_ball_radius = session.get('rolling_ball_radius', 50)
+
+            if self.colocalization_mode:
+                self.show_color_view = True
+                self.color_toggle_btn.setText("Show Grayscale (C)")
+                self.channel_select_btn.setVisible(True)
+
+            # Ensure output dirs exist
+            if self.output_dir:
+                os.makedirs(self.output_dir, exist_ok=True)
+            if self.masks_dir:
+                os.makedirs(self.masks_dir, exist_ok=True)
+                self.somas_dir = os.path.join(self.output_dir, "somas") if self.output_dir else None
+                if self.somas_dir:
+                    os.makedirs(self.somas_dir, exist_ok=True)
+
+            # Restore images
+            from PyQt5.QtGui import QColor, QBrush
+            self.images = {}
+            self.file_list.clear()
+
+            for img_name, img_session in session['images'].items():
+                if img_name in missing:
+                    continue
+
+                # Try to reload processed image from disk
+                processed_data = None
+                processed_path = img_session.get('processed_path')
+                if processed_path and os.path.exists(processed_path):
+                    try:
+                        processed_data = tifffile.imread(processed_path)
+                    except Exception:
+                        processed_data = None
+
+                # Reconstruct soma outlines with full metadata
+                restored_outlines = []
+                for outline_data in img_session.get('soma_outlines', []):
+                    if isinstance(outline_data, dict) and 'soma_idx' in outline_data:
+                        # New format: full outline dict
+                        polygon_pts = [tuple(pt) for pt in outline_data.get('polygon_points', [])]
+                        centroid = tuple(outline_data['centroid']) if outline_data.get('centroid') else None
+                        # Reconstruct the outline mask from polygon points if we have the processed image
+                        outline_mask = None
+                        if polygon_pts and len(polygon_pts) >= 3 and processed_data is not None:
+                            outline_mask = self._polygon_to_mask(polygon_pts, processed_data.shape)
+                        restored_outlines.append({
+                            'soma_idx': outline_data['soma_idx'],
+                            'soma_id': outline_data['soma_id'],
+                            'centroid': centroid,
+                            'outline': outline_mask,
+                            'polygon_points': polygon_pts,
+                            'soma_area_um2': outline_data.get('soma_area_um2', 0),
+                        })
+                    else:
+                        # Legacy format: flat list of points
+                        polygon_pts = [tuple(pt) for pt in outline_data]
+                        restored_outlines.append({
+                            'soma_idx': len(restored_outlines),
+                            'soma_id': '',
+                            'centroid': None,
+                            'outline': None,
+                            'polygon_points': polygon_pts,
+                            'soma_area_um2': 0,
+                        })
+
+                self.images[img_name] = {
+                    'raw_path': img_session['raw_path'],
+                    'processed': processed_data,
+                    'rolling_ball_radius': img_session.get('rolling_ball_radius', 50),
+                    'somas': [tuple(s) for s in img_session.get('somas', [])],
+                    'soma_ids': img_session.get('soma_ids', []),
+                    'soma_outlines': restored_outlines,
+                    'masks': [],
+                    'status': img_session.get('status', 'loaded'),
+                    'selected': img_session.get('selected', False),
+                    'animal_id': img_session.get('animal_id', ''),
+                    'treatment': img_session.get('treatment', ''),
+                }
+
+                # If processed image wasn't found, downgrade status
+                # But don't downgrade qa_complete — masks on disk are still valid
+                if processed_data is None and img_session.get('status') not in ('loaded', 'masks_generated', 'qa_complete', 'analyzed'):
+                    self.images[img_name]['status'] = 'loaded'
+
+                # Load mask TIFFs from disk for masks_generated/qa_complete/analyzed images
+                orig_status = img_session.get('status', 'loaded')
+                if orig_status in ('masks_generated', 'qa_complete', 'analyzed') and self.masks_dir and os.path.isdir(self.masks_dir):
+                    img_basename = os.path.splitext(img_name)[0]
+                    mask_pattern = re.compile(
+                        re.escape(img_basename) + r'_(soma_\d+_\d+)_area(\d+)_mask\.tif$'
+                    )
+                    # Build a lookup of soma outlines for soma_area_um2
+                    outline_lookup = {}
+                    for ol in restored_outlines:
+                        outline_lookup[ol.get('soma_id', '')] = ol.get('soma_area_um2', 0)
+
+                    # Build approval state lookup from session
+                    qa_state_lookup = {}
+                    for qs in img_session.get('mask_qa_state', []):
+                        key = (qs.get('soma_id', ''), qs.get('area_um2', 0))
+                        qa_state_lookup[key] = qs.get('approved')
+
+                    for mf in sorted(os.listdir(self.masks_dir)):
+                        m = mask_pattern.match(mf)
+                        if not m:
+                            continue
+                        soma_id = m.group(1)
+                        area_um2 = int(m.group(2))
+                        mask_path = os.path.join(self.masks_dir, mf)
+                        try:
+                            mask_arr = tifffile.imread(mask_path)
+                            # Find soma_idx from soma_ids list
+                            soma_ids_list = self.images[img_name]['soma_ids']
+                            soma_idx = soma_ids_list.index(soma_id) if soma_id in soma_ids_list else 0
+                            # Restore approval state: use saved state if available,
+                            # default to True for qa_complete/analyzed, None for masks_generated
+                            saved_approval = qa_state_lookup.get((soma_id, area_um2))
+                            if saved_approval is not None:
+                                approval = saved_approval
+                            elif orig_status in ('qa_complete', 'analyzed'):
+                                approval = True
+                            else:
+                                approval = None
+                            self.images[img_name]['masks'].append({
+                                'image_name': img_name,
+                                'soma_idx': soma_idx,
+                                'soma_id': soma_id,
+                                'area_um2': area_um2,
+                                'mask': mask_arr,
+                                'approved': approval,
+                                'soma_area_um2': outline_lookup.get(soma_id, 0),
+                            })
+                        except Exception as e:
+                            print(f"Warning: Could not load mask {mf}: {e}")
+                    n_loaded_masks = len(self.images[img_name]['masks'])
+                    if n_loaded_masks > 0:
+                        print(f"Loaded {n_loaded_masks} masks from disk for {img_name}")
+                    else:
+                        print(f"Warning: No masks found on disk for {img_name} in {self.masks_dir}")
+
+                status = self.images[img_name]['status']
+                status_colors = {
+                    'loaded': ('#808080', '⚪'),
+                    'processed': ('#009600', '🟢'),
+                    'somas_picked': ('#0064C8', '🔵'),
+                    'outlined': ('#C89600', '🟡'),
+                    'masks_generated': ('#FF8C00', '🟠'),
+                    'qa_complete': ('#800080', '🟣'),
+                    'analyzed': ('#00B400', '✅'),
+                }
+                color_hex, icon = status_colors.get(status, ('#808080', '⚪'))
+                check_icon = "☑" if img_session.get('selected') else "☐"
+                item = QListWidgetItem(f"{check_icon} {icon} {img_name} [{status}]")
+                item.setData(Qt.UserRole, img_name)
+                item.setCheckState(Qt.Checked if img_session.get('selected') else Qt.Unchecked)
+                item.setForeground(QBrush(QColor(color_hex)))
+                self.file_list.addItem(item)
+
+            # Load and display first image
+            if self.images:
+                first_name = sorted(self.images.keys())[0]
+                self.current_image_name = first_name
+                self._display_current_image()
+                self.file_list.setCurrentRow(0)
+                self.process_selected_btn.setEnabled(True)
+
+            # Rebuild all_masks_flat from loaded masks
+            self.all_masks_flat = []
+            for iname, idata in self.images.items():
+                if not idata['selected']:
+                    continue
+                for mask_data in idata['masks']:
+                    self.all_masks_flat.append({
+                        'image_name': iname,
+                        'mask_data': mask_data,
+                        'processed_img': idata['processed'],
+                    })
+
+            # Enable buttons based on restored state
+            self._update_buttons_after_session_load()
+
+            n_loaded = len(self.images)
+            n_with_somas = sum(1 for d in self.images.values() if d['somas'])
+            n_with_outlines = sum(1 for d in self.images.values() if d['soma_outlines'])
+            n_with_processed = sum(1 for d in self.images.values() if d['processed'] is not None)
+
+            # Count mask files found on disk
+            n_mask_files = 0
+            if self.masks_dir and os.path.isdir(self.masks_dir):
+                n_mask_files = len([f for f in os.listdir(self.masks_dir) if f.endswith('_mask.tif')])
+
+            self.log("=" * 50)
+            self.log(f"Session loaded: {n_loaded} images")
+            if n_with_processed:
+                self.log(f"  {n_with_processed} processed images restored from disk")
+            if n_with_somas:
+                self.log(f"  {n_with_somas} images with somas picked")
+            if n_with_outlines:
+                self.log(f"  {n_with_outlines} images with soma outlines")
+            if n_mask_files:
+                self.log(f"  {n_mask_files} exported masks found in {self.masks_dir}")
+            self.log("=" * 50)
+
+            note = ""
+            if n_with_processed < n_loaded:
+                n_need = n_loaded - n_with_processed
+                note += f"\n{n_need} image(s) need re-processing (Run 'Process Selected Images')."
+            if n_mask_files > 0:
+                note += f"\n{n_mask_files} mask TIFFs found on disk (ready for ImageJ)."
+
+            QMessageBox.information(self, "Session Loaded",
+                f"Session restored:\n\n"
+                f"Images: {n_loaded}\n"
+                f"Processed: {n_with_processed}\n"
+                f"With somas: {n_with_somas}\n"
+                f"With outlines: {n_with_outlines}\n"
+                f"Mask files on disk: {n_mask_files}"
+                f"{note}"
+            )
+
+        except Exception as e:
+            self.log(f"ERROR loading session: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to load session:\n{e}")
+
+    def _update_buttons_after_session_load(self):
+        """Enable appropriate buttons based on restored session state"""
+        has_selected = any(d['selected'] for d in self.images.values())
+        has_processed = any(d['processed'] is not None for d in self.images.values())
+        has_somas = any(d['somas'] for d in self.images.values())
+        has_outlines = any(d['soma_outlines'] for d in self.images.values())
+
+        self.process_selected_btn.setEnabled(has_selected)
+        if has_processed:
+            self.batch_pick_somas_btn.setEnabled(True)
+        if has_somas:
+            self.batch_outline_btn.setEnabled(True)
+        if has_outlines:
+            self.batch_generate_masks_btn.setEnabled(True)
+
+        # Enable QA and calculate buttons based on image statuses
+        has_masks = any(d['status'] in ('masks_generated', 'qa_complete', 'analyzed') for d in self.images.values())
+        has_qa_complete = any(d['status'] in ('qa_complete', 'analyzed') for d in self.images.values())
+        if has_masks:
+            self.batch_qa_btn.setEnabled(True)
+        if has_qa_complete:
+            self.batch_calculate_btn.setEnabled(True)
+
+        if self.output_dir:
+            self.launch_imagej_btn.setEnabled(True)
+            self.import_imagej_btn.setEnabled(True)
+
+        # Check for partially-outlined session and offer to resume
+        if has_somas and has_outlines:
+            total_somas = sum(len(d['somas']) for d in self.images.values()
+                              if d['selected'] and d['status'] in ('somas_picked', 'outlined'))
+            total_outlines = sum(len(d['soma_outlines']) for d in self.images.values()
+                                 if d['selected'] and d['status'] in ('somas_picked', 'outlined'))
+            if 0 < total_outlines < total_somas:
+                reply = QMessageBox.question(
+                    self, 'Resume Outlining',
+                    f"Found {total_outlines}/{total_somas} soma outlines completed.\n\n"
+                    f"Resume outlining the remaining {total_somas - total_outlines} somas?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    self.start_batch_outlining()
+                    return  # Don't check QA if resuming outlining
+
+        # Check for partially-QA'd masks and offer to resume
+        if has_masks:
+            total_masks = sum(len(d['masks']) for d in self.images.values()
+                              if d['selected'] and d['status'] in ('masks_generated', 'qa_complete', 'analyzed'))
+            reviewed_masks = sum(
+                1 for d in self.images.values()
+                if d['selected'] and d['status'] in ('masks_generated', 'qa_complete', 'analyzed')
+                for m in d['masks'] if m.get('approved') is not None
+            )
+            if total_masks > 0 and 0 < reviewed_masks < total_masks:
+                reply = QMessageBox.question(
+                    self, 'Resume Mask QA',
+                    f"Found {reviewed_masks}/{total_masks} masks reviewed.\n\n"
+                    f"Resume QA for the remaining {total_masks - reviewed_masks} masks?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    self.start_batch_qa()
+
+    # ========================================================================
+    # IMAGEJ SCRIPT GENERATION
+    # ========================================================================
+
+    def generate_imagej_scripts(self):
+        """Generate Fiji/ImageJ scripts for Sholl and Skeleton analysis"""
+        if not self.masks_dir or not self.output_dir:
+            QMessageBox.warning(self, "Warning",
+                "Please set an output folder and export masks first.")
+            return
+
+        try:
+            pixel_size = float(self.pixel_size_input.text())
+        except ValueError:
+            pixel_size = 0.316
+
+        masks_path = self.masks_dir.replace("\\", "/")
+        output_path = self.output_dir.replace("\\", "/")
+        somas_path = os.path.join(self.output_dir, "somas").replace("\\", "/")
+
+        # Determine scale factor from pixel size
+        scale_factor = 2 if pixel_size > 0.2 else 1
+
+        # Generate Sholl analysis script
+        sholl_script = f'''// Sholl Analysis - Auto-generated by MMPS
+// Run this in Fiji with the SNT plugin installed
+// Masks dir: {masks_path}
+// Output dir: {output_path}
+
+#@File(label="Masks Directory", style="directory", value="{masks_path}") masksDir
+#@File(label="Somas Directory", style="directory", value="{somas_path}") somasDir
+#@File(label="Output Directory", style="directory", value="{output_path}") outputDir
+#@Float(label="Pixel Size (um/pixel)", value={pixel_size}) pixelSize
+
+// This script requires Sholl_Attempt3.py to be run in Fiji's script editor.
+// 1. Open Fiji
+// 2. File > Open... > select Sholl_Attempt3.py
+// 3. Click Run
+// 4. Set the directories when prompted
+
+print("=== Sholl Analysis ===");
+print("Masks: " + masksDir);
+print("Somas: " + somasDir);
+print("Output: " + outputDir);
+print("Pixel size: " + pixelSize + " um/px");
+'''
+
+        # Generate Skeleton analysis script
+        skeleton_script = f'''// Skeleton Analysis - Auto-generated by MMPS
+// Run this in Fiji
+// Masks dir: {masks_path}
+// Output dir: {output_path}
+
+#@File(label="Masks Directory", style="directory", value="{masks_path}") masksDir
+#@File(label="Output Directory", style="directory", value="{output_path}") outputDir
+#@Float(label="Pixel Size (um/pixel)", value={pixel_size}) pixelSize
+#@Integer(label="Upscale Factor (2 for 20x, 1 for 40x)", value={scale_factor}) scaleFactor
+
+// This script requires SkeletonAnalysisImageJ.py to be run in Fiji's script editor.
+// 1. Open Fiji
+// 2. File > Open... > select SkeletonAnalysisImageJ.py
+// 3. Click Run
+// 4. Set the directories when prompted
+
+print("=== Skeleton Analysis ===");
+print("Masks: " + masksDir);
+print("Output: " + outputDir);
+print("Pixel size: " + pixelSize + " um/px");
+print("Scale factor: " + scaleFactor + "x");
+'''
+
+        # Generate a combined batch runner script
+        script_dir = self.output_dir
+
+        # Write instructions file
+        instructions = f"""MMPS ImageJ Analysis Instructions
+===================================
+
+Your masks are in: {masks_path}
+Your soma files are in: {somas_path}
+Output goes to: {output_path}
+Pixel size: {pixel_size} um/pixel
+Upscale factor: {scale_factor}x
+
+Step 1: Sholl Analysis
+-----------------------
+1. Open Fiji/ImageJ
+2. File > Open > select "Sholl_Attempt3.py" from your Microglia folder
+3. Click "Run" in the script editor
+4. When prompted, set:
+   - Masks Directory: {masks_path}
+   - Somas Directory: {somas_path}
+   - Output Directory: {output_path}
+   - Pixel Size: {pixel_size}
+
+Step 2: Skeleton Analysis
+--------------------------
+1. In Fiji, File > Open > select "SkeletonAnalysisImageJ.py"
+2. Click "Run" in the script editor
+3. When prompted, set:
+   - Masks Directory: {masks_path}
+   - Output Directory: {output_path}
+   - Pixel Size: {pixel_size}
+   - Upscale Factor: {scale_factor}
+
+Step 3: Import Results Back
+----------------------------
+1. Return to MMPS
+2. Click "Import ImageJ Results"
+3. Select the output folder
+4. The Sholl and Skeleton results will be merged with your morphology CSV
+"""
+
+        instructions_path = os.path.join(script_dir, "ImageJ_Analysis_Instructions.txt")
+        with open(instructions_path, 'w') as f:
+            f.write(instructions)
+
+        # Write parameter file that Sholl/Skeleton scripts can read
+        params = {
+            'masks_dir': masks_path,
+            'somas_dir': somas_path,
+            'output_dir': output_path,
+            'pixel_size': pixel_size,
+            'scale_factor': scale_factor,
+        }
+        params_path = os.path.join(script_dir, "imagej_params.json")
+        with open(params_path, 'w') as f:
+            json.dump(params, f, indent=2)
+
+        self.log("=" * 50)
+        self.log("ImageJ analysis files generated:")
+        self.log(f"  Instructions: {instructions_path}")
+        self.log(f"  Parameters: {params_path}")
+        self.log("")
+        self.log("To run analysis:")
+        self.log("  1. Open Fiji/ImageJ")
+        self.log(f"  2. Open Sholl_Attempt3.py and run with masks dir: {masks_path}")
+        self.log(f"  3. Open SkeletonAnalysisImageJ.py and run with masks dir: {masks_path}")
+        self.log("  4. Return here and click 'Import ImageJ Results'")
+        self.log("=" * 50)
+
+        QMessageBox.information(self, "ImageJ Scripts Generated",
+            f"Analysis files saved to:\n{script_dir}\n\n"
+            f"See ImageJ_Analysis_Instructions.txt for step-by-step guide.\n\n"
+            f"Directories pre-configured:\n"
+            f"  Masks: {masks_path}\n"
+            f"  Somas: {somas_path}\n"
+            f"  Output: {output_path}\n"
+            f"  Pixel size: {pixel_size} um/px"
+        )
+
+    # ========================================================================
+    # IMPORT IMAGEJ RESULTS
+    # ========================================================================
+
+    def import_imagej_results(self):
+        """Import Sholl and Skeleton CSVs from ImageJ and merge with morphology results"""
+        if not self.output_dir:
+            QMessageBox.warning(self, "Warning", "Please set an output folder first.")
+            return
+
+        import csv
+
+        # Look for ImageJ output files
+        sholl_path = os.path.join(self.output_dir, "Sholl_Combined_Results.csv")
+        skeleton_path = os.path.join(self.output_dir, "Skeleton_Analysis_Results.csv")
+        morphology_path = os.path.join(self.output_dir, "combined_morphology_results.csv")
+
+        # Allow user to locate files if not found in expected location
+        found_sholl = os.path.exists(sholl_path)
+        found_skeleton = os.path.exists(skeleton_path)
+        found_morphology = os.path.exists(morphology_path)
+
+        if not found_sholl and not found_skeleton:
+            reply = QMessageBox.question(
+                self, "Files Not Found",
+                "No Sholl or Skeleton results found in the output folder.\n\n"
+                "Would you like to browse for them?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+            # Browse for Sholl results
+            sholl_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Sholl Results CSV (or Cancel to skip)", self.output_dir,
+                "CSV Files (*.csv);;All Files (*)",
+                options=QFileDialog.DontUseNativeDialog
+            )
+            found_sholl = bool(sholl_path) and os.path.exists(sholl_path)
+
+            # Browse for Skeleton results
+            skeleton_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Skeleton Results CSV (or Cancel to skip)", self.output_dir,
+                "CSV Files (*.csv);;All Files (*)",
+                options=QFileDialog.DontUseNativeDialog
+            )
+            found_skeleton = bool(skeleton_path) and os.path.exists(skeleton_path)
+
+        if not found_sholl and not found_skeleton:
+            QMessageBox.information(self, "No Files", "No ImageJ results to import.")
+            return
+
+        self.log("=" * 50)
+        self.log("Importing ImageJ results...")
+
+        # Read Sholl results
+        sholl_data = {}
+        if found_sholl:
+            try:
+                with open(sholl_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        # Match by cell_name which corresponds to mask filename pattern
+                        cell_name = row.get('Cell', row.get('cell_name', ''))
+                        if cell_name:
+                            sholl_data[cell_name] = {f"sholl_{k}": v for k, v in row.items() if k != 'Cell' and k != 'cell_name'}
+                self.log(f"  Sholl: loaded {len(sholl_data)} cells from {os.path.basename(sholl_path)}")
+            except Exception as e:
+                self.log(f"  ERROR reading Sholl results: {e}")
+
+        # Read Skeleton results
+        skeleton_data = {}
+        if found_skeleton:
+            try:
+                with open(skeleton_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        cell_name = row.get('cell_name', '')
+                        if cell_name:
+                            skeleton_data[cell_name] = {f"skel_{k}": v for k, v in row.items() if k != 'cell_name'}
+                self.log(f"  Skeleton: loaded {len(skeleton_data)} cells from {os.path.basename(skeleton_path)}")
+            except Exception as e:
+                self.log(f"  ERROR reading Skeleton results: {e}")
+
+        # Read existing morphology results
+        morphology_rows = []
+        morph_fieldnames = []
+        if found_morphology:
+            try:
+                with open(morphology_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    morph_fieldnames = list(reader.fieldnames)
+                    morphology_rows = list(reader)
+                self.log(f"  Morphology: loaded {len(morphology_rows)} cells")
+            except Exception as e:
+                self.log(f"  ERROR reading morphology results: {e}")
+
+        if not morphology_rows:
+            self.log("  No morphology results to merge with. Saving ImageJ results separately.")
+            # Save a combined ImageJ-only file
+            all_ij_data = {}
+            for cell_name, data in sholl_data.items():
+                all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(data)
+            for cell_name, data in skeleton_data.items():
+                all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(data)
+
+            if all_ij_data:
+                combined_ij_path = os.path.join(self.output_dir, "imagej_combined_results.csv")
+                all_keys = set()
+                for d in all_ij_data.values():
+                    all_keys.update(d.keys())
+                ordered = ['cell_name'] + sorted(k for k in all_keys if k != 'cell_name')
+                with open(combined_ij_path, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=ordered)
+                    writer.writeheader()
+                    writer.writerows(all_ij_data.values())
+                self.log(f"  Saved ImageJ results to: {combined_ij_path}")
+        else:
+            # Merge with morphology results
+            matched_sholl = 0
+            matched_skel = 0
+
+            new_sholl_keys = set()
+            new_skel_keys = set()
+            for d in sholl_data.values():
+                new_sholl_keys.update(d.keys())
+            for d in skeleton_data.values():
+                new_skel_keys.update(d.keys())
+
+            for row in morphology_rows:
+                img_name = row.get('image_name', '')
+                soma_id = row.get('soma_id', '')
+                # Build possible cell name patterns to match against
+                cell_key = f"{img_name}_{soma_id}" if img_name and soma_id else ''
+
+                # Try to match Sholl data
+                for key in [cell_key] + [k for k in sholl_data.keys() if cell_key and cell_key in k]:
+                    if key in sholl_data:
+                        row.update(sholl_data[key])
+                        matched_sholl += 1
+                        break
+
+                # Try to match Skeleton data
+                for key in [cell_key] + [k for k in skeleton_data.keys() if cell_key and cell_key in k]:
+                    if key in skeleton_data:
+                        row.update(skeleton_data[key])
+                        matched_skel += 1
+                        break
+
+            # Write merged results
+            all_keys = morph_fieldnames + sorted(new_sholl_keys) + sorted(new_skel_keys)
+            # Remove duplicates while preserving order
+            seen = set()
+            ordered_keys = []
+            for k in all_keys:
+                if k not in seen:
+                    seen.add(k)
+                    ordered_keys.append(k)
+
+            merged_path = os.path.join(self.output_dir, "combined_all_results.csv")
+            with open(merged_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=ordered_keys, extrasaction='ignore')
+                writer.writeheader()
+                writer.writerows(morphology_rows)
+
+            self.log(f"  Matched Sholl data: {matched_sholl}/{len(morphology_rows)} cells")
+            self.log(f"  Matched Skeleton data: {matched_skel}/{len(morphology_rows)} cells")
+            self.log(f"  Merged results saved to: {merged_path}")
+
+        self.log("=" * 50)
+
+        summary = "ImageJ Results Import Complete\n\n"
+        if found_sholl:
+            summary += f"Sholl: {len(sholl_data)} cells\n"
+        if found_skeleton:
+            summary += f"Skeleton: {len(skeleton_data)} cells\n"
+        if morphology_rows:
+            summary += f"\nMerged with {len(morphology_rows)} morphology results\n"
+            summary += f"Output: combined_all_results.csv"
+        else:
+            summary += "\nSaved as: imagej_combined_results.csv"
+
+        QMessageBox.information(self, "Import Complete", summary)
+
     def show_legend(self):
         """Display a popup dialog with the workflow status legend"""
         dialog = QMessageBox(self)
@@ -2202,12 +3621,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
             )
             return
 
-        # Get a sample color image to detect channel format
+        # Use the current image to detect channel count
         sample_color_img = None
-        for img_name, img_data in self.images.items():
+        if self.current_image_name and self.current_image_name in self.images:
+            img_data = self.images[self.current_image_name]
             if 'color_image' in img_data:
                 sample_color_img = img_data['color_image']
-                break
+        if sample_color_img is None:
+            for img_data in self.images.values():
+                if 'color_image' in img_data:
+                    sample_color_img = img_data['color_image']
+                    break
 
         dialog = ChannelSelectDialog(
             self,
@@ -2245,16 +3669,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 adjusted = self._apply_display_adjustments_color(img_data['color_image'])
             pixmap = self._array_to_pixmap_color(adjusted)
             # Preserve markers
-            if self.processed_label.soma_mode:
-                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
-            elif self.processed_label.polygon_mode:
-                queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
+            if self.processed_label.polygon_mode and hasattr(self, 'outlining_queue') and self.outlining_queue:
+                queue_idx = getattr(self, 'current_outline_idx', 0)
                 if queue_idx < len(self.outlining_queue):
-                    img_name, soma_idx = self.outlining_queue[queue_idx]
-                    if img_name == self.current_image_name:
-                        soma = img_data['somas'][soma_idx]
-                        self.processed_label.set_image(pixmap, centroids=[soma],
-                                                       polygon_pts=self.polygon_points)
+                    q_img_name, q_soma_idx = self.outlining_queue[queue_idx]
+                    q_img_data = self.images[q_img_name]
+                    soma = q_img_data['somas'][q_soma_idx]
+                    pixmap = self._get_outlining_pixmap(q_img_data)
+                    self.processed_label.set_image(pixmap, centroids=[soma],
+                                                   polygon_pts=self.polygon_points)
+            elif self.processed_label.soma_mode:
+                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
             else:
                 self.processed_label.set_image(pixmap, centroids=img_data['somas'])
 
@@ -2328,8 +3753,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         self.preview_label.set_image(pixmap)
                 elif current_tab == 2:  # Processed
-                    # Show color image when color view is on
-                    if use_color and 'color_image' in img_data:
+                    # In outlining mode, use the queue's image, not current_image_name
+                    if self.processed_label.polygon_mode and hasattr(self, 'outlining_queue') and self.outlining_queue:
+                        queue_idx = getattr(self, 'current_outline_idx', 0)
+                        if queue_idx < len(self.outlining_queue):
+                            q_img_name, q_soma_idx = self.outlining_queue[queue_idx]
+                            q_img_data = self.images[q_img_name]
+                            soma = q_img_data['somas'][q_soma_idx]
+                            pixmap = self._get_outlining_pixmap(q_img_data)
+                            self.processed_label.set_image(pixmap, centroids=[soma],
+                                                           polygon_pts=self.polygon_points)
+                    elif use_color and 'color_image' in img_data:
                         # Use processed channel in color composite if available
                         proc_color = self._build_processed_color_image(img_data)
                         if proc_color is not None:
@@ -2337,25 +3771,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         else:
                             adjusted = self._apply_display_adjustments_color(img_data['color_image'])
                         pixmap = self._array_to_pixmap_color(adjusted)
-                        # Preserve polygon if in outlining mode
-                        if self.processed_label.polygon_mode:
-                            # Use review index in review mode, otherwise count completed outlines
-                            if hasattr(self, 'review_mode') and self.review_mode:
-                                queue_idx = self.current_review_idx
-                            else:
-                                queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
-                            if queue_idx < len(self.outlining_queue):
-                                img_name, soma_idx = self.outlining_queue[queue_idx]
-                                soma = img_data['somas'][soma_idx] if img_name == self.current_image_name else (img_data['somas'][0] if img_data['somas'] else None)
-                                if soma is not None:
-                                    self.processed_label.set_image(pixmap, centroids=[soma],
-                                                                   polygon_pts=self.polygon_points)
-                                else:
-                                    self.processed_label.set_image(pixmap, polygon_pts=self.polygon_points)
-                            else:
-                                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
-                        else:
-                            self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+                        self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                     elif img_data['processed'] is not None:
                         # Always use the processed image for grayscale display
                         gray_img = img_data['processed']
@@ -2364,25 +3780,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         # Preserve soma markers if in soma picking mode
                         if self.soma_mode:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
-                        # Preserve polygon if in outlining mode
-                        elif self.processed_label.polygon_mode:
-                            # Use review index in review mode, otherwise count completed outlines
-                            if hasattr(self, 'review_mode') and self.review_mode:
-                                queue_idx = self.current_review_idx
-                            else:
-                                queue_idx = len([data for img in self.images.values() for data in img['soma_outlines']])
-                            if queue_idx < len(self.outlining_queue):
-                                img_name, soma_idx = self.outlining_queue[queue_idx]
-                                soma = img_data['somas'][soma_idx] if img_name == self.current_image_name else (img_data['somas'][0] if img_data['somas'] else None)
-                                if soma is not None:
-                                    self.processed_label.set_image(pixmap, centroids=[soma],
-                                                                   polygon_pts=self.polygon_points)
-                                else:
-                                    self.processed_label.set_image(pixmap, polygon_pts=self.polygon_points)
-                            else:
-                                self.processed_label.set_image(pixmap, centroids=img_data['somas'])
                         else:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+                elif current_tab == 3:  # Masks
+                    # Re-render the current mask with updated color settings
+                    if self.mask_qa_active:
+                        self._show_current_mask()
         except Exception as e:
             self.log(f"ERROR updating display: {str(e)}")
             import traceback
@@ -2621,6 +4024,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.log(f"Output folder: {folder}")
             self.log(f"Masks will be saved to: {self.masks_dir}")
             self.log(f"Somas will be saved to: {self.somas_dir}")
+            self.launch_imagej_btn.setEnabled(True)
+            self.import_imagej_btn.setEnabled(True)
 
     def select_all_images(self):
         """Select all images and check all checkboxes"""
@@ -2651,6 +4056,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.images[img_name]['selected'] = is_checked
 
     def on_image_selected(self, item):
+        # During outlining or QA, don't switch images from file list clicks
+        if self.processed_label.polygon_mode or self.mask_qa_active:
+            return
         img_name = item.data(Qt.UserRole)
         is_checked = item.checkState() == Qt.Checked
         self.images[img_name]['selected'] = is_checked
@@ -2668,6 +4076,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             # Always store color image for toggle functionality
             if raw_img.ndim == 3:
                 img_data['color_image'] = raw_img.copy()
+                img_data['num_channels'] = raw_img.shape[2]
 
             # Display in color or grayscale based on toggle, with adjustments
             if self.show_color_view and raw_img.ndim == 3:
@@ -2735,43 +4144,70 @@ class MicrogliaAnalysisGUI(QMainWindow):
         img = img.copy()
         return QPixmap.fromImage(img)
 
-    def _array_to_pixmap_color(self, arr):
-        """Convert a color (RGB) numpy array to QPixmap, respecting channel selection"""
+    def _array_to_pixmap_color(self, arr, num_source_channels=None):
+        """Convert a color (RGB) numpy array to QPixmap, respecting channel selection.
+
+        num_source_channels: how many channels the original image actually has.
+            If provided, channels beyond this count are treated as empty.
+        """
         if arr is None:
             return self._create_blank_pixmap()
+
+        # Track which RGB slots have real data
+        real_channels = {0: True, 1: True, 2: True}
 
         # Handle different array shapes
         if arr.ndim == 2:
             # Grayscale - convert to RGB
             arr = np.stack([arr, arr, arr], axis=-1)
+            real_channels = {0: True, 1: False, 2: False}
         elif arr.ndim == 3:
-            if arr.shape[2] == 4:
+            n_ch = arr.shape[2]
+            if n_ch == 4:
                 # RGBA - take RGB only
                 arr = arr[:, :, :3]
-            elif arr.shape[2] != 3:
-                # Multi-channel (e.g., 2 channels) - create RGB composite
-                if arr.shape[2] >= 2:
-                    # Channel 1 = Green, Channel 2 = Red
-                    h, w, c = arr.shape
-                    rgb = np.zeros((h, w, 3), dtype=arr.dtype)
-                    rgb[:, :, 1] = arr[:, :, 0]  # Green channel
-                    rgb[:, :, 0] = arr[:, :, 1]  # Red channel
-                    if c >= 3:
-                        rgb[:, :, 2] = arr[:, :, 2]  # Blue channel
-                    arr = rgb
+            elif n_ch < 3:
+                # Fewer than 3 channels — map to RGB, mark missing as empty
+                h, w, c = arr.shape
+                rgb = np.zeros((h, w, 3), dtype=arr.dtype)
+                if c >= 1:
+                    rgb[:, :, 1] = arr[:, :, 0]  # Ch1 -> Green
+                if c >= 2:
+                    rgb[:, :, 0] = arr[:, :, 1]  # Ch2 -> Red
+                # Mark channels that don't exist
+                if c < 3:
+                    real_channels[2] = False  # No blue
+                if c < 2:
+                    real_channels[0] = False  # No red
+                if c < 1:
+                    real_channels[1] = False  # No green
+                arr = rgb
 
-        # Apply channel selection mask (using channel indices)
+        # Determine real source channel count — from parameter, or from current image
+        if num_source_channels is None and self.current_image_name and self.current_image_name in self.images:
+            num_source_channels = self.images[self.current_image_name].get('num_channels')
+
+        # Apply source channel limit (handles pre-expanded 3-channel arrays from composites)
+        if num_source_channels is not None and num_source_channels < 3:
+            # Ch1->Green(1), Ch2->Red(0), Ch3->Blue(2) mapping
+            if num_source_channels < 3:
+                real_channels[2] = False  # No blue
+            if num_source_channels < 2:
+                real_channels[0] = False  # No red
+            if num_source_channels < 1:
+                real_channels[1] = False  # No green
+
+        # Apply channel selection mask — zero out disabled or missing channels
         arr_display = arr.copy()
         for i in range(min(3, arr_display.shape[2])):
-            if not self.display_channels.get(i, True):
+            if not real_channels.get(i, False) or not self.display_channels.get(i, True):
                 arr_display[:, :, i] = 0
 
-        # Normalize to 0-255
+        # Normalize to 0-255 — only for real, enabled channels
         arr_float = arr_display.astype(np.float32)
         for i in range(arr_display.shape[2]):
-            channel = arr_float[:, :, i]
-            # Only normalize if channel is enabled
-            if self.display_channels.get(i, True):
+            if real_channels.get(i, False) and self.display_channels.get(i, True):
+                channel = arr_float[:, :, i]
                 c_min, c_max = channel.min(), channel.max()
                 if c_max > c_min:
                     arr_float[:, :, i] = (channel - c_min) / (c_max - c_min) * 255
@@ -2973,7 +4409,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("✓ Background removal complete!")
         self.log("✓ Ready for batch soma picking")
         self.log("=" * 50)
-        # self.update_workflow_status()
+        self._auto_save()
         QMessageBox.information(
             self, "Complete",
             "All selected images processed!\n\nYou can now pick somas."
@@ -3054,10 +4490,45 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f"Somas: {len(img_data['somas'])}"
         )
 
+    def _snap_to_brightest(self, coords):
+        """Snap coords to the brightest pixel within 5 µm radius."""
+        if not self.current_image_name:
+            return coords
+        img_data = self.images[self.current_image_name]
+        # Get the grayscale image to search
+        if img_data['processed'] is not None:
+            gray = img_data['processed']
+        elif 'color_image' in img_data:
+            gray = extract_channel(img_data['color_image'], self.grayscale_channel)
+        else:
+            return coords
+        try:
+            pixel_size = float(self.pixel_size_input.text())
+        except (ValueError, AttributeError):
+            pixel_size = 0.3
+        radius_px = max(1, int(round(2.0 / pixel_size)))
+        row, col = int(coords[0]), int(coords[1])
+        h, w = gray.shape[:2]
+        r_min = max(0, row - radius_px)
+        r_max = min(h, row + radius_px + 1)
+        c_min = max(0, col - radius_px)
+        c_max = min(w, col + radius_px + 1)
+        best_val = -1
+        best_r, best_c = row, col
+        for r in range(r_min, r_max):
+            for c in range(c_min, c_max):
+                if (r - row) ** 2 + (c - col) ** 2 <= radius_px ** 2:
+                    val = float(gray[r, c])
+                    if val > best_val:
+                        best_val = val
+                        best_r, best_c = r, c
+        return (best_r, best_c)
+
     def add_soma(self, coords):
         if not self.current_image_name:
             return
         img_data = self.images[self.current_image_name]
+        coords = self._snap_to_brightest(coords)
         img_data['somas'].append(coords)
         soma_id = f"soma_{coords[0]}_{coords[1]}"
         img_data['soma_ids'].append(soma_id)
@@ -3165,6 +4636,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log(f"✓ Soma picking complete! Total somas: {total_somas}")
         self.log("✓ Ready for outlining")
         self.log("=" * 50)
+        self._auto_save()
         QMessageBox.information(
             self, "Complete",
             f"Soma picking complete!\n\nTotal somas marked: {total_somas}\n\nReady to outline."
@@ -3173,13 +4645,24 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def start_batch_outlining(self):
         self.outlining_queue = []
         for img_name, img_data in self.images.items():
-            if not img_data['selected'] or img_data['status'] != 'somas_picked':
+            if not img_data['selected']:
+                continue
+            if img_data['status'] not in ('somas_picked', 'outlined'):
                 continue
             for soma_idx in range(len(img_data['somas'])):
                 self.outlining_queue.append((img_name, soma_idx))
         if not self.outlining_queue:
             QMessageBox.warning(self, "Warning", "No somas to outline")
             return
+
+        # Find first unoutlined soma
+        first_unoutlined = self._find_next_unoutlined_idx()
+        if first_unoutlined is None:
+            QMessageBox.information(self, "Complete", "All somas are already outlined!")
+            return
+
+        already_done = first_unoutlined
+        remaining = len(self.outlining_queue) - already_done
 
         # In colocalization mode, ask which channel to use for grayscale outlining
         if self.colocalization_mode:
@@ -3211,7 +4694,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         dialog.setModal(True)
         layout = QVBoxLayout()
 
-        label = QLabel(f"<b>{len(self.outlining_queue)} somas to outline</b><br><br>Choose outline method:")
+        if already_done > 0:
+            label = QLabel(
+                f"<b>{remaining} somas remaining</b> ({already_done}/{len(self.outlining_queue)} already done)"
+                f"<br><br>Choose outline method for remaining somas:"
+            )
+        else:
+            label = QLabel(f"<b>{len(self.outlining_queue)} somas to outline</b><br><br>Choose outline method:")
         layout.addWidget(label)
 
         manual_btn = QPushButton("Manual - Draw each outline by hand")
@@ -3220,7 +4709,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         auto_btn = QPushButton("Auto - Auto-detect all, then review/fix")
         auto_btn.clicked.connect(lambda: dialog.done(2))
-        auto_btn.setStyleSheet("background-color: #90EE90; font-weight: bold;")
+        auto_btn.setStyleSheet("border: 2px solid #4CAF50; font-weight: bold;")
         layout.addWidget(auto_btn)
 
         # Auto settings
@@ -3270,8 +4759,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.failed_auto_outlines = []  # List of queue_idx that failed
         self.review_mode = False
         self.current_review_idx = 0
+        self.current_outline_idx = 0
 
-        # Show outline progress bar
+        # Show outline controls and progress bar
+        self.outline_controls_widget.setVisible(True)
+        self.outline_method_display.setCurrentIndex(self.auto_outline_method.currentIndex())
+        self.outline_sens_display.setValue(self.auto_outline_sensitivity.value())
         self._update_outline_progress()
 
         if result == 1:
@@ -3283,7 +4776,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def _start_manual_outlining(self):
         """Start manual outlining mode - draw each soma one by one"""
-        self._load_soma_for_outlining(0)
+        start_idx = self._find_next_unoutlined_idx()
+        if start_idx is None:
+            self._finish_outlining()
+            return
+        self._load_soma_for_outlining(start_idx)
 
         self.auto_outline_btn.setEnabled(True)
         self.manual_draw_btn.setEnabled(True)
@@ -3314,6 +4811,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.failed_auto_outlines = []
 
         for i, (img_name, soma_idx) in enumerate(self.outlining_queue):
+            # Skip already-outlined somas
+            if self._soma_has_outline(img_name, soma_idx):
+                continue
+
             img_data = self.images[img_name]
             soma = img_data['somas'][soma_idx]
 
@@ -3334,6 +4835,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 fail_count += 1
                 self.failed_auto_outlines.append(i)
             else:
+                # Remove branch juts from auto outline
+                points = _remove_branch_juts(points, soma)
                 self.auto_outlined_points[i] = list(points)
                 success_count += 1
 
@@ -3383,8 +4886,21 @@ class MicrogliaAnalysisGUI(QMainWindow):
             return
 
         self.current_review_idx = review_idx
+        self.current_outline_idx = review_idx
         img_name, soma_idx = self.outlining_queue[review_idx]
+        self.current_image_name = img_name
         img_data = self.images[img_name]
+
+        # Ensure color_image is loaded for color toggle support
+        if 'color_image' not in img_data and 'raw_path' in img_data:
+            try:
+                raw_img = load_tiff_image(img_data['raw_path'])
+                if raw_img is not None and raw_img.ndim == 3:
+                    img_data['color_image'] = raw_img.copy()
+                    img_data['num_channels'] = raw_img.shape[2]
+            except Exception:
+                pass
+
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
 
@@ -3398,6 +4914,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+        self.processed_label.zoom_to_point(soma[0], soma[1], zoom_level=3.0)
         self.tabs.setCurrentIndex(2)
 
         self.nav_status_label.setText(
@@ -3454,13 +4971,26 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if queue_idx >= len(self.outlining_queue):
             self._finish_outlining()
             return
+        self.current_outline_idx = queue_idx
         img_name, soma_idx = self.outlining_queue[queue_idx]
         self.current_image_name = img_name
         img_data = self.images[img_name]
+
+        # Ensure color_image is loaded for color toggle support
+        if 'color_image' not in img_data and 'raw_path' in img_data:
+            try:
+                raw_img = load_tiff_image(img_data['raw_path'])
+                if raw_img is not None and raw_img.ndim == 3:
+                    img_data['color_image'] = raw_img.copy()
+                    img_data['num_channels'] = raw_img.shape[2]
+            except Exception:
+                pass
+
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+        self.processed_label.zoom_to_point(soma[0], soma[1], zoom_level=3.0)
         self.tabs.setCurrentIndex(2)
         self.nav_status_label.setText(
             f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
@@ -3473,7 +5003,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.z_key_held = False
 
         self.polygon_points.append(coords)
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        queue_idx = getattr(self, 'current_outline_idx', 0)
         if queue_idx < len(self.outlining_queue):
             img_name, soma_idx = self.outlining_queue[queue_idx]
             img_data = self.images[img_name]
@@ -3497,7 +5027,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.polygon_points.pop()
             self.log(f"↩️ Undid last point ({len(self.polygon_points)} points remaining)")
             # Refresh the display
-            queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+            queue_idx = getattr(self, 'current_outline_idx', 0)
             if queue_idx < len(self.outlining_queue):
                 img_name, soma_idx = self.outlining_queue[queue_idx]
                 img_data = self.images[img_name]
@@ -3520,7 +5050,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.polygon_points = []
             self.log("🔄 Restarted outline (all points cleared)")
             # Refresh the display
-            queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+            queue_idx = getattr(self, 'current_outline_idx', 0)
             if queue_idx < len(self.outlining_queue):
                 img_name, soma_idx = self.outlining_queue[queue_idx]
                 img_data = self.images[img_name]
@@ -3547,11 +5077,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "Need at least 3 points")
             return
 
-        # In review mode, use current_review_idx; otherwise calculate from outlines
-        if hasattr(self, 'review_mode') and self.review_mode:
-            queue_idx = self.current_review_idx
-        else:
-            queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        queue_idx = getattr(self, 'current_outline_idx', 0)
 
         if queue_idx >= len(self.outlining_queue):
             return
@@ -3583,66 +5109,75 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Update outline progress
         self._update_outline_progress()
 
+        # Auto-save after each outline
+        self._auto_save()
+
         # Enable Redo button after first outline is complete
         self.redo_outline_btn.setEnabled(True)
 
         # Reset accept button for next soma
         self.accept_outline_btn.setEnabled(False)
 
-        # Move to next soma
-        if hasattr(self, 'review_mode') and self.review_mode:
-            self._load_review_soma(queue_idx + 1)
+        # Move to next unoutlined soma
+        next_idx = self._find_next_unoutlined_idx(start_from=queue_idx + 1)
+        if next_idx is None:
+            self._finish_outlining()
+        elif hasattr(self, 'review_mode') and self.review_mode:
+            self._load_review_soma(next_idx)
         else:
-            self._load_soma_for_outlining(queue_idx + 1)
+            self._load_soma_for_outlining(next_idx)
 
     def redo_last_outline(self):
         """Delete the last completed outline and go back to redo it"""
-        # Find the last outline across all images
+        # Find the last outline by walking the outlining_queue in reverse
+        # and checking which ones still have outlines saved
         last_outline_img = None
         last_outline_data = None
-        
-        for img_name, img_data in self.images.items():
-            if img_data['soma_outlines']:
-                last_outline_img = img_name
-                last_outline_data = img_data['soma_outlines'][-1]
-        
+        last_queue_idx = None
+
+        # Count outlines in queue order to find the last completed one
+        outline_count = 0
+        for qi, (img_name, soma_idx) in enumerate(self.outlining_queue):
+            img_data = self.images[img_name]
+            soma_id = img_data['soma_ids'][soma_idx]
+            # Check if this queue entry has a matching outline
+            for ol in img_data['soma_outlines']:
+                if ol['soma_idx'] == soma_idx and ol['soma_id'] == soma_id:
+                    last_outline_img = img_name
+                    last_outline_data = ol
+                    last_queue_idx = qi
+                    break
+
         if not last_outline_data:
             QMessageBox.warning(self, "Warning", "No outlines to redo")
             return
-        
-        reply = QMessageBox.question(
-            self, 'Redo Last Outline',
-            f"Delete outline for {last_outline_data['soma_id']} and redo it?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        
-        if reply == QMessageBox.No:
-            return
-        
-        # Remove the last outline
-        self.images[last_outline_img]['soma_outlines'].pop()
-        
+
+        # Remove the outline
+        self.images[last_outline_img]['soma_outlines'].remove(last_outline_data)
+
         # Delete the exported soma file if it exists
         if self.masks_dir:
             soma_id = last_outline_data['soma_id']
             soma_file = os.path.join(self.masks_dir, f"{os.path.splitext(last_outline_img)[0]}_{soma_id}_soma.tif")
             if os.path.exists(soma_file):
                 os.remove(soma_file)
-        
-        self.log(f"↩ Deleted outline for {last_outline_data['soma_id']} - ready to redo")
+
+        self.log(f"↩ Undid outline for {last_outline_data['soma_id']} - ready to redo")
 
         # Update outline progress
         self._update_outline_progress()
 
         # Go back to that soma for re-outlining
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
         self.polygon_points = []
-        
-        # If no more outlines left, disable the redo button
-        if queue_idx == 0:
+
+        # If no more outlines left in this session, disable the redo button
+        has_outlines_in_queue = any(
+            self._soma_has_outline(in_, si) for in_, si in self.outlining_queue
+        )
+        if not has_outlines_in_queue:
             self.redo_outline_btn.setEnabled(False)
 
-        self._load_soma_for_outlining(queue_idx)
+        self._load_soma_for_outlining(last_queue_idx)
 
     def _get_auto_outline_method(self):
         """Get the selected auto-outline method function"""
@@ -3670,7 +5205,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "No somas in outlining queue")
             return
 
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        queue_idx = getattr(self, 'current_outline_idx', 0)
         if queue_idx >= len(self.outlining_queue):
             QMessageBox.warning(self, "Warning", "All somas already outlined")
             return
@@ -3708,6 +5243,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
             )
             return
 
+        # Remove branch juts from auto outline
+        points = _remove_branch_juts(points, soma)
+
         # Set the polygon points and display
         self.polygon_points = list(points)
         pixmap = self._get_outlining_pixmap(img_data)
@@ -3734,7 +5272,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "No somas in outlining queue")
             return
 
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        queue_idx = getattr(self, 'current_outline_idx', 0)
         remaining = len(self.outlining_queue) - queue_idx
 
         if remaining <= 0:
@@ -3764,6 +5302,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         for i in range(queue_idx, len(self.outlining_queue)):
             img_name, soma_idx = self.outlining_queue[i]
+            # Skip already-outlined somas
+            if self._soma_has_outline(img_name, soma_idx):
+                continue
             img_data = self.images[img_name]
             soma = img_data['somas'][soma_idx]
             soma_id = img_data['soma_ids'][soma_idx]
@@ -3783,6 +5324,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 fail_count += 1
                 failed_somas.append(soma_id)
                 continue
+
+            # Remove branch juts from auto outline
+            points = _remove_branch_juts(points, soma)
 
             # Create mask from points
             mask = self._polygon_to_mask(points, outline_img.shape)
@@ -3811,13 +5355,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Update outline progress
         self._update_outline_progress()
 
-        # Check if all done
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
-        if queue_idx >= len(self.outlining_queue):
+        # Check if all done — find first queue entry without an outline
+        next_idx = self._find_next_unoutlined_idx()
+        if next_idx is None:
             self._finish_outlining()
         else:
             # Load the first failed soma for manual outlining
-            self._load_soma_for_outlining(queue_idx)
+            self._load_soma_for_outlining(next_idx)
             self.auto_outline_btn.setEnabled(True)
             self.manual_draw_btn.setEnabled(True)
 
@@ -3835,7 +5379,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.processed_label.selected_point_idx = None
         self.processed_label.dragging_point = False
 
-        queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
+        queue_idx = getattr(self, 'current_outline_idx', 0)
         if queue_idx < len(self.outlining_queue):
             img_name, soma_idx = self.outlining_queue[queue_idx]
             img_data = self.images[img_name]
@@ -3925,11 +5469,28 @@ class MicrogliaAnalysisGUI(QMainWindow):
         mask = path.contains_points(points).reshape(h, w)
         return mask.astype(np.uint8)
 
+    def _soma_has_outline(self, img_name, soma_idx):
+        """Check if a soma already has a completed outline."""
+        img_data = self.images[img_name]
+        soma_id = img_data['soma_ids'][soma_idx]
+        return any(
+            ol['soma_idx'] == soma_idx and ol['soma_id'] == soma_id
+            for ol in img_data['soma_outlines']
+        )
+
+    def _find_next_unoutlined_idx(self, start_from=0):
+        """Find the first queue entry that doesn't have an outline yet."""
+        for qi in range(start_from, len(self.outlining_queue)):
+            img_name, soma_idx = self.outlining_queue[qi]
+            if not self._soma_has_outline(img_name, soma_idx):
+                return qi
+        return None  # All done
+
     def _update_outline_progress(self):
         """Update the outline progress bar with current completion count."""
         if not hasattr(self, 'outlining_queue') or not self.outlining_queue:
             return
-        completed = sum(len(data['soma_outlines']) for data in self.images.values())
+        completed = sum(1 for in_, si in self.outlining_queue if self._soma_has_outline(in_, si))
         total = len(self.outlining_queue)
         self.outline_progress_bar.setMaximum(total)
         self.outline_progress_bar.setValue(completed)
@@ -3937,6 +5498,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def _finish_outlining(self):
         self.outline_progress_bar.setVisible(False)
+        self.outline_controls_widget.setVisible(False)
         self.batch_mode = False
         self.processed_label.polygon_mode = False
         self.processed_label.point_edit_mode = False
@@ -3949,7 +5511,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.accept_outline_btn.setEnabled(False)
 
         for img_name, img_data in self.images.items():
-            if img_data['selected'] and len(img_data['soma_outlines']) == len(img_data['somas']):
+            if img_data['selected'] and img_data['soma_outlines']:
                 img_data['status'] = 'outlined'
                 self._update_file_list_item(img_name)
         self.batch_generate_masks_btn.setEnabled(True)
@@ -3958,6 +5520,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("✓ All somas outlined!")
         self.log("✓ Ready to generate masks")
         self.log("=" * 50)
+        self._auto_save()
         QMessageBox.information(self, "Complete", "All somas outlined!\n\nReady to generate masks.")
 
     def batch_generate_masks(self):
@@ -3976,12 +5539,66 @@ class MicrogliaAnalysisGUI(QMainWindow):
         title.setFont(title_font)
         layout.addWidget(title)
 
-        # Description
-        desc = QLabel("Adjust settings to prevent dim background from being included in masks:")
-        desc.setWordWrap(True)
-        layout.addWidget(desc)
+        # --- Mask Size Settings ---
+        size_group = QLabel("<b>Mask Sizes (µm²)</b>")
+        layout.addWidget(size_group)
+
+        size_grid = QHBoxLayout()
+
+        size_grid.addWidget(QLabel("Min:"))
+        min_area_spin = QSpinBox()
+        min_area_spin.setRange(100, 2000)
+        min_area_spin.setSingleStep(50)
+        min_area_spin.setValue(self.mask_min_area)
+        min_area_spin.setSuffix(" µm²")
+        size_grid.addWidget(min_area_spin)
+
+        size_grid.addWidget(QLabel("Max:"))
+        max_area_spin = QSpinBox()
+        max_area_spin.setRange(200, 5000)
+        max_area_spin.setSingleStep(50)
+        max_area_spin.setValue(self.mask_max_area)
+        max_area_spin.setSuffix(" µm²")
+        size_grid.addWidget(max_area_spin)
+
+        size_grid.addWidget(QLabel("Step:"))
+        step_spin = QSpinBox()
+        step_spin.setRange(10, 500)
+        step_spin.setSingleStep(10)
+        step_spin.setValue(self.mask_step_size)
+        step_spin.setSuffix(" µm²")
+        size_grid.addWidget(step_spin)
+
+        layout.addLayout(size_grid)
+
+        # Preview of mask sizes that will be generated
+        preview_label = QLabel("")
+        preview_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+        preview_label.setWordWrap(True)
+        layout.addWidget(preview_label)
+
+        def update_size_preview():
+            mn = min_area_spin.value()
+            mx = max_area_spin.value()
+            st = step_spin.value()
+            if mn > mx:
+                preview_label.setText("⚠ Min must be ≤ Max")
+                return
+            sizes = list(range(mn, mx + 1, st))
+            if sizes[-1] != mx:
+                sizes.append(mx)
+            preview_label.setText(f"Masks: {', '.join(str(s) for s in sizes)} µm²  ({len(sizes)} masks per cell)")
+
+        min_area_spin.valueChanged.connect(lambda: update_size_preview())
+        max_area_spin.valueChanged.connect(lambda: update_size_preview())
+        step_spin.valueChanged.connect(lambda: update_size_preview())
+        update_size_preview()
 
         layout.addSpacing(10)
+
+        # --- Intensity Settings ---
+        intensity_group = QLabel("<b>Intensity Filtering</b>")
+        layout.addWidget(intensity_group)
 
         # Minimum intensity threshold checkbox
         min_intensity_check = QCheckBox("Use minimum intensity threshold")
@@ -4009,11 +5626,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         help_text = QLabel(
             "💡 Tip:\n"
             "• 0% = No minimum (include all pixels)\n"
-            "• 30% = Default (good for most images)\n"
-            "• 50% = Strict (exclude dimmer pixels)\n"
-            "• 70%+ = Very strict (only bright pixels)"
+            "• 5% = Default (exclude background)\n"
+            "• 30% = Moderate (exclude dimmer pixels)\n"
+            "• 50%+ = Strict (only bright pixels)"
         )
-        help_text.setStyleSheet("background-color: #f0f0f0; padding: 10px; border-radius: 5px;")
+        help_text.setStyleSheet("padding: 10px; border-radius: 5px; border: 1px solid palette(mid);")
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
 
@@ -4029,7 +5646,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(dialog.accept)
         ok_btn.setStyleSheet(
-            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 5px; }")
+            "QPushButton { border: 2px solid #4CAF50; font-weight: bold; padding: 5px; }")
         button_layout.addWidget(ok_btn)
 
         layout.addLayout(button_layout)
@@ -4044,20 +5661,28 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Save settings
         self.use_min_intensity = min_intensity_check.isChecked()
         self.min_intensity_percent = min_intensity_slider.value()
+        self.mask_min_area = min_area_spin.value()
+        self.mask_max_area = max_area_spin.value()
+        self.mask_step_size = step_spin.value()
 
         # Now proceed with mask generation
         try:
             pixel_size = float(self.pixel_size_input.text())
-            area_list = [200, 300, 400, 500, 600, 700, 800]
+
+            # Build area list from user settings
+            area_list = list(range(self.mask_min_area, self.mask_max_area + 1, self.mask_step_size))
+            if area_list[-1] != self.mask_max_area:
+                area_list.append(self.mask_max_area)
 
             self.progress_bar.setVisible(True)
             self.progress_status_label.setVisible(True)
 
-            total_outlines = sum(len(data['soma_outlines']) for data in self.images.values() if data['selected'])
+            total_outlines = sum(len(data['soma_outlines']) for data in self.images.values()
+                                 if data['selected'] and data['soma_outlines'])
             current_count = 0
 
             for img_name, img_data in self.images.items():
-                if not img_data['selected'] or img_data['status'] != 'outlined':
+                if not img_data['selected'] or not img_data['soma_outlines']:
                     continue
 
                 self.log(f"Generating masks for {img_name}...")
@@ -4066,14 +5691,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     centroid = soma_data['centroid']
                     soma_idx = soma_data['soma_idx']
                     soma_id = soma_data['soma_id']
-                    soma_area_um2 = soma_data.get('soma_area_um2', 0)  # Get soma area from outline
+                    soma_area_um2 = soma_data.get('soma_area_um2', 0)
+                    soma_outline = soma_data.get('outline')
 
                     self.progress_status_label.setText(f"Generating masks: {current_count + 1}/{total_outlines}")
                     QApplication.processEvents()
 
                     masks = self._create_annulus_masks(
                         centroid, area_list, pixel_size, soma_idx, soma_id,
-                        img_data['processed'], img_name, soma_area_um2  # Pass soma area
+                        img_data['processed'], img_name, soma_area_um2,
+                        soma_outline_mask=soma_outline
                     )
                     img_data['masks'].extend(masks)
 
@@ -4087,17 +5714,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.progress_status_label.setVisible(False)
 
             self.batch_qa_btn.setEnabled(True)
-            self.clear_masks_btn.setEnabled(True)  # Enable clear masks button
+            self.clear_masks_btn.setEnabled(True)
             # self.update_workflow_status()
 
             total_masks = sum(len(data['masks']) for data in self.images.values() if data['selected'])
 
             self.log("=" * 50)
             self.log(f"✓ Generated {total_masks} masks total")
+            self.log(f"✓ Mask sizes: {', '.join(str(a) for a in area_list)} µm²")
             if self.use_min_intensity:
                 self.log(f"✓ Used minimum intensity: {self.min_intensity_percent}%")
             self.log("✓ Ready for QA")
             self.log("=" * 50)
+            self._auto_save()
 
             QMessageBox.information(
                 self, "Success",
@@ -4112,101 +5741,336 @@ class MicrogliaAnalysisGUI(QMainWindow):
             traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Failed: {e}")
 
+    def regenerate_masks_current_image(self):
+        """Regenerate masks for the image currently shown in QA with custom settings."""
+        # Determine which image we're looking at
+        if self.mask_qa_active and self.all_masks_flat and self.mask_qa_idx < len(self.all_masks_flat):
+            img_name = self.all_masks_flat[self.mask_qa_idx]['image_name']
+        elif self.current_image_name and self.current_image_name in self.images:
+            img_name = self.current_image_name
+        else:
+            QMessageBox.warning(self, "Warning", "No image selected.")
+            return
+
+        img_data = self.images[img_name]
+
+        if not img_data.get('soma_outlines'):
+            QMessageBox.warning(self, "Warning", f"{img_name} has no soma outlines.")
+            return
+
+        # Show settings dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Redo Masks — {os.path.splitext(img_name)[0]}")
+        dialog.setModal(True)
+
+        layout = QVBoxLayout()
+
+        title = QLabel(f"<b>{os.path.splitext(img_name)[0]}</b>")
+        layout.addWidget(title)
+
+        # Mask Size Settings
+        size_grid = QHBoxLayout()
+        size_grid.addWidget(QLabel("Min:"))
+        min_area_spin = QSpinBox()
+        min_area_spin.setRange(100, 2000)
+        min_area_spin.setSingleStep(50)
+        min_area_spin.setValue(self.mask_min_area)
+        min_area_spin.setSuffix(" µm²")
+        size_grid.addWidget(min_area_spin)
+
+        size_grid.addWidget(QLabel("Max:"))
+        max_area_spin = QSpinBox()
+        max_area_spin.setRange(200, 5000)
+        max_area_spin.setSingleStep(50)
+        max_area_spin.setValue(self.mask_max_area)
+        max_area_spin.setSuffix(" µm²")
+        size_grid.addWidget(max_area_spin)
+
+        size_grid.addWidget(QLabel("Step:"))
+        step_spin = QSpinBox()
+        step_spin.setRange(10, 500)
+        step_spin.setSingleStep(10)
+        step_spin.setValue(self.mask_step_size)
+        step_spin.setSuffix(" µm²")
+        size_grid.addWidget(step_spin)
+        layout.addLayout(size_grid)
+
+        # Preview of sizes
+        preview_label = QLabel("")
+        preview_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+        preview_label.setWordWrap(True)
+        layout.addWidget(preview_label)
+
+        def update_size_preview():
+            mn = min_area_spin.value()
+            mx = max_area_spin.value()
+            st = step_spin.value()
+            if mn > mx:
+                preview_label.setText("Min must be <= Max")
+                return
+            sizes = list(range(mn, mx + 1, st))
+            if sizes[-1] != mx:
+                sizes.append(mx)
+            preview_label.setText(f"Masks: {', '.join(str(s) for s in sizes)} µm²  ({len(sizes)} per cell)")
+
+        min_area_spin.valueChanged.connect(lambda: update_size_preview())
+        max_area_spin.valueChanged.connect(lambda: update_size_preview())
+        step_spin.valueChanged.connect(lambda: update_size_preview())
+        update_size_preview()
+
+        layout.addSpacing(5)
+
+        # Intensity Settings
+        layout.addWidget(QLabel("<b>Intensity Floor</b>"))
+        slider_layout = QHBoxLayout()
+        slider_layout.addWidget(QLabel("Min intensity:"))
+        min_intensity_slider = QSlider(Qt.Horizontal)
+        min_intensity_slider.setRange(0, 100)
+        min_intensity_slider.setValue(self.min_intensity_percent)
+        slider_layout.addWidget(min_intensity_slider)
+        min_intensity_label = QLabel(f"{self.min_intensity_percent}%")
+        min_intensity_slider.valueChanged.connect(
+            lambda v: min_intensity_label.setText(f"{v}%")
+        )
+        slider_layout.addWidget(min_intensity_label)
+        layout.addLayout(slider_layout)
+
+        hint = QLabel("0% = no floor (grow freely)   |   Higher = only bright pixels")
+        hint.setStyleSheet("color: palette(dark); font-size: 10px;")
+        layout.addWidget(hint)
+
+        layout.addSpacing(5)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_btn)
+
+        ok_btn = QPushButton("Redo Masks")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(dialog.accept)
+        ok_btn.setStyleSheet(
+            "QPushButton { border: 2px solid #4CAF50; font-weight: bold; padding: 5px; }")
+        button_layout.addWidget(ok_btn)
+
+        layout.addLayout(button_layout)
+        dialog.setLayout(layout)
+        dialog.setMinimumWidth(420)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        # Read settings
+        regen_min = min_area_spin.value()
+        regen_max = max_area_spin.value()
+        regen_step = step_spin.value()
+        regen_intensity = min_intensity_slider.value()
+
+        if regen_min > regen_max:
+            QMessageBox.warning(self, "Warning", "Min area must be <= Max area.")
+            return
+
+        area_list = list(range(regen_min, regen_max + 1, regen_step))
+        if area_list[-1] != regen_max:
+            area_list.append(regen_max)
+
+        try:
+            pixel_size = float(self.pixel_size_input.text())
+        except ValueError:
+            pixel_size = 0.316
+
+        # Delete old mask files from disk for this image
+        if self.masks_dir and os.path.isdir(self.masks_dir):
+            img_basename = os.path.splitext(img_name)[0]
+            for f in os.listdir(self.masks_dir):
+                if f.startswith(img_basename + "_") and f.endswith("_mask.tif"):
+                    try:
+                        os.remove(os.path.join(self.masks_dir, f))
+                    except Exception:
+                        pass
+
+        # Remove old masks from all_masks_flat
+        self.all_masks_flat = [flat for flat in self.all_masks_flat
+                               if flat['image_name'] != img_name]
+
+        # Clear existing masks for this image
+        img_data['masks'] = []
+
+        # Temporarily override intensity setting for this generation
+        saved_intensity = self.min_intensity_percent
+        saved_use_intensity = self.use_min_intensity
+        self.min_intensity_percent = regen_intensity
+        self.use_min_intensity = regen_intensity > 0
+
+        # Generate new masks
+        self.log(f"Redoing masks for {img_name}: {regen_min}-{regen_max} µm², "
+                 f"step {regen_step}, intensity {regen_intensity}%")
+
+        for soma_data in img_data['soma_outlines']:
+            centroid = soma_data['centroid']
+            soma_idx = soma_data['soma_idx']
+            soma_id = soma_data['soma_id']
+            soma_area_um2 = soma_data.get('soma_area_um2', 0)
+            soma_outline = soma_data.get('outline')
+
+            masks = self._create_annulus_masks(
+                centroid, area_list, pixel_size, soma_idx, soma_id,
+                img_data['processed'], img_name, soma_area_um2,
+                soma_outline_mask=soma_outline
+            )
+            img_data['masks'].extend(masks)
+
+        # Restore global intensity settings
+        self.min_intensity_percent = saved_intensity
+        self.use_min_intensity = saved_use_intensity
+
+        # Update status
+        img_data['status'] = 'masks_generated'
+        self._update_file_list_item(img_name)
+
+        # Add new masks to all_masks_flat
+        if img_data['selected']:
+            for mask_data in img_data['masks']:
+                self.all_masks_flat.append({
+                    'image_name': img_name,
+                    'mask_data': mask_data,
+                    'processed_img': img_data['processed'],
+                })
+
+        total = len(img_data['masks'])
+        self.log(f"Generated {total} new masks for {img_name}")
+        self._auto_save()
+
+        # If QA was active, jump to the first new mask for this image
+        if self.mask_qa_active:
+            for i, flat in enumerate(self.all_masks_flat):
+                if flat['image_name'] == img_name and flat['mask_data']['approved'] is None:
+                    self.mask_qa_idx = i
+                    self._show_current_mask()
+                    return
+        else:
+            self.batch_qa_btn.setEnabled(True)
+            QMessageBox.information(self, "Done",
+                f"Regenerated {total} masks for {os.path.splitext(img_name)[0]}.\n\nReady for QA.")
+
     def _create_annulus_masks(self, centroid, area_list_um2, pixel_size_um, soma_idx, soma_id, processed_img, img_name,
-                              soma_area_um2):
-        """Create cell masks with unique soma ID and constant soma area"""
-        from skimage.filters import threshold_otsu
-        from skimage.measure import label
-        from scipy.ndimage import shift
+                              soma_area_um2, soma_outline_mask=None):
+        """Create nested cell masks using priority region growing from the soma outline.
+
+        Seeds the growth with the entire soma outline so the soma pixels are
+        "free" and the mask pixel budget goes toward territory beyond the soma.
+        Grows outward from the soma boundary, always adding the brightest
+        neighboring pixel next.  Respects the minimum intensity floor setting.
+        """
+        import heapq
 
         masks = []
         cy, cx = int(centroid[0]), int(centroid[1])
 
-        roi_size = 200
+        # Convert all target areas to pixels and find the largest
+        sorted_areas = sorted(area_list_um2, reverse=True)
+        largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
+
+        # Size the ROI to guarantee enough room for the largest mask
+        # Use radius of equivalent circle * 3 for safety (processes extend far)
+        min_roi_radius = int(np.sqrt(largest_target_px / np.pi) * 3)
+        roi_size = max(200, min_roi_radius)
+
         y_min = max(0, cy - roi_size)
         y_max = min(processed_img.shape[0], cy + roi_size)
         x_min = max(0, cx - roi_size)
         x_max = min(processed_img.shape[1], cx + roi_size)
 
-        roi = processed_img[y_min:y_max, x_min:x_max].copy()
-        centroid_in_roi = (cy - y_min, cx - x_min)
+        roi = processed_img[y_min:y_max, x_min:x_max].astype(np.float64)
+        cy_roi, cx_roi = cy - y_min, cx - x_min
+        h, w = roi.shape
 
-        reversed_area_list = sorted(area_list_um2, reverse=True)
+        # Clamp centroid to ROI bounds
+        cy_roi = max(0, min(h - 1, cy_roi))
+        cx_roi = max(0, min(w - 1, cx_roi))
 
-        for i, target_area_um2 in enumerate(reversed_area_list):
-            if target_area_um2 == 200:
-                continue
+        # Compute intensity floor from user settings
+        intensity_floor = 0.0
+        if self.use_min_intensity and self.min_intensity_percent > 0:
+            roi_max = roi.max()
+            if roi_max > 0:
+                intensity_floor = roi_max * (self.min_intensity_percent / 100.0)
 
-            target_area_px = target_area_um2 / (pixel_size_um ** 2)
+        # Priority region growing: grow from soma outline, brightest neighbor first
+        # Use a max-heap (negate intensity for min-heap)
+        visited = np.zeros((h, w), dtype=bool)
+        growth_order = []  # list of (row, col) in the order pixels were added
 
-            # Calculate minimum intensity threshold if enabled
-            # Scale it based on mask size - larger masks get lower minimum
-            min_intensity = None
-            if self.use_min_intensity:
-                # Convert percentage to actual intensity value
-                roi_max = roi.max()
-                base_min_intensity = (self.min_intensity_percent / 100.0) * roi_max
+        heap = []
 
-                # Scale factor: smaller masks use full minimum, larger masks use less
-                # 300 µm² (smallest) = 100% of minimum
-                # 800 µm² (largest) = 30% of minimum
-                smallest_area = 300
-                largest_area = 800
-                if target_area_um2 <= smallest_area:
-                    scale_factor = 1.0
-                elif target_area_um2 >= largest_area:
-                    scale_factor = 0.3
-                else:
-                    # Linear interpolation between 1.0 and 0.3
-                    scale_factor = 1.0 - (0.7 * (target_area_um2 - smallest_area) / (largest_area - smallest_area))
+        # Seed with all soma outline pixels (they are "free" — part of every mask)
+        soma_seed_count = 0
+        if soma_outline_mask is not None:
+            outline_roi = soma_outline_mask[y_min:y_max, x_min:x_max]
+            soma_ys, soma_xs = np.where(outline_roi > 0)
+            for sr, sc in zip(soma_ys, soma_xs):
+                if not visited[sr, sc]:
+                    visited[sr, sc] = True
+                    growth_order.append((sr, sc))
+                    soma_seed_count += 1
+            # Push boundary neighbors of the soma into the heap
+            for sr, sc in zip(soma_ys, soma_xs):
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = sr + dr, sc + dc
+                    if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                        if roi[nr, nc] >= intensity_floor:
+                            visited[nr, nc] = True
+                            heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
-                min_intensity = base_min_intensity * scale_factor
+        # Fallback: if no soma outline available, seed with centroid
+        if soma_seed_count == 0:
+            visited[cy_roi, cx_roi] = True
+            growth_order.append((cy_roi, cx_roi))
+            soma_seed_count = 1
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = cy_roi + dr, cx_roi + dc
+                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                    if roi[nr, nc] >= intensity_floor:
+                        visited[nr, nc] = True
+                        heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
-            mask = self._iterative_threshold_mask(
-                roi, centroid_in_roi, target_area_px, max_iterations=30, min_intensity=min_intensity
-            )
+        # Grow outward from the soma boundary up to largest target
+        while heap and len(growth_order) < largest_target_px:
+            neg_intensity, r, c = heapq.heappop(heap)
 
-            if np.any(mask):
-                labeled_mask = label(mask)
+            growth_order.append((r, c))
 
-                if labeled_mask.max() > 0:
-                    cy_roi, cx_roi = int(centroid_in_roi[0]), int(centroid_in_roi[1])
+            # Add 4-connected neighbors to the heap
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                    if roi[nr, nc] >= intensity_floor:
+                        visited[nr, nc] = True
+                        heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
-                    if (0 <= cy_roi < labeled_mask.shape[0] and
-                            0 <= cx_roi < labeled_mask.shape[1] and
-                            labeled_mask[cy_roi, cx_roi] > 0):
-                        target_label = labeled_mask[cy_roi, cx_roi]
-                        mask = (labeled_mask == target_label).astype(np.uint8)
-                    else:
-                        best_region = None
-                        min_dist = float('inf')
+        print(f"  {soma_id}: soma={soma_seed_count}px, grew to {len(growth_order)}px (target: {largest_target_px})")
 
-                        for region_id in range(1, labeled_mask.max() + 1):
-                            region_mask = (labeled_mask == region_id)
-                            region_coords = np.argwhere(region_mask)
-                            distances = np.sqrt(np.sum((region_coords - np.array(centroid_in_roi)) ** 2, axis=1))
-                            closest_dist = np.min(distances)
+        # Build masks for each target area from the growth order
+        # Largest first (matches QA presentation order)
+        # Every mask always includes the full soma at minimum
+        # Target area is a ceiling — if intensity floor stopped growth early,
+        # min(target_px, len(growth_order)) naturally caps the mask smaller
+        for target_area_um2 in sorted_areas:
+            target_px = int(target_area_um2 / (pixel_size_um ** 2))
+            n_pixels = min(target_px, len(growth_order))
+            n_pixels = max(n_pixels, soma_seed_count)  # always include full soma
+            n_pixels = min(n_pixels, len(growth_order))
 
-                            if closest_dist < min_dist:
-                                min_dist = closest_dist
-                                best_region = region_mask
-
-                        if best_region is not None:
-                            mask = best_region.astype(np.uint8)
-
-                    # Don't shift the mask - let it use its natural center
-                    # The clicked centroid is just used to select which region, not to force positioning
+            mask_roi = np.zeros((h, w), dtype=np.uint8)
+            for r, c in growth_order[:n_pixels]:
+                mask_roi[r, c] = 1
 
             full_mask = np.zeros(processed_img.shape, dtype=np.uint8)
-            full_mask[y_min:y_max, x_min:x_max] = mask
+            full_mask[y_min:y_max, x_min:x_max] = mask_roi
 
-            # Mask saving now happens during QA approval (see _export_approved_mask)
-            # This avoids saving masks that will be rejected
-            # if self.masks_dir and np.any(full_mask):
-            #     image_name_base = os.path.splitext(img_name)[0]
-            #     mask_filename = f"{image_name_base}_{soma_id}_area{int(target_area_um2)}.tif"
-            #     mask_path = os.path.join(self.masks_dir, mask_filename)
-            #     tifffile.imwrite(mask_path, full_mask)
+            actual_area_um2 = n_pixels * (pixel_size_um ** 2)
+            print(f"    {target_area_um2} um²: {n_pixels} px = {actual_area_um2:.1f} um² actual")
 
             masks.append({
                 'image_name': img_name,
@@ -4215,83 +6079,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 'area_um2': target_area_um2,
                 'mask': full_mask,
                 'approved': None,
-                'soma_area_um2': soma_area_um2  # Store constant soma area from outline
+                'soma_area_um2': soma_area_um2
             })
 
         return masks
-
-    def _iterative_threshold_mask(self, roi, centroid, target_area, max_iterations=30, tolerance=100,
-                                  min_intensity=None):
-        """Use iterative thresholding to create a mask of target area"""
-        from skimage.filters import threshold_otsu
-        from skimage.measure import label
-
-        try:
-            current_thresh = threshold_otsu(roi)
-        except:
-            current_thresh = np.percentile(roi, 50)
-
-        # If min_intensity is set, make sure we start at least that high
-        if min_intensity is not None:
-            current_thresh = max(current_thresh, min_intensity)
-
-        cy, cx = int(centroid[0]), int(centroid[1])
-
-        best_mask = None
-        best_diff = float('inf')
-
-        for iteration in range(max_iterations):
-            binary = roi > current_thresh
-            labeled = label(binary)
-
-            mask = None
-            if 0 <= cy < labeled.shape[0] and 0 <= cx < labeled.shape[1]:
-                centroid_label = labeled[cy, cx]
-                if centroid_label > 0:
-                    mask = (labeled == centroid_label).astype(np.uint8)
-                else:
-                    if labeled.max() > 0:
-                        distances = []
-                        for region_label in range(1, labeled.max() + 1):
-                            region_mask = (labeled == region_label)
-                            region_coords = np.argwhere(region_mask)
-                            if len(region_coords) > 0:
-                                dists = np.sqrt(np.sum((region_coords - np.array([cy, cx])) ** 2, axis=1))
-                                min_dist = np.min(dists)
-                                distances.append((min_dist, region_label))
-
-                        if distances:
-                            _, closest_label = min(distances, key=lambda x: x[0])
-                            mask = (labeled == closest_label).astype(np.uint8)
-
-                    if mask is None:
-                        mask = binary.astype(np.uint8)
-            else:
-                mask = binary.astype(np.uint8)
-
-            current_area = np.sum(mask)
-            area_diff = abs(current_area - target_area)
-
-            if area_diff < best_diff:
-                best_diff = area_diff
-                best_mask = mask.copy()
-
-            if area_diff <= tolerance:
-                return mask
-
-            adjustment = current_thresh * (current_area - target_area) / (iteration + 1) / target_area
-            current_thresh += adjustment
-
-            # Clip threshold, but respect minimum intensity if set
-            if min_intensity is not None:
-                current_thresh = np.clip(current_thresh, min_intensity, roi.max())
-            else:
-                current_thresh = np.clip(current_thresh, roi.min(), roi.max())
-
-            if abs(adjustment) < 0.1:
-                break
-
-        return best_mask if best_mask is not None else np.zeros_like(roi, dtype=np.uint8)
 
     def start_batch_qa(self):
         # Flatten all masks from all images
@@ -4311,20 +6102,34 @@ class MicrogliaAnalysisGUI(QMainWindow):
             return
 
         self.mask_qa_active = True
-        self.mask_qa_idx = 0
+        self.last_qa_decisions = []
+
+        # Find first unreviewed mask to resume from
+        reviewed_count = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
+        first_unreviewed = 0
+        for i, flat in enumerate(self.all_masks_flat):
+            if flat['mask_data'].get('approved') is None:
+                first_unreviewed = i
+                break
+        self.mask_qa_idx = first_unreviewed
 
         self.approve_mask_btn.setEnabled(True)
         self.reject_mask_btn.setEnabled(True)
         self.prev_btn.setEnabled(True)
         self.next_btn.setEnabled(True)
         self.done_btn.setEnabled(False)
+        self.undo_qa_btn.setEnabled(True)
+        self.regen_masks_btn.setVisible(True)
 
         self._show_current_mask()
         self.tabs.setCurrentIndex(3)
 
         self.log("=" * 50)
         self.log("🎯 BATCH MASK QA MODE")
-        self.log(f"Total masks to review: {len(self.all_masks_flat)}")
+        if reviewed_count > 0:
+            self.log(f"Resuming: {reviewed_count}/{len(self.all_masks_flat)} already reviewed")
+        else:
+            self.log(f"Total masks to review: {len(self.all_masks_flat)}")
         self.log("Keyboard: A=Approve, R=Reject, ←→=Navigate, Space=Approve&Next")
         self.log("=" * 50)
 
@@ -4337,15 +6142,43 @@ class MicrogliaAnalysisGUI(QMainWindow):
         processed_img = flat_data['processed_img']
         img_name = flat_data['image_name']
 
-        adjusted = self._apply_display_adjustments(processed_img)
-        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+        # Display in color or grayscale based on toggle
+        img_data = self.images.get(img_name, {})
+        # Ensure color_image is loaded for color toggle
+        if 'color_image' not in img_data and 'raw_path' in img_data:
+            try:
+                raw_img = load_tiff_image(img_data['raw_path'])
+                if raw_img is not None and raw_img.ndim == 3:
+                    img_data['color_image'] = raw_img.copy()
+                    img_data['num_channels'] = raw_img.shape[2]
+            except Exception:
+                pass
+        if self.show_color_view and 'color_image' in img_data:
+            proc_color = self._build_processed_color_image(img_data)
+            if proc_color is not None:
+                adjusted = self._apply_display_adjustments_color(proc_color)
+            else:
+                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
+            pixmap = self._array_to_pixmap_color(adjusted)
+        else:
+            adjusted = self._apply_display_adjustments(processed_img)
+            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
         self.mask_label.set_image(pixmap, mask_overlay=mask_data['mask'])
+
+        # Auto-zoom to mask center
+        mask_coords = np.argwhere(mask_data['mask'] > 0)
+        if len(mask_coords) > 0:
+            center_row = float(np.mean(mask_coords[:, 0]))
+            center_col = float(np.mean(mask_coords[:, 1]))
+            self.mask_label.zoom_to_point(center_row, center_col, zoom_level=3.0)
 
         status = mask_data.get('approved')
         status_text = "✓ Approved" if status is True else "✗ Rejected" if status is False else "⏳ Not reviewed"
+        reviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
 
         self.nav_status_label.setText(
             f"Mask {self.mask_qa_idx + 1}/{len(self.all_masks_flat)} | "
+            f"Reviewed: {reviewed}/{len(self.all_masks_flat)} | "
             f"{img_name} | {mask_data['soma_id']} | "
             f"Area: {mask_data['area_um2']} µm² | {status_text}"
         )
@@ -4364,6 +6197,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.log(f"✅ APPROVED | {current_img} | {current_soma_id} | Area: {current_area} µm²")
 
+        # Record decision for undo
+        self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': True})
+
         # Export mask immediately upon approval
         self._export_approved_mask(flat_data)
 
@@ -4380,6 +6216,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     other_mask['approved'] is None):
                 other_mask['approved'] = True
                 auto_approved.append((i + 1, other_mask['area_um2']))
+                # Record auto-approval for undo
+                self.last_qa_decisions.append({'flat_data': other_flat, 'was_approved': True})
                 # Export auto-approved masks too
                 self._export_approved_mask(other_flat)
 
@@ -4387,6 +6225,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.log(f"   ⚡ Auto-approved {len(auto_approved)} smaller masks for {current_soma_id}:")
             for mask_num, area in auto_approved:
                 self.log(f"      Mask #{mask_num} ({area} µm²)")
+
+        # Auto-save every 5 QA decisions
+        if len(self.last_qa_decisions) % 5 == 0:
+            self._auto_save()
 
         # Move to next unreviewed mask
         self._advance_to_next_unreviewed()
@@ -4528,6 +6370,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         mask_data = flat_data['mask_data']
         mask_data['approved'] = False
 
+        # Record decision for undo
+        self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': False})
+
         self.log(f"✗ Rejected: {mask_data['soma_id']} ({mask_data['area_um2']} µm²)")
 
         if self.mask_qa_idx < len(self.all_masks_flat) - 1:
@@ -4559,6 +6404,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.reject_mask_btn.setEnabled(False)
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
+            self.regen_masks_btn.setVisible(False)
 
             # Update image statuses
             for img_name, img_data in self.images.items():
@@ -4567,7 +6413,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     self._update_file_list_item(img_name)
 
             self.batch_calculate_btn.setEnabled(True)
-            # self.update_workflow_status()
+            self.undo_qa_btn.setEnabled(True)
 
             approved_count = sum(1 for flat in self.all_masks_flat if flat['mask_data']['approved'])
             rejected_count = len(self.all_masks_flat) - approved_count
@@ -4576,11 +6422,96 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.log(f"✓ QA Complete!")
             self.log(f"Approved: {approved_count}, Rejected: {rejected_count}")
             self.log("=" * 50)
+            self._auto_save()
 
             QMessageBox.information(
                 self, "QA Complete",
                 f"QA Complete!\n\nApproved: {approved_count}\nRejected: {rejected_count}"
             )
+
+    def undo_last_qa(self):
+        """Reset only the last QA session's approvals, delete its exported files, and revert statuses."""
+        if not hasattr(self, 'last_qa_decisions') or not self.last_qa_decisions:
+            QMessageBox.warning(self, "Nothing to Undo", "No recent QA decisions to undo.")
+            return
+
+        n_decisions = len(self.last_qa_decisions)
+        n_approved = sum(1 for d in self.last_qa_decisions if d['was_approved'])
+        n_rejected = n_decisions - n_approved
+
+        reply = QMessageBox.question(
+            self, "Undo Last QA",
+            f"This will undo the last QA session:\n\n"
+            f"  {n_approved} approved masks → reset to unreviewed\n"
+            f"  {n_rejected} rejected masks → reset to unreviewed\n"
+            f"  Exported mask files will be deleted\n\n"
+            f"Continue?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Delete exported mask TIFFs and reset approval states
+        deleted_count = 0
+        reset_count = 0
+        affected_images = set()
+
+        for decision in self.last_qa_decisions:
+            flat_data = decision['flat_data']
+            mask_data = flat_data['mask_data']
+            affected_images.add(flat_data['image_name'])
+
+            # Delete exported file if it was approved
+            if decision['was_approved'] and self.masks_dir and os.path.isdir(self.masks_dir):
+                img_basename = os.path.splitext(flat_data['image_name'])[0]
+                soma_id = mask_data['soma_id']
+                area_um2 = mask_data.get('area_um2', 0)
+                mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+                mask_path = os.path.join(self.masks_dir, mask_filename)
+                if os.path.exists(mask_path):
+                    os.remove(mask_path)
+                    deleted_count += 1
+
+            # Reset approval state
+            mask_data['approved'] = None
+            reset_count += 1
+
+        # Revert affected image statuses back to masks_generated
+        for img_name in affected_images:
+            if img_name in self.images:
+                img_data = self.images[img_name]
+                if img_data['status'] in ('qa_complete', 'analyzed'):
+                    img_data['status'] = 'masks_generated'
+                    self._update_file_list_item(img_name)
+
+        # Clear the undo history
+        self.last_qa_decisions = []
+
+        self.log("=" * 50)
+        self.log(f"↩ Last QA undone: {reset_count} masks reset, {deleted_count} exported files removed")
+        self.log("=" * 50)
+
+        # Jump QA back to the first mask that was just reset
+        # (don't call start_batch_qa which rebuilds everything from scratch)
+        if hasattr(self, 'all_masks_flat') and self.all_masks_flat:
+            # Find the first unreviewed mask (the ones we just reset)
+            for i, flat in enumerate(self.all_masks_flat):
+                if flat['mask_data'].get('approved') is None:
+                    self.mask_qa_idx = i
+                    break
+
+            self.mask_qa_active = True
+            self.approve_mask_btn.setEnabled(True)
+            self.reject_mask_btn.setEnabled(True)
+            self.prev_btn.setEnabled(True)
+            self.next_btn.setEnabled(True)
+            self.undo_qa_btn.setEnabled(False)
+            self.regen_masks_btn.setVisible(True)
+            self._show_current_mask()
+            self.tabs.setCurrentIndex(3)
+        else:
+            self.mask_qa_active = False
+            self.start_batch_qa()
 
     def batch_calculate_morphology(self):
         try:
@@ -4589,11 +6520,23 @@ class MicrogliaAnalysisGUI(QMainWindow):
             # No ImageJ required for simple characteristics
             # Complex analysis (Sholl, Skeleton) will be done separately in ImageJ
 
+            self.log(f"all_masks_flat has {len(self.all_masks_flat)} entries")
             approved_masks = [flat for flat in self.all_masks_flat if flat['mask_data']['approved']]
             total = len(approved_masks)
 
             if total == 0:
-                QMessageBox.warning(self, "Warning", "No approved masks to analyze")
+                self.log(f"DEBUG: all_masks_flat count = {len(self.all_masks_flat)}")
+                for i, flat in enumerate(self.all_masks_flat[:5]):
+                    self.log(f"  mask {i}: approved={flat['mask_data'].get('approved')}, "
+                             f"soma_id={flat['mask_data'].get('soma_id')}, "
+                             f"area={flat['mask_data'].get('area_um2')}")
+                # Also check images directly
+                for iname, idata in self.images.items():
+                    self.log(f"  image '{iname}': status={idata['status']}, "
+                             f"selected={idata['selected']}, masks={len(idata['masks'])}")
+                QMessageBox.warning(self, "Warning", "No approved masks to analyze.\n\n"
+                    f"Check the log for details.\n"
+                    f"all_masks_flat: {len(self.all_masks_flat)} entries")
                 return
 
             self.log("=" * 50)
@@ -4691,6 +6634,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("  2. Run imagej_batch_analysis.ijm macro")
         self.log("  3. Select the masks folder when prompted")
         self.log("=" * 50)
+        self._auto_save()
 
         # Build success message
         success_msg = f"Simple characteristics calculated for {len(all_results)} cells!\n\n"
@@ -4938,7 +6882,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             writer.writerow(['mask_filename', 'soma_filename', 'image_name', 'soma_id', 'soma_idx',
                              'soma_x', 'soma_y', 'soma_area_um2', 'cell_area_um2',
                              'pixel_size_um', 'perimeter', 'eccentricity', 'roundness',
-                             'cell_spread', 'animal_id', 'treatment'])
+                             'cell_spread', 'polarity_index', 'principal_angle',
+                             'major_axis_um', 'minor_axis_um', 'animal_id', 'treatment'])
 
             for result in results:
                 img_name = result['image_name']
@@ -4966,11 +6911,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     f"{soma_y:.2f}",
                     result.get('soma_area', 0),
                     result.get('area_um2', 0),
-                    result.get('mask_area', 0),  # This should be in the results
+                    result.get('mask_area', 0),
                     result.get('perimeter', 0),
                     result.get('eccentricity', 0),
                     result.get('roundness', 0),
                     result.get('cell_spread', 0),
+                    result.get('polarity_index', 0),
+                    result.get('principal_angle', 0),
+                    result.get('major_axis_um', 0),
+                    result.get('minor_axis_um', 0),
                     result.get('animal_id', ''),
                     result.get('treatment', '')
                 ])
