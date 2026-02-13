@@ -6441,26 +6441,13 @@ Step 3: Import Results Back
         # Clear the undo history
         self.last_qa_decisions = []
 
-        # Update button states
-        self.batch_qa_btn.setEnabled(True)
-        self.batch_calculate_btn.setEnabled(False)
-        self.undo_qa_btn.setEnabled(False)
-        self.mask_qa_active = False
-        self.approve_mask_btn.setEnabled(False)
-        self.reject_mask_btn.setEnabled(False)
-
         self.log("=" * 50)
         self.log(f"↩ Last QA undone: {reset_count} masks reset, {deleted_count} exported files removed")
-        self.log("You can now re-run QA All Masks.")
         self.log("=" * 50)
 
-        QMessageBox.information(
-            self, "QA Undone",
-            f"Last QA session has been reset.\n\n"
-            f"Masks reset: {reset_count}\n"
-            f"Exported files deleted: {deleted_count}\n\n"
-            f"You can now re-run QA."
-        )
+        # Restart QA automatically so user can redo those masks
+        self.mask_qa_active = False
+        self.start_batch_qa()
 
     def batch_calculate_morphology(self):
         try:
