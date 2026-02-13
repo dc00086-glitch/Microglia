@@ -6102,7 +6102,9 @@ Step 3: Import Results Back
             return
 
         self.mask_qa_active = True
-        self.last_qa_decisions = []
+        # Keep existing undo history so user can undo back across QA sessions
+        if not hasattr(self, 'last_qa_decisions'):
+            self.last_qa_decisions = []
 
         # Find first unreviewed mask to resume from
         reviewed_count = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
@@ -6118,7 +6120,7 @@ Step 3: Import Results Back
         self.prev_btn.setEnabled(True)
         self.next_btn.setEnabled(True)
         self.done_btn.setEnabled(False)
-        self.undo_qa_btn.setEnabled(True)
+        self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
         self.regen_masks_btn.setVisible(True)
 
         self._show_current_mask()
