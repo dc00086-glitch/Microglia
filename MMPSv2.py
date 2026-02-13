@@ -6491,9 +6491,27 @@ Step 3: Import Results Back
         self.log(f"↩ Last QA undone: {reset_count} masks reset, {deleted_count} exported files removed")
         self.log("=" * 50)
 
-        # Restart QA automatically so user can redo those masks
-        self.mask_qa_active = False
-        self.start_batch_qa()
+        # Jump QA back to the first mask that was just reset
+        # (don't call start_batch_qa which rebuilds everything from scratch)
+        if hasattr(self, 'all_masks_flat') and self.all_masks_flat:
+            # Find the first unreviewed mask (the ones we just reset)
+            for i, flat in enumerate(self.all_masks_flat):
+                if flat['mask_data'].get('approved') is None:
+                    self.mask_qa_idx = i
+                    break
+
+            self.mask_qa_active = True
+            self.approve_mask_btn.setEnabled(True)
+            self.reject_mask_btn.setEnabled(True)
+            self.prev_btn.setEnabled(True)
+            self.next_btn.setEnabled(True)
+            self.undo_qa_btn.setEnabled(False)
+            self.regen_masks_btn.setVisible(True)
+            self._show_current_mask()
+            self.tabs.setCurrentIndex(3)
+        else:
+            self.mask_qa_active = False
+            self.start_batch_qa()
 
     def batch_calculate_morphology(self):
         try:
