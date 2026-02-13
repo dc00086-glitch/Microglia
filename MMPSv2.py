@@ -1736,7 +1736,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.channel_brightness = {'R': 0, 'G': 0, 'B': 0}
         # Mask generation settings (defaults)
         self.use_min_intensity = True
-        self.min_intensity_percent = 30
+        self.min_intensity_percent = 5
         self.mask_min_area = 200
         self.mask_max_area = 800
         self.mask_step_size = 100
@@ -2805,7 +2805,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.masks_dir = session.get('masks_dir')
             self.colocalization_mode = session.get('colocalization_mode', False)
             self.use_min_intensity = session.get('use_min_intensity', True)
-            self.min_intensity_percent = session.get('min_intensity_percent', 30)
+            self.min_intensity_percent = session.get('min_intensity_percent', 5)
             self.mask_min_area = session.get('mask_min_area', 200)
             self.mask_max_area = session.get('mask_max_area', 800)
             self.mask_step_size = session.get('mask_step_size', 100)
@@ -5626,9 +5626,9 @@ Step 3: Import Results Back
         help_text = QLabel(
             "💡 Tip:\n"
             "• 0% = No minimum (include all pixels)\n"
-            "• 30% = Default (good for most images)\n"
-            "• 50% = Strict (exclude dimmer pixels)\n"
-            "• 70%+ = Very strict (only bright pixels)"
+            "• 5% = Default (exclude background)\n"
+            "• 30% = Moderate (exclude dimmer pixels)\n"
+            "• 50%+ = Strict (only bright pixels)"
         )
         help_text.setStyleSheet("padding: 10px; border-radius: 5px; border: 1px solid palette(mid);")
         help_text.setWordWrap(True)
@@ -5991,24 +5991,11 @@ Step 3: Import Results Back
         cx_roi = max(0, min(w - 1, cx_roi))
 
         # Compute intensity floor from user settings
-        # Use the mean intensity of the soma region (not ROI max, which can be
-        # skewed by hot pixels or neighboring bright cells)
         intensity_floor = 0.0
         if self.use_min_intensity and self.min_intensity_percent > 0:
-            if soma_outline_mask is not None:
-                outline_roi = soma_outline_mask[y_min:y_max, x_min:x_max]
-                soma_pixels = roi[outline_roi > 0]
-                if len(soma_pixels) > 0:
-                    soma_mean = float(np.mean(soma_pixels))
-                    intensity_floor = soma_mean * (self.min_intensity_percent / 100.0)
-            if intensity_floor == 0.0:
-                # Fallback: use intensity at centroid
-                centroid_val = roi[cy_roi, cx_roi]
-                if centroid_val > 0:
-                    intensity_floor = centroid_val * (self.min_intensity_percent / 100.0)
-
-        if intensity_floor > 0:
-            print(f"  {soma_id}: intensity floor={intensity_floor:.1f} ({self.min_intensity_percent}% of soma mean)")
+            roi_max = roi.max()
+            if roi_max > 0:
+                intensity_floor = roi_max * (self.min_intensity_percent / 100.0)
 
         # Priority region growing: grow from soma outline, brightest neighbor first
         # Use a max-heap (negate intensity for min-heap)
