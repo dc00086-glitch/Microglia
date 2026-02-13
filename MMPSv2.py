@@ -6055,9 +6055,11 @@ Step 3: Import Results Back
 
         # Build masks for each target area from the growth order
         # Largest first (matches QA presentation order)
+        # Every mask always includes the full soma at minimum
         for target_area_um2 in sorted_areas:
             target_px = int(target_area_um2 / (pixel_size_um ** 2))
-            n_pixels = min(target_px, len(growth_order))
+            n_pixels = max(target_px, soma_seed_count)
+            n_pixels = min(n_pixels, len(growth_order))
 
             mask_roi = np.zeros((h, w), dtype=np.uint8)
             for r, c in growth_order[:n_pixels]:
