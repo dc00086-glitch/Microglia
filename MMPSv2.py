@@ -1737,7 +1737,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Mask generation settings (defaults)
         self.use_min_intensity = True
         self.min_intensity_percent = 5
-        self.mask_min_area = 200
+        self.mask_min_area = 100
         self.mask_max_area = 800
         self.mask_step_size = 100
         self.use_imagej = False
@@ -2806,7 +2806,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.colocalization_mode = session.get('colocalization_mode', False)
             self.use_min_intensity = session.get('use_min_intensity', True)
             self.min_intensity_percent = session.get('min_intensity_percent', 5)
-            self.mask_min_area = session.get('mask_min_area', 200)
+            self.mask_min_area = session.get('mask_min_area', 100)
             self.mask_max_area = session.get('mask_max_area', 800)
             self.mask_step_size = session.get('mask_step_size', 100)
             self.coloc_channel_1 = session.get('coloc_channel_1', 0)
