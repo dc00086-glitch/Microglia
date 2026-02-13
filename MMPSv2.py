@@ -6001,6 +6001,7 @@ Step 3: Import Results Back
         # Use a max-heap (negate intensity for min-heap)
         visited = np.zeros((h, w), dtype=bool)
         growth_order = []  # list of (row, col) in the order pixels were added
+        growth_intensity = []  # intensity of each pixel in growth order
 
         heap = []
 
@@ -6013,6 +6014,7 @@ Step 3: Import Results Back
                 if not visited[sr, sc]:
                     visited[sr, sc] = True
                     growth_order.append((sr, sc))
+                    growth_intensity.append(roi[sr, sc])
                     soma_seed_count += 1
             # Push boundary neighbors of the soma into the heap
             for sr, sc in zip(soma_ys, soma_xs):
@@ -6027,21 +6029,21 @@ Step 3: Import Results Back
         if soma_seed_count == 0:
             visited[cy_roi, cx_roi] = True
             growth_order.append((cy_roi, cx_roi))
+            growth_intensity.append(roi[cy_roi, cx_roi])
             soma_seed_count = 1
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nr, nc = cy_roi + dr, cx_roi + dc
+                nr, nc = cy_roi + dr, cy_roi + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
                     if roi[nr, nc] >= intensity_floor:
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
         # Grow outward from the soma boundary up to largest target
-        # The soma pixels are already in growth_order, so the budget
-        # for each mask size = target_px total (soma + grown pixels)
         while heap and len(growth_order) < largest_target_px:
             neg_intensity, r, c = heapq.heappop(heap)
 
             growth_order.append((r, c))
+            growth_intensity.append(-neg_intensity)
 
             # Add 4-connected neighbors to the heap
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
@@ -6051,14 +6053,42 @@ Step 3: Import Results Back
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
-        print(f"  {soma_id}: soma={soma_seed_count}px, grew to {len(growth_order)}px (target: {largest_target_px})")
+        natural_limit_um2 = natural_limit * (pixel_size_um ** 2)
+        print(f"  {soma_id}: soma={soma_seed_count}px, grew to {len(growth_order)}px, "
+              f"natural limit={natural_limit}px ({natural_limit_um2:.0f} µm²)")
+
+        # Compute the natural growth limit for each target area.
+        # Like the reference ImageJ plugin, the mask should not be forced
+        # to reach the target — it should stop where intensity stabilises.
+        # We detect this by looking for where the rolling-average intensity
+        # of newly-added pixels drops below the Otsu threshold of the ROI,
+        # meaning growth has left the cell body into background.
+        otsu_thresh, _ = cv2.threshold(roi.astype(np.uint8), 0, 255,
+                                        cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Natural limit: first index past soma where rolling intensity
+        # (window=50px) drops below the Otsu threshold
+        window = 50
+        natural_limit = len(growth_order)  # default: use everything
+        if len(growth_intensity) > soma_seed_count + window:
+            intensities = np.array(growth_intensity[soma_seed_count:])
+            # Cumulative sum for efficient rolling average
+            cumsum = np.cumsum(intensities)
+            rolling = np.empty(len(intensities))
+            rolling[:window] = cumsum[:window] / np.arange(1, window + 1)
+            rolling[window:] = (cumsum[window:] - cumsum[:-window]) / window
+            # Find where rolling average drops below Otsu
+            below = np.where(rolling < otsu_thresh)[0]
+            if len(below) > 0:
+                natural_limit = soma_seed_count + int(below[0])
 
         # Build masks for each target area from the growth order
         # Largest first (matches QA presentation order)
         # Every mask always includes the full soma at minimum
+        # Target area is a goal/ceiling — mask stops at natural limit if smaller
         for target_area_um2 in sorted_areas:
             target_px = int(target_area_um2 / (pixel_size_um ** 2))
-            n_pixels = max(target_px, soma_seed_count)
+            n_pixels = min(target_px, natural_limit)
+            n_pixels = max(n_pixels, soma_seed_count)  # always include full soma
             n_pixels = min(n_pixels, len(growth_order))
 
             mask_roi = np.zeros((h, w), dtype=np.uint8)
