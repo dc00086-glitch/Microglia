@@ -6430,73 +6430,44 @@ Step 3: Import Results Back
             )
 
     def undo_last_qa(self):
-        """Reset only the last QA session's approvals, delete its exported files, and revert statuses."""
+        """Undo the single most recent QA decision and jump back to that mask."""
         if not hasattr(self, 'last_qa_decisions') or not self.last_qa_decisions:
             QMessageBox.warning(self, "Nothing to Undo", "No recent QA decisions to undo.")
             return
 
-        n_decisions = len(self.last_qa_decisions)
-        n_approved = sum(1 for d in self.last_qa_decisions if d['was_approved'])
-        n_rejected = n_decisions - n_approved
+        # Pop the last decision
+        decision = self.last_qa_decisions.pop()
+        flat_data = decision['flat_data']
+        mask_data = flat_data['mask_data']
+        img_name = flat_data['image_name']
 
-        reply = QMessageBox.question(
-            self, "Undo Last QA",
-            f"This will undo the last QA session:\n\n"
-            f"  {n_approved} approved masks → reset to unreviewed\n"
-            f"  {n_rejected} rejected masks → reset to unreviewed\n"
-            f"  Exported mask files will be deleted\n\n"
-            f"Continue?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            return
+        # Delete exported file if it was approved
+        if decision['was_approved'] and self.masks_dir and os.path.isdir(self.masks_dir):
+            img_basename = os.path.splitext(img_name)[0]
+            soma_id = mask_data['soma_id']
+            area_um2 = mask_data.get('area_um2', 0)
+            mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+            mask_path = os.path.join(self.masks_dir, mask_filename)
+            if os.path.exists(mask_path):
+                os.remove(mask_path)
 
-        # Delete exported mask TIFFs and reset approval states
-        deleted_count = 0
-        reset_count = 0
-        affected_images = set()
+        # Reset approval state
+        was = "approved" if decision['was_approved'] else "rejected"
+        mask_data['approved'] = None
 
-        for decision in self.last_qa_decisions:
-            flat_data = decision['flat_data']
-            mask_data = flat_data['mask_data']
-            affected_images.add(flat_data['image_name'])
+        # Revert image status if needed
+        if img_name in self.images:
+            img_data = self.images[img_name]
+            if img_data['status'] in ('qa_complete', 'analyzed'):
+                img_data['status'] = 'masks_generated'
+                self._update_file_list_item(img_name)
 
-            # Delete exported file if it was approved
-            if decision['was_approved'] and self.masks_dir and os.path.isdir(self.masks_dir):
-                img_basename = os.path.splitext(flat_data['image_name'])[0]
-                soma_id = mask_data['soma_id']
-                area_um2 = mask_data.get('area_um2', 0)
-                mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
-                mask_path = os.path.join(self.masks_dir, mask_filename)
-                if os.path.exists(mask_path):
-                    os.remove(mask_path)
-                    deleted_count += 1
+        self.log(f"↩ Undid {was}: {mask_data['soma_id']} ({mask_data['area_um2']} µm²)")
 
-            # Reset approval state
-            mask_data['approved'] = None
-            reset_count += 1
-
-        # Revert affected image statuses back to masks_generated
-        for img_name in affected_images:
-            if img_name in self.images:
-                img_data = self.images[img_name]
-                if img_data['status'] in ('qa_complete', 'analyzed'):
-                    img_data['status'] = 'masks_generated'
-                    self._update_file_list_item(img_name)
-
-        # Clear the undo history
-        self.last_qa_decisions = []
-
-        self.log("=" * 50)
-        self.log(f"↩ Last QA undone: {reset_count} masks reset, {deleted_count} exported files removed")
-        self.log("=" * 50)
-
-        # Jump QA back to the first mask that was just reset
-        # (don't call start_batch_qa which rebuilds everything from scratch)
+        # Jump QA back to that mask
         if hasattr(self, 'all_masks_flat') and self.all_masks_flat:
-            # Find the first unreviewed mask (the ones we just reset)
             for i, flat in enumerate(self.all_masks_flat):
-                if flat['mask_data'].get('approved') is None:
+                if flat is flat_data:
                     self.mask_qa_idx = i
                     break
 
@@ -6505,13 +6476,10 @@ Step 3: Import Results Back
             self.reject_mask_btn.setEnabled(True)
             self.prev_btn.setEnabled(True)
             self.next_btn.setEnabled(True)
-            self.undo_qa_btn.setEnabled(False)
+            self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
             self.regen_masks_btn.setVisible(True)
             self._show_current_mask()
             self.tabs.setCurrentIndex(3)
-        else:
-            self.mask_qa_active = False
-            self.start_batch_qa()
 
     def batch_calculate_morphology(self):
         try:
