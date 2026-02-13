@@ -5691,14 +5691,16 @@ Step 3: Import Results Back
                     centroid = soma_data['centroid']
                     soma_idx = soma_data['soma_idx']
                     soma_id = soma_data['soma_id']
-                    soma_area_um2 = soma_data.get('soma_area_um2', 0)  # Get soma area from outline
+                    soma_area_um2 = soma_data.get('soma_area_um2', 0)
+                    soma_outline = soma_data.get('outline')
 
                     self.progress_status_label.setText(f"Generating masks: {current_count + 1}/{total_outlines}")
                     QApplication.processEvents()
 
                     masks = self._create_annulus_masks(
                         centroid, area_list, pixel_size, soma_idx, soma_id,
-                        img_data['processed'], img_name, soma_area_um2  # Pass soma area
+                        img_data['processed'], img_name, soma_area_um2,
+                        soma_outline_mask=soma_outline
                     )
                     img_data['masks'].extend(masks)
 
@@ -5910,10 +5912,12 @@ Step 3: Import Results Back
             soma_idx = soma_data['soma_idx']
             soma_id = soma_data['soma_id']
             soma_area_um2 = soma_data.get('soma_area_um2', 0)
+            soma_outline = soma_data.get('outline')
 
             masks = self._create_annulus_masks(
                 centroid, area_list, pixel_size, soma_idx, soma_id,
-                img_data['processed'], img_name, soma_area_um2
+                img_data['processed'], img_name, soma_area_um2,
+                soma_outline_mask=soma_outline
             )
             img_data['masks'].extend(masks)
 
@@ -5951,12 +5955,13 @@ Step 3: Import Results Back
                 f"Regenerated {total} masks for {os.path.splitext(img_name)[0]}.\n\nReady for QA.")
 
     def _create_annulus_masks(self, centroid, area_list_um2, pixel_size_um, soma_idx, soma_id, processed_img, img_name,
-                              soma_area_um2):
-        """Create nested cell masks using priority region growing from the centroid.
+                              soma_area_um2, soma_outline_mask=None):
+        """Create nested cell masks using priority region growing from the soma outline.
 
-        Grows outward from the soma centroid, always adding the brightest
-        neighboring pixel next. Each smaller mask is automatically a strict
-        subset of the larger one because they share the same growth order.
+        Seeds the growth with the entire soma outline so the soma pixels are
+        "free" and the mask pixel budget goes toward territory beyond the soma.
+        Grows outward from the soma boundary, always adding the brightest
+        neighboring pixel next.  Respects the minimum intensity floor setting.
         """
         import heapq
 
@@ -5985,17 +5990,54 @@ Step 3: Import Results Back
         cy_roi = max(0, min(h - 1, cy_roi))
         cx_roi = max(0, min(w - 1, cx_roi))
 
-        # Priority region growing: grow from centroid, brightest neighbor first
+        # Compute intensity floor from user settings
+        intensity_floor = 0.0
+        if self.use_min_intensity and self.min_intensity_percent > 0:
+            roi_max = roi.max()
+            if roi_max > 0:
+                intensity_floor = roi_max * (self.min_intensity_percent / 100.0)
+
+        # Priority region growing: grow from soma outline, brightest neighbor first
         # Use a max-heap (negate intensity for min-heap)
-        # The heap ordering ensures bright cell pixels are added first,
-        # so smaller masks = bright core, larger masks extend outward naturally.
         visited = np.zeros((h, w), dtype=bool)
         growth_order = []  # list of (row, col) in the order pixels were added
 
-        # Seed with the centroid
-        heap = [(-roi[cy_roi, cx_roi], cy_roi, cx_roi)]
-        visited[cy_roi, cx_roi] = True
+        heap = []
 
+        # Seed with all soma outline pixels (they are "free" — part of every mask)
+        soma_seed_count = 0
+        if soma_outline_mask is not None:
+            outline_roi = soma_outline_mask[y_min:y_max, x_min:x_max]
+            soma_ys, soma_xs = np.where(outline_roi > 0)
+            for sr, sc in zip(soma_ys, soma_xs):
+                if not visited[sr, sc]:
+                    visited[sr, sc] = True
+                    growth_order.append((sr, sc))
+                    soma_seed_count += 1
+            # Push boundary neighbors of the soma into the heap
+            for sr, sc in zip(soma_ys, soma_xs):
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = sr + dr, sc + dc
+                    if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                        if roi[nr, nc] >= intensity_floor:
+                            visited[nr, nc] = True
+                            heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+
+        # Fallback: if no soma outline available, seed with centroid
+        if soma_seed_count == 0:
+            visited[cy_roi, cx_roi] = True
+            growth_order.append((cy_roi, cx_roi))
+            soma_seed_count = 1
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = cy_roi + dr, cx_roi + dc
+                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                    if roi[nr, nc] >= intensity_floor:
+                        visited[nr, nc] = True
+                        heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+
+        # Grow outward from the soma boundary up to largest target
+        # The soma pixels are already in growth_order, so the budget
+        # for each mask size = target_px total (soma + grown pixels)
         while heap and len(growth_order) < largest_target_px:
             neg_intensity, r, c = heapq.heappop(heap)
 
@@ -6005,10 +6047,11 @@ Step 3: Import Results Back
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    visited[nr, nc] = True
-                    heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+                    if roi[nr, nc] >= intensity_floor:
+                        visited[nr, nc] = True
+                        heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
-        print(f"  {soma_id}: grew {len(growth_order)} pixels (target largest: {largest_target_px})")
+        print(f"  {soma_id}: soma={soma_seed_count}px, grew to {len(growth_order)}px (target: {largest_target_px})")
 
         # Build masks for each target area from the growth order
         # Largest first (matches QA presentation order)
