@@ -5560,7 +5560,7 @@ Step 3: Import Results Back
 
         size_grid.addWidget(QLabel("Min:"))
         min_area_spin = QSpinBox()
-        min_area_spin.setRange(100, 2000)
+        min_area_spin.setRange(10, 2000)
         min_area_spin.setSingleStep(50)
         min_area_spin.setValue(self.mask_min_area)
         min_area_spin.setSuffix(" µm²")
@@ -5785,7 +5785,7 @@ Step 3: Import Results Back
         size_grid = QHBoxLayout()
         size_grid.addWidget(QLabel("Min:"))
         min_area_spin = QSpinBox()
-        min_area_spin.setRange(100, 2000)
+        min_area_spin.setRange(10, 2000)
         min_area_spin.setSingleStep(50)
         min_area_spin.setValue(self.mask_min_area)
         min_area_spin.setSuffix(" µm²")
