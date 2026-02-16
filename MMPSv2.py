@@ -6069,19 +6069,13 @@ Step 3: Import Results Back
         # Every mask always includes the full soma at minimum
         # Target area is a ceiling — if intensity floor stopped growth early,
         # min(target_px, len(growth_order)) naturally caps the mask smaller
+        # If target < soma area, substitute the soma mask for that size
         soma_area_px = soma_seed_count
-        last_n_pixels = -1  # track to skip duplicate masks
         for target_area_um2 in sorted_areas:
             target_px = int(target_area_um2 / (pixel_size_um ** 2))
             n_pixels = min(target_px, len(growth_order))
             n_pixels = max(n_pixels, soma_area_px)  # always include full soma
             n_pixels = min(n_pixels, len(growth_order))
-
-            # Skip if this produces the same mask as the previous (larger) target
-            # (happens when target < soma area)
-            if n_pixels == last_n_pixels:
-                continue
-            last_n_pixels = n_pixels
 
             mask_roi = np.zeros((h, w), dtype=np.uint8)
             for r, c in growth_order[:n_pixels]:
