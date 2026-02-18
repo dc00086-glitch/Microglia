@@ -3214,6 +3214,17 @@ Output goes to: {output_path}
 Pixel size: {pixel_size} um/pixel
 Upscale factor: {scale_factor}x
 
+RECOMMENDED: Combined Script (runs all analyses at once)
+---------------------------------------------------------
+1. Open Fiji/ImageJ
+2. File > Open > select "CombinedAnalysis_ImageJ.py" from your Microglia folder
+3. Click "Run" in the script editor
+4. Set your MMPS Output Folder and parameters in the dialog
+5. Check which analyses to run (Skeleton, Sholl, Fractal)
+6. Return to MMPS and click "Import ImageJ Results"
+
+OR run individual scripts:
+
 Step 1: Sholl Analysis
 -----------------------
 1. Open Fiji/ImageJ
@@ -3264,16 +3275,22 @@ Step 3: Import Results Back
         self.log(f"  Instructions: {instructions_path}")
         self.log(f"  Parameters: {params_path}")
         self.log("")
-        self.log("To run analysis:")
+        self.log("To run analysis (RECOMMENDED - combined script):")
         self.log("  1. Open Fiji/ImageJ")
-        self.log(f"  2. Open Sholl_Attempt3.py and run with masks dir: {masks_path}")
-        self.log(f"  3. Open SkeletonAnalysisImageJ.py and run with masks dir: {masks_path}")
+        self.log("  2. Open CombinedAnalysis_ImageJ.py and click Run")
+        self.log(f"  3. Set MMPS Output Folder to: {output_path}")
         self.log("  4. Return here and click 'Import ImageJ Results'")
+        self.log("")
+        self.log("Or run individual scripts:")
+        self.log(f"  - Sholl_Attempt3.py (Sholl analysis)")
+        self.log(f"  - SkeletonAnalysisImageJ.py (Skeleton analysis)")
         self.log("=" * 50)
 
         QMessageBox.information(self, "ImageJ Scripts Generated",
             f"Analysis files saved to:\n{script_dir}\n\n"
-            f"See ImageJ_Analysis_Instructions.txt for step-by-step guide.\n\n"
+            f"RECOMMENDED: Run CombinedAnalysis_ImageJ.py in Fiji\n"
+            f"(runs Skeleton + Sholl + Fractal in one step)\n\n"
+            f"See ImageJ_Analysis_Instructions.txt for full guide.\n\n"
             f"Directories pre-configured:\n"
             f"  Masks: {masks_path}\n"
             f"  Somas: {somas_path}\n"
@@ -3293,33 +3310,77 @@ Step 3: Import Results Back
 
         import csv
 
-        # Look for ImageJ output files
-        sholl_path = os.path.join(self.output_dir, "Sholl_Combined_Results.csv")
-        skeleton_path = os.path.join(self.output_dir, "Skeleton_Analysis_Results.csv")
+        # Look for ImageJ output files (check combined script output first, then individual)
+        combined_results_dir = os.path.join(self.output_dir, "combined_imagej_results")
+
+        # Combined script output
+        combined_analysis_path = os.path.join(combined_results_dir, "Combined_Analysis_Results.csv")
+
+        # Sholl: check combined dir, then sholl_results dir, then root output dir
+        sholl_path = None
+        for candidate in [
+            os.path.join(combined_results_dir, "Sholl_All_Results.csv"),
+            os.path.join(self.output_dir, "sholl_results", "Sholl_All_Results.csv"),
+            os.path.join(self.output_dir, "Sholl_Combined_Results.csv"),
+            os.path.join(self.output_dir, "Sholl_All_Results.csv"),
+        ]:
+            if os.path.exists(candidate):
+                sholl_path = candidate
+                break
+
+        # Skeleton: check combined dir, then root output dir
+        skeleton_path = None
+        for candidate in [
+            os.path.join(combined_results_dir, "Skeleton_Analysis_Results.csv"),
+            os.path.join(self.output_dir, "Skeleton_Analysis_Results.csv"),
+        ]:
+            if os.path.exists(candidate):
+                skeleton_path = candidate
+                break
+
+        # Fractal: check combined dir
+        fractal_path = None
+        for candidate in [
+            os.path.join(combined_results_dir, "Fractal_Analysis_Results.csv"),
+            os.path.join(self.output_dir, "Fractal_Analysis_Results.csv"),
+        ]:
+            if os.path.exists(candidate):
+                fractal_path = candidate
+                break
+
         morphology_path = os.path.join(self.output_dir, "combined_morphology_results.csv")
 
         # Allow user to locate files if not found in expected location
-        found_sholl = os.path.exists(sholl_path)
-        found_skeleton = os.path.exists(skeleton_path)
+        found_combined = os.path.exists(combined_analysis_path)
+        found_sholl = sholl_path is not None and os.path.exists(sholl_path)
+        found_skeleton = skeleton_path is not None and os.path.exists(skeleton_path)
+        found_fractal = fractal_path is not None and os.path.exists(fractal_path)
         found_morphology = os.path.exists(morphology_path)
 
-        if not found_sholl and not found_skeleton:
+        if not found_combined and not found_sholl and not found_skeleton and not found_fractal:
             reply = QMessageBox.question(
                 self, "Files Not Found",
-                "No Sholl or Skeleton results found in the output folder.\n\n"
+                "No ImageJ analysis results found in the output folder.\n\n"
                 "Would you like to browse for them?",
                 QMessageBox.Yes | QMessageBox.No
             )
             if reply != QMessageBox.Yes:
                 return
 
-            # Browse for Sholl results
-            sholl_path, _ = QFileDialog.getOpenFileName(
-                self, "Select Sholl Results CSV (or Cancel to skip)", self.output_dir,
+            # Browse for combined or individual results
+            browse_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Combined or Sholl Results CSV (or Cancel to skip)", self.output_dir,
                 "CSV Files (*.csv);;All Files (*)",
                 options=QFileDialog.DontUseNativeDialog
             )
-            found_sholl = bool(sholl_path) and os.path.exists(sholl_path)
+            if browse_path and os.path.exists(browse_path):
+                basename = os.path.basename(browse_path).lower()
+                if 'combined_analysis' in basename:
+                    combined_analysis_path = browse_path
+                    found_combined = True
+                else:
+                    sholl_path = browse_path
+                    found_sholl = True
 
             # Browse for Skeleton results
             skeleton_path, _ = QFileDialog.getOpenFileName(
@@ -3329,41 +3390,108 @@ Step 3: Import Results Back
             )
             found_skeleton = bool(skeleton_path) and os.path.exists(skeleton_path)
 
-        if not found_sholl and not found_skeleton:
+        if not found_combined and not found_sholl and not found_skeleton and not found_fractal:
             QMessageBox.information(self, "No Files", "No ImageJ results to import.")
             return
 
         self.log("=" * 50)
         self.log("Importing ImageJ results...")
 
-        # Read Sholl results
+        # If combined results file exists, use it directly (already has prefixed columns)
         sholl_data = {}
-        if found_sholl:
+        skeleton_data = {}
+        fractal_data = {}
+
+        if found_combined:
+            try:
+                with open(combined_analysis_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        cell_name = row.get('cell_name', '')
+                        if not cell_name:
+                            continue
+                        # Columns from combined script are already prefixed (sholl_, skel_, fractal_)
+                        ij_row = {}
+                        for k, v in row.items():
+                            if k in ('cell_name', 'image_name', 'soma_id', 'mask_file', 'mask_area_um2'):
+                                continue
+                            ij_row[k] = v
+                        # Split into categories for the merge logic
+                        sholl_part = {k: v for k, v in ij_row.items() if k.startswith('sholl_')}
+                        skel_part = {k: v for k, v in ij_row.items() if k.startswith('skel_')}
+                        frac_part = {k: v for k, v in ij_row.items() if k.startswith('fractal_')}
+                        if sholl_part:
+                            sholl_data[cell_name] = sholl_part
+                        if skel_part:
+                            skeleton_data[cell_name] = skel_part
+                        if frac_part:
+                            fractal_data[cell_name] = frac_part
+                total = len(sholl_data) + len(skeleton_data) + len(fractal_data)
+                self.log(f"  Combined: loaded from {os.path.basename(combined_analysis_path)}")
+                if sholl_data:
+                    self.log(f"    Sholl: {len(sholl_data)} cells")
+                if skeleton_data:
+                    self.log(f"    Skeleton: {len(skeleton_data)} cells")
+                if fractal_data:
+                    self.log(f"    Fractal: {len(fractal_data)} cells")
+            except Exception as e:
+                self.log(f"  ERROR reading combined results: {e}")
+
+        # Also read individual files (supplements or overrides combined data)
+        if found_sholl and not sholl_data:
             try:
                 with open(sholl_path, 'r') as f:
                     reader = csv.DictReader(f)
                     for row in reader:
-                        # Match by cell_name which corresponds to mask filename pattern
                         cell_name = row.get('Cell', row.get('cell_name', ''))
                         if cell_name:
-                            sholl_data[cell_name] = {f"sholl_{k}": v for k, v in row.items() if k != 'Cell' and k != 'cell_name'}
+                            # Add sholl_ prefix if not already present
+                            data = {}
+                            for k, v in row.items():
+                                if k in ('Cell', 'cell_name', 'image_name', 'soma_id', 'mask_file', 'mask_area_um2'):
+                                    continue
+                                key = k if k.startswith('sholl_') else f"sholl_{k}"
+                                data[key] = v
+                            sholl_data[cell_name] = data
                 self.log(f"  Sholl: loaded {len(sholl_data)} cells from {os.path.basename(sholl_path)}")
             except Exception as e:
                 self.log(f"  ERROR reading Sholl results: {e}")
 
-        # Read Skeleton results
-        skeleton_data = {}
-        if found_skeleton:
+        if found_skeleton and not skeleton_data:
             try:
                 with open(skeleton_path, 'r') as f:
                     reader = csv.DictReader(f)
                     for row in reader:
                         cell_name = row.get('cell_name', '')
                         if cell_name:
-                            skeleton_data[cell_name] = {f"skel_{k}": v for k, v in row.items() if k != 'cell_name'}
+                            data = {}
+                            for k, v in row.items():
+                                if k in ('cell_name', 'image_name', 'soma_id', 'mask_file', 'mask_area_um2'):
+                                    continue
+                                key = k if k.startswith('skel_') else f"skel_{k}"
+                                data[key] = v
+                            skeleton_data[cell_name] = data
                 self.log(f"  Skeleton: loaded {len(skeleton_data)} cells from {os.path.basename(skeleton_path)}")
             except Exception as e:
                 self.log(f"  ERROR reading Skeleton results: {e}")
+
+        if found_fractal and not fractal_data:
+            try:
+                with open(fractal_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        cell_name = row.get('cell_name', '')
+                        if cell_name:
+                            data = {}
+                            for k, v in row.items():
+                                if k in ('cell_name', 'image_name', 'soma_id', 'mask_file', 'mask_area_um2'):
+                                    continue
+                                key = k if k.startswith('fractal_') else f"fractal_{k}"
+                                data[key] = v
+                            fractal_data[cell_name] = data
+                self.log(f"  Fractal: loaded {len(fractal_data)} cells from {os.path.basename(fractal_path)}")
+            except Exception as e:
+                self.log(f"  ERROR reading Fractal results: {e}")
 
         # Read existing morphology results
         morphology_rows = []
@@ -3386,6 +3514,8 @@ Step 3: Import Results Back
                 all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(data)
             for cell_name, data in skeleton_data.items():
                 all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(data)
+            for cell_name, data in fractal_data.items():
+                all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(data)
 
             if all_ij_data:
                 combined_ij_path = os.path.join(self.output_dir, "imagej_combined_results.csv")
@@ -3402,13 +3532,17 @@ Step 3: Import Results Back
             # Merge with morphology results
             matched_sholl = 0
             matched_skel = 0
+            matched_fractal = 0
 
             new_sholl_keys = set()
             new_skel_keys = set()
+            new_fractal_keys = set()
             for d in sholl_data.values():
                 new_sholl_keys.update(d.keys())
             for d in skeleton_data.values():
                 new_skel_keys.update(d.keys())
+            for d in fractal_data.values():
+                new_fractal_keys.update(d.keys())
 
             for row in morphology_rows:
                 img_name = row.get('image_name', '')
@@ -3430,8 +3564,15 @@ Step 3: Import Results Back
                         matched_skel += 1
                         break
 
+                # Try to match Fractal data
+                for key in [cell_key] + [k for k in fractal_data.keys() if cell_key and cell_key in k]:
+                    if key in fractal_data:
+                        row.update(fractal_data[key])
+                        matched_fractal += 1
+                        break
+
             # Write merged results
-            all_keys = morph_fieldnames + sorted(new_sholl_keys) + sorted(new_skel_keys)
+            all_keys = morph_fieldnames + sorted(new_sholl_keys) + sorted(new_skel_keys) + sorted(new_fractal_keys)
             # Remove duplicates while preserving order
             seen = set()
             ordered_keys = []
@@ -3448,15 +3589,18 @@ Step 3: Import Results Back
 
             self.log(f"  Matched Sholl data: {matched_sholl}/{len(morphology_rows)} cells")
             self.log(f"  Matched Skeleton data: {matched_skel}/{len(morphology_rows)} cells")
+            self.log(f"  Matched Fractal data: {matched_fractal}/{len(morphology_rows)} cells")
             self.log(f"  Merged results saved to: {merged_path}")
 
         self.log("=" * 50)
 
         summary = "ImageJ Results Import Complete\n\n"
-        if found_sholl:
+        if sholl_data:
             summary += f"Sholl: {len(sholl_data)} cells\n"
-        if found_skeleton:
+        if skeleton_data:
             summary += f"Skeleton: {len(skeleton_data)} cells\n"
+        if fractal_data:
+            summary += f"Fractal: {len(fractal_data)} cells\n"
         if morphology_rows:
             summary += f"\nMerged with {len(morphology_rows)} morphology results\n"
             summary += f"Output: combined_all_results.csv"
