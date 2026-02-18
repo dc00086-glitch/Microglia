@@ -1728,6 +1728,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_qa_idx = 0
         self.mask_qa_active = False
         self.last_qa_decisions = []
+        # Sliding window for mask QA memory management:
+        # Only keep masks for current + last 10 somas in memory.
+        self._qa_soma_order = []        # ordered list of (img_name, soma_id) as encountered
+        self._qa_finalized_somas = set()  # somas evicted from memory
+        self._qa_soma_window_size = 10    # keep last N reviewed somas in memory
         self.soma_mode = False  # Initialize soma_mode to prevent crashes
         # Initialize display adjustment values
         self.brightness_value = 0
@@ -3005,6 +3010,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         'mask_data': mask_data,
                         'processed_img': idata['processed'],
                     })
+
+            # Rebuild soma ordering for sliding window memory management
+            self._qa_soma_order = []
+            self._qa_finalized_somas = set()
+            seen_somas = set()
+            for flat in self.all_masks_flat:
+                key = (flat['image_name'], flat['mask_data']['soma_id'])
+                if key not in seen_somas:
+                    seen_somas.add(key)
+                    self._qa_soma_order.append(key)
 
             # Enable buttons based on restored state
             self._update_buttons_after_session_load()
@@ -5960,6 +5975,17 @@ Step 3: Import Results Back
                     'processed_img': img_data['processed'],
                 })
 
+        # Rebuild soma ordering after regeneration
+        self._qa_soma_order = []
+        seen_somas = set()
+        for flat in self.all_masks_flat:
+            key = (flat['image_name'], flat['mask_data']['soma_id'])
+            if key not in seen_somas:
+                seen_somas.add(key)
+                self._qa_soma_order.append(key)
+        # Keep existing finalized set — only somas still present matter
+        self._qa_finalized_somas = {k for k in self._qa_finalized_somas if k in seen_somas}
+
         total = len(img_data['masks'])
         self.log(f"Generated {total} new masks for {img_name}")
         self._auto_save()
@@ -6130,6 +6156,16 @@ Step 3: Import Results Back
         if not hasattr(self, 'last_qa_decisions'):
             self.last_qa_decisions = []
 
+        # Build soma ordering for sliding window memory management
+        self._qa_soma_order = []
+        self._qa_finalized_somas = set()
+        seen_somas = set()
+        for flat in self.all_masks_flat:
+            key = (flat['image_name'], flat['mask_data']['soma_id'])
+            if key not in seen_somas:
+                seen_somas.add(key)
+                self._qa_soma_order.append(key)
+
         # Find first unreviewed mask to resume from
         reviewed_count = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
         first_unreviewed = 0
@@ -6138,6 +6174,10 @@ Step 3: Import Results Back
                 first_unreviewed = i
                 break
         self.mask_qa_idx = first_unreviewed
+
+        # If resuming, finalize somas that are already far behind
+        if reviewed_count > 0:
+            self._evict_old_qa_masks()
 
         self.approve_mask_btn.setEnabled(True)
         self.reject_mask_btn.setEnabled(True)
@@ -6164,6 +6204,100 @@ Step 3: Import Results Back
         self.log("Keyboard: A=Approve, R=Reject, ←→=Navigate, Space=Approve&Next")
         self.log("=" * 50)
 
+    def _evict_old_qa_masks(self):
+        """Evict mask arrays for somas that are beyond the sliding window.
+
+        Keeps only the current soma + last _qa_soma_window_size reviewed somas
+        in memory. Evicted approved masks are already on disk. Evicted rejected
+        masks have their TIFF files deleted from disk.
+        """
+        if not self.all_masks_flat or self.mask_qa_idx >= len(self.all_masks_flat):
+            return
+
+        # Determine which soma we're currently on
+        current_flat = self.all_masks_flat[self.mask_qa_idx]
+        current_soma_key = (current_flat['image_name'], current_flat['mask_data']['soma_id'])
+
+        try:
+            current_soma_idx = self._qa_soma_order.index(current_soma_key)
+        except ValueError:
+            return
+
+        # Everything before this index should be evicted
+        evict_before = current_soma_idx - self._qa_soma_window_size
+        if evict_before <= 0:
+            return
+
+        for soma_idx in range(evict_before):
+            soma_key = self._qa_soma_order[soma_idx]
+            if soma_key in self._qa_finalized_somas:
+                continue  # already evicted
+
+            self._qa_finalized_somas.add(soma_key)
+            img_name, soma_id = soma_key
+
+            for flat in self.all_masks_flat:
+                if flat['image_name'] != img_name or flat['mask_data']['soma_id'] != soma_id:
+                    continue
+                mask_data = flat['mask_data']
+                # Delete rejected mask TIFFs from disk
+                if mask_data.get('approved') is False:
+                    self._delete_rejected_mask_tiff(img_name, mask_data)
+                # Free the mask array from memory (metadata kept for bookkeeping)
+                mask_data['mask'] = None
+
+            self.log(f"   💾 Finalized {soma_id} — freed mask arrays from memory")
+
+        # Trim undo history: remove decisions for finalized somas
+        self.last_qa_decisions = [
+            d for d in self.last_qa_decisions
+            if (d['flat_data']['image_name'], d['flat_data']['mask_data']['soma_id'])
+            not in self._qa_finalized_somas
+        ]
+
+    def _delete_rejected_mask_tiff(self, img_name, mask_data):
+        """Delete the TIFF file for a rejected mask from disk."""
+        if not self.masks_dir or not os.path.isdir(self.masks_dir):
+            return
+        img_basename = os.path.splitext(img_name)[0]
+        soma_id = mask_data['soma_id']
+        area_um2 = mask_data.get('area_um2', 0)
+        mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+        mask_path = os.path.join(self.masks_dir, mask_filename)
+        if os.path.exists(mask_path):
+            try:
+                os.remove(mask_path)
+                self.log(f"   🗑️ Deleted rejected mask: {mask_filename}")
+            except Exception as e:
+                self.log(f"   ⚠️ Could not delete {mask_filename}: {e}")
+
+    def _reload_mask_from_disk(self, mask_data, img_name):
+        """Reload a mask array from its TIFF file on disk.
+
+        Returns True if successfully loaded, False otherwise.
+        """
+        if mask_data.get('mask') is not None:
+            return True  # already in memory
+
+        if not self.masks_dir or not os.path.isdir(self.masks_dir):
+            return False
+
+        img_basename = os.path.splitext(img_name)[0]
+        soma_id = mask_data['soma_id']
+        area_um2 = mask_data.get('area_um2', 0)
+        mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+        mask_path = os.path.join(self.masks_dir, mask_filename)
+
+        if os.path.exists(mask_path):
+            try:
+                mask_arr = tifffile.imread(mask_path)
+                # Convert back from 0/255 to 0/1
+                mask_data['mask'] = (mask_arr > 0).astype(np.uint8)
+                return True
+            except Exception as e:
+                self.log(f"   ⚠️ Could not reload mask {mask_filename}: {e}")
+        return False
+
     def _show_current_mask(self):
         if not self.all_masks_flat or self.mask_qa_idx >= len(self.all_masks_flat):
             return
@@ -6172,6 +6306,12 @@ Step 3: Import Results Back
         mask_data = flat_data['mask_data']
         processed_img = flat_data['processed_img']
         img_name = flat_data['image_name']
+
+        # Reload mask from disk if it was evicted from memory
+        if mask_data.get('mask') is None:
+            if not self._reload_mask_from_disk(mask_data, img_name):
+                self.log(f"⚠️ Cannot display mask — file not found on disk")
+                return
 
         # Display in color or grayscale based on toggle
         img_data = self.images.get(img_name, {})
@@ -6266,6 +6406,9 @@ Step 3: Import Results Back
 
         # Move to next unreviewed mask
         self._advance_to_next_unreviewed()
+
+        # Evict old somas outside the sliding window to free memory
+        self._evict_old_qa_masks()
 
     def _export_approved_mask(self, flat_data):
         """Export a single approved mask to TIFF file"""
@@ -6468,6 +6611,9 @@ Step 3: Import Results Back
         else:
             self._check_qa_complete()
 
+        # Evict old somas outside the sliding window to free memory
+        self._evict_old_qa_masks()
+
     def next_mask(self):
         if not self.mask_qa_active:
             return
@@ -6479,6 +6625,12 @@ Step 3: Import Results Back
         if not self.mask_qa_active:
             return
         if self.mask_qa_idx > 0:
+            # Check if the previous mask's soma has been finalized
+            prev_flat = self.all_masks_flat[self.mask_qa_idx - 1]
+            prev_key = (prev_flat['image_name'], prev_flat['mask_data']['soma_id'])
+            if prev_key in self._qa_finalized_somas:
+                self.log("⚠️ Cannot go back further — those masks have been finalized to save memory")
+                return
             self.mask_qa_idx -= 1
             self._show_current_mask()
 
@@ -6570,6 +6722,16 @@ Step 3: Import Results Back
             # Complex analysis (Sholl, Skeleton) will be done separately in ImageJ
 
             self.log(f"all_masks_flat has {len(self.all_masks_flat)} entries")
+
+            # Reload any evicted mask arrays from disk before analysis
+            reload_count = 0
+            for flat in self.all_masks_flat:
+                if flat['mask_data'].get('approved') and flat['mask_data'].get('mask') is None:
+                    if self._reload_mask_from_disk(flat['mask_data'], flat['image_name']):
+                        reload_count += 1
+            if reload_count > 0:
+                self.log(f"   Reloaded {reload_count} evicted masks from disk for analysis")
+
             approved_masks = [flat for flat in self.all_masks_flat if flat['mask_data']['approved']]
             total = len(approved_masks)
 
@@ -6646,6 +6808,9 @@ Step 3: Import Results Back
                     if (flat_data['mask_data'].get('approved') and
                         flat_data['mask_data'].get('soma_id') == result.get('soma_id') and
                         os.path.splitext(flat_data['image_name'])[0] == img_name):
+                        # Reload from disk if evicted
+                        if flat_data['mask_data'].get('mask') is None:
+                            self._reload_mask_from_disk(flat_data['mask_data'], flat_data['image_name'])
                         mask = flat_data['mask_data'].get('mask')
                         full_img_name = flat_data['image_name']
                         if mask is not None:
