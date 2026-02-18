@@ -2335,6 +2335,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.reject_mask_btn.setEnabled(False)
         self.reject_mask_btn.setVisible(False)
 
+        # Mask QA progress bar
+        self.mask_qa_progress_bar = QProgressBar()
+        self.mask_qa_progress_bar.setVisible(False)
+        self.mask_qa_progress_bar.setMinimumHeight(20)
+        self.mask_qa_progress_bar.setFormat("%v / %m masks reviewed")
+        self.mask_qa_progress_bar.setStyleSheet("""
+            QProgressBar { text-align: center; font-weight: bold; }
+        """)
+        layout.addWidget(self.mask_qa_progress_bar)
+
         return panel
 
     def update_timer_display(self):
@@ -5550,7 +5560,7 @@ Step 3: Import Results Back
 
         size_grid.addWidget(QLabel("Min:"))
         min_area_spin = QSpinBox()
-        min_area_spin.setRange(100, 2000)
+        min_area_spin.setRange(10, 2000)
         min_area_spin.setSingleStep(50)
         min_area_spin.setValue(self.mask_min_area)
         min_area_spin.setSuffix(" µm²")
@@ -5710,6 +5720,11 @@ Step 3: Import Results Back
                     current_count += 1
                     self.progress_bar.setValue(int((current_count / total_outlines) * 100))
 
+                # Export ALL generated masks to disk immediately so they
+                # survive save/load even before QA approval
+                if self.masks_dir and os.path.isdir(self.masks_dir):
+                    self._export_all_masks_to_disk(img_name, img_data['masks'])
+
                 img_data['status'] = 'masks_generated'
                 self._update_file_list_item(img_name)
 
@@ -5775,7 +5790,7 @@ Step 3: Import Results Back
         size_grid = QHBoxLayout()
         size_grid.addWidget(QLabel("Min:"))
         min_area_spin = QSpinBox()
-        min_area_spin.setRange(100, 2000)
+        min_area_spin.setRange(10, 2000)
         min_area_spin.setSingleStep(50)
         min_area_spin.setValue(self.mask_min_area)
         min_area_spin.setSuffix(" µm²")
@@ -5928,6 +5943,10 @@ Step 3: Import Results Back
         self.min_intensity_percent = saved_intensity
         self.use_min_intensity = saved_use_intensity
 
+        # Export all regenerated masks to disk
+        if self.masks_dir and os.path.isdir(self.masks_dir):
+            self._export_all_masks_to_disk(img_name, img_data['masks'])
+
         # Update status
         img_data['status'] = 'masks_generated'
         self._update_file_list_item(img_name)
@@ -6059,10 +6078,12 @@ Step 3: Import Results Back
         # Every mask always includes the full soma at minimum
         # Target area is a ceiling — if intensity floor stopped growth early,
         # min(target_px, len(growth_order)) naturally caps the mask smaller
+        # If target < soma area, substitute the soma mask for that size
+        soma_area_px = soma_seed_count
         for target_area_um2 in sorted_areas:
             target_px = int(target_area_um2 / (pixel_size_um ** 2))
             n_pixels = min(target_px, len(growth_order))
-            n_pixels = max(n_pixels, soma_seed_count)  # always include full soma
+            n_pixels = max(n_pixels, soma_area_px)  # always include full soma
             n_pixels = min(n_pixels, len(growth_order))
 
             mask_roi = np.zeros((h, w), dtype=np.uint8)
@@ -6126,6 +6147,11 @@ Step 3: Import Results Back
         self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
         self.regen_masks_btn.setVisible(True)
 
+        # Show and init progress bar
+        self.mask_qa_progress_bar.setMaximum(len(self.all_masks_flat))
+        self.mask_qa_progress_bar.setValue(reviewed_count)
+        self.mask_qa_progress_bar.setVisible(True)
+
         self._show_current_mask()
         self.tabs.setCurrentIndex(3)
 
@@ -6187,6 +6213,9 @@ Step 3: Import Results Back
             f"{img_name} | {mask_data['soma_id']} | "
             f"Area: {mask_data['area_um2']} µm² | {status_text}"
         )
+
+        # Update progress bar
+        self.mask_qa_progress_bar.setValue(reviewed)
 
     def approve_current_mask(self):
         if not self.mask_qa_active or self.mask_qa_idx >= len(self.all_masks_flat):
@@ -6303,6 +6332,59 @@ Step 3: Import Results Back
         except Exception as e:
             self.log(f"   ❌ Failed to export {mask_filename}: {e}")
 
+    def _export_all_masks_to_disk(self, img_name, masks):
+        """Export all masks for an image to disk (for session persistence).
+
+        Called after mask generation so that ALL masks exist on disk before QA.
+        This ensures masks survive a save/load cycle even if QA is incomplete.
+        """
+        if not self.masks_dir:
+            return
+
+        img_basename = os.path.splitext(img_name)[0]
+
+        try:
+            pixel_size = float(self.pixel_size_input.text())
+        except (ValueError, AttributeError):
+            pixel_size = 0.316
+
+        exported = 0
+        for mask_data in masks:
+            mask = mask_data.get('mask')
+            if mask is None or not np.any(mask):
+                continue
+
+            soma_id = mask_data['soma_id']
+            area_um2 = mask_data.get('area_um2', 0)
+            mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+            mask_path = os.path.join(self.masks_dir, mask_filename)
+
+            # Skip if already on disk (e.g. from a previous run)
+            if os.path.exists(mask_path):
+                continue
+
+            if mask.dtype == bool:
+                mask_8bit = mask.astype(np.uint8) * 255
+            else:
+                mask_8bit = (mask > 0).astype(np.uint8) * 255
+
+            if np.count_nonzero(mask_8bit) == 0:
+                continue
+
+            try:
+                tifffile.imwrite(
+                    mask_path,
+                    mask_8bit,
+                    resolution=(1.0 / pixel_size, 1.0 / pixel_size),
+                    metadata={'unit': 'um'}
+                )
+                exported += 1
+            except Exception:
+                pass  # Don't interrupt generation for export failures
+
+        if exported > 0:
+            self.log(f"   💾 Saved {exported} masks to disk for {img_name}")
+
     def _export_soma_outline(self, img_name, soma_id, mask, pixel_size, soma_area_um2):
         """Export a soma outline to TIFF file in the somas directory"""
         if not hasattr(self, 'somas_dir') or not self.somas_dir:
@@ -6410,6 +6492,7 @@ Step 3: Import Results Back
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
             self.regen_masks_btn.setVisible(False)
+            self.mask_qa_progress_bar.setVisible(False)
 
             # Update image statuses
             for img_name, img_data in self.images.items():
@@ -6446,15 +6529,8 @@ Step 3: Import Results Back
         mask_data = flat_data['mask_data']
         img_name = flat_data['image_name']
 
-        # Delete exported file if it was approved
-        if decision['was_approved'] and self.masks_dir and os.path.isdir(self.masks_dir):
-            img_basename = os.path.splitext(img_name)[0]
-            soma_id = mask_data['soma_id']
-            area_um2 = mask_data.get('area_um2', 0)
-            mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
-            mask_path = os.path.join(self.masks_dir, mask_filename)
-            if os.path.exists(mask_path):
-                os.remove(mask_path)
+        # Mask files are kept on disk (written during generation) —
+        # only the in-memory approval state is reset.
 
         # Reset approval state
         was = "approved" if decision['was_approved'] else "rejected"
