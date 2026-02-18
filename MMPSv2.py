@@ -5720,6 +5720,11 @@ Step 3: Import Results Back
                     current_count += 1
                     self.progress_bar.setValue(int((current_count / total_outlines) * 100))
 
+                # Export ALL generated masks to disk immediately so they
+                # survive save/load even before QA approval
+                if self.masks_dir and os.path.isdir(self.masks_dir):
+                    self._export_all_masks_to_disk(img_name, img_data['masks'])
+
                 img_data['status'] = 'masks_generated'
                 self._update_file_list_item(img_name)
 
@@ -5937,6 +5942,10 @@ Step 3: Import Results Back
         # Restore global intensity settings
         self.min_intensity_percent = saved_intensity
         self.use_min_intensity = saved_use_intensity
+
+        # Export all regenerated masks to disk
+        if self.masks_dir and os.path.isdir(self.masks_dir):
+            self._export_all_masks_to_disk(img_name, img_data['masks'])
 
         # Update status
         img_data['status'] = 'masks_generated'
@@ -6323,6 +6332,59 @@ Step 3: Import Results Back
         except Exception as e:
             self.log(f"   ❌ Failed to export {mask_filename}: {e}")
 
+    def _export_all_masks_to_disk(self, img_name, masks):
+        """Export all masks for an image to disk (for session persistence).
+
+        Called after mask generation so that ALL masks exist on disk before QA.
+        This ensures masks survive a save/load cycle even if QA is incomplete.
+        """
+        if not self.masks_dir:
+            return
+
+        img_basename = os.path.splitext(img_name)[0]
+
+        try:
+            pixel_size = float(self.pixel_size_input.text())
+        except (ValueError, AttributeError):
+            pixel_size = 0.316
+
+        exported = 0
+        for mask_data in masks:
+            mask = mask_data.get('mask')
+            if mask is None or not np.any(mask):
+                continue
+
+            soma_id = mask_data['soma_id']
+            area_um2 = mask_data.get('area_um2', 0)
+            mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+            mask_path = os.path.join(self.masks_dir, mask_filename)
+
+            # Skip if already on disk (e.g. from a previous run)
+            if os.path.exists(mask_path):
+                continue
+
+            if mask.dtype == bool:
+                mask_8bit = mask.astype(np.uint8) * 255
+            else:
+                mask_8bit = (mask > 0).astype(np.uint8) * 255
+
+            if np.count_nonzero(mask_8bit) == 0:
+                continue
+
+            try:
+                tifffile.imwrite(
+                    mask_path,
+                    mask_8bit,
+                    resolution=(1.0 / pixel_size, 1.0 / pixel_size),
+                    metadata={'unit': 'um'}
+                )
+                exported += 1
+            except Exception:
+                pass  # Don't interrupt generation for export failures
+
+        if exported > 0:
+            self.log(f"   💾 Saved {exported} masks to disk for {img_name}")
+
     def _export_soma_outline(self, img_name, soma_id, mask, pixel_size, soma_area_um2):
         """Export a soma outline to TIFF file in the somas directory"""
         if not hasattr(self, 'somas_dir') or not self.somas_dir:
@@ -6467,15 +6529,8 @@ Step 3: Import Results Back
         mask_data = flat_data['mask_data']
         img_name = flat_data['image_name']
 
-        # Delete exported file if it was approved
-        if decision['was_approved'] and self.masks_dir and os.path.isdir(self.masks_dir):
-            img_basename = os.path.splitext(img_name)[0]
-            soma_id = mask_data['soma_id']
-            area_um2 = mask_data.get('area_um2', 0)
-            mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
-            mask_path = os.path.join(self.masks_dir, mask_filename)
-            if os.path.exists(mask_path):
-                os.remove(mask_path)
+        # Mask files are kept on disk (written during generation) —
+        # only the in-memory approval state is reset.
 
         # Reset approval state
         was = "approved" if decision['was_approved'] else "rejected"
