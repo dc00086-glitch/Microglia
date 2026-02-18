@@ -4775,12 +4775,20 @@ Step 3: Import Results Back
         self.processed_label.soma_mode = False
         self.processed_label.point_edit_mode = False
         self.processed_label.selected_point_idx = None
+        self.processed_label.dragging_point = False
         self.original_label.polygon_mode = False
         self.preview_label.polygon_mode = False
         self.mask_label.polygon_mode = False
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.done_btn.setEnabled(False)
+        # Reset stale interaction state
+        self.z_key_held = False
+        for label in [self.processed_label, self.original_label, self.preview_label, self.mask_label]:
+            label.measure_mode = False
+            label.measure_pt1 = None
+            label.measure_pt2 = None
+        self.measure_mode = False
 
         # Store for review mode
         self.auto_outlined_points = {}  # {queue_idx: points}
@@ -4895,7 +4903,23 @@ Step 3: Import Results Back
     def _start_review_mode(self):
         """Start reviewing auto-outlined somas one by one"""
         self.review_mode = True
-        self.current_review_idx = 0
+
+        # Reset stale UI state that could block interaction
+        self.z_key_held = False
+        for label in [self.processed_label, self.original_label, self.preview_label, self.mask_label]:
+            label.measure_mode = False
+            label.measure_pt1 = None
+            label.measure_pt2 = None
+        self.measure_mode = False
+
+        # Find the first soma that actually needs review (skip already-outlined)
+        start_idx = self._find_next_unoutlined_idx(0)
+        if start_idx is None:
+            # All somas already outlined — nothing to review
+            self._finish_review_mode()
+            return
+
+        self.current_review_idx = start_idx
 
         self.log("")
         self.log("=" * 50)
@@ -4905,13 +4929,29 @@ Step 3: Import Results Back
         self.log("• Click [Manual] to redraw from scratch")
         self.log("=" * 50)
 
-        self._load_review_soma(0)
+        self._load_review_soma(start_idx)
 
     def _load_review_soma(self, review_idx):
         """Load a soma for review"""
         if review_idx >= len(self.outlining_queue):
             self._finish_review_mode()
             return
+
+        # Skip somas that already have saved outlines (from previous session)
+        img_name_check, soma_idx_check = self.outlining_queue[review_idx]
+        if self._soma_has_outline(img_name_check, soma_idx_check):
+            # This soma is already outlined — advance to the next unoutlined one
+            next_idx = self._find_next_unoutlined_idx(start_from=review_idx + 1)
+            if next_idx is None:
+                self._finish_review_mode()
+            else:
+                self._load_review_soma(next_idx)
+            return
+
+        # Reset interaction state to prevent stale flags from blocking drag/click
+        self.z_key_held = False
+        self.processed_label.dragging_point = False
+        self.processed_label.selected_point_idx = None
 
         self.current_review_idx = review_idx
         self.current_outline_idx = review_idx
