@@ -2748,8 +2748,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def save_session(self):
         """Save the entire project state to a JSON file"""
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Session", "", "Session Files (*.mmps_session);;All Files (*)",
-            options=QFileDialog.DontUseNativeDialog
+            self, "Save Session", "", "Session Files (*.mmps_session);;All Files (*)"
         )
         if not path:
             return
@@ -2784,8 +2783,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def load_session(self):
         """Restore a previously saved session"""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Session", "", "Session Files (*.mmps_session);;All Files (*)",
-            options=QFileDialog.DontUseNativeDialog
+            self, "Load Session", "", "Session Files (*.mmps_session);;All Files (*)"
         )
         if not path:
             return
@@ -3370,8 +3368,7 @@ Step 3: Import Results Back
             # Browse for combined or individual results
             browse_path, _ = QFileDialog.getOpenFileName(
                 self, "Select Combined or Sholl Results CSV (or Cancel to skip)", self.output_dir,
-                "CSV Files (*.csv);;All Files (*)",
-                options=QFileDialog.DontUseNativeDialog
+                "CSV Files (*.csv);;All Files (*)"
             )
             if browse_path and os.path.exists(browse_path):
                 basename = os.path.basename(browse_path).lower()
@@ -3385,8 +3382,7 @@ Step 3: Import Results Back
             # Browse for Skeleton results
             skeleton_path, _ = QFileDialog.getOpenFileName(
                 self, "Select Skeleton Results CSV (or Cancel to skip)", self.output_dir,
-                "CSV Files (*.csv);;All Files (*)",
-                options=QFileDialog.DontUseNativeDialog
+                "CSV Files (*.csv);;All Files (*)"
             )
             found_skeleton = bool(skeleton_path) and os.path.exists(skeleton_path)
 
@@ -4097,8 +4093,7 @@ Step 3: Import Results Back
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(
             self,
-            "Select Image Folder",
-            options=QFileDialog.DontUseNativeDialog
+            "Select Image Folder"
         )
         if not folder:
             return
@@ -4183,9 +4178,8 @@ Step 3: Import Results Back
 
     def select_output(self):
         folder = QFileDialog.getExistingDirectory(
-            self, 
-            "Select Output Folder",
-            options=QFileDialog.DontUseNativeDialog
+            self,
+            "Select Output Folder"
         )
         if folder:
             self.output_dir = folder
