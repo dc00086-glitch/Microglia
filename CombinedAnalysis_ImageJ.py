@@ -79,6 +79,19 @@ def findSomaFile(somasDir, maskFilename):
     return None
 
 
+def filterLargestMasks(maskFiles):
+    """Keep only the largest area mask per cell (image + soma combination).
+    E.g. if a cell has area300, area400, area500, only area500 is kept."""
+    best = {}  # (imgName, somaId) -> (area, filename)
+    for f in maskFiles:
+        imgName, somaId, area = parseMaskInfo(f)
+        key = (imgName, somaId)
+        if key not in best or area > best[key][0]:
+            best[key] = (area, f)
+    kept = set(v[1] for v in best.values())
+    return [f for f in maskFiles if f in kept]
+
+
 def getSomaCentroid(somaPath):
     """Calculate centroid (center of mass) from a binary soma mask.
     Returns (x_pixel, y_pixel) in pixel coordinates."""
@@ -565,6 +578,8 @@ def main():
     gd.addNumericField("Sholl Step Size (um) [0 = continuous]", 0.0, 1)
     gd.addCheckbox("Use soma radius as Sholl start radius", True)
     gd.addNumericField("Manual start radius (um) [if unchecked]", 5.0, 1)
+    gd.addMessage("--- Mask Filtering ---")
+    gd.addCheckbox("Only analyze largest mask per cell", False)
     gd.addMessage("--- Analyses to Run ---")
     gd.addCheckbox("Skeleton Analysis", True)
     gd.addCheckbox("Sholl Analysis", True)
@@ -579,6 +594,7 @@ def main():
     stepSize = gd.getNextNumber()
     useSomaRadius = gd.getNextBoolean()
     manualStartRad = gd.getNextNumber()
+    largestOnly = gd.getNextBoolean()
     doSkeleton = gd.getNextBoolean()
     doSholl = gd.getNextBoolean()
     doFractal = gd.getNextBoolean()
@@ -621,6 +637,11 @@ def main():
     if not maskFiles:
         IJ.error("No mask files found in: " + masksDir)
         return
+
+    if largestOnly:
+        totalBefore = len(maskFiles)
+        maskFiles = filterLargestMasks(maskFiles)
+        IJ.log("Largest-only filter: " + str(totalBefore) + " masks -> " + str(len(maskFiles)) + " (one per cell)")
 
     analyses = []
     if doSkeleton:

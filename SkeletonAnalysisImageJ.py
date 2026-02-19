@@ -2,6 +2,7 @@
 #@File(label="Output Directory", style="directory") outputDir
 #@Float(label="Pixel Size (um/pixel)", value=0.316) pixelSize
 #@Integer(label="Upscale Factor (2 for 20x, 1 for 40x)", value=2) scaleFactor
+#@Boolean(label="Only analyze largest mask per cell", value=false) largestOnly
 
 from ij import IJ, ImagePlus
 from ij.measure import Calibration, ResultsTable
@@ -10,6 +11,29 @@ from sc.fiji.analyzeSkeleton import AnalyzeSkeleton_
 import os
 import csv
 import re
+
+
+def parseMaskInfo(maskFilename):
+    """Extract image name, soma ID, and area from mask filename.
+    e.g. 'Image_soma_586_510_area400_mask.tif'
+      -> ('Image', 'soma_586_510', 400)"""
+    m = re.match(r'^(.+?)_(soma_\d+_\d+)_area(\d+)_mask\.tif$', maskFilename)
+    if m:
+        return m.group(1), m.group(2), int(m.group(3))
+    return maskFilename, 'unknown', 0
+
+
+def filterLargestMasks(maskFiles):
+    """Keep only the largest area mask per cell (image + soma combination).
+    E.g. if a cell has area300, area400, area500, only area500 is kept."""
+    best = {}  # (imgName, somaId) -> (area, filename)
+    for f in maskFiles:
+        imgName, somaId, area = parseMaskInfo(f)
+        key = (imgName, somaId)
+        if key not in best or area > best[key][0]:
+            best[key] = (area, f)
+    kept = set(v[1] for v in best.values())
+    return [f for f in maskFiles if f in kept]
 
 
 def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
@@ -241,6 +265,11 @@ def main():
     if len(maskFiles) == 0:
         print("ERROR: No mask files found")
         return
+
+    if largestOnly:
+        totalBefore = len(maskFiles)
+        maskFiles = filterLargestMasks(maskFiles)
+        print("Largest-only filter: " + str(totalBefore) + " masks -> " + str(len(maskFiles)) + " (one per cell)")
 
     print("Found " + str(len(maskFiles)) + " mask files")
     print("Pixel size: " + str(pixelSize) + " um/pixel")

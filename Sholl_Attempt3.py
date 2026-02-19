@@ -197,6 +197,19 @@ def parseMaskInfo(maskFilename):
     return maskFilename, 'unknown', 0
 
 
+def filterLargestMasks(maskFiles):
+    """Keep only the largest area mask per cell (image + soma combination).
+    E.g. if a cell has area300, area400, area500, only area500 is kept."""
+    best = {}  # (imgName, somaId) -> (area, filename)
+    for f in maskFiles:
+        imgName, somaId, area = parseMaskInfo(f)
+        key = (imgName, somaId)
+        if key not in best or area > best[key][0]:
+            best[key] = (area, f)
+    kept = set(v[1] for v in best.values())
+    return [f for f in maskFiles if f in kept]
+
+
 # ---------------------------------------------------------------------------
 # Single mask analysis (core math from reference script)
 # ---------------------------------------------------------------------------
@@ -314,6 +327,7 @@ def main():
     gd.addNumericField("Step Size (um) [0 = continuous]", 0.0, 1)
     gd.addCheckbox("Use soma radius as start radius", True)
     gd.addNumericField("Manual start radius (um) [if unchecked]", 5.0, 1)
+    gd.addCheckbox("Only analyze largest mask per cell", False)
     gd.showDialog()
     if gd.wasCanceled():
         return
@@ -323,6 +337,7 @@ def main():
     stepSize = gd.getNextNumber()
     useSomaRadius = gd.getNextBoolean()
     manualStartRad = gd.getNextNumber()
+    largestOnly = gd.getNextBoolean()
 
     # Locate masks and somas directories
     masksDir = os.path.join(outputFolder, "masks")
@@ -344,6 +359,11 @@ def main():
     if not maskFiles:
         IJ.error("No mask files found in: " + masksDir)
         return
+
+    if largestOnly:
+        totalBefore = len(maskFiles)
+        maskFiles = filterLargestMasks(maskFiles)
+        IJ.log("Largest-only filter: " + str(totalBefore) + " masks -> " + str(len(maskFiles)) + " (one per cell)")
 
     IJ.log("=" * 60)
     IJ.log("MMPS Sholl Analysis")
