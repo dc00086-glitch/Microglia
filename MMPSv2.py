@@ -23,6 +23,7 @@ from matplotlib.path import Path as mplPath
 import cv2
 import glob
 import json
+import csv
 import math
 
 
@@ -2656,8 +2657,103 @@ class MicrogliaAnalysisGUI(QMainWindow):
     # SESSION SAVE / RESTORE
     # ========================================================================
 
+    def _determine_last_completed_step(self):
+        """Determine the furthest completed workflow step across all images."""
+        statuses = [d['status'] for d in self.images.values() if d['selected']]
+        if not statuses:
+            return 'none'
+        # Priority order (highest = furthest along)
+        priority = ['analyzed', 'qa_complete', 'masks_generated', 'outlined',
+                     'somas_picked', 'processed', 'loaded']
+        for step in priority:
+            if any(s == step for s in statuses):
+                return step
+        return 'loaded'
+
+    def _get_step_display_name(self, step):
+        """Return a human-readable name for a workflow step."""
+        names = {
+            'none': 'No images loaded',
+            'loaded': 'Images loaded',
+            'processed': 'Image processing',
+            'somas_picked': 'Soma selection',
+            'outlined': 'Soma outlining',
+            'masks_generated': 'Mask generation',
+            'qa_complete': 'Mask QA',
+            'analyzed': 'Morphology analysis',
+        }
+        return names.get(step, step)
+
+    def _get_next_step_hint(self, step):
+        """Return a hint about what the user should do next."""
+        hints = {
+            'none': 'Load images and select an output folder to begin.',
+            'loaded': 'Select images and click "Process Selected Images".',
+            'processed': 'Click "Pick Somas" to mark cell bodies.',
+            'somas_picked': 'Click "Outline Somas" to trace soma boundaries.',
+            'outlined': 'Click "Generate All Masks" to create analysis masks.',
+            'masks_generated': 'Click "QA All Masks" to review masks.',
+            'qa_complete': 'Click "Calculate Simple Characteristics" or run ImageJ scripts.',
+            'analyzed': 'Analysis complete. Export results or run ImageJ scripts.',
+        }
+        return hints.get(step, '')
+
+    # --- Checklist CSV helpers for tracking progress ---
+
+    def _get_checklist_path(self, name):
+        """Get path for a checklist CSV in the output directory."""
+        if not self.output_dir:
+            return None
+        return os.path.join(self.output_dir, name)
+
+    def _write_checklist(self, path, rows, header):
+        """Write a checklist CSV with the given header and rows."""
+        with open(path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(rows)
+
+    def _read_checklist(self, path):
+        """Read a checklist CSV and return rows as list of lists."""
+        if not path or not os.path.exists(path):
+            return []
+        with open(path, 'r') as f:
+            reader = csv.reader(f)
+            next(reader, None)  # skip header
+            return [row for row in reader]
+
+    def _update_checklist_row(self, path, key_col_idx, key_value, status_col_idx, new_status):
+        """Update a single row in a checklist CSV by matching key column."""
+        if not path or not os.path.exists(path):
+            return
+        rows = []
+        header = None
+        with open(path, 'r') as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            rows = [row for row in reader]
+        for row in rows:
+            if row[key_col_idx] == key_value:
+                row[status_col_idx] = str(new_status)
+        if header:
+            with open(path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(rows)
+
+    def _delete_checklist(self, path):
+        """Delete a checklist CSV if it exists."""
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
     def _build_session_dict(self):
         """Build a serializable session dictionary from current state."""
+        # Determine the last completed workflow step
+        last_step = self._determine_last_completed_step()
+
         session = {
             'version': 2,
             'output_dir': self.output_dir,
@@ -2673,6 +2769,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             'coloc_channel_1': self.coloc_channel_1,
             'coloc_channel_2': self.coloc_channel_2,
             'grayscale_channel': self.grayscale_channel,
+            'last_completed_step': last_step,
+            'last_image_name': self.current_image_name,
             'images': {}
         }
 
@@ -2750,8 +2848,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
             with open(path, 'w') as f:
                 json.dump(session, f, indent=2)
 
+            last_step = session.get('last_completed_step', 'none')
+            step_name = self._get_step_display_name(last_step)
+            next_hint = self._get_next_step_hint(last_step)
+
             self.log(f"Session saved to: {path}")
-            QMessageBox.information(self, "Session Saved", f"Session saved to:\n{path}")
+            self.log(f"Last completed step: {step_name}")
+            QMessageBox.information(self, "Session Saved",
+                f"Session saved to:\n{path}\n\n"
+                f"Last completed step: {step_name}\n"
+                f"Next: {next_hint}")
 
         except Exception as e:
             self.log(f"ERROR saving session: {e}")
@@ -2978,12 +3084,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 item.setForeground(QBrush(QColor(color_hex)))
                 self.file_list.addItem(item)
 
-            # Load and display first image
+            # Load and display the last viewed image (or first if not saved)
             if self.images:
-                first_name = sorted(self.images.keys())[0]
-                self.current_image_name = first_name
+                last_img = session.get('last_image_name')
+                if last_img and last_img in self.images:
+                    self.current_image_name = last_img
+                else:
+                    self.current_image_name = sorted(self.images.keys())[0]
                 self._display_current_image()
-                self.file_list.setCurrentRow(0)
+                # Set the file list selection to match
+                for row_i in range(self.file_list.count()):
+                    item = self.file_list.item(row_i)
+                    if item and item.data(Qt.UserRole) == self.current_image_name:
+                        self.file_list.setCurrentRow(row_i)
+                        break
                 self.process_selected_btn.setEnabled(True)
 
             # Rebuild all_masks_flat from loaded masks
@@ -3021,6 +3135,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
             if self.masks_dir and os.path.isdir(self.masks_dir):
                 n_mask_files = len([f for f in os.listdir(self.masks_dir) if f.endswith('_mask.tif')])
 
+            # Determine last completed step
+            last_step = session.get('last_completed_step', self._determine_last_completed_step())
+            step_name = self._get_step_display_name(last_step)
+            next_hint = self._get_next_step_hint(last_step)
+
             self.log("=" * 50)
             self.log(f"Session loaded: {n_loaded} images")
             if n_with_processed:
@@ -3031,6 +3150,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.log(f"  {n_with_outlines} images with soma outlines")
             if n_mask_files:
                 self.log(f"  {n_mask_files} exported masks found in {self.masks_dir}")
+            self.log(f"  Last completed step: {step_name}")
+            self.log(f"  Next: {next_hint}")
+
+            # Check for in-progress checklist files
+            soma_cl_path = self._get_checklist_path('soma_checklist.csv')
+            mask_cl_path = self._get_checklist_path('mask_checklist.csv')
+            if soma_cl_path and os.path.exists(soma_cl_path):
+                rows = self._read_checklist(soma_cl_path)
+                done = sum(1 for r in rows if len(r) > 1 and r[1] == '1')
+                self.log(f"  Found soma_checklist.csv: {done}/{len(rows)} somas outlined")
+            if mask_cl_path and os.path.exists(mask_cl_path):
+                rows = self._read_checklist(mask_cl_path)
+                done = sum(1 for r in rows if len(r) > 1 and r[1] == '1')
+                self.log(f"  Found mask_checklist.csv: {done}/{len(rows)} masks generated")
             self.log("=" * 50)
 
             note = ""
@@ -3046,7 +3179,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 f"Processed: {n_with_processed}\n"
                 f"With somas: {n_with_somas}\n"
                 f"With outlines: {n_with_outlines}\n"
-                f"Mask files on disk: {n_mask_files}"
+                f"Mask files on disk: {n_mask_files}\n\n"
+                f"Last completed step: {step_name}\n"
+                f"Next: {next_hint}"
                 f"{note}"
             )
 
@@ -4591,12 +4726,22 @@ Step 3: Import Results Back
 
     def start_batch_soma_picking(self):
         self.soma_picking_queue = [name for name, data in self.images.items()
-                                   if data['selected'] and data['status'] == 'processed']
+                                   if data['selected'] and data['status'] in ('processed', 'somas_picked')]
         if not self.soma_picking_queue:
             QMessageBox.warning(self, "Warning", "No processed images to pick somas from")
             return
         self.batch_mode = True
-        self.current_image_name = self.soma_picking_queue[0]
+        # Resume on the last image the user was working on, if available
+        if self.current_image_name and self.current_image_name in self.soma_picking_queue:
+            pass  # keep current_image_name
+        else:
+            # Start at the first image that doesn't have somas yet
+            resume_name = None
+            for name in self.soma_picking_queue:
+                if not self.images[name]['somas']:
+                    resume_name = name
+                    break
+            self.current_image_name = resume_name or self.soma_picking_queue[0]
         self.processed_label.soma_mode = True
         self.original_label.soma_mode = False
         self.preview_label.soma_mode = False
@@ -4929,6 +5074,17 @@ Step 3: Import Results Back
         self.outline_method_display.setCurrentIndex(self.auto_outline_method.currentIndex())
         self.outline_sens_display.setValue(self.auto_outline_sensitivity.value())
         self._update_outline_progress()
+
+        # Create soma_checklist.csv to track outline progress
+        cl_path = self._get_checklist_path('soma_checklist.csv')
+        if cl_path:
+            rows = []
+            for img_name, soma_idx in self.outlining_queue:
+                soma_id = self.images[img_name]['soma_ids'][soma_idx]
+                name = f"{img_name}_{soma_id}"
+                passed = 1 if self._soma_has_outline(img_name, soma_idx) else 0
+                rows.append([name, str(passed)])
+            self._write_checklist(cl_path, rows, ['Soma', 'Passed QA'])
 
         if result == 1:
             # Manual mode
@@ -5303,6 +5459,12 @@ Step 3: Import Results Back
 
         # Update outline progress
         self._update_outline_progress()
+
+        # Update soma_checklist.csv
+        cl_path = self._get_checklist_path('soma_checklist.csv')
+        if cl_path and os.path.exists(cl_path):
+            checklist_key = f"{img_name}_{soma_id}"
+            self._update_checklist_row(cl_path, 0, checklist_key, 1, 1)
 
         # Auto-save after each outline
         self._auto_save()
@@ -5713,6 +5875,9 @@ Step 3: Import Results Back
                 self._update_file_list_item(img_name)
         self.batch_generate_masks_btn.setEnabled(True)
         # self.update_workflow_status()
+        # Delete soma checklist — outlining is done
+        self._delete_checklist(self._get_checklist_path('soma_checklist.csv'))
+
         self.log("=" * 50)
         self.log("✓ All somas outlined!")
         self.log("✓ Ready to generate masks")
@@ -5878,6 +6043,19 @@ Step 3: Import Results Back
                                  if data['selected'] and data['soma_outlines'])
             current_count = 0
 
+            # Create mask_checklist.csv to track generation progress
+            mask_cl_path = self._get_checklist_path('mask_checklist.csv')
+            if mask_cl_path:
+                cl_rows = []
+                for iname, idata in self.images.items():
+                    if not idata['selected'] or not idata['soma_outlines']:
+                        continue
+                    for sd in idata['soma_outlines']:
+                        for area_val in area_list:
+                            mask_key = f"{iname}_{sd['soma_id']}_area{area_val}"
+                            cl_rows.append([mask_key, '0'])
+                self._write_checklist(mask_cl_path, cl_rows, ['Mask', 'Generated'])
+
             for img_name, img_data in self.images.items():
                 if not img_data['selected'] or not img_data['soma_outlines']:
                     continue
@@ -5901,6 +6079,12 @@ Step 3: Import Results Back
                     )
                     img_data['masks'].extend(masks)
 
+                    # Mark each generated mask in the checklist
+                    if mask_cl_path and os.path.exists(mask_cl_path):
+                        for m in masks:
+                            m_key = f"{img_name}_{soma_id}_area{m['area_um2']}"
+                            self._update_checklist_row(mask_cl_path, 0, m_key, 1, 1)
+
                     current_count += 1
                     self.progress_bar.setValue(int((current_count / total_outlines) * 100))
 
@@ -5914,6 +6098,9 @@ Step 3: Import Results Back
 
             self.progress_bar.setVisible(False)
             self.progress_status_label.setVisible(False)
+
+            # Delete mask checklist — generation is done
+            self._delete_checklist(self._get_checklist_path('mask_checklist.csv'))
 
             self.batch_qa_btn.setEnabled(True)
             self.clear_masks_btn.setEnabled(True)
