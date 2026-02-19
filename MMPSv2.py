@@ -1775,8 +1775,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.z_key_held = True
             return  # Don't process further, Z is for zoom
 
-        # F1 shows help regardless of mode
-        if key == Qt.Key_F1:
+        # ? shows help regardless of mode
+        if key == Qt.Key_Question:
             self.show_shortcut_help()
             return
 
@@ -1888,7 +1888,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.shortcut_color.activated.connect(self.toggle_color_view)
         self.shortcut_zoom_reset = QShortcut(QKeySequence('U'), self)
         self.shortcut_zoom_reset.activated.connect(self._reset_current_zoom)
-        self.shortcut_help = QShortcut(QKeySequence(Qt.Key_F1), self)
+        self.shortcut_help = QShortcut(QKeySequence('?'), self)
         self.shortcut_help.setContext(Qt.ApplicationShortcut)
         self.shortcut_help.activated.connect(self.show_shortcut_help)
         self.shortcut_measure = QShortcut(QKeySequence('M'), self)
@@ -2103,17 +2103,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.redo_outline_btn.setStyleSheet("border: 2px solid #FF9800;")
         outline_controls_layout.addWidget(self.redo_outline_btn)
 
-        # Outline progress bar
-        self.outline_progress_bar = QProgressBar()
-        self.outline_progress_bar.setVisible(False)
-        self.outline_progress_bar.setMinimumHeight(20)
-        self.outline_progress_bar.setFormat("%v / %m somas outlined")
-        self.outline_progress_bar.setStyleSheet("""
-            QProgressBar { border: 1px solid palette(mid); border-radius: 3px; text-align: center; }
-            QProgressBar::chunk { background-color: #4CAF50; }
-        """)
-        outline_controls_layout.addWidget(self.outline_progress_bar)
-
         self.outline_controls_widget.setVisible(False)
         batch_layout.addWidget(self.outline_controls_widget)
         
@@ -2237,8 +2226,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         display_btn_layout.addWidget(self.measure_btn)
 
         # Help button
-        help_btn = QPushButton("? (F1)")
-        help_btn.setFixedWidth(55)
+        help_btn = QPushButton("?")
+        help_btn.setFixedWidth(35)
         help_btn.clicked.connect(self.show_shortcut_help)
         help_btn.setToolTip("Show keyboard shortcuts for current mode")
         display_btn_layout.addWidget(help_btn)
@@ -2264,7 +2253,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Zoom hint row
         zoom_layout = QHBoxLayout()
-        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, U: reset, M: measure, F1: help")
+        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, U: reset, M: measure, ?: help")
         zoom_hint.setStyleSheet("color: palette(dark); font-size: 10px;")
         zoom_layout.addWidget(zoom_hint)
         zoom_layout.addStretch()
@@ -2546,7 +2535,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Always-available shortcuts
         html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Always Available</b></td></tr>"
         always = [
-            ("F1", "Show this help"),
+            ("?", "Show this help"),
             ("C", "Toggle color / grayscale"),
             ("U", "Reset zoom"),
             ("Z + Left-click", "Zoom in"),
@@ -5693,17 +5682,19 @@ Step 3: Import Results Back
         return None  # All done
 
     def _update_outline_progress(self):
-        """Update the outline progress bar with current completion count."""
+        """Update the main progress bar with current outline completion count."""
         if not hasattr(self, 'outlining_queue') or not self.outlining_queue:
             return
         completed = sum(1 for in_, si in self.outlining_queue if self._soma_has_outline(in_, si))
         total = len(self.outlining_queue)
-        self.outline_progress_bar.setMaximum(total)
-        self.outline_progress_bar.setValue(completed)
-        self.outline_progress_bar.setVisible(True)
+        self.progress_bar.setFormat("%v / %m somas outlined")
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(completed)
+        self.progress_bar.setVisible(True)
 
     def _finish_outlining(self):
-        self.outline_progress_bar.setVisible(False)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setFormat("%p%")  # Reset to default format
         self.outline_controls_widget.setVisible(False)
         self.batch_mode = False
         self.processed_label.polygon_mode = False
