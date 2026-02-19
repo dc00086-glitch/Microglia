@@ -7070,18 +7070,34 @@ Step 3: Import Results Back
             approved_count = sum(1 for flat in self.all_masks_flat if flat['mask_data']['approved'])
             rejected_count = len(self.all_masks_flat) - approved_count
 
+            # Count somas that have at least one approved mask
+            somas_with_masks = set()
+            total_somas = set()
+            for flat in self.all_masks_flat:
+                key = (flat['image_name'], flat['mask_data']['soma_id'])
+                total_somas.add(key)
+                if flat['mask_data']['approved']:
+                    somas_with_masks.add(key)
+            cells_used = len(somas_with_masks)
+            cells_total = len(total_somas)
+
             # Delete mask QA checklist — QA is done
             self._delete_checklist(self._get_checklist_path('mask_qa_checklist.csv'))
 
             self.log("=" * 50)
             self.log(f"✓ QA Complete!")
             self.log(f"Approved: {approved_count}, Rejected: {rejected_count}")
+            self.log(f"Cells used: {cells_used}/{cells_total}")
             self.log("=" * 50)
             self._auto_save()
 
             QMessageBox.information(
                 self, "QA Complete",
-                f"QA Complete!\n\nApproved: {approved_count}\nRejected: {rejected_count}"
+                f"QA Complete!\n\n"
+                f"Approved masks: {approved_count}\n"
+                f"Rejected masks: {rejected_count}\n\n"
+                f"Cells used: {cells_used} / {cells_total}\n"
+                f"({cells_total - cells_used} cells had all masks rejected)"
             )
 
     def undo_last_qa(self):
