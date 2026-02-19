@@ -3164,6 +3164,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 rows = self._read_checklist(mask_cl_path)
                 done = sum(1 for r in rows if len(r) > 1 and r[1] == '1')
                 self.log(f"  Found mask_checklist.csv: {done}/{len(rows)} masks generated")
+            qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
+            if qa_cl_path and os.path.exists(qa_cl_path):
+                rows = self._read_checklist(qa_cl_path)
+                done = sum(1 for r in rows if len(r) > 1 and r[1] == '1')
+                self.log(f"  Found mask_qa_checklist.csv: {done}/{len(rows)} masks QA'd")
             self.log("=" * 50)
 
             note = ""
@@ -6535,6 +6540,17 @@ Step 3: Import Results Back
         if reviewed_count > 0:
             self._evict_old_qa_masks()
 
+        # Create mask_qa_checklist.csv to track QA progress
+        qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
+        if qa_cl_path:
+            cl_rows = []
+            for flat in self.all_masks_flat:
+                md = flat['mask_data']
+                key = f"{flat['image_name']}_{md['soma_id']}_area{md['area_um2']}"
+                passed = 1 if md.get('approved') is not None else 0
+                cl_rows.append([key, str(passed)])
+            self._write_checklist(qa_cl_path, cl_rows, ['Mask', 'Passed QA'])
+
         self.approve_mask_btn.setEnabled(True)
         self.reject_mask_btn.setEnabled(True)
         self.prev_btn.setEnabled(True)
@@ -6756,6 +6772,15 @@ Step 3: Import Results Back
             for mask_num, area in auto_approved:
                 self.log(f"      Mask #{mask_num} ({area} µm²)")
 
+        # Update mask_qa_checklist.csv
+        qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
+        if qa_cl_path and os.path.exists(qa_cl_path):
+            self._update_checklist_row(qa_cl_path, 0,
+                f"{current_img}_{current_soma_id}_area{current_area}", 1, 1)
+            for _, area in auto_approved:
+                self._update_checklist_row(qa_cl_path, 0,
+                    f"{current_img}_{current_soma_id}_area{area}", 1, 1)
+
         # Auto-save every 5 QA decisions
         if len(self.last_qa_decisions) % 5 == 0:
             self._auto_save()
@@ -6961,6 +6986,12 @@ Step 3: Import Results Back
 
         self.log(f"✗ Rejected: {mask_data['soma_id']} ({mask_data['area_um2']} µm²)")
 
+        # Update mask_qa_checklist.csv
+        qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
+        if qa_cl_path and os.path.exists(qa_cl_path):
+            key = f"{flat_data['image_name']}_{mask_data['soma_id']}_area{mask_data['area_um2']}"
+            self._update_checklist_row(qa_cl_path, 0, key, 1, 1)
+
         if self.mask_qa_idx < len(self.all_masks_flat) - 1:
             self.mask_qa_idx += 1
             self._show_current_mask()
@@ -7013,6 +7044,9 @@ Step 3: Import Results Back
 
             approved_count = sum(1 for flat in self.all_masks_flat if flat['mask_data']['approved'])
             rejected_count = len(self.all_masks_flat) - approved_count
+
+            # Delete mask QA checklist — QA is done
+            self._delete_checklist(self._get_checklist_path('mask_qa_checklist.csv'))
 
             self.log("=" * 50)
             self.log(f"✓ QA Complete!")
