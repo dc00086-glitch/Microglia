@@ -2237,8 +2237,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         layout.addLayout(display_btn_layout)
 
-        # Mask overlay opacity slider
-        opacity_layout = QHBoxLayout()
+        # Mask overlay opacity slider — hidden until masks are generated
+        self.opacity_widget = QWidget()
+        opacity_layout = QHBoxLayout(self.opacity_widget)
+        opacity_layout.setContentsMargins(0, 0, 0, 0)
         opacity_label = QLabel("Mask Opacity:")
         opacity_label.setFixedWidth(85)
         opacity_layout.addWidget(opacity_label)
@@ -2252,7 +2254,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.opacity_value_label = QLabel("40%")
         self.opacity_value_label.setFixedWidth(35)
         opacity_layout.addWidget(self.opacity_value_label)
-        layout.addLayout(opacity_layout)
+        self.opacity_widget.setVisible(False)
+        layout.addWidget(self.opacity_widget)
 
         # Zoom hint row
         zoom_layout = QHBoxLayout()
@@ -3220,6 +3223,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         has_qa_complete = any(d['status'] in ('qa_complete', 'analyzed') for d in self.images.values())
         if has_masks:
             self.batch_qa_btn.setEnabled(True)
+            self.opacity_widget.setVisible(True)
         if has_qa_complete:
             self.batch_calculate_btn.setEnabled(True)
 
@@ -5822,6 +5826,7 @@ Step 3: Import Results Back
         self.undo_qa_btn.setVisible(False)
         self.mask_qa_active = False
         self.mask_qa_progress_bar.setVisible(False)
+        self.opacity_widget.setVisible(False)
 
         # Re-enable mask generation
         self.batch_generate_masks_btn.setEnabled(True)
@@ -6120,6 +6125,7 @@ Step 3: Import Results Back
 
             self.batch_qa_btn.setEnabled(True)
             self.clear_masks_btn.setEnabled(True)
+            self.opacity_widget.setVisible(True)
             # self.update_workflow_status()
 
             total_masks = sum(len(data['masks']) for data in self.images.values() if data['selected'])
@@ -6371,6 +6377,7 @@ Step 3: Import Results Back
                     return
         else:
             self.batch_qa_btn.setEnabled(True)
+            self.opacity_widget.setVisible(True)
             QMessageBox.information(self, "Done",
                 f"Regenerated {total} masks for {os.path.splitext(img_name)[0]}.\n\nReady for QA.")
 
