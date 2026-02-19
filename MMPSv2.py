@@ -1869,6 +1869,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("Microglia Analysis - Multi-Image Batch Processing")
+
+        # Menu bar — Session management lives here instead of crowding the left panel
+        menu_bar = self.menuBar()
+        session_menu = menu_bar.addMenu("Session")
+        save_action = session_menu.addAction("Save Session")
+        save_action.setShortcut("Ctrl+S")
+        save_action.setToolTip("Save current project state to resume later")
+        save_action.triggered.connect(self.save_session)
+        load_action = session_menu.addAction("Load Session")
+        load_action.setShortcut("Ctrl+O")
+        load_action.setToolTip("Resume a previously saved session")
+        load_action.triggered.connect(self.load_session)
+
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
@@ -2112,57 +2125,46 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_generate_masks_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_generate_masks_btn)
 
-        # Add Clear All Masks button
-        self.clear_masks_btn = QPushButton("🗑 Clear All Masks")
+        # Clear All Masks — created here but placed in right panel (visible only during QA)
+        self.clear_masks_btn = QPushButton("Clear All Masks")
         self.clear_masks_btn.clicked.connect(self.clear_all_masks)
         self.clear_masks_btn.setEnabled(False)
-        self.clear_masks_btn.setStyleSheet("border: 2px solid #F44336;")
-        batch_layout.addWidget(self.clear_masks_btn)
-        qa_row = QHBoxLayout()
+        self.clear_masks_btn.setVisible(False)
+        self.clear_masks_btn.setStyleSheet("border: 2px solid #F44336; font-weight: bold; padding: 4px 10px;")
+
         self.batch_qa_btn = QPushButton("QA All Masks")
         self.batch_qa_btn.clicked.connect(self.start_batch_qa)
         self.batch_qa_btn.setEnabled(False)
-        qa_row.addWidget(self.batch_qa_btn)
+        batch_layout.addWidget(self.batch_qa_btn)
         self.undo_qa_btn = QPushButton("Undo QA")
         self.undo_qa_btn.clicked.connect(self.undo_last_qa)
         self.undo_qa_btn.setEnabled(False)
         self.undo_qa_btn.setToolTip("Reset all mask approvals and restart QA")
         self.undo_qa_btn.setStyleSheet("border: 2px solid #FF9800;")
-        qa_row.addWidget(self.undo_qa_btn)
-        batch_layout.addLayout(qa_row)
+        self.undo_qa_btn.setVisible(False)
         self.batch_calculate_btn = QPushButton("Calculate Simple Characteristics")
         self.batch_calculate_btn.clicked.connect(self.batch_calculate_morphology)
         self.batch_calculate_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_calculate_btn)
 
-        # ImageJ integration buttons
-        imagej_layout = QHBoxLayout()
+        batch_group.setLayout(batch_layout)
+        layout.addWidget(batch_group)
+
+        # --- Step 4: ImageJ Plugin ---
+        imagej_group = QGroupBox("4. ImageJ Plugin")
+        imagej_group_layout = QVBoxLayout()
         self.launch_imagej_btn = QPushButton("Generate ImageJ Scripts")
         self.launch_imagej_btn.clicked.connect(self.generate_imagej_scripts)
         self.launch_imagej_btn.setEnabled(False)
         self.launch_imagej_btn.setToolTip("Generate Sholl & Skeleton analysis scripts for Fiji")
-        imagej_layout.addWidget(self.launch_imagej_btn)
+        imagej_group_layout.addWidget(self.launch_imagej_btn)
         self.import_imagej_btn = QPushButton("Import ImageJ Results")
         self.import_imagej_btn.clicked.connect(self.import_imagej_results)
         self.import_imagej_btn.setEnabled(False)
-        self.import_imagej_btn.setToolTip("Import Sholl & Skeleton CSVs and merge with morphology results")
-        imagej_layout.addWidget(self.import_imagej_btn)
-        batch_layout.addLayout(imagej_layout)
-
-        # Session save/restore buttons
-        session_layout = QHBoxLayout()
-        save_session_btn = QPushButton("Save Session")
-        save_session_btn.clicked.connect(self.save_session)
-        save_session_btn.setToolTip("Save current project state to resume later")
-        session_layout.addWidget(save_session_btn)
-        load_session_btn = QPushButton("Load Session")
-        load_session_btn.clicked.connect(self.load_session)
-        load_session_btn.setToolTip("Resume a previously saved session")
-        session_layout.addWidget(load_session_btn)
-        batch_layout.addLayout(session_layout)
-
-        batch_group.setLayout(batch_layout)
-        layout.addWidget(batch_group)
+        self.import_imagej_btn.setToolTip("Import Sholl & Skeleton CSVs and merge into combined CSV")
+        imagej_group_layout.addWidget(self.import_imagej_btn)
+        imagej_group.setLayout(imagej_group_layout)
+        layout.addWidget(imagej_group)
         log_group = QGroupBox("Log")
         log_layout = QVBoxLayout()
         self.log_text = QTextEdit()
@@ -2266,6 +2268,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.regen_masks_btn.setStyleSheet("border: 2px solid #FF9800; font-weight: bold; padding: 4px 10px;")
         self.regen_masks_btn.setToolTip("Regenerate masks for this image with different settings")
         zoom_layout.addWidget(self.regen_masks_btn)
+
+        # Clear All Masks + Undo QA — next to Redo, only visible during QA
+        zoom_layout.addWidget(self.clear_masks_btn)
+        zoom_layout.addWidget(self.undo_qa_btn)
 
         self.zoom_level_label = QLabel("1.0x")
         self.zoom_level_label.setFixedWidth(50)
@@ -5811,7 +5817,12 @@ Step 3: Import Results Back
         self.batch_qa_btn.setEnabled(False)
         self.batch_calculate_btn.setEnabled(False)
         self.clear_masks_btn.setEnabled(False)
-        
+        self.clear_masks_btn.setVisible(False)
+        self.regen_masks_btn.setVisible(False)
+        self.undo_qa_btn.setVisible(False)
+        self.mask_qa_active = False
+        self.mask_qa_progress_bar.setVisible(False)
+
         # Re-enable mask generation
         self.batch_generate_masks_btn.setEnabled(True)
         
@@ -6557,7 +6568,10 @@ Step 3: Import Results Back
         self.next_btn.setEnabled(True)
         self.done_btn.setEnabled(False)
         self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
+        self.undo_qa_btn.setVisible(True)
         self.regen_masks_btn.setVisible(True)
+        self.clear_masks_btn.setEnabled(True)
+        self.clear_masks_btn.setVisible(True)
 
         # Show and init progress bar
         self.mask_qa_progress_bar.setMaximum(len(self.all_masks_flat))
@@ -7031,6 +7045,9 @@ Step 3: Import Results Back
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
             self.regen_masks_btn.setVisible(False)
+            self.clear_masks_btn.setVisible(False)
+            self.clear_masks_btn.setEnabled(False)
+            self.undo_qa_btn.setVisible(False)
             self.mask_qa_progress_bar.setVisible(False)
 
             # Update image statuses
@@ -7041,6 +7058,7 @@ Step 3: Import Results Back
 
             self.batch_calculate_btn.setEnabled(True)
             self.undo_qa_btn.setEnabled(True)
+            self.undo_qa_btn.setVisible(True)
 
             approved_count = sum(1 for flat in self.all_masks_flat if flat['mask_data']['approved'])
             rejected_count = len(self.all_masks_flat) - approved_count
@@ -7100,7 +7118,10 @@ Step 3: Import Results Back
             self.prev_btn.setEnabled(True)
             self.next_btn.setEnabled(True)
             self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
+            self.undo_qa_btn.setVisible(True)
             self.regen_masks_btn.setVisible(True)
+            self.clear_masks_btn.setEnabled(True)
+            self.clear_masks_btn.setVisible(True)
             self._show_current_mask()
             self.tabs.setCurrentIndex(3)
 
