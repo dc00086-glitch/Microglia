@@ -221,7 +221,10 @@ def main():
             print(f"  SKIP (empty mask): {filename}")
             continue
 
+        treatment = image_name.split('_')[0] if image_name else ''
+
         row = {
+            'treatment': treatment,
             'image_name': image_name,
             'soma_id': soma_id,
             'area_um2': area,
@@ -240,7 +243,7 @@ def main():
     output_path = os.path.join(os.path.dirname(masks_dir), "combined_morphology_results.csv")
 
     fieldnames = [
-        'image_name', 'soma_id', 'area_um2',
+        'treatment', 'image_name', 'soma_id', 'area_um2',
         'mask_area', 'perimeter', 'roundness', 'eccentricity',
         'cell_spread', 'soma_area',
         'polarity_index', 'principal_angle',
