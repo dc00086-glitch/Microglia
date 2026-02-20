@@ -6,7 +6,7 @@ combined_morphology.csv using the mask TIFF files on disk.
 Updated formulas (matching MMPSv2.py):
     axis_ratio   = minor_axis / major_axis
     eccentricity = sqrt(1 - axis_ratio^2)   (0 = circle, 1 = elongated)
-    roundness    = minor_axis / major_axis   (0 = elongated, 1 = circle)
+    roundness    = (minor_axis / major_axis)^2  (0 = elongated, 1 = circle)
 
 Usage:
     python recompute_roundness_eccentricity.py
@@ -44,7 +44,7 @@ def recompute_for_mask(mask_path):
     if major > 0:
         axis_ratio = minor / major
         eccentricity = round(np.sqrt(1 - axis_ratio ** 2), 6)
-        roundness = round(axis_ratio, 6)
+        roundness = round(axis_ratio ** 2, 6)
     else:
         eccentricity = 0.0
         roundness = 0.0

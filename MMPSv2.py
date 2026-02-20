@@ -805,9 +805,9 @@ class MorphologyCalculator:
             else:
                 params['eccentricity'] = 0
             
-            # Roundness: minor/major ratio (unchanged)
+            # Roundness: (minor/major)^2  — 0 = elongated, 1 = circular
             if major_axis > 0:
-                params['roundness'] = minor_axis / major_axis
+                params['roundness'] = axis_ratio ** 2
             else:
                 params['roundness'] = 0
 
