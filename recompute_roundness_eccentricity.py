@@ -144,6 +144,7 @@ def main():
     skipped = 0
     errors = 0
     skipped_rows = []
+    kept_rows = []
 
     for row in rows:
         image_name = row.get("image_name", "")
@@ -152,7 +153,7 @@ def main():
 
         mask_path = find_mask_file(masks_dir, image_name, soma_id, area)
         if mask_path is None:
-            print(f"  SKIP (no file): {image_name} / {soma_id} / area={area}")
+            print(f"  SKIP (no mask on disk): {image_name} / {soma_id} / area={area}")
             skipped += 1
             skipped_rows.append(row)
             continue
@@ -173,30 +174,39 @@ def main():
 
         row["roundness"] = str(roundness)
         row["eccentricity"] = str(eccentricity)
+        kept_rows.append(row)
         updated += 1
 
-    # ── Report rows that still have bad values ─────────────────────────
+    # ── Report rows that will be removed ───────────────────────────────
     if skipped_rows:
-        print(f"\n⚠️  {len(skipped_rows)} rows were NOT updated (no matching mask file).")
-        print("These rows still have their OLD roundness/eccentricity values:")
+        print(f"\n⚠️  {len(skipped_rows)} rows had no mask file on disk (likely rejected masks).")
+        print("These rows will be REMOVED from the output CSV:")
         for r in skipped_rows:
             print(f"    {r.get('image_name','?')} / {r.get('soma_id','?')} / "
-                  f"area={r.get(area_col,'?')}  "
-                  f"roundness={r.get('roundness','?')}  eccentricity={r.get('eccentricity','?')}")
+                  f"area={r.get(area_col,'?')}")
         print()
 
-    # ── Write updated CSV ──────────────────────────────────────────────
+    # ── Write updated CSV (only rows with valid recomputed values) ─────
     backup_path = csv_path.replace(".csv", "_old_backup.csv")
+    if os.path.exists(backup_path):
+        # Don't overwrite an earlier backup
+        i = 2
+        while os.path.exists(backup_path):
+            backup_path = csv_path.replace(".csv", f"_old_backup_{i}.csv")
+            i += 1
     os.rename(csv_path, backup_path)
-    print(f"\nBackup saved to: {backup_path}")
+    print(f"Backup saved to: {backup_path}")
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(kept_rows)
 
-    print(f"\nDone!  Updated: {updated}  |  Skipped: {skipped}  |  Errors: {errors}")
-    print(f"Updated CSV: {csv_path}")
+    print(f"\nDone!")
+    print(f"  Rows updated:  {updated}")
+    print(f"  Rows removed:  {len(skipped_rows)} (no mask file = rejected)")
+    print(f"  Errors:        {errors}")
+    print(f"Updated CSV:     {csv_path}")
 
 
 if __name__ == "__main__":
