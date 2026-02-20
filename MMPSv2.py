@@ -23,6 +23,7 @@ from matplotlib.path import Path as mplPath
 import cv2
 import glob
 import json
+import csv
 import math
 
 
@@ -1728,6 +1729,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_qa_idx = 0
         self.mask_qa_active = False
         self.last_qa_decisions = []
+        # Sliding window for mask QA memory management:
+        # Only keep masks for current + last 10 somas in memory.
+        self._qa_soma_order = []        # ordered list of (img_name, soma_id) as encountered
+        self._qa_finalized_somas = set()  # somas evicted from memory
+        self._qa_soma_window_size = 10    # keep last N reviewed somas in memory
         self.soma_mode = False  # Initialize soma_mode to prevent crashes
         # Initialize display adjustment values
         self.brightness_value = 0
@@ -1770,8 +1776,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.z_key_held = True
             return  # Don't process further, Z is for zoom
 
-        # F1 shows help regardless of mode
-        if key == Qt.Key_F1:
+        # ? shows help regardless of mode
+        if key == Qt.Key_Question:
             self.show_shortcut_help()
             return
 
@@ -1863,6 +1869,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("Microglia Analysis - Multi-Image Batch Processing")
+
+        # Menu bar — Session management lives here instead of crowding the left panel
+        menu_bar = self.menuBar()
+        session_menu = menu_bar.addMenu("Session")
+        save_action = session_menu.addAction("Save Session")
+        save_action.setShortcut("Ctrl+S")
+        save_action.setToolTip("Save current project state to resume later")
+        save_action.triggered.connect(self.save_session)
+        load_action = session_menu.addAction("Load Session")
+        load_action.setShortcut("Ctrl+O")
+        load_action.setToolTip("Resume a previously saved session")
+        load_action.triggered.connect(self.load_session)
+
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
@@ -1883,7 +1902,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.shortcut_color.activated.connect(self.toggle_color_view)
         self.shortcut_zoom_reset = QShortcut(QKeySequence('U'), self)
         self.shortcut_zoom_reset.activated.connect(self._reset_current_zoom)
-        self.shortcut_help = QShortcut(QKeySequence(Qt.Key_F1), self)
+        self.shortcut_help = QShortcut(QKeySequence('?'), self)
         self.shortcut_help.setContext(Qt.ApplicationShortcut)
         self.shortcut_help.activated.connect(self.show_shortcut_help)
         self.shortcut_measure = QShortcut(QKeySequence('M'), self)
@@ -2098,17 +2117,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.redo_outline_btn.setStyleSheet("border: 2px solid #FF9800;")
         outline_controls_layout.addWidget(self.redo_outline_btn)
 
-        # Outline progress bar
-        self.outline_progress_bar = QProgressBar()
-        self.outline_progress_bar.setVisible(False)
-        self.outline_progress_bar.setMinimumHeight(20)
-        self.outline_progress_bar.setFormat("%v / %m somas outlined")
-        self.outline_progress_bar.setStyleSheet("""
-            QProgressBar { border: 1px solid palette(mid); border-radius: 3px; text-align: center; }
-            QProgressBar::chunk { background-color: #4CAF50; }
-        """)
-        outline_controls_layout.addWidget(self.outline_progress_bar)
-
         self.outline_controls_widget.setVisible(False)
         batch_layout.addWidget(self.outline_controls_widget)
         
@@ -2117,57 +2125,46 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_generate_masks_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_generate_masks_btn)
 
-        # Add Clear All Masks button
-        self.clear_masks_btn = QPushButton("🗑 Clear All Masks")
+        # Clear All Masks — created here but placed in right panel (visible only during QA)
+        self.clear_masks_btn = QPushButton("Clear All Masks")
         self.clear_masks_btn.clicked.connect(self.clear_all_masks)
         self.clear_masks_btn.setEnabled(False)
-        self.clear_masks_btn.setStyleSheet("border: 2px solid #F44336;")
-        batch_layout.addWidget(self.clear_masks_btn)
-        qa_row = QHBoxLayout()
+        self.clear_masks_btn.setVisible(False)
+        self.clear_masks_btn.setStyleSheet("border: 2px solid #F44336; font-weight: bold; padding: 4px 10px;")
+
         self.batch_qa_btn = QPushButton("QA All Masks")
         self.batch_qa_btn.clicked.connect(self.start_batch_qa)
         self.batch_qa_btn.setEnabled(False)
-        qa_row.addWidget(self.batch_qa_btn)
+        batch_layout.addWidget(self.batch_qa_btn)
         self.undo_qa_btn = QPushButton("Undo QA")
         self.undo_qa_btn.clicked.connect(self.undo_last_qa)
         self.undo_qa_btn.setEnabled(False)
         self.undo_qa_btn.setToolTip("Reset all mask approvals and restart QA")
         self.undo_qa_btn.setStyleSheet("border: 2px solid #FF9800;")
-        qa_row.addWidget(self.undo_qa_btn)
-        batch_layout.addLayout(qa_row)
+        self.undo_qa_btn.setVisible(False)
         self.batch_calculate_btn = QPushButton("Calculate Simple Characteristics")
         self.batch_calculate_btn.clicked.connect(self.batch_calculate_morphology)
         self.batch_calculate_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_calculate_btn)
 
-        # ImageJ integration buttons
-        imagej_layout = QHBoxLayout()
+        batch_group.setLayout(batch_layout)
+        layout.addWidget(batch_group)
+
+        # --- Step 4: ImageJ Plugin ---
+        imagej_group = QGroupBox("4. ImageJ Plugin")
+        imagej_group_layout = QVBoxLayout()
         self.launch_imagej_btn = QPushButton("Generate ImageJ Scripts")
         self.launch_imagej_btn.clicked.connect(self.generate_imagej_scripts)
         self.launch_imagej_btn.setEnabled(False)
         self.launch_imagej_btn.setToolTip("Generate Sholl & Skeleton analysis scripts for Fiji")
-        imagej_layout.addWidget(self.launch_imagej_btn)
+        imagej_group_layout.addWidget(self.launch_imagej_btn)
         self.import_imagej_btn = QPushButton("Import ImageJ Results")
         self.import_imagej_btn.clicked.connect(self.import_imagej_results)
         self.import_imagej_btn.setEnabled(False)
-        self.import_imagej_btn.setToolTip("Import Sholl & Skeleton CSVs and merge with morphology results")
-        imagej_layout.addWidget(self.import_imagej_btn)
-        batch_layout.addLayout(imagej_layout)
-
-        # Session save/restore buttons
-        session_layout = QHBoxLayout()
-        save_session_btn = QPushButton("Save Session")
-        save_session_btn.clicked.connect(self.save_session)
-        save_session_btn.setToolTip("Save current project state to resume later")
-        session_layout.addWidget(save_session_btn)
-        load_session_btn = QPushButton("Load Session")
-        load_session_btn.clicked.connect(self.load_session)
-        load_session_btn.setToolTip("Resume a previously saved session")
-        session_layout.addWidget(load_session_btn)
-        batch_layout.addLayout(session_layout)
-
-        batch_group.setLayout(batch_layout)
-        layout.addWidget(batch_group)
+        self.import_imagej_btn.setToolTip("Import Sholl & Skeleton CSVs and merge into combined CSV")
+        imagej_group_layout.addWidget(self.import_imagej_btn)
+        imagej_group.setLayout(imagej_group_layout)
+        layout.addWidget(imagej_group)
         log_group = QGroupBox("Log")
         log_layout = QVBoxLayout()
         self.log_text = QTextEdit()
@@ -2232,16 +2229,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         display_btn_layout.addWidget(self.measure_btn)
 
         # Help button
-        help_btn = QPushButton("? (F1)")
-        help_btn.setFixedWidth(55)
+        help_btn = QPushButton("?")
+        help_btn.setFixedWidth(35)
         help_btn.clicked.connect(self.show_shortcut_help)
         help_btn.setToolTip("Show keyboard shortcuts for current mode")
         display_btn_layout.addWidget(help_btn)
 
         layout.addLayout(display_btn_layout)
 
-        # Mask overlay opacity slider
-        opacity_layout = QHBoxLayout()
+        # Mask overlay opacity slider — hidden until masks are generated
+        self.opacity_widget = QWidget()
+        opacity_layout = QHBoxLayout(self.opacity_widget)
+        opacity_layout.setContentsMargins(0, 0, 0, 0)
         opacity_label = QLabel("Mask Opacity:")
         opacity_label.setFixedWidth(85)
         opacity_layout.addWidget(opacity_label)
@@ -2255,11 +2254,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.opacity_value_label = QLabel("40%")
         self.opacity_value_label.setFixedWidth(35)
         opacity_layout.addWidget(self.opacity_value_label)
-        layout.addLayout(opacity_layout)
+        self.opacity_widget.setVisible(False)
+        layout.addWidget(self.opacity_widget)
 
         # Zoom hint row
         zoom_layout = QHBoxLayout()
-        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, U: reset, M: measure, F1: help")
+        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, U: reset, M: measure, ?: help")
         zoom_hint.setStyleSheet("color: palette(dark); font-size: 10px;")
         zoom_layout.addWidget(zoom_hint)
         zoom_layout.addStretch()
@@ -2271,6 +2271,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.regen_masks_btn.setStyleSheet("border: 2px solid #FF9800; font-weight: bold; padding: 4px 10px;")
         self.regen_masks_btn.setToolTip("Regenerate masks for this image with different settings")
         zoom_layout.addWidget(self.regen_masks_btn)
+
+        # Clear All Masks + Undo QA — next to Redo, only visible during QA
+        zoom_layout.addWidget(self.clear_masks_btn)
+        zoom_layout.addWidget(self.undo_qa_btn)
 
         self.zoom_level_label = QLabel("1.0x")
         self.zoom_level_label.setFixedWidth(50)
@@ -2541,7 +2545,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Always-available shortcuts
         html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Always Available</b></td></tr>"
         always = [
-            ("F1", "Show this help"),
+            ("?", "Show this help"),
             ("C", "Toggle color / grayscale"),
             ("U", "Reset zoom"),
             ("Z + Left-click", "Zoom in"),
@@ -2662,8 +2666,103 @@ class MicrogliaAnalysisGUI(QMainWindow):
     # SESSION SAVE / RESTORE
     # ========================================================================
 
+    def _determine_last_completed_step(self):
+        """Determine the furthest completed workflow step across all images."""
+        statuses = [d['status'] for d in self.images.values() if d['selected']]
+        if not statuses:
+            return 'none'
+        # Priority order (highest = furthest along)
+        priority = ['analyzed', 'qa_complete', 'masks_generated', 'outlined',
+                     'somas_picked', 'processed', 'loaded']
+        for step in priority:
+            if any(s == step for s in statuses):
+                return step
+        return 'loaded'
+
+    def _get_step_display_name(self, step):
+        """Return a human-readable name for a workflow step."""
+        names = {
+            'none': 'No images loaded',
+            'loaded': 'Images loaded',
+            'processed': 'Image processing',
+            'somas_picked': 'Soma selection',
+            'outlined': 'Soma outlining',
+            'masks_generated': 'Mask generation',
+            'qa_complete': 'Mask QA',
+            'analyzed': 'Morphology analysis',
+        }
+        return names.get(step, step)
+
+    def _get_next_step_hint(self, step):
+        """Return a hint about what the user should do next."""
+        hints = {
+            'none': 'Load images and select an output folder to begin.',
+            'loaded': 'Select images and click "Process Selected Images".',
+            'processed': 'Click "Pick Somas" to mark cell bodies.',
+            'somas_picked': 'Click "Outline Somas" to trace soma boundaries.',
+            'outlined': 'Click "Generate All Masks" to create analysis masks.',
+            'masks_generated': 'Click "QA All Masks" to review masks.',
+            'qa_complete': 'Click "Calculate Simple Characteristics" or run ImageJ scripts.',
+            'analyzed': 'Analysis complete. Export results or run ImageJ scripts.',
+        }
+        return hints.get(step, '')
+
+    # --- Checklist CSV helpers for tracking progress ---
+
+    def _get_checklist_path(self, name):
+        """Get path for a checklist CSV in the output directory."""
+        if not self.output_dir:
+            return None
+        return os.path.join(self.output_dir, name)
+
+    def _write_checklist(self, path, rows, header):
+        """Write a checklist CSV with the given header and rows."""
+        with open(path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(rows)
+
+    def _read_checklist(self, path):
+        """Read a checklist CSV and return rows as list of lists."""
+        if not path or not os.path.exists(path):
+            return []
+        with open(path, 'r') as f:
+            reader = csv.reader(f)
+            next(reader, None)  # skip header
+            return [row for row in reader]
+
+    def _update_checklist_row(self, path, key_col_idx, key_value, status_col_idx, new_status):
+        """Update a single row in a checklist CSV by matching key column."""
+        if not path or not os.path.exists(path):
+            return
+        rows = []
+        header = None
+        with open(path, 'r') as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            rows = [row for row in reader]
+        for row in rows:
+            if row[key_col_idx] == key_value:
+                row[status_col_idx] = str(new_status)
+        if header:
+            with open(path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(rows)
+
+    def _delete_checklist(self, path):
+        """Delete a checklist CSV if it exists."""
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
     def _build_session_dict(self):
         """Build a serializable session dictionary from current state."""
+        # Determine the last completed workflow step
+        last_step = self._determine_last_completed_step()
+
         session = {
             'version': 2,
             'output_dir': self.output_dir,
@@ -2679,6 +2778,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             'coloc_channel_1': self.coloc_channel_1,
             'coloc_channel_2': self.coloc_channel_2,
             'grayscale_channel': self.grayscale_channel,
+            'last_completed_step': last_step,
+            'last_image_name': self.current_image_name,
             'images': {}
         }
 
@@ -2743,8 +2844,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def save_session(self):
         """Save the entire project state to a JSON file"""
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Session", "", "Session Files (*.mmps_session);;All Files (*)",
-            options=QFileDialog.DontUseNativeDialog
+            self, "Save Session", "", "Session Files (*.mmps_session);;All Files (*)"
         )
         if not path:
             return
@@ -2757,8 +2857,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
             with open(path, 'w') as f:
                 json.dump(session, f, indent=2)
 
+            last_step = session.get('last_completed_step', 'none')
+            step_name = self._get_step_display_name(last_step)
+            next_hint = self._get_next_step_hint(last_step)
+
             self.log(f"Session saved to: {path}")
-            QMessageBox.information(self, "Session Saved", f"Session saved to:\n{path}")
+            self.log(f"Last completed step: {step_name}")
+            QMessageBox.information(self, "Session Saved",
+                f"Session saved to:\n{path}\n\n"
+                f"Last completed step: {step_name}\n"
+                f"Next: {next_hint}")
 
         except Exception as e:
             self.log(f"ERROR saving session: {e}")
@@ -2779,8 +2887,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def load_session(self):
         """Restore a previously saved session"""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Session", "", "Session Files (*.mmps_session);;All Files (*)",
-            options=QFileDialog.DontUseNativeDialog
+            self, "Load Session", "", "Session Files (*.mmps_session);;All Files (*)"
         )
         if not path:
             return
@@ -2986,12 +3093,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 item.setForeground(QBrush(QColor(color_hex)))
                 self.file_list.addItem(item)
 
-            # Load and display first image
+            # Load and display the last viewed image (or first if not saved)
             if self.images:
-                first_name = sorted(self.images.keys())[0]
-                self.current_image_name = first_name
+                last_img = session.get('last_image_name')
+                if last_img and last_img in self.images:
+                    self.current_image_name = last_img
+                else:
+                    self.current_image_name = sorted(self.images.keys())[0]
                 self._display_current_image()
-                self.file_list.setCurrentRow(0)
+                # Set the file list selection to match
+                for row_i in range(self.file_list.count()):
+                    item = self.file_list.item(row_i)
+                    if item and item.data(Qt.UserRole) == self.current_image_name:
+                        self.file_list.setCurrentRow(row_i)
+                        break
                 self.process_selected_btn.setEnabled(True)
 
             # Rebuild all_masks_flat from loaded masks
@@ -3006,6 +3121,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         'processed_img': idata['processed'],
                     })
 
+            # Rebuild soma ordering for sliding window memory management
+            self._qa_soma_order = []
+            self._qa_finalized_somas = set()
+            seen_somas = set()
+            for flat in self.all_masks_flat:
+                key = (flat['image_name'], flat['mask_data']['soma_id'])
+                if key not in seen_somas:
+                    seen_somas.add(key)
+                    self._qa_soma_order.append(key)
+
             # Enable buttons based on restored state
             self._update_buttons_after_session_load()
 
@@ -3019,6 +3144,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
             if self.masks_dir and os.path.isdir(self.masks_dir):
                 n_mask_files = len([f for f in os.listdir(self.masks_dir) if f.endswith('_mask.tif')])
 
+            # Determine last completed step
+            last_step = session.get('last_completed_step', self._determine_last_completed_step())
+            step_name = self._get_step_display_name(last_step)
+            next_hint = self._get_next_step_hint(last_step)
+
             self.log("=" * 50)
             self.log(f"Session loaded: {n_loaded} images")
             if n_with_processed:
@@ -3029,6 +3159,25 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.log(f"  {n_with_outlines} images with soma outlines")
             if n_mask_files:
                 self.log(f"  {n_mask_files} exported masks found in {self.masks_dir}")
+            self.log(f"  Last completed step: {step_name}")
+            self.log(f"  Next: {next_hint}")
+
+            # Check for in-progress checklist files
+            soma_cl_path = self._get_checklist_path('soma_checklist.csv')
+            mask_cl_path = self._get_checklist_path('mask_checklist.csv')
+            if soma_cl_path and os.path.exists(soma_cl_path):
+                rows = self._read_checklist(soma_cl_path)
+                done = sum(1 for r in rows if len(r) > 1 and r[1] == '1')
+                self.log(f"  Found soma_checklist.csv: {done}/{len(rows)} somas outlined")
+            if mask_cl_path and os.path.exists(mask_cl_path):
+                rows = self._read_checklist(mask_cl_path)
+                done = sum(1 for r in rows if len(r) > 1 and r[1] == '1')
+                self.log(f"  Found mask_checklist.csv: {done}/{len(rows)} masks generated")
+            qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
+            if qa_cl_path and os.path.exists(qa_cl_path):
+                rows = self._read_checklist(qa_cl_path)
+                done = sum(1 for r in rows if len(r) > 1 and r[1] == '1')
+                self.log(f"  Found mask_qa_checklist.csv: {done}/{len(rows)} masks QA'd")
             self.log("=" * 50)
 
             note = ""
@@ -3044,7 +3193,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 f"Processed: {n_with_processed}\n"
                 f"With somas: {n_with_somas}\n"
                 f"With outlines: {n_with_outlines}\n"
-                f"Mask files on disk: {n_mask_files}"
+                f"Mask files on disk: {n_mask_files}\n\n"
+                f"Last completed step: {step_name}\n"
+                f"Next: {next_hint}"
                 f"{note}"
             )
 
@@ -3072,6 +3223,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         has_qa_complete = any(d['status'] in ('qa_complete', 'analyzed') for d in self.images.values())
         if has_masks:
             self.batch_qa_btn.setEnabled(True)
+            self.opacity_widget.setVisible(True)
         if has_qa_complete:
             self.batch_calculate_btn.setEnabled(True)
 
@@ -3199,6 +3351,17 @@ Output goes to: {output_path}
 Pixel size: {pixel_size} um/pixel
 Upscale factor: {scale_factor}x
 
+RECOMMENDED: Combined Script (runs all analyses at once)
+---------------------------------------------------------
+1. Open Fiji/ImageJ
+2. File > Open > select "CombinedAnalysis_ImageJ.py" from your Microglia folder
+3. Click "Run" in the script editor
+4. Set your MMPS Output Folder and parameters in the dialog
+5. Check which analyses to run (Skeleton, Sholl, Fractal)
+6. Return to MMPS and click "Import ImageJ Results"
+
+OR run individual scripts:
+
 Step 1: Sholl Analysis
 -----------------------
 1. Open Fiji/ImageJ
@@ -3249,16 +3412,22 @@ Step 3: Import Results Back
         self.log(f"  Instructions: {instructions_path}")
         self.log(f"  Parameters: {params_path}")
         self.log("")
-        self.log("To run analysis:")
+        self.log("To run analysis (RECOMMENDED - combined script):")
         self.log("  1. Open Fiji/ImageJ")
-        self.log(f"  2. Open Sholl_Attempt3.py and run with masks dir: {masks_path}")
-        self.log(f"  3. Open SkeletonAnalysisImageJ.py and run with masks dir: {masks_path}")
+        self.log("  2. Open CombinedAnalysis_ImageJ.py and click Run")
+        self.log(f"  3. Set MMPS Output Folder to: {output_path}")
         self.log("  4. Return here and click 'Import ImageJ Results'")
+        self.log("")
+        self.log("Or run individual scripts:")
+        self.log(f"  - Sholl_Attempt3.py (Sholl analysis)")
+        self.log(f"  - SkeletonAnalysisImageJ.py (Skeleton analysis)")
         self.log("=" * 50)
 
         QMessageBox.information(self, "ImageJ Scripts Generated",
             f"Analysis files saved to:\n{script_dir}\n\n"
-            f"See ImageJ_Analysis_Instructions.txt for step-by-step guide.\n\n"
+            f"RECOMMENDED: Run CombinedAnalysis_ImageJ.py in Fiji\n"
+            f"(runs Skeleton + Sholl + Fractal in one step)\n\n"
+            f"See ImageJ_Analysis_Instructions.txt for full guide.\n\n"
             f"Directories pre-configured:\n"
             f"  Masks: {masks_path}\n"
             f"  Somas: {somas_path}\n"
@@ -3278,77 +3447,186 @@ Step 3: Import Results Back
 
         import csv
 
-        # Look for ImageJ output files
-        sholl_path = os.path.join(self.output_dir, "Sholl_Combined_Results.csv")
-        skeleton_path = os.path.join(self.output_dir, "Skeleton_Analysis_Results.csv")
+        # Look for ImageJ output files (check combined script output first, then individual)
+        combined_results_dir = os.path.join(self.output_dir, "combined_imagej_results")
+
+        # Combined script output
+        combined_analysis_path = os.path.join(combined_results_dir, "Combined_Analysis_Results.csv")
+
+        # Sholl: check combined dir, then sholl_results dir, then root output dir
+        sholl_path = None
+        for candidate in [
+            os.path.join(combined_results_dir, "Sholl_All_Results.csv"),
+            os.path.join(self.output_dir, "sholl_results", "Sholl_All_Results.csv"),
+            os.path.join(self.output_dir, "Sholl_Combined_Results.csv"),
+            os.path.join(self.output_dir, "Sholl_All_Results.csv"),
+        ]:
+            if os.path.exists(candidate):
+                sholl_path = candidate
+                break
+
+        # Skeleton: check combined dir, then root output dir
+        skeleton_path = None
+        for candidate in [
+            os.path.join(combined_results_dir, "Skeleton_Analysis_Results.csv"),
+            os.path.join(self.output_dir, "Skeleton_Analysis_Results.csv"),
+        ]:
+            if os.path.exists(candidate):
+                skeleton_path = candidate
+                break
+
+        # Fractal: check combined dir
+        fractal_path = None
+        for candidate in [
+            os.path.join(combined_results_dir, "Fractal_Analysis_Results.csv"),
+            os.path.join(self.output_dir, "Fractal_Analysis_Results.csv"),
+        ]:
+            if os.path.exists(candidate):
+                fractal_path = candidate
+                break
+
         morphology_path = os.path.join(self.output_dir, "combined_morphology_results.csv")
 
         # Allow user to locate files if not found in expected location
-        found_sholl = os.path.exists(sholl_path)
-        found_skeleton = os.path.exists(skeleton_path)
+        found_combined = os.path.exists(combined_analysis_path)
+        found_sholl = sholl_path is not None and os.path.exists(sholl_path)
+        found_skeleton = skeleton_path is not None and os.path.exists(skeleton_path)
+        found_fractal = fractal_path is not None and os.path.exists(fractal_path)
         found_morphology = os.path.exists(morphology_path)
 
-        if not found_sholl and not found_skeleton:
+        if not found_combined and not found_sholl and not found_skeleton and not found_fractal:
             reply = QMessageBox.question(
                 self, "Files Not Found",
-                "No Sholl or Skeleton results found in the output folder.\n\n"
+                "No ImageJ analysis results found in the output folder.\n\n"
                 "Would you like to browse for them?",
                 QMessageBox.Yes | QMessageBox.No
             )
             if reply != QMessageBox.Yes:
                 return
 
-            # Browse for Sholl results
-            sholl_path, _ = QFileDialog.getOpenFileName(
-                self, "Select Sholl Results CSV (or Cancel to skip)", self.output_dir,
-                "CSV Files (*.csv);;All Files (*)",
-                options=QFileDialog.DontUseNativeDialog
+            # Browse for combined or individual results
+            browse_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Combined or Sholl Results CSV (or Cancel to skip)", self.output_dir,
+                "CSV Files (*.csv);;All Files (*)"
             )
-            found_sholl = bool(sholl_path) and os.path.exists(sholl_path)
+            if browse_path and os.path.exists(browse_path):
+                basename = os.path.basename(browse_path).lower()
+                if 'combined_analysis' in basename:
+                    combined_analysis_path = browse_path
+                    found_combined = True
+                else:
+                    sholl_path = browse_path
+                    found_sholl = True
 
             # Browse for Skeleton results
             skeleton_path, _ = QFileDialog.getOpenFileName(
                 self, "Select Skeleton Results CSV (or Cancel to skip)", self.output_dir,
-                "CSV Files (*.csv);;All Files (*)",
-                options=QFileDialog.DontUseNativeDialog
+                "CSV Files (*.csv);;All Files (*)"
             )
             found_skeleton = bool(skeleton_path) and os.path.exists(skeleton_path)
 
-        if not found_sholl and not found_skeleton:
+        if not found_combined and not found_sholl and not found_skeleton and not found_fractal:
             QMessageBox.information(self, "No Files", "No ImageJ results to import.")
             return
 
         self.log("=" * 50)
         self.log("Importing ImageJ results...")
 
-        # Read Sholl results
+        # If combined results file exists, use it directly (already has prefixed columns)
         sholl_data = {}
-        if found_sholl:
+        skeleton_data = {}
+        fractal_data = {}
+
+        if found_combined:
+            try:
+                with open(combined_analysis_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        cell_name = row.get('cell_name', '')
+                        if not cell_name:
+                            continue
+                        # Columns from combined script are already prefixed (sholl_, skel_, fractal_)
+                        ij_row = {}
+                        for k, v in row.items():
+                            if k in ('cell_name', 'image_name', 'soma_id', 'mask_file', 'mask_area_um2'):
+                                continue
+                            ij_row[k] = v
+                        # Split into categories for the merge logic
+                        sholl_part = {k: v for k, v in ij_row.items() if k.startswith('sholl_')}
+                        skel_part = {k: v for k, v in ij_row.items() if k.startswith('skel_')}
+                        frac_part = {k: v for k, v in ij_row.items() if k.startswith('fractal_')}
+                        if sholl_part:
+                            sholl_data[cell_name] = sholl_part
+                        if skel_part:
+                            skeleton_data[cell_name] = skel_part
+                        if frac_part:
+                            fractal_data[cell_name] = frac_part
+                total = len(sholl_data) + len(skeleton_data) + len(fractal_data)
+                self.log(f"  Combined: loaded from {os.path.basename(combined_analysis_path)}")
+                if sholl_data:
+                    self.log(f"    Sholl: {len(sholl_data)} cells")
+                if skeleton_data:
+                    self.log(f"    Skeleton: {len(skeleton_data)} cells")
+                if fractal_data:
+                    self.log(f"    Fractal: {len(fractal_data)} cells")
+            except Exception as e:
+                self.log(f"  ERROR reading combined results: {e}")
+
+        # Also read individual files (supplements or overrides combined data)
+        if found_sholl and not sholl_data:
             try:
                 with open(sholl_path, 'r') as f:
                     reader = csv.DictReader(f)
                     for row in reader:
-                        # Match by cell_name which corresponds to mask filename pattern
                         cell_name = row.get('Cell', row.get('cell_name', ''))
                         if cell_name:
-                            sholl_data[cell_name] = {f"sholl_{k}": v for k, v in row.items() if k != 'Cell' and k != 'cell_name'}
+                            # Add sholl_ prefix if not already present
+                            data = {}
+                            for k, v in row.items():
+                                if k in ('Cell', 'cell_name', 'image_name', 'soma_id', 'mask_file', 'mask_area_um2'):
+                                    continue
+                                key = k if k.startswith('sholl_') else f"sholl_{k}"
+                                data[key] = v
+                            sholl_data[cell_name] = data
                 self.log(f"  Sholl: loaded {len(sholl_data)} cells from {os.path.basename(sholl_path)}")
             except Exception as e:
                 self.log(f"  ERROR reading Sholl results: {e}")
 
-        # Read Skeleton results
-        skeleton_data = {}
-        if found_skeleton:
+        if found_skeleton and not skeleton_data:
             try:
                 with open(skeleton_path, 'r') as f:
                     reader = csv.DictReader(f)
                     for row in reader:
                         cell_name = row.get('cell_name', '')
                         if cell_name:
-                            skeleton_data[cell_name] = {f"skel_{k}": v for k, v in row.items() if k != 'cell_name'}
+                            data = {}
+                            for k, v in row.items():
+                                if k in ('cell_name', 'image_name', 'soma_id', 'mask_file', 'mask_area_um2'):
+                                    continue
+                                key = k if k.startswith('skel_') else f"skel_{k}"
+                                data[key] = v
+                            skeleton_data[cell_name] = data
                 self.log(f"  Skeleton: loaded {len(skeleton_data)} cells from {os.path.basename(skeleton_path)}")
             except Exception as e:
                 self.log(f"  ERROR reading Skeleton results: {e}")
+
+        if found_fractal and not fractal_data:
+            try:
+                with open(fractal_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        cell_name = row.get('cell_name', '')
+                        if cell_name:
+                            data = {}
+                            for k, v in row.items():
+                                if k in ('cell_name', 'image_name', 'soma_id', 'mask_file', 'mask_area_um2'):
+                                    continue
+                                key = k if k.startswith('fractal_') else f"fractal_{k}"
+                                data[key] = v
+                            fractal_data[cell_name] = data
+                self.log(f"  Fractal: loaded {len(fractal_data)} cells from {os.path.basename(fractal_path)}")
+            except Exception as e:
+                self.log(f"  ERROR reading Fractal results: {e}")
 
         # Read existing morphology results
         morphology_rows = []
@@ -3371,6 +3649,8 @@ Step 3: Import Results Back
                 all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(data)
             for cell_name, data in skeleton_data.items():
                 all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(data)
+            for cell_name, data in fractal_data.items():
+                all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(data)
 
             if all_ij_data:
                 combined_ij_path = os.path.join(self.output_dir, "imagej_combined_results.csv")
@@ -3387,13 +3667,17 @@ Step 3: Import Results Back
             # Merge with morphology results
             matched_sholl = 0
             matched_skel = 0
+            matched_fractal = 0
 
             new_sholl_keys = set()
             new_skel_keys = set()
+            new_fractal_keys = set()
             for d in sholl_data.values():
                 new_sholl_keys.update(d.keys())
             for d in skeleton_data.values():
                 new_skel_keys.update(d.keys())
+            for d in fractal_data.values():
+                new_fractal_keys.update(d.keys())
 
             for row in morphology_rows:
                 img_name = row.get('image_name', '')
@@ -3415,8 +3699,15 @@ Step 3: Import Results Back
                         matched_skel += 1
                         break
 
+                # Try to match Fractal data
+                for key in [cell_key] + [k for k in fractal_data.keys() if cell_key and cell_key in k]:
+                    if key in fractal_data:
+                        row.update(fractal_data[key])
+                        matched_fractal += 1
+                        break
+
             # Write merged results
-            all_keys = morph_fieldnames + sorted(new_sholl_keys) + sorted(new_skel_keys)
+            all_keys = morph_fieldnames + sorted(new_sholl_keys) + sorted(new_skel_keys) + sorted(new_fractal_keys)
             # Remove duplicates while preserving order
             seen = set()
             ordered_keys = []
@@ -3433,15 +3724,18 @@ Step 3: Import Results Back
 
             self.log(f"  Matched Sholl data: {matched_sholl}/{len(morphology_rows)} cells")
             self.log(f"  Matched Skeleton data: {matched_skel}/{len(morphology_rows)} cells")
+            self.log(f"  Matched Fractal data: {matched_fractal}/{len(morphology_rows)} cells")
             self.log(f"  Merged results saved to: {merged_path}")
 
         self.log("=" * 50)
 
         summary = "ImageJ Results Import Complete\n\n"
-        if found_sholl:
+        if sholl_data:
             summary += f"Sholl: {len(sholl_data)} cells\n"
-        if found_skeleton:
+        if skeleton_data:
             summary += f"Skeleton: {len(skeleton_data)} cells\n"
+        if fractal_data:
+            summary += f"Fractal: {len(fractal_data)} cells\n"
         if morphology_rows:
             summary += f"\nMerged with {len(morphology_rows)} morphology results\n"
             summary += f"Output: combined_all_results.csv"
@@ -3938,8 +4232,7 @@ Step 3: Import Results Back
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(
             self,
-            "Select Image Folder",
-            options=QFileDialog.DontUseNativeDialog
+            "Select Image Folder"
         )
         if not folder:
             return
@@ -4024,9 +4317,8 @@ Step 3: Import Results Back
 
     def select_output(self):
         folder = QFileDialog.getExistingDirectory(
-            self, 
-            "Select Output Folder",
-            options=QFileDialog.DontUseNativeDialog
+            self,
+            "Select Output Folder"
         )
         if folder:
             self.output_dir = folder
@@ -4449,12 +4741,22 @@ Step 3: Import Results Back
 
     def start_batch_soma_picking(self):
         self.soma_picking_queue = [name for name, data in self.images.items()
-                                   if data['selected'] and data['status'] == 'processed']
+                                   if data['selected'] and data['status'] in ('processed', 'somas_picked')]
         if not self.soma_picking_queue:
             QMessageBox.warning(self, "Warning", "No processed images to pick somas from")
             return
         self.batch_mode = True
-        self.current_image_name = self.soma_picking_queue[0]
+        # Resume on the last image the user was working on, if available
+        if self.current_image_name and self.current_image_name in self.soma_picking_queue:
+            pass  # keep current_image_name
+        else:
+            # Start at the first image that doesn't have somas yet
+            resume_name = None
+            for name in self.soma_picking_queue:
+                if not self.images[name]['somas']:
+                    resume_name = name
+                    break
+            self.current_image_name = resume_name or self.soma_picking_queue[0]
         self.processed_label.soma_mode = True
         self.original_label.soma_mode = False
         self.preview_label.soma_mode = False
@@ -4760,12 +5062,20 @@ Step 3: Import Results Back
         self.processed_label.soma_mode = False
         self.processed_label.point_edit_mode = False
         self.processed_label.selected_point_idx = None
+        self.processed_label.dragging_point = False
         self.original_label.polygon_mode = False
         self.preview_label.polygon_mode = False
         self.mask_label.polygon_mode = False
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.done_btn.setEnabled(False)
+        # Reset stale interaction state
+        self.z_key_held = False
+        for label in [self.processed_label, self.original_label, self.preview_label, self.mask_label]:
+            label.measure_mode = False
+            label.measure_pt1 = None
+            label.measure_pt2 = None
+        self.measure_mode = False
 
         # Store for review mode
         self.auto_outlined_points = {}  # {queue_idx: points}
@@ -4779,6 +5089,17 @@ Step 3: Import Results Back
         self.outline_method_display.setCurrentIndex(self.auto_outline_method.currentIndex())
         self.outline_sens_display.setValue(self.auto_outline_sensitivity.value())
         self._update_outline_progress()
+
+        # Create soma_checklist.csv to track outline progress
+        cl_path = self._get_checklist_path('soma_checklist.csv')
+        if cl_path:
+            rows = []
+            for img_name, soma_idx in self.outlining_queue:
+                soma_id = self.images[img_name]['soma_ids'][soma_idx]
+                name = f"{img_name}_{soma_id}"
+                passed = 1 if self._soma_has_outline(img_name, soma_idx) else 0
+                rows.append([name, str(passed)])
+            self._write_checklist(cl_path, rows, ['Soma', 'Passed QA'])
 
         if result == 1:
             # Manual mode
@@ -4880,7 +5201,23 @@ Step 3: Import Results Back
     def _start_review_mode(self):
         """Start reviewing auto-outlined somas one by one"""
         self.review_mode = True
-        self.current_review_idx = 0
+
+        # Reset stale UI state that could block interaction
+        self.z_key_held = False
+        for label in [self.processed_label, self.original_label, self.preview_label, self.mask_label]:
+            label.measure_mode = False
+            label.measure_pt1 = None
+            label.measure_pt2 = None
+        self.measure_mode = False
+
+        # Find the first soma that actually needs review (skip already-outlined)
+        start_idx = self._find_next_unoutlined_idx(0)
+        if start_idx is None:
+            # All somas already outlined — nothing to review
+            self._finish_review_mode()
+            return
+
+        self.current_review_idx = start_idx
 
         self.log("")
         self.log("=" * 50)
@@ -4890,13 +5227,29 @@ Step 3: Import Results Back
         self.log("• Click [Manual] to redraw from scratch")
         self.log("=" * 50)
 
-        self._load_review_soma(0)
+        self._load_review_soma(start_idx)
 
     def _load_review_soma(self, review_idx):
         """Load a soma for review"""
         if review_idx >= len(self.outlining_queue):
             self._finish_review_mode()
             return
+
+        # Skip somas that already have saved outlines (from previous session)
+        img_name_check, soma_idx_check = self.outlining_queue[review_idx]
+        if self._soma_has_outline(img_name_check, soma_idx_check):
+            # This soma is already outlined — advance to the next unoutlined one
+            next_idx = self._find_next_unoutlined_idx(start_from=review_idx + 1)
+            if next_idx is None:
+                self._finish_review_mode()
+            else:
+                self._load_review_soma(next_idx)
+            return
+
+        # Reset interaction state to prevent stale flags from blocking drag/click
+        self.z_key_held = False
+        self.processed_label.dragging_point = False
+        self.processed_label.selected_point_idx = None
 
         self.current_review_idx = review_idx
         self.current_outline_idx = review_idx
@@ -5121,6 +5474,12 @@ Step 3: Import Results Back
 
         # Update outline progress
         self._update_outline_progress()
+
+        # Update soma_checklist.csv
+        cl_path = self._get_checklist_path('soma_checklist.csv')
+        if cl_path and os.path.exists(cl_path):
+            checklist_key = f"{img_name}_{soma_id}"
+            self._update_checklist_row(cl_path, 0, checklist_key, 1, 1)
 
         # Auto-save after each outline
         self._auto_save()
@@ -5462,7 +5821,13 @@ Step 3: Import Results Back
         self.batch_qa_btn.setEnabled(False)
         self.batch_calculate_btn.setEnabled(False)
         self.clear_masks_btn.setEnabled(False)
-        
+        self.clear_masks_btn.setVisible(False)
+        self.regen_masks_btn.setVisible(False)
+        self.undo_qa_btn.setVisible(False)
+        self.mask_qa_active = False
+        self.mask_qa_progress_bar.setVisible(False)
+        self.opacity_widget.setVisible(False)
+
         # Re-enable mask generation
         self.batch_generate_masks_btn.setEnabled(True)
         
@@ -5500,17 +5865,19 @@ Step 3: Import Results Back
         return None  # All done
 
     def _update_outline_progress(self):
-        """Update the outline progress bar with current completion count."""
+        """Update the main progress bar with current outline completion count."""
         if not hasattr(self, 'outlining_queue') or not self.outlining_queue:
             return
         completed = sum(1 for in_, si in self.outlining_queue if self._soma_has_outline(in_, si))
         total = len(self.outlining_queue)
-        self.outline_progress_bar.setMaximum(total)
-        self.outline_progress_bar.setValue(completed)
-        self.outline_progress_bar.setVisible(True)
+        self.progress_bar.setFormat("%v / %m somas outlined")
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(completed)
+        self.progress_bar.setVisible(True)
 
     def _finish_outlining(self):
-        self.outline_progress_bar.setVisible(False)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setFormat("%p%")  # Reset to default format
         self.outline_controls_widget.setVisible(False)
         self.batch_mode = False
         self.processed_label.polygon_mode = False
@@ -5529,6 +5896,9 @@ Step 3: Import Results Back
                 self._update_file_list_item(img_name)
         self.batch_generate_masks_btn.setEnabled(True)
         # self.update_workflow_status()
+        # Delete soma checklist — outlining is done
+        self._delete_checklist(self._get_checklist_path('soma_checklist.csv'))
+
         self.log("=" * 50)
         self.log("✓ All somas outlined!")
         self.log("✓ Ready to generate masks")
@@ -5694,6 +6064,19 @@ Step 3: Import Results Back
                                  if data['selected'] and data['soma_outlines'])
             current_count = 0
 
+            # Create mask_checklist.csv to track generation progress
+            mask_cl_path = self._get_checklist_path('mask_checklist.csv')
+            if mask_cl_path:
+                cl_rows = []
+                for iname, idata in self.images.items():
+                    if not idata['selected'] or not idata['soma_outlines']:
+                        continue
+                    for sd in idata['soma_outlines']:
+                        for area_val in area_list:
+                            mask_key = f"{iname}_{sd['soma_id']}_area{area_val}"
+                            cl_rows.append([mask_key, '0'])
+                self._write_checklist(mask_cl_path, cl_rows, ['Mask', 'Generated'])
+
             for img_name, img_data in self.images.items():
                 if not img_data['selected'] or not img_data['soma_outlines']:
                     continue
@@ -5717,6 +6100,12 @@ Step 3: Import Results Back
                     )
                     img_data['masks'].extend(masks)
 
+                    # Mark each generated mask in the checklist
+                    if mask_cl_path and os.path.exists(mask_cl_path):
+                        for m in masks:
+                            m_key = f"{img_name}_{soma_id}_area{m['area_um2']}"
+                            self._update_checklist_row(mask_cl_path, 0, m_key, 1, 1)
+
                     current_count += 1
                     self.progress_bar.setValue(int((current_count / total_outlines) * 100))
 
@@ -5731,8 +6120,12 @@ Step 3: Import Results Back
             self.progress_bar.setVisible(False)
             self.progress_status_label.setVisible(False)
 
+            # Delete mask checklist — generation is done
+            self._delete_checklist(self._get_checklist_path('mask_checklist.csv'))
+
             self.batch_qa_btn.setEnabled(True)
             self.clear_masks_btn.setEnabled(True)
+            self.opacity_widget.setVisible(True)
             # self.update_workflow_status()
 
             total_masks = sum(len(data['masks']) for data in self.images.values() if data['selected'])
@@ -5960,6 +6353,17 @@ Step 3: Import Results Back
                     'processed_img': img_data['processed'],
                 })
 
+        # Rebuild soma ordering after regeneration
+        self._qa_soma_order = []
+        seen_somas = set()
+        for flat in self.all_masks_flat:
+            key = (flat['image_name'], flat['mask_data']['soma_id'])
+            if key not in seen_somas:
+                seen_somas.add(key)
+                self._qa_soma_order.append(key)
+        # Keep existing finalized set — only somas still present matter
+        self._qa_finalized_somas = {k for k in self._qa_finalized_somas if k in seen_somas}
+
         total = len(img_data['masks'])
         self.log(f"Generated {total} new masks for {img_name}")
         self._auto_save()
@@ -5973,6 +6377,7 @@ Step 3: Import Results Back
                     return
         else:
             self.batch_qa_btn.setEnabled(True)
+            self.opacity_widget.setVisible(True)
             QMessageBox.information(self, "Done",
                 f"Regenerated {total} masks for {os.path.splitext(img_name)[0]}.\n\nReady for QA.")
 
@@ -6130,6 +6535,16 @@ Step 3: Import Results Back
         if not hasattr(self, 'last_qa_decisions'):
             self.last_qa_decisions = []
 
+        # Build soma ordering for sliding window memory management
+        self._qa_soma_order = []
+        self._qa_finalized_somas = set()
+        seen_somas = set()
+        for flat in self.all_masks_flat:
+            key = (flat['image_name'], flat['mask_data']['soma_id'])
+            if key not in seen_somas:
+                seen_somas.add(key)
+                self._qa_soma_order.append(key)
+
         # Find first unreviewed mask to resume from
         reviewed_count = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
         first_unreviewed = 0
@@ -6139,13 +6554,31 @@ Step 3: Import Results Back
                 break
         self.mask_qa_idx = first_unreviewed
 
+        # If resuming, finalize somas that are already far behind
+        if reviewed_count > 0:
+            self._evict_old_qa_masks()
+
+        # Create mask_qa_checklist.csv to track QA progress
+        qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
+        if qa_cl_path:
+            cl_rows = []
+            for flat in self.all_masks_flat:
+                md = flat['mask_data']
+                key = f"{flat['image_name']}_{md['soma_id']}_area{md['area_um2']}"
+                passed = 1 if md.get('approved') is not None else 0
+                cl_rows.append([key, str(passed)])
+            self._write_checklist(qa_cl_path, cl_rows, ['Mask', 'Passed QA'])
+
         self.approve_mask_btn.setEnabled(True)
         self.reject_mask_btn.setEnabled(True)
         self.prev_btn.setEnabled(True)
         self.next_btn.setEnabled(True)
         self.done_btn.setEnabled(False)
         self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
+        self.undo_qa_btn.setVisible(True)
         self.regen_masks_btn.setVisible(True)
+        self.clear_masks_btn.setEnabled(True)
+        self.clear_masks_btn.setVisible(True)
 
         # Show and init progress bar
         self.mask_qa_progress_bar.setMaximum(len(self.all_masks_flat))
@@ -6164,6 +6597,100 @@ Step 3: Import Results Back
         self.log("Keyboard: A=Approve, R=Reject, ←→=Navigate, Space=Approve&Next")
         self.log("=" * 50)
 
+    def _evict_old_qa_masks(self):
+        """Evict mask arrays for somas that are beyond the sliding window.
+
+        Keeps only the current soma + last _qa_soma_window_size reviewed somas
+        in memory. Evicted approved masks are already on disk. Evicted rejected
+        masks have their TIFF files deleted from disk.
+        """
+        if not self.all_masks_flat or self.mask_qa_idx >= len(self.all_masks_flat):
+            return
+
+        # Determine which soma we're currently on
+        current_flat = self.all_masks_flat[self.mask_qa_idx]
+        current_soma_key = (current_flat['image_name'], current_flat['mask_data']['soma_id'])
+
+        try:
+            current_soma_idx = self._qa_soma_order.index(current_soma_key)
+        except ValueError:
+            return
+
+        # Everything before this index should be evicted
+        evict_before = current_soma_idx - self._qa_soma_window_size
+        if evict_before <= 0:
+            return
+
+        for soma_idx in range(evict_before):
+            soma_key = self._qa_soma_order[soma_idx]
+            if soma_key in self._qa_finalized_somas:
+                continue  # already evicted
+
+            self._qa_finalized_somas.add(soma_key)
+            img_name, soma_id = soma_key
+
+            for flat in self.all_masks_flat:
+                if flat['image_name'] != img_name or flat['mask_data']['soma_id'] != soma_id:
+                    continue
+                mask_data = flat['mask_data']
+                # Delete rejected mask TIFFs from disk
+                if mask_data.get('approved') is False:
+                    self._delete_rejected_mask_tiff(img_name, mask_data)
+                # Free the mask array from memory (metadata kept for bookkeeping)
+                mask_data['mask'] = None
+
+            self.log(f"   💾 Finalized {soma_id} — freed mask arrays from memory")
+
+        # Trim undo history: remove decisions for finalized somas
+        self.last_qa_decisions = [
+            d for d in self.last_qa_decisions
+            if (d['flat_data']['image_name'], d['flat_data']['mask_data']['soma_id'])
+            not in self._qa_finalized_somas
+        ]
+
+    def _delete_rejected_mask_tiff(self, img_name, mask_data):
+        """Delete the TIFF file for a rejected mask from disk."""
+        if not self.masks_dir or not os.path.isdir(self.masks_dir):
+            return
+        img_basename = os.path.splitext(img_name)[0]
+        soma_id = mask_data['soma_id']
+        area_um2 = mask_data.get('area_um2', 0)
+        mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+        mask_path = os.path.join(self.masks_dir, mask_filename)
+        if os.path.exists(mask_path):
+            try:
+                os.remove(mask_path)
+                self.log(f"   🗑️ Deleted rejected mask: {mask_filename}")
+            except Exception as e:
+                self.log(f"   ⚠️ Could not delete {mask_filename}: {e}")
+
+    def _reload_mask_from_disk(self, mask_data, img_name):
+        """Reload a mask array from its TIFF file on disk.
+
+        Returns True if successfully loaded, False otherwise.
+        """
+        if mask_data.get('mask') is not None:
+            return True  # already in memory
+
+        if not self.masks_dir or not os.path.isdir(self.masks_dir):
+            return False
+
+        img_basename = os.path.splitext(img_name)[0]
+        soma_id = mask_data['soma_id']
+        area_um2 = mask_data.get('area_um2', 0)
+        mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+        mask_path = os.path.join(self.masks_dir, mask_filename)
+
+        if os.path.exists(mask_path):
+            try:
+                mask_arr = tifffile.imread(mask_path)
+                # Convert back from 0/255 to 0/1
+                mask_data['mask'] = (mask_arr > 0).astype(np.uint8)
+                return True
+            except Exception as e:
+                self.log(f"   ⚠️ Could not reload mask {mask_filename}: {e}")
+        return False
+
     def _show_current_mask(self):
         if not self.all_masks_flat or self.mask_qa_idx >= len(self.all_masks_flat):
             return
@@ -6172,6 +6699,12 @@ Step 3: Import Results Back
         mask_data = flat_data['mask_data']
         processed_img = flat_data['processed_img']
         img_name = flat_data['image_name']
+
+        # Reload mask from disk if it was evicted from memory
+        if mask_data.get('mask') is None:
+            if not self._reload_mask_from_disk(mask_data, img_name):
+                self.log(f"⚠️ Cannot display mask — file not found on disk")
+                return
 
         # Display in color or grayscale based on toggle
         img_data = self.images.get(img_name, {})
@@ -6260,12 +6793,24 @@ Step 3: Import Results Back
             for mask_num, area in auto_approved:
                 self.log(f"      Mask #{mask_num} ({area} µm²)")
 
+        # Update mask_qa_checklist.csv
+        qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
+        if qa_cl_path and os.path.exists(qa_cl_path):
+            self._update_checklist_row(qa_cl_path, 0,
+                f"{current_img}_{current_soma_id}_area{current_area}", 1, 1)
+            for _, area in auto_approved:
+                self._update_checklist_row(qa_cl_path, 0,
+                    f"{current_img}_{current_soma_id}_area{area}", 1, 1)
+
         # Auto-save every 5 QA decisions
         if len(self.last_qa_decisions) % 5 == 0:
             self._auto_save()
 
         # Move to next unreviewed mask
         self._advance_to_next_unreviewed()
+
+        # Evict old somas outside the sliding window to free memory
+        self._evict_old_qa_masks()
 
     def _export_approved_mask(self, flat_data):
         """Export a single approved mask to TIFF file"""
@@ -6462,11 +7007,20 @@ Step 3: Import Results Back
 
         self.log(f"✗ Rejected: {mask_data['soma_id']} ({mask_data['area_um2']} µm²)")
 
+        # Update mask_qa_checklist.csv
+        qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
+        if qa_cl_path and os.path.exists(qa_cl_path):
+            key = f"{flat_data['image_name']}_{mask_data['soma_id']}_area{mask_data['area_um2']}"
+            self._update_checklist_row(qa_cl_path, 0, key, 1, 1)
+
         if self.mask_qa_idx < len(self.all_masks_flat) - 1:
             self.mask_qa_idx += 1
             self._show_current_mask()
         else:
             self._check_qa_complete()
+
+        # Evict old somas outside the sliding window to free memory
+        self._evict_old_qa_masks()
 
     def next_mask(self):
         if not self.mask_qa_active:
@@ -6479,6 +7033,12 @@ Step 3: Import Results Back
         if not self.mask_qa_active:
             return
         if self.mask_qa_idx > 0:
+            # Check if the previous mask's soma has been finalized
+            prev_flat = self.all_masks_flat[self.mask_qa_idx - 1]
+            prev_key = (prev_flat['image_name'], prev_flat['mask_data']['soma_id'])
+            if prev_key in self._qa_finalized_somas:
+                self.log("⚠️ Cannot go back further — those masks have been finalized to save memory")
+                return
             self.mask_qa_idx -= 1
             self._show_current_mask()
 
@@ -6492,6 +7052,9 @@ Step 3: Import Results Back
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
             self.regen_masks_btn.setVisible(False)
+            self.clear_masks_btn.setVisible(False)
+            self.clear_masks_btn.setEnabled(False)
+            self.undo_qa_btn.setVisible(False)
             self.mask_qa_progress_bar.setVisible(False)
 
             # Update image statuses
@@ -6502,19 +7065,39 @@ Step 3: Import Results Back
 
             self.batch_calculate_btn.setEnabled(True)
             self.undo_qa_btn.setEnabled(True)
+            self.undo_qa_btn.setVisible(True)
 
             approved_count = sum(1 for flat in self.all_masks_flat if flat['mask_data']['approved'])
             rejected_count = len(self.all_masks_flat) - approved_count
 
+            # Count somas that have at least one approved mask
+            somas_with_masks = set()
+            total_somas = set()
+            for flat in self.all_masks_flat:
+                key = (flat['image_name'], flat['mask_data']['soma_id'])
+                total_somas.add(key)
+                if flat['mask_data']['approved']:
+                    somas_with_masks.add(key)
+            cells_used = len(somas_with_masks)
+            cells_total = len(total_somas)
+
+            # Delete mask QA checklist — QA is done
+            self._delete_checklist(self._get_checklist_path('mask_qa_checklist.csv'))
+
             self.log("=" * 50)
             self.log(f"✓ QA Complete!")
             self.log(f"Approved: {approved_count}, Rejected: {rejected_count}")
+            self.log(f"Cells used: {cells_used}/{cells_total}")
             self.log("=" * 50)
             self._auto_save()
 
             QMessageBox.information(
                 self, "QA Complete",
-                f"QA Complete!\n\nApproved: {approved_count}\nRejected: {rejected_count}"
+                f"QA Complete!\n\n"
+                f"Approved masks: {approved_count}\n"
+                f"Rejected masks: {rejected_count}\n\n"
+                f"Cells used: {cells_used} / {cells_total}\n"
+                f"({cells_total - cells_used} cells had all masks rejected)"
             )
 
     def undo_last_qa(self):
@@ -6558,7 +7141,10 @@ Step 3: Import Results Back
             self.prev_btn.setEnabled(True)
             self.next_btn.setEnabled(True)
             self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
+            self.undo_qa_btn.setVisible(True)
             self.regen_masks_btn.setVisible(True)
+            self.clear_masks_btn.setEnabled(True)
+            self.clear_masks_btn.setVisible(True)
             self._show_current_mask()
             self.tabs.setCurrentIndex(3)
 
@@ -6570,6 +7156,16 @@ Step 3: Import Results Back
             # Complex analysis (Sholl, Skeleton) will be done separately in ImageJ
 
             self.log(f"all_masks_flat has {len(self.all_masks_flat)} entries")
+
+            # Reload any evicted mask arrays from disk before analysis
+            reload_count = 0
+            for flat in self.all_masks_flat:
+                if flat['mask_data'].get('approved') and flat['mask_data'].get('mask') is None:
+                    if self._reload_mask_from_disk(flat['mask_data'], flat['image_name']):
+                        reload_count += 1
+            if reload_count > 0:
+                self.log(f"   Reloaded {reload_count} evicted masks from disk for analysis")
+
             approved_masks = [flat for flat in self.all_masks_flat if flat['mask_data']['approved']]
             total = len(approved_masks)
 
@@ -6646,6 +7242,9 @@ Step 3: Import Results Back
                     if (flat_data['mask_data'].get('approved') and
                         flat_data['mask_data'].get('soma_id') == result.get('soma_id') and
                         os.path.splitext(flat_data['image_name'])[0] == img_name):
+                        # Reload from disk if evicted
+                        if flat_data['mask_data'].get('mask') is None:
+                            self._reload_mask_from_disk(flat_data['mask_data'], flat_data['image_name'])
                         mask = flat_data['mask_data'].get('mask')
                         full_img_name = flat_data['image_name']
                         if mask is not None:
