@@ -54,16 +54,29 @@ def recompute_for_mask(mask_path):
 
 def find_mask_file(masks_dir, image_name, soma_id, area_um2):
     """Try to locate the mask file matching this CSV row."""
-    # Primary pattern: {image}_{soma_id}_area{N}_mask.tif
-    candidate = f"{image_name}_{soma_id}_area{int(float(area_um2))}_mask.tif"
-    path = os.path.join(masks_dir, candidate)
-    if os.path.exists(path):
-        return path
+    area_int = int(float(area_um2))
 
-    # Fallback: glob for anything matching image + soma_id + area
+    # Try multiple naming conventions (MMPSv2 current + old MMPS patterns)
+    candidates = [
+        f"{image_name}_{soma_id}_area{area_int}_mask.tif",   # MMPSv2 approved masks
+        f"{image_name}_{soma_id}_area{area_int}.tif",        # MMPSv2 generated (no _mask)
+        f"{image_name}_{soma_id}_mask.tif",                  # old MMPS (no area in name)
+        f"{image_name}_{soma_id}.tif",                       # old MMPS bare
+    ]
+    for c in candidates:
+        path = os.path.join(masks_dir, c)
+        if os.path.exists(path):
+            return path
+
+    # Broad fallback: any file matching image + soma_id + area
     for f in os.listdir(masks_dir):
-        if (f.startswith(image_name) and soma_id in f
-                and f"area{int(float(area_um2))}" in f and f.endswith("_mask.tif")):
+        if f.startswith(image_name) and soma_id in f and f.endswith(".tif"):
+            if f"area{area_int}" in f:
+                return os.path.join(masks_dir, f)
+
+    # Last resort: any file matching image + soma_id (ignore area)
+    for f in os.listdir(masks_dir):
+        if f.startswith(image_name) and soma_id in f and f.endswith(".tif"):
             return os.path.join(masks_dir, f)
 
     return None
@@ -119,10 +132,18 @@ def main():
         print("ERROR: CSV has no 'area_um2' or 'mask_area' column to match mask files.")
         return
 
+    # ── List mask files in folder for diagnostics ────────────────────
+    all_mask_files = sorted(f for f in os.listdir(masks_dir) if f.endswith(".tif"))
+    print(f"\nFound {len(all_mask_files)} TIFF files in masks folder.")
+    if all_mask_files:
+        print(f"  First few: {all_mask_files[:5]}")
+    print(f"CSV has {len(rows)} rows, matching on column '{area_col}'.\n")
+
     # ── Recompute ──────────────────────────────────────────────────────
     updated = 0
     skipped = 0
     errors = 0
+    skipped_rows = []
 
     for row in rows:
         image_name = row.get("image_name", "")
@@ -133,6 +154,7 @@ def main():
         if mask_path is None:
             print(f"  SKIP (no file): {image_name} / {soma_id} / area={area}")
             skipped += 1
+            skipped_rows.append(row)
             continue
 
         try:
@@ -140,16 +162,28 @@ def main():
         except Exception as e:
             print(f"  ERROR: {mask_path}: {e}")
             errors += 1
+            skipped_rows.append(row)
             continue
 
         if roundness is None:
             print(f"  SKIP (empty mask): {mask_path}")
             skipped += 1
+            skipped_rows.append(row)
             continue
 
         row["roundness"] = str(roundness)
         row["eccentricity"] = str(eccentricity)
         updated += 1
+
+    # ── Report rows that still have bad values ─────────────────────────
+    if skipped_rows:
+        print(f"\n⚠️  {len(skipped_rows)} rows were NOT updated (no matching mask file).")
+        print("These rows still have their OLD roundness/eccentricity values:")
+        for r in skipped_rows:
+            print(f"    {r.get('image_name','?')} / {r.get('soma_id','?')} / "
+                  f"area={r.get(area_col,'?')}  "
+                  f"roundness={r.get('roundness','?')}  eccentricity={r.get('eccentricity','?')}")
+        print()
 
     # ── Write updated CSV ──────────────────────────────────────────────
     backup_path = csv_path.replace(".csv", "_old_backup.csv")
