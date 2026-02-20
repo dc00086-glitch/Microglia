@@ -78,13 +78,16 @@ class MorphologyCalculator:
             major_axis = props.major_axis_length
             minor_axis = props.minor_axis_length
 
-            if minor_axis > 0:
-                params['eccentricity'] = major_axis / minor_axis
+            # Range: 0 (perfect circle) to 1 (highly elongated)
+            if major_axis > 0:
+                axis_ratio = minor_axis / major_axis
+                params['eccentricity'] = np.sqrt(1 - axis_ratio**2)
             else:
                 params['eccentricity'] = 0
 
+            # Roundness: (minor/major)^2  — 0 = elongated, 1 = circular
             if major_axis > 0:
-                params['roundness'] = minor_axis / major_axis
+                params['roundness'] = axis_ratio ** 2
             else:
                 params['roundness'] = 0
 
