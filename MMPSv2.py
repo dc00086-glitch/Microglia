@@ -7596,8 +7596,55 @@ Step 3: Import Results Back
         self.log(f"Per-image results saved for {len(by_image)} images")
 
 
+def _generate_microglia_icon():
+    """Generate a microglia-cell-themed icon programmatically."""
+    size = 256
+    pixmap = QPixmap(size, size)
+    pixmap.fill(QColor(0, 0, 0, 0))  # transparent background
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    cx, cy = size // 2, size // 2
+
+    # Draw branching processes (arms) radiating from center
+    branch_pen = QPen(QColor(100, 180, 255), 5)
+    branch_pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(branch_pen)
+    import math as _m
+    branches = [
+        (0, 90), (45, 80), (90, 85), (135, 75),
+        (180, 88), (225, 82), (270, 78), (315, 86),
+        (22, 60), (67, 55), (112, 65), (157, 58),
+        (202, 62), (247, 57), (292, 63), (337, 60),
+    ]
+    for angle_deg, length in branches:
+        angle = _m.radians(angle_deg)
+        x1 = cx + int(30 * _m.cos(angle))
+        y1 = cy + int(30 * _m.sin(angle))
+        x2 = cx + int(length * _m.cos(angle))
+        y2 = cy + int(length * _m.sin(angle))
+        painter.drawLine(x1, y1, x2, y2)
+        # Small fork at tips
+        for fork in (-25, 25):
+            fa = angle + _m.radians(fork)
+            fx = x2 + int(20 * _m.cos(fa))
+            fy = y2 + int(20 * _m.sin(fa))
+            painter.drawLine(x2, y2, fx, fy)
+
+    # Draw soma (cell body) — filled circle in center
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QBrush(QColor(60, 140, 220)))
+    painter.drawEllipse(cx - 28, cy - 28, 56, 56)
+    # Nucleus highlight
+    painter.setBrush(QBrush(QColor(180, 220, 255)))
+    painter.drawEllipse(cx - 10, cy - 12, 18, 18)
+
+    painter.end()
+    return QIcon(pixmap)
+
+
 def _get_app_icon():
-    """Load MMPS app icon from common locations next to the script."""
+    """Load MMPS app icon from common locations, or generate a default."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     # Check for icon files in order of preference
     icon_names = ['MMPS.icns', 'MMPS.ico', 'MMPS.png', 'MMPS.icn']
@@ -7614,7 +7661,8 @@ def _get_app_icon():
                 icon = QIcon(path)
                 if not icon.isNull():
                     return icon
-    return None
+    # No file found — generate a microglia icon
+    return _generate_microglia_icon()
 
 
 def main():
