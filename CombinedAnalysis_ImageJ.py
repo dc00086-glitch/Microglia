@@ -507,9 +507,15 @@ def runFractalAnalysis(maskPath, pixelSize):
 
         # Lacunarity: lambda = var(counts)/mean(counts)^2 + 1
         n = len(counts)
-        meanC = sum(counts) / float(n)
+        sumC = 0.0
+        for c in counts:
+            sumC += c
+        meanC = sumC / float(n)
         if meanC > 0:
-            varC = sum((c - meanC) ** 2 for c in counts) / float(n)
+            varC = 0.0
+            for c in counts:
+                varC += (c - meanC) ** 2
+            varC = varC / float(n)
             lac = varC / (meanC ** 2) + 1.0
         else:
             lac = float('nan')
@@ -520,10 +526,15 @@ def runFractalAnalysis(maskPath, pixelSize):
 
     # Linear regression: log(N) = D * log(1/s) + b
     n = len(logInvS)
-    sx = sum(logInvS)
-    sy = sum(logN)
-    sxx = sum(x * x for x in logInvS)
-    sxy = sum(x * y for x, y in zip(logInvS, logN))
+    sx = 0.0
+    sy = 0.0
+    sxx = 0.0
+    sxy = 0.0
+    for i in range(n):
+        sx += logInvS[i]
+        sy += logN[i]
+        sxx += logInvS[i] * logInvS[i]
+        sxy += logInvS[i] * logN[i]
 
     denom = n * sxx - sx * sx
     if abs(denom) < 1e-12:
@@ -535,14 +546,25 @@ def runFractalAnalysis(maskPath, pixelSize):
 
         # R-squared
         yMean = sy / n
-        ssTot = sum((y - yMean) ** 2 for y in logN)
-        ssRes = sum((y - (fractalDim * x + intercept)) ** 2
-                     for x, y in zip(logInvS, logN))
+        ssTot = 0.0
+        ssRes = 0.0
+        for i in range(n):
+            ssTot += (logN[i] - yMean) ** 2
+            ssRes += (logN[i] - (fractalDim * logInvS[i] + intercept)) ** 2
         rSquared = 1.0 - ssRes / ssTot if ssTot > 0 else float('nan')
 
     # Average lacunarity across scales
-    validLac = [l for l in lacunarities if l == l]  # filter NaN
-    avgLacunarity = sum(validLac) / len(validLac) if validLac else float('nan')
+    validLac = []
+    for l in lacunarities:
+        if l == l:  # filter NaN
+            validLac.append(l)
+    if validLac:
+        lacSum = 0.0
+        for l in validLac:
+            lacSum += l
+        avgLacunarity = lacSum / len(validLac)
+    else:
+        avgLacunarity = float('nan')
 
     # Span ratio (max extent / cell area) as simple density measure
     fgArea = totalFG * (pixelSize ** 2)
