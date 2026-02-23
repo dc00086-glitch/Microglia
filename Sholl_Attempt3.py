@@ -468,4 +468,5 @@ def main():
         IJ.log("No results collected. Check masks and soma files.")
 
 
-main()
+if __name__ == '__main__':
+    main()

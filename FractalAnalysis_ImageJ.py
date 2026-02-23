@@ -315,4 +315,5 @@ def main():
         IJ.log("No results collected. Check mask files.")
 
 
-main()
+if __name__ == '__main__':
+    main()

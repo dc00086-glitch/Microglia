@@ -1,10 +1,5 @@
-#@File(label="Masks Directory", style="directory") masksDir
-#@File(label="Output Directory", style="directory") outputDir
-#@Float(label="Pixel Size (um/pixel)", value=0.316) pixelSize
-#@Integer(label="Upscale Factor (2 for 20x, 1 for 40x)", value=2) scaleFactor
-#@Boolean(label="Only analyze largest mask per cell", value=false) largestOnly
-
 from ij import IJ, ImagePlus
+from ij.gui import GenericDialog
 from ij.measure import Calibration, ResultsTable
 from sc.fiji.analyzeSkeleton import AnalyzeSkeleton_
 
@@ -252,12 +247,26 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
 
 
 def main():
+    # --- User dialog ---
+    gd = GenericDialog("MMPS Skeleton Analysis")
+    gd.addDirectoryField("Masks Directory", "")
+    gd.addDirectoryField("Output Directory", "")
+    gd.addNumericField("Pixel Size (um/pixel)", 0.316, 4)
+    gd.addNumericField("Upscale Factor (2 for 20x, 1 for 40x)", 2, 0)
+    gd.addCheckbox("Only analyze largest mask per cell", False)
+    gd.showDialog()
+    if gd.wasCanceled():
+        return
+
+    masksDirPath = gd.getNextString()
+    outputDirPath = gd.getNextString()
+    pixelSize = gd.getNextNumber()
+    scaleFactor = int(gd.getNextNumber())
+    largestOnly = gd.getNextBoolean()
+
     print("=" * 60)
     print("SKELETON ANALYSIS - BATCH PROCESSOR")
     print("=" * 60)
-
-    masksDirPath = str(masksDir)
-    outputDirPath = str(outputDir)
 
     # Find mask files
     maskFiles = sorted([f for f in os.listdir(masksDirPath) if f.endswith('_mask.tif')])
