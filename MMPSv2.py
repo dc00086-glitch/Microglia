@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QCheckBox, QComboBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QKeySequence
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QKeySequence, QIcon
 from PyQt5.QtWidgets import QShortcut
 from PIL import Image
 import tifffile
@@ -1869,6 +1869,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("Microglia Analysis - Multi-Image Batch Processing")
+        # Set window icon (picks up MMPS.icns/.ico/.png next to the script)
+        icon = _get_app_icon()
+        if icon:
+            self.setWindowIcon(icon)
 
         # Menu bar — Session management lives here instead of crowding the left panel
         menu_bar = self.menuBar()
@@ -7592,9 +7596,36 @@ Step 3: Import Results Back
         self.log(f"Per-image results saved for {len(by_image)} images")
 
 
+def _get_app_icon():
+    """Load MMPS app icon from common locations next to the script."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Check for icon files in order of preference
+    icon_names = ['MMPS.icns', 'MMPS.ico', 'MMPS.png', 'MMPS.icn']
+    search_dirs = [
+        script_dir,
+        os.path.join(script_dir, 'resources'),
+        # macOS .app bundle: Contents/Resources
+        os.path.join(script_dir, '..', 'Resources'),
+    ]
+    for d in search_dirs:
+        for name in icon_names:
+            path = os.path.join(d, name)
+            if os.path.isfile(path):
+                icon = QIcon(path)
+                if not icon.isNull():
+                    return icon
+    return None
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+
+    # Set application icon
+    icon = _get_app_icon()
+    if icon:
+        app.setWindowIcon(icon)
+
     window = MicrogliaAnalysisGUI()
     window.show()
     sys.exit(app.exec_())
