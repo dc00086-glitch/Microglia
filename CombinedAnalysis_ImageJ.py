@@ -69,7 +69,7 @@ def main():
             doSkeleton = False
 
     if doSholl:
-        shollPath = pick_script("Locate Sholl_Attempt3.py")
+        shollPath = pick_script("Locate Sholl Analysis script")
         if shollPath is None:
             IJ.log("Sholl Analysis skipped (no file selected).")
             doSholl = False
