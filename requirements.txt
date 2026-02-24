@@ -1,0 +1,8 @@
+PyQt5>=5.15
+numpy
+Pillow
+tifffile
+scikit-image
+scipy
+matplotlib
+opencv-python
