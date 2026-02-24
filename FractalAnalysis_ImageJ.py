@@ -182,7 +182,7 @@ def runFractalAnalysis(maskPath, pixelSize):
     sx = sum(logInvS)
     sy = sum(logN)
     sxx = sum(x * x for x in logInvS)
-    sxy = sum(x * y for x, y in zip(logInvS, logN))
+    sxy = sum(logInvS[i] * logN[i] for i in range(n))
 
     denom = n * sxx - sx * sx
     if abs(denom) < 1e-12:
@@ -195,8 +195,8 @@ def runFractalAnalysis(maskPath, pixelSize):
         # R-squared
         yMean = sy / n
         ssTot = sum((y - yMean) ** 2 for y in logN)
-        ssRes = sum((y - (fractalDim * x + intercept)) ** 2
-                     for x, y in zip(logInvS, logN))
+        ssRes = sum((logN[i] - (fractalDim * logInvS[i] + intercept)) ** 2
+                     for i in range(n))
         rSquared = 1.0 - ssRes / ssTot if ssTot > 0 else float('nan')
 
     # Average lacunarity across scales
