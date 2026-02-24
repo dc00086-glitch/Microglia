@@ -8,6 +8,23 @@ import csv
 import re
 
 
+def openImageQuiet(path):
+    """Open an image without the Bio-Formats options dialog."""
+    try:
+        from loci.plugins import BF
+        import loci.plugins
+        ImporterOptions = getattr(loci.plugins, 'in').ImporterOptions
+        opts = ImporterOptions()
+        opts.setId(path)
+        opts.setWindowless(True)
+        imps = BF.openImagePlus(opts)
+        if imps and len(imps) > 0:
+            return imps[0]
+        return None
+    except Exception:
+        return IJ.openImage(path)
+
+
 def parseMaskInfo(maskFilename):
     """Extract image name, soma ID, and area from mask filename.
     e.g. 'Image_soma_586_510_area400_mask.tif'
@@ -42,7 +59,7 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
     print("Processing: " + os.path.basename(maskPath))
 
     # Open mask
-    mask = IJ.openImage(maskPath)
+    mask = openImageQuiet(maskPath)
     if mask is None:
         print("  ERROR: Could not open mask")
         return None
@@ -247,13 +264,20 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
 
 
 def main():
+    # Check if launched from combined analysis with a preset
+    try:
+        from java.lang import System
+        defaultLargest = System.getProperty("mmps.largestOnly", "false") == "true"
+    except Exception:
+        defaultLargest = False
+
     # --- User dialog ---
     gd = GenericDialog("MMPS Skeleton Analysis")
     gd.addDirectoryField("Masks Directory", "")
     gd.addDirectoryField("Output Directory", "")
     gd.addNumericField("Pixel Size (um/pixel)", 0.316, 4)
     gd.addNumericField("Upscale Factor (2 for 20x, 1 for 40x)", 2, 0)
-    gd.addCheckbox("Only analyze largest mask per cell", False)
+    gd.addCheckbox("Only analyze largest mask per cell", defaultLargest)
     gd.showDialog()
     if gd.wasCanceled():
         return
@@ -269,7 +293,8 @@ def main():
     print("=" * 60)
 
     # Find mask files
-    maskFiles = sorted([f for f in os.listdir(masksDirPath) if f.endswith('_mask.tif')])
+    maskFiles = sorted([f for f in os.listdir(masksDirPath)
+                        if f.endswith('_mask.tif') and not f.startswith('.')])
 
     if len(maskFiles) == 0:
         print("ERROR: No mask files found")

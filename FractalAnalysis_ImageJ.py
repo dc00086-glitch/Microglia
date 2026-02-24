@@ -25,6 +25,23 @@ import re
 import math
 
 
+def openImageQuiet(path):
+    """Open an image without the Bio-Formats options dialog."""
+    try:
+        from loci.plugins import BF
+        import loci.plugins
+        ImporterOptions = getattr(loci.plugins, 'in').ImporterOptions
+        opts = ImporterOptions()
+        opts.setId(path)
+        opts.setWindowless(True)
+        imps = BF.openImagePlus(opts)
+        if imps and len(imps) > 0:
+            return imps[0]
+        return None
+    except Exception:
+        return IJ.openImage(path)
+
+
 # ============================================================================
 # Helpers
 # ============================================================================
@@ -79,7 +96,7 @@ def runFractalAnalysis(maskPath, pixelSize):
       - For each box size, compute mean and variance of foreground pixel counts
       - Lambda(s) = variance / mean^2 + 1
     """
-    imp = IJ.openImage(maskPath)
+    imp = openImageQuiet(maskPath)
     if imp is None:
         return None
 
@@ -211,11 +228,18 @@ def runFractalAnalysis(maskPath, pixelSize):
 # ============================================================================
 
 def main():
+    # Check if launched from combined analysis with a preset
+    try:
+        from java.lang import System
+        defaultLargest = System.getProperty("mmps.largestOnly", "false") == "true"
+    except Exception:
+        defaultLargest = False
+
     # --- User dialog ---
     gd = GenericDialog("MMPS Fractal Analysis (Box-Counting)")
     gd.addDirectoryField("MMPS Output Folder", "")
     gd.addNumericField("Pixel Size (um/px)", 0.316, 4)
-    gd.addCheckbox("Only analyze largest mask per cell", False)
+    gd.addCheckbox("Only analyze largest mask per cell", defaultLargest)
     gd.showDialog()
     if gd.wasCanceled():
         return
@@ -236,7 +260,8 @@ def main():
         os.makedirs(resultsDir)
 
     # Collect mask files
-    maskFiles = sorted([f for f in os.listdir(masksDir) if f.endswith('_mask.tif')])
+    maskFiles = sorted([f for f in os.listdir(masksDir)
+                        if f.endswith('_mask.tif') and not f.startswith('.')])
     if not maskFiles:
         IJ.error("No mask files found in: " + masksDir)
         return

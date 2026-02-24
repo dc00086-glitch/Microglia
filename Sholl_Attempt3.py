@@ -38,6 +38,23 @@ import csv
 import re
 
 
+def openImageQuiet(path):
+    """Open an image without the Bio-Formats options dialog."""
+    try:
+        from loci.plugins import BF
+        import loci.plugins
+        ImporterOptions = getattr(loci.plugins, 'in').ImporterOptions
+        opts = ImporterOptions()
+        opts.setId(path)
+        opts.setWindowless(True)
+        imps = BF.openImagePlus(opts)
+        if imps and len(imps) > 0:
+            return imps[0]
+        return None
+    except Exception:
+        return IJ.openImage(path)
+
+
 # ---------------------------------------------------------------------------
 # Helper functions (analysis math preserved from reference script)
 # ---------------------------------------------------------------------------
@@ -131,7 +148,7 @@ def saveShollPlots(nStatsObj, saveLoc):
 def getSomaCentroid(somaPath):
     """Calculate centroid (center of mass) from a binary soma mask TIFF.
     Returns (x_pixel, y_pixel) in pixel coordinates."""
-    somaImp = IJ.openImage(somaPath)
+    somaImp = openImageQuiet(somaPath)
     if somaImp is None:
         return None
     ip = somaImp.getProcessor()
@@ -155,7 +172,7 @@ def getSomaCentroid(somaPath):
 def getSomaRadius(somaPath, centroid, pixelSize):
     """Estimate the soma radius in calibrated units from the soma mask.
     Used as the start radius for Sholl analysis (begin at soma edge)."""
-    somaImp = IJ.openImage(somaPath)
+    somaImp = openImageQuiet(somaPath)
     if somaImp is None or centroid is None:
         return 0.0
     ip = somaImp.getProcessor()
@@ -220,7 +237,7 @@ def analyzeOneMask(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, m
     cellName = os.path.splitext(maskName)[0]
 
     # Open the mask image
-    imp = IJ.openImage(maskPath)
+    imp = openImageQuiet(maskPath)
     if imp is None:
         IJ.log("ERROR: Could not open: " + maskPath)
         return None
@@ -320,6 +337,13 @@ def analyzeOneMask(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, m
 # ---------------------------------------------------------------------------
 
 def main():
+    # Check if launched from combined analysis with a preset
+    try:
+        from java.lang import System
+        defaultLargest = System.getProperty("mmps.largestOnly", "false") == "true"
+    except Exception:
+        defaultLargest = False
+
     # --- User dialog ---
     gd = GenericDialog("MMPS Sholl Analysis")
     gd.addDirectoryField("MMPS Output Folder", "")
@@ -327,7 +351,7 @@ def main():
     gd.addNumericField("Step Size (um) [0 = continuous]", 0.0, 1)
     gd.addCheckbox("Use soma radius as start radius", True)
     gd.addNumericField("Manual start radius (um) [if unchecked]", 5.0, 1)
-    gd.addCheckbox("Only analyze largest mask per cell", False)
+    gd.addCheckbox("Only analyze largest mask per cell", defaultLargest)
     gd.showDialog()
     if gd.wasCanceled():
         return
@@ -355,7 +379,8 @@ def main():
         os.makedirs(shollDir)
 
     # Collect all mask files
-    maskFiles = sorted([f for f in os.listdir(masksDir) if f.endswith('_mask.tif')])
+    maskFiles = sorted([f for f in os.listdir(masksDir)
+                        if f.endswith('_mask.tif') and not f.startswith('.')])
     if not maskFiles:
         IJ.error("No mask files found in: " + masksDir)
         return

@@ -45,6 +45,8 @@ def main():
     gd.addCheckbox("Skeleton Analysis", True)
     gd.addCheckbox("Sholl Analysis", True)
     gd.addCheckbox("Fractal Analysis (box-counting)", True)
+    gd.addMessage("")
+    gd.addCheckbox("Only analyze largest mask per cell", False)
     gd.showDialog()
     if gd.wasCanceled():
         return
@@ -52,6 +54,11 @@ def main():
     doSkeleton = gd.getNextBoolean()
     doSholl = gd.getNextBoolean()
     doFractal = gd.getNextBoolean()
+    largestOnly = gd.getNextBoolean()
+
+    # Store as Java system property so sub-scripts can read it
+    from java.lang import System
+    System.setProperty("mmps.largestOnly", "true" if largestOnly else "false")
 
     if not doSkeleton and not doSholl and not doFractal:
         IJ.error("No analyses selected.")
