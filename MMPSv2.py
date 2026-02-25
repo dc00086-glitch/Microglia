@@ -6129,7 +6129,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
                 self.log(f"Generating masks for {img_name}...")
 
-                if seg_method == 'competitive' and len(img_data['soma_outlines']) > 1:
+                if seg_method == 'competitive':
                     # Competitive growth: all somas grow simultaneously
                     self.log(f"  Using competitive growth for {len(img_data['soma_outlines'])} cells")
                     self.progress_status_label.setText(f"Competitive growth: {img_name}")
@@ -6151,7 +6151,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 else:
                     # Independent or watershed: per-soma growth
                     territory_map = None
-                    if seg_method == 'watershed' and len(img_data['soma_outlines']) > 1:
+                    if seg_method == 'watershed':
                         self.log(f"  Computing watershed territories for {len(img_data['soma_outlines'])} cells")
                         self.progress_status_label.setText(f"Watershed: {img_name}")
                         QApplication.processEvents()
