@@ -18,6 +18,7 @@ Usage: Open in Fiji script editor and click Run.
 
 from ij import IJ
 from ij.gui import GenericDialog
+from ij.plugin.filter import ThresholdToSelection
 
 import os
 import csv
@@ -224,6 +225,197 @@ def runFractalAnalysis(maskPath, pixelSize):
 
 
 # ============================================================================
+# Convex hull analysis (FracLac-style)
+# ============================================================================
+
+def _grahamScanHull(points):
+    """Graham scan convex hull.  Input: list of (x, y) tuples.
+    Returns hull vertices in counter-clockwise order.
+    Pure-Python implementation for Jython compatibility."""
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    points = sorted(set(points))
+    if len(points) <= 1:
+        return list(points)
+
+    # Build lower hull
+    lower = []
+    for p in points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    # Build upper hull
+    upper = []
+    for p in reversed(points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    return lower[:-1] + upper[:-1]
+
+
+def runConvexHullAnalysis(maskPath, pixelSize):
+    """Compute convex hull metrics for a binary cell mask.
+    Returns metrics dict or None.
+
+    Computes FracLac-style hull metrics:
+      - Hull Area / Perimeter
+      - Hull Circularity = 4*pi*area/perimeter^2
+      - Density = foreground_pixels / hull_area
+      - Max Span Across Hull
+      - Span Ratio = max_span / perpendicular_width
+
+    Uses ImageJ's ROI.getConvexHull() when available, with a pure-Python
+    Graham scan fallback.
+    """
+    imp = openImageQuiet(maskPath)
+    if imp is None:
+        return None
+
+    ip = imp.getProcessor()
+    w = imp.getWidth()
+    h = imp.getHeight()
+
+    # Count foreground pixels and collect boundary pixels for fallback
+    totalFG = 0
+    boundary = []
+    for y in range(h):
+        for x in range(w):
+            if ip.getPixel(x, y) > 0:
+                totalFG += 1
+                # Check if boundary pixel (has at least one bg neighbor)
+                isBoundary = False
+                for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    ny, nx = y + dy, x + dx
+                    if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                        isBoundary = True
+                        break
+                    if ip.getPixel(nx, ny) == 0:
+                        isBoundary = True
+                        break
+                if isBoundary:
+                    boundary.append((x, y))
+
+    if totalFG == 0:
+        imp.close()
+        return None
+
+    # Try ImageJ ROI approach first
+    hullX = None
+    hullY = None
+    try:
+        ip.setThreshold(1, 255, ip.NO_LUT_UPDATE)
+        roi = ThresholdToSelection.run(imp)
+        if roi is not None:
+            hullPoly = roi.getConvexHull()
+            if hullPoly is not None:
+                nPts = hullPoly.npoints
+                if nPts >= 3:
+                    hullX = [float(hullPoly.xpoints[i]) for i in range(nPts)]
+                    hullY = [float(hullPoly.ypoints[i]) for i in range(nPts)]
+    except Exception:
+        pass
+
+    # Fallback: pure-Python Graham scan on boundary pixels
+    if hullX is None:
+        if len(boundary) < 3:
+            imp.close()
+            return None
+        hullVerts = _grahamScanHull(boundary)
+        if len(hullVerts) < 3:
+            imp.close()
+            return None
+        hullX = [float(v[0]) for v in hullVerts]
+        hullY = [float(v[1]) for v in hullVerts]
+
+    imp.close()
+
+    nPoints = len(hullX)
+
+    # Hull area via shoelace formula (in pixels)
+    hullArea = 0.0
+    for i in range(nPoints):
+        j = (i + 1) % nPoints
+        hullArea += hullX[i] * hullY[j]
+        hullArea -= hullX[j] * hullY[i]
+    hullArea = abs(hullArea) / 2.0
+
+    if hullArea == 0:
+        return None
+
+    # Hull perimeter
+    hullPerimeter = 0.0
+    for i in range(nPoints):
+        j = (i + 1) % nPoints
+        dx = hullX[j] - hullX[i]
+        dy = hullY[j] - hullY[i]
+        hullPerimeter += math.sqrt(dx * dx + dy * dy)
+
+    # Hull circularity: 4 * pi * area / perimeter^2
+    if hullPerimeter > 0:
+        hullCircularity = 4.0 * math.pi * hullArea / (hullPerimeter * hullPerimeter)
+    else:
+        hullCircularity = float('nan')
+
+    # Density: foreground pixels / hull area
+    density = totalFG / hullArea
+
+    # Max Span Across Hull: maximum distance between any two hull vertices
+    maxSpan = 0.0
+    maxI, maxJ = 0, 0
+    for i in range(nPoints):
+        for j in range(i + 1, nPoints):
+            dx = hullX[j] - hullX[i]
+            dy = hullY[j] - hullY[i]
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist > maxSpan:
+                maxSpan = dist
+                maxI = i
+                maxJ = j
+
+    # Span Ratio: major axis / perpendicular width
+    if maxSpan > 0:
+        # Direction vector of major axis
+        axDx = hullX[maxJ] - hullX[maxI]
+        axDy = hullY[maxJ] - hullY[maxI]
+        axLen = math.sqrt(axDx * axDx + axDy * axDy)
+        # Perpendicular direction (unit vector)
+        perpX = -axDy / axLen
+        perpY = axDx / axLen
+
+        # Project all hull points onto perpendicular axis
+        minProj = float('inf')
+        maxProj = float('-inf')
+        for i in range(nPoints):
+            proj = (hullX[i] - hullX[maxI]) * perpX + (hullY[i] - hullY[maxI]) * perpY
+            if proj < minProj:
+                minProj = proj
+            if proj > maxProj:
+                maxProj = proj
+        perpWidth = maxProj - minProj
+        spanRatio = maxSpan / perpWidth if perpWidth > 0 else float('nan')
+    else:
+        spanRatio = float('nan')
+
+    # Build metrics dict with both pixel and calibrated units
+    metrics = {
+        'hull_area_px': round(hullArea, 4),
+        'hull_area_um2': round(hullArea * pixelSize * pixelSize, 4),
+        'hull_perimeter_px': round(hullPerimeter, 4),
+        'hull_perimeter_um': round(hullPerimeter * pixelSize, 4),
+        'hull_circularity': round(hullCircularity, 6) if hullCircularity == hullCircularity else 'NaN',
+        'hull_density': round(density, 6),
+        'hull_max_span_px': round(maxSpan, 4),
+        'hull_max_span_um': round(maxSpan * pixelSize, 4),
+        'hull_span_ratio': round(spanRatio, 6) if spanRatio == spanRatio else 'NaN',
+    }
+
+    return metrics
+
+
+# ============================================================================
 # Main batch processing
 # ============================================================================
 
@@ -292,6 +484,7 @@ def main():
 
         try:
             fracMetrics = runFractalAnalysis(maskPath, pixelSize)
+            hullMetrics = runConvexHullAnalysis(maskPath, pixelSize)
             if fracMetrics is not None:
                 row = {
                     'cell_name': cellName,
@@ -301,9 +494,14 @@ def main():
                     'mask_file': maskFile,
                 }
                 row.update(fracMetrics)
+                if hullMetrics is not None:
+                    row.update(hullMetrics)
                 allResults.append(row)
                 processed += 1
-                IJ.log("  OK (D=" + str(fracMetrics['fractal_dimension']) + ", R2=" + str(fracMetrics['fractal_r_squared']) + ")")
+                hullInfo = ""
+                if hullMetrics:
+                    hullInfo = ", Hull_D=" + str(hullMetrics.get('hull_density', '?'))
+                IJ.log("  OK (D=" + str(fracMetrics['fractal_dimension']) + ", R2=" + str(fracMetrics['fractal_r_squared']) + hullInfo + ")")
             else:
                 skipped += 1
                 IJ.log("  FAILED (empty mask or too few scales)")
@@ -320,8 +518,13 @@ def main():
                     'fractal_lacunarity_mean', 'fractal_lacunarity_small',
                     'fractal_lacunarity_large', 'fractal_num_scales',
                     'fractal_foreground_pixels', 'fractal_foreground_area_um2']
+        hullCols = ['hull_area_px', 'hull_area_um2',
+                    'hull_perimeter_px', 'hull_perimeter_um',
+                    'hull_circularity', 'hull_density',
+                    'hull_max_span_px', 'hull_max_span_um',
+                    'hull_span_ratio']
 
-        columns = idCols + fracCols
+        columns = idCols + fracCols + hullCols
 
         with open(outputPath, 'wb') as f:
             writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
