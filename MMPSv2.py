@@ -1788,6 +1788,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_min_area = 100
         self.mask_max_area = 800
         self.mask_step_size = 100
+        self.mask_segmentation_method = 'none'  # 'none', 'competitive', 'watershed'
         self.use_imagej = False
         # Colocalization mode - show images in color
         self.colocalization_mode = False
@@ -2837,6 +2838,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             'mask_min_area': self.mask_min_area,
             'mask_max_area': self.mask_max_area,
             'mask_step_size': self.mask_step_size,
+            'mask_segmentation_method': self.mask_segmentation_method,
             'coloc_channel_1': self.coloc_channel_1,
             'coloc_channel_2': self.coloc_channel_2,
             'grayscale_channel': self.grayscale_channel,
@@ -3002,6 +3004,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.mask_min_area = session.get('mask_min_area', 100)
             self.mask_max_area = session.get('mask_max_area', 800)
             self.mask_step_size = session.get('mask_step_size', 100)
+            self.mask_segmentation_method = session.get('mask_segmentation_method', 'none')
             self.coloc_channel_1 = session.get('coloc_channel_1', 0)
             self.coloc_channel_2 = session.get('coloc_channel_2', 1)
             self.grayscale_channel = session.get('grayscale_channel', 0)
@@ -6001,6 +6004,50 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         layout.addSpacing(10)
 
+        # --- Cell Boundary Segmentation ---
+        seg_group = QLabel("<b>Cell Boundary Segmentation</b>")
+        layout.addWidget(seg_group)
+
+        seg_desc = QLabel("Controls how neighboring cells share territory when masks overlap:")
+        seg_desc.setWordWrap(True)
+        layout.addWidget(seg_desc)
+
+        seg_combo = QComboBox()
+        seg_combo.addItem("None (independent growth)", "none")
+        seg_combo.addItem("Competitive Growth (shared priority queue)", "competitive")
+        seg_combo.addItem("Watershed Territories (pre-computed basins)", "watershed")
+        # Set current selection
+        for idx in range(seg_combo.count()):
+            if seg_combo.itemData(idx) == self.mask_segmentation_method:
+                seg_combo.setCurrentIndex(idx)
+                break
+        layout.addWidget(seg_combo)
+
+        seg_help = QLabel("")
+        seg_help.setWordWrap(True)
+        seg_help.setStyleSheet("color: palette(dark); font-size: 10px;")
+        layout.addWidget(seg_help)
+
+        def update_seg_help(index):
+            method = seg_combo.itemData(index)
+            if method == 'none':
+                seg_help.setText("Each cell grows independently. Masks may overlap for cells in close proximity.")
+            elif method == 'competitive':
+                seg_help.setText(
+                    "All cells grow simultaneously in a single shared priority queue. "
+                    "Each pixel is claimed by whichever cell reaches it first (brightest-neighbor-first). "
+                    "Creates natural boundaries along intensity valleys between cells.")
+            elif method == 'watershed':
+                seg_help.setText(
+                    "Computes watershed basins from the image gradient using soma centroids as seeds. "
+                    "Each cell's growth is confined to its watershed territory. "
+                    "Good for cells separated by clear intensity dips.")
+
+        seg_combo.currentIndexChanged.connect(update_seg_help)
+        update_seg_help(seg_combo.currentIndex())
+
+        layout.addSpacing(10)
+
         # Help text
         help_text = QLabel(
             "💡 Tip:\n"
@@ -6043,6 +6090,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_min_area = min_area_spin.value()
         self.mask_max_area = max_area_spin.value()
         self.mask_step_size = step_spin.value()
+        self.mask_segmentation_method = seg_combo.currentData()
 
         # Now proceed with mask generation
         try:
@@ -6073,37 +6121,70 @@ class MicrogliaAnalysisGUI(QMainWindow):
                             cl_rows.append([mask_key, '0'])
                 self._write_checklist(mask_cl_path, cl_rows, ['Mask', 'Generated'])
 
+            seg_method = self.mask_segmentation_method
+
             for img_name, img_data in self.images.items():
                 if not img_data['selected'] or not img_data['soma_outlines']:
                     continue
 
                 self.log(f"Generating masks for {img_name}...")
 
-                for soma_data in img_data['soma_outlines']:
-                    centroid = soma_data['centroid']
-                    soma_idx = soma_data['soma_idx']
-                    soma_id = soma_data['soma_id']
-                    soma_area_um2 = soma_data.get('soma_area_um2', 0)
-                    soma_outline = soma_data.get('outline')
-
-                    self.progress_status_label.setText(f"Generating masks: {current_count + 1}/{total_outlines}")
+                if seg_method == 'competitive' and len(img_data['soma_outlines']) > 1:
+                    # Competitive growth: all somas grow simultaneously
+                    self.log(f"  Using competitive growth for {len(img_data['soma_outlines'])} cells")
+                    self.progress_status_label.setText(f"Competitive growth: {img_name}")
                     QApplication.processEvents()
 
-                    masks = self._create_annulus_masks(
-                        centroid, area_list, pixel_size, soma_idx, soma_id,
-                        img_data['processed'], img_name, soma_area_um2,
-                        soma_outline_mask=soma_outline
+                    masks = self._create_competitive_masks(
+                        img_data['processed'], img_data['soma_outlines'],
+                        area_list, pixel_size, img_name
                     )
                     img_data['masks'].extend(masks)
 
-                    # Mark each generated mask in the checklist
                     if mask_cl_path and os.path.exists(mask_cl_path):
                         for m in masks:
-                            m_key = f"{img_name}_{soma_id}_area{m['area_um2']}"
+                            m_key = f"{img_name}_{m['soma_id']}_area{m['area_um2']}"
                             self._update_checklist_row(mask_cl_path, 0, m_key, 1, 1)
 
-                    current_count += 1
+                    current_count += len(img_data['soma_outlines'])
                     self.progress_bar.setValue(int((current_count / total_outlines) * 100))
+                else:
+                    # Independent or watershed: per-soma growth
+                    territory_map = None
+                    if seg_method == 'watershed' and len(img_data['soma_outlines']) > 1:
+                        self.log(f"  Computing watershed territories for {len(img_data['soma_outlines'])} cells")
+                        self.progress_status_label.setText(f"Watershed: {img_name}")
+                        QApplication.processEvents()
+                        territory_map = self._build_watershed_territory_map(
+                            img_data['processed'], img_data['soma_outlines'], pixel_size
+                        )
+
+                    for soma_data in img_data['soma_outlines']:
+                        centroid = soma_data['centroid']
+                        soma_idx = soma_data['soma_idx']
+                        soma_id = soma_data['soma_id']
+                        soma_area_um2 = soma_data.get('soma_area_um2', 0)
+                        soma_outline = soma_data.get('outline')
+
+                        self.progress_status_label.setText(f"Generating masks: {current_count + 1}/{total_outlines}")
+                        QApplication.processEvents()
+
+                        masks = self._create_annulus_masks(
+                            centroid, area_list, pixel_size, soma_idx, soma_id,
+                            img_data['processed'], img_name, soma_area_um2,
+                            soma_outline_mask=soma_outline,
+                            territory_map=territory_map
+                        )
+                        img_data['masks'].extend(masks)
+
+                        # Mark each generated mask in the checklist
+                        if mask_cl_path and os.path.exists(mask_cl_path):
+                            for m in masks:
+                                m_key = f"{img_name}_{soma_id}_area{m['area_um2']}"
+                                self._update_checklist_row(mask_cl_path, 0, m_key, 1, 1)
+
+                        current_count += 1
+                        self.progress_bar.setValue(int((current_count / total_outlines) * 100))
 
                 # Export ALL generated masks to disk immediately so they
                 # survive save/load even before QA approval
@@ -6126,11 +6207,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
             total_masks = sum(len(data['masks']) for data in self.images.values() if data['selected'])
 
+            seg_labels = {'none': 'None (independent)', 'competitive': 'Competitive growth', 'watershed': 'Watershed territories'}
             self.log("=" * 50)
             self.log(f"✓ Generated {total_masks} masks total")
             self.log(f"✓ Mask sizes: {', '.join(str(a) for a in area_list)} µm²")
             if self.use_min_intensity:
                 self.log(f"✓ Used minimum intensity: {self.min_intensity_percent}%")
+            if seg_method != 'none':
+                self.log(f"✓ Cell boundary segmentation: {seg_labels.get(seg_method, seg_method)}")
             self.log("✓ Ready for QA")
             self.log("=" * 50)
             self._auto_save()
@@ -6377,14 +6461,208 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QMessageBox.information(self, "Done",
                 f"Regenerated {total} masks for {os.path.splitext(img_name)[0]}.\n\nReady for QA.")
 
+    def _build_watershed_territory_map(self, processed_img, soma_outlines, pixel_size_um):
+        """Build a watershed territory map assigning each pixel to the nearest soma basin.
+
+        Uses soma centroids as seeds and the image gradient as the landscape.
+        Returns an array of same shape as processed_img where each pixel value
+        is the soma index (1-based) that owns it, 0 for background/boundary.
+        """
+        import cv2 as _cv2
+
+        h, w = processed_img.shape
+        img_norm = processed_img.astype(np.float64)
+        imin, imax = img_norm.min(), img_norm.max()
+        if imax > imin:
+            img_norm = (img_norm - imin) / (imax - imin) * 255.0
+        img_u8 = img_norm.astype(np.uint8)
+
+        # Compute gradient magnitude for watershed landscape
+        grad_x = _cv2.Sobel(img_u8, _cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = _cv2.Sobel(img_u8, _cv2.CV_64F, 0, 1, ksize=3)
+        gradient = np.sqrt(grad_x ** 2 + grad_y ** 2)
+        gradient = (gradient / (gradient.max() + 1e-10) * 255).astype(np.uint8)
+
+        # Build markers: each soma gets a unique label (1-based)
+        markers = np.zeros((h, w), dtype=np.int32)
+        for i, soma_data in enumerate(soma_outlines):
+            label = i + 1
+            centroid = soma_data['centroid']
+            cy, cx = int(centroid[0]), int(centroid[1])
+            cy = max(0, min(h - 1, cy))
+            cx = max(0, min(w - 1, cx))
+            # Seed with soma outline if available, otherwise a small circle
+            outline_mask = soma_data.get('outline')
+            if outline_mask is not None and outline_mask.shape == (h, w):
+                markers[outline_mask > 0] = label
+            else:
+                _cv2.circle(markers, (cx, cy), max(3, int(5 / pixel_size_um)), label, -1)
+
+        # Convert gradient to 3-channel for cv2.watershed
+        grad_color = _cv2.cvtColor(gradient, _cv2.COLOR_GRAY2BGR)
+        _cv2.watershed(grad_color, markers)
+
+        # markers now has: -1 = boundary, 0 = bg, >0 = soma label
+        # Convert to territory map: set boundaries to 0
+        territory = markers.copy()
+        territory[territory < 0] = 0
+        return territory
+
+    def _create_competitive_masks(self, processed_img, soma_outlines_data, area_list_um2,
+                                   pixel_size_um, img_name):
+        """Create masks for ALL somas in an image using competitive priority region growing.
+
+        All somas grow simultaneously from a single shared priority queue.
+        Each pixel is claimed by whichever soma reaches it first (brightest-
+        neighbor-first).  This naturally creates territory boundaries along
+        intensity valleys between cells.
+
+        Returns a list of mask dicts (same format as _create_annulus_masks).
+        """
+        import heapq
+
+        h, w = processed_img.shape
+        sorted_areas = sorted(area_list_um2, reverse=True)
+        largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
+
+        # Compute intensity floor
+        intensity_floor = 0.0
+        if self.use_min_intensity and self.min_intensity_percent > 0:
+            img_max = processed_img.max()
+            if img_max > 0:
+                intensity_floor = img_max * (self.min_intensity_percent / 100.0)
+
+        roi = processed_img.astype(np.float64)
+
+        # Shared state across all somas
+        # owner_map: which soma owns each pixel (-1 = unclaimed)
+        owner_map = np.full((h, w), -1, dtype=np.int32)
+        visited = np.zeros((h, w), dtype=bool)
+        heap = []  # shared priority queue: (-intensity, row, col, soma_index)
+
+        # Per-soma growth tracking
+        n_somas = len(soma_outlines_data)
+        growth_orders = [[] for _ in range(n_somas)]  # growth_orders[i] = [(r,c), ...]
+        soma_seed_counts = [0] * n_somas
+
+        # Seed all somas into the shared heap
+        for si, soma_data in enumerate(soma_outlines_data):
+            centroid = soma_data['centroid']
+            cy, cx = int(centroid[0]), int(centroid[1])
+            cy = max(0, min(h - 1, cy))
+            cx = max(0, min(w - 1, cx))
+            soma_outline = soma_data.get('outline')
+
+            seeded = False
+            if soma_outline is not None and soma_outline.shape == (h, w):
+                soma_ys, soma_xs = np.where(soma_outline > 0)
+                for sr, sc in zip(soma_ys, soma_xs):
+                    if not visited[sr, sc]:
+                        visited[sr, sc] = True
+                        owner_map[sr, sc] = si
+                        growth_orders[si].append((sr, sc))
+                        soma_seed_counts[si] += 1
+                # Push boundary neighbors
+                for sr, sc in zip(soma_ys, soma_xs):
+                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        nr, nc = sr + dr, sc + dc
+                        if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                            if roi[nr, nc] >= intensity_floor:
+                                visited[nr, nc] = True
+                                owner_map[nr, nc] = si
+                                heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
+                seeded = True
+
+            if not seeded:
+                if not visited[cy, cx]:
+                    visited[cy, cx] = True
+                    owner_map[cy, cx] = si
+                    growth_orders[si].append((cy, cx))
+                    soma_seed_counts[si] = 1
+                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        nr, nc = cy + dr, cx + dc
+                        if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                            if roi[nr, nc] >= intensity_floor:
+                                visited[nr, nc] = True
+                                owner_map[nr, nc] = si
+                                heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
+
+        # Competitive growth: all somas grow simultaneously
+        # Stop each soma when it reaches its largest target
+        soma_done = [False] * n_somas
+        while heap:
+            neg_intensity, r, c, si = heapq.heappop(heap)
+
+            # Check if this pixel was already claimed by another soma
+            # (can happen if a neighbor was pushed by multiple somas before being popped)
+            if owner_map[r, c] != si:
+                continue
+
+            # Check if this soma has reached its target
+            if len(growth_orders[si]) >= largest_target_px:
+                soma_done[si] = True
+                if all(soma_done):
+                    break
+                continue
+
+            growth_orders[si].append((r, c))
+
+            # Push unclaimed 4-connected neighbors
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                    if roi[nr, nc] >= intensity_floor:
+                        visited[nr, nc] = True
+                        owner_map[nr, nc] = si
+                        heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
+
+        # Build mask dicts for each soma at each target area
+        all_masks = []
+        for si, soma_data in enumerate(soma_outlines_data):
+            soma_idx = soma_data['soma_idx']
+            soma_id = soma_data['soma_id']
+            soma_area_um2 = soma_data.get('soma_area_um2', 0)
+            soma_area_px = soma_seed_counts[si]
+            go = growth_orders[si]
+
+            print(f"  {soma_id}: soma={soma_area_px}px, grew to {len(go)}px (target: {largest_target_px})")
+
+            for target_area_um2 in sorted_areas:
+                target_px = int(target_area_um2 / (pixel_size_um ** 2))
+                n_pixels = min(target_px, len(go))
+                n_pixels = max(n_pixels, soma_area_px)
+                n_pixels = min(n_pixels, len(go))
+
+                full_mask = np.zeros((h, w), dtype=np.uint8)
+                for r, c in go[:n_pixels]:
+                    full_mask[r, c] = 1
+
+                actual_area_um2 = n_pixels * (pixel_size_um ** 2)
+                print(f"    {target_area_um2} um2: {n_pixels} px = {actual_area_um2:.1f} um2 actual")
+
+                all_masks.append({
+                    'image_name': img_name,
+                    'soma_idx': soma_idx,
+                    'soma_id': soma_id,
+                    'area_um2': target_area_um2,
+                    'mask': full_mask,
+                    'approved': None,
+                    'soma_area_um2': soma_area_um2
+                })
+
+        return all_masks
+
     def _create_annulus_masks(self, centroid, area_list_um2, pixel_size_um, soma_idx, soma_id, processed_img, img_name,
-                              soma_area_um2, soma_outline_mask=None):
+                              soma_area_um2, soma_outline_mask=None, territory_map=None):
         """Create nested cell masks using priority region growing from the soma outline.
 
         Seeds the growth with the entire soma outline so the soma pixels are
         "free" and the mask pixel budget goes toward territory beyond the soma.
         Grows outward from the soma boundary, always adding the brightest
         neighboring pixel next.  Respects the minimum intensity floor setting.
+
+        If territory_map is provided (from watershed), growth is constrained to
+        pixels within this soma's territory.
         """
         import heapq
 
@@ -6420,6 +6698,29 @@ class MicrogliaAnalysisGUI(QMainWindow):
             if roi_max > 0:
                 intensity_floor = roi_max * (self.min_intensity_percent / 100.0)
 
+        # Build territory constraint ROI if watershed territory_map is provided
+        territory_roi = None
+        if territory_map is not None:
+            territory_roi = territory_map[y_min:y_max, x_min:x_max]
+            # Find this soma's label from the centroid position
+            my_label = territory_roi[cy_roi, cx_roi]
+            if my_label <= 0:
+                # Centroid fell on a boundary — search nearby for our label
+                for dr in range(-3, 4):
+                    for dc in range(-3, 4):
+                        nr, nc = cy_roi + dr, cx_roi + dc
+                        if 0 <= nr < h and 0 <= nc < w and territory_roi[nr, nc] > 0:
+                            my_label = territory_roi[nr, nc]
+                            break
+                    if my_label > 0:
+                        break
+
+        def _in_territory(r, c):
+            """Check if pixel (r,c) is within this soma's watershed territory."""
+            if territory_roi is None:
+                return True
+            return territory_roi[r, c] == my_label or territory_roi[r, c] <= 0
+
         # Priority region growing: grow from soma outline, brightest neighbor first
         # Use a max-heap (negate intensity for min-heap)
         visited = np.zeros((h, w), dtype=bool)
@@ -6442,7 +6743,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     nr, nc = sr + dr, sc + dc
                     if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                        if roi[nr, nc] >= intensity_floor:
+                        if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
                             visited[nr, nc] = True
                             heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -6454,7 +6755,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = cy_roi + dr, cx_roi + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    if roi[nr, nc] >= intensity_floor:
+                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -6468,7 +6769,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    if roi[nr, nc] >= intensity_floor:
+                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
