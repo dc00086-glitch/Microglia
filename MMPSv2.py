@@ -1016,6 +1016,8 @@ class BackgroundRemovalThread(QThread):
     progress = pyqtSignal(int)
     status_update = pyqtSignal(str)
     finished_image = pyqtSignal(str, str, object)
+    # Signal for extra cleaned channels: (img_name, {ch_idx: cleaned_array})
+    finished_extra_channels = pyqtSignal(str, object)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, image_data_list, output_dir):
@@ -1023,43 +1025,83 @@ class BackgroundRemovalThread(QThread):
         self.image_data_list = image_data_list
         self.output_dir = output_dir
 
+    def _clean_single_channel(self, raw_img, ch_idx, radius, rb_enabled,
+                               denoise_enabled, denoise_size,
+                               sharpen_enabled, sharpen_amount):
+        """Apply the cleaning pipeline to one channel and return the result."""
+        if raw_img.ndim == 3:
+            img = extract_channel(raw_img, ch_idx)
+        else:
+            img = raw_img
+        img_dtype = img.dtype
+        result = img.copy()
+
+        if rb_enabled:
+            background = restoration.rolling_ball(img, radius=radius)
+            result = img - background
+            result = np.clip(result, 0, np.iinfo(img_dtype).max)
+
+        if denoise_enabled:
+            result = ndimage.median_filter(result, size=denoise_size)
+
+        if sharpen_enabled:
+            blurred = ndimage.gaussian_filter(result.astype(np.float32), sigma=2)
+            result_float = result.astype(np.float32)
+            sharpened = result_float + sharpen_amount * (result_float - blurred)
+            result = np.clip(sharpened, 0, np.iinfo(img_dtype).max).astype(img_dtype)
+
+        return result
+
     def run(self):
         try:
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, rb_enabled, denoise_enabled, denoise_size,
-                    sharpen_enabled, sharpen_amount, process_channel) in enumerate(
+                    sharpen_enabled, sharpen_amount, process_channels) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
-                    img = load_tiff_image(img_path)
-                    # Extract only the selected channel for processing
-                    if img.ndim == 3:
-                        img = extract_channel(img, process_channel)
-                    img_dtype = img.dtype
-                    result = img.copy()
+                    raw_img = load_tiff_image(img_path)
 
-                    # Apply optional rolling ball background subtraction
-                    if rb_enabled:
-                        background = restoration.rolling_ball(img, radius=radius)
-                        result = img - background
-                        result = np.clip(result, 0, np.iinfo(img_dtype).max)
+                    # process_channels is a list; first element is the primary channel
+                    # Support legacy callers passing a single int
+                    if isinstance(process_channels, int):
+                        process_channels = [process_channels]
 
-                    # Apply optional denoising
-                    if denoise_enabled:
-                        result = ndimage.median_filter(result, size=denoise_size)
+                    primary_ch = process_channels[0]
+                    extra_channels = process_channels[1:] if len(process_channels) > 1 else []
 
-                    # Apply optional sharpening
-                    if sharpen_enabled:
-                        blurred = ndimage.gaussian_filter(result.astype(np.float32), sigma=2)
-                        result_float = result.astype(np.float32)
-                        sharpened = result_float + sharpen_amount * (result_float - blurred)
-                        result = np.clip(sharpened, 0, np.iinfo(img_dtype).max).astype(img_dtype)
+                    # Clean the primary channel
+                    result = self._clean_single_channel(
+                        raw_img, primary_ch, radius, rb_enabled,
+                        denoise_enabled, denoise_size,
+                        sharpen_enabled, sharpen_amount)
 
                     name = os.path.splitext(img_name)[0]
                     out_path = os.path.join(self.output_dir, f"{name}_processed.tif")
-                    tifffile.imwrite(out_path, result.astype(img_dtype))
+                    tifffile.imwrite(out_path, result.astype(result.dtype))
                     self.finished_image.emit(out_path, img_name, result)
+
+                    # Clean extra channels if requested
+                    if extra_channels and raw_img.ndim == 3:
+                        extra_results = {}
+                        for ch_idx in extra_channels:
+                            if ch_idx < raw_img.shape[2]:
+                                self.status_update.emit(
+                                    f"Processing: {img_name} (Ch {ch_idx + 1})")
+                                ch_result = self._clean_single_channel(
+                                    raw_img, ch_idx, radius, rb_enabled,
+                                    denoise_enabled, denoise_size,
+                                    sharpen_enabled, sharpen_amount)
+                                # Save extra channel to disk
+                                ch_path = os.path.join(
+                                    self.output_dir,
+                                    f"{name}_processed_ch{ch_idx + 1}.tif")
+                                tifffile.imwrite(ch_path, ch_result.astype(ch_result.dtype))
+                                extra_results[ch_idx] = ch_result
+                        if extra_results:
+                            self.finished_extra_channels.emit(img_name, extra_results)
+
                     self.progress.emit(int((i + 1) / total * 100))
                 except Exception as e:
                     self.error_occurred.emit(f"Error: {img_name}: {e}")
@@ -1961,6 +2003,27 @@ class MicrogliaAnalysisGUI(QMainWindow):
         channel_layout.addStretch()
         param_layout.addLayout(channel_layout)
 
+        # Multi-channel cleaning option
+        self.multi_clean_check = QCheckBox("Also clean additional channels")
+        self.multi_clean_check.setChecked(False)
+        self.multi_clean_check.setToolTip("Apply the same cleaning pipeline to extra channels (for color composite display)")
+        self.multi_clean_check.toggled.connect(self._toggle_multi_channel_ui)
+        param_layout.addWidget(self.multi_clean_check)
+
+        self.extra_channel_widget = QWidget()
+        extra_ch_layout = QHBoxLayout(self.extra_channel_widget)
+        extra_ch_layout.setContentsMargins(20, 0, 0, 0)
+        extra_ch_layout.addWidget(QLabel("Clean:"))
+        self.clean_ch_checks = []
+        for i in range(3):
+            ch_check = QCheckBox(f"Ch {i + 1}")
+            ch_check.setChecked(False)
+            extra_ch_layout.addWidget(ch_check)
+            self.clean_ch_checks.append(ch_check)
+        extra_ch_layout.addStretch()
+        self.extra_channel_widget.setVisible(False)
+        param_layout.addWidget(self.extra_channel_widget)
+
 
         self.use_imagej = False
 
@@ -2785,17 +2848,28 @@ class MicrogliaAnalysisGUI(QMainWindow):
         for img_name, img_data in self.images.items():
             # Build path to processed TIFF if it exists on disk
             processed_path = None
+            name_stem = os.path.splitext(img_name)[0]
             if self.output_dir:
                 candidate = os.path.join(
-                    self.output_dir,
-                    os.path.splitext(img_name)[0] + "_processed.tif"
+                    self.output_dir, f"{name_stem}_processed.tif"
                 )
                 if os.path.exists(candidate):
                     processed_path = candidate
 
+            # Build paths for extra cleaned channel TIFFs
+            extra_channel_paths = {}
+            if self.output_dir:
+                for ch_idx in range(3):
+                    ch_candidate = os.path.join(
+                        self.output_dir, f"{name_stem}_processed_ch{ch_idx + 1}.tif"
+                    )
+                    if os.path.exists(ch_candidate):
+                        extra_channel_paths[str(ch_idx)] = ch_candidate
+
             img_session = {
                 'raw_path': img_data['raw_path'],
                 'processed_path': processed_path,
+                'extra_channel_paths': extra_channel_paths,
                 'status': img_data['status'],
                 'selected': img_data['selected'],
                 'animal_id': img_data.get('animal_id', ''),
@@ -2968,6 +3042,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     except Exception:
                         processed_data = None
 
+                # Reload extra cleaned channel TIFFs
+                processed_channels = {}
+                for ch_str, ch_path in img_session.get('extra_channel_paths', {}).items():
+                    if os.path.exists(ch_path):
+                        try:
+                            processed_channels[int(ch_str)] = tifffile.imread(ch_path)
+                        except Exception:
+                            pass
+
                 # Reconstruct soma outlines with full metadata
                 restored_outlines = []
                 for outline_data in img_session.get('soma_outlines', []):
@@ -3002,6 +3085,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.images[img_name] = {
                     'raw_path': img_session['raw_path'],
                     'processed': processed_data,
+                    'processed_channels': processed_channels,
                     'rolling_ball_radius': img_session.get('rolling_ball_radius', 50),
                     'somas': [tuple(s) for s in img_session.get('somas', [])],
                     'soma_ids': img_session.get('soma_ids', []),
@@ -3873,10 +3957,32 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.channel_select_btn.setVisible(False)
         self.update_display()
 
+    def _toggle_multi_channel_ui(self, checked):
+        """Show/hide the extra channel checkboxes"""
+        self.extra_channel_widget.setVisible(checked)
+        if checked:
+            # Auto-check the primary channel and uncheck others
+            for i, ch_check in enumerate(self.clean_ch_checks):
+                ch_check.setChecked(i == self.grayscale_channel)
+
+    def _get_channels_to_clean(self):
+        """Return list of channel indices to clean. Always includes the primary channel."""
+        channels = [self.grayscale_channel]
+        if self.multi_clean_check.isChecked():
+            for i, ch_check in enumerate(self.clean_ch_checks):
+                if ch_check.isChecked() and i != self.grayscale_channel:
+                    channels.append(i)
+        return sorted(set(channels))
+
     def _on_process_channel_changed(self, index):
         """Update the grayscale channel when user changes the dropdown"""
         self.grayscale_channel = index
         self.log(f"Processing channel set to: Channel {index + 1}")
+        # Auto-check the primary channel in the multi-clean checkboxes
+        if self.multi_clean_check.isChecked():
+            for i, ch_check in enumerate(self.clean_ch_checks):
+                if i == index:
+                    ch_check.setChecked(True)
         # Refresh display if not in color mode
         if not self.show_color_view:
             self.update_display()
@@ -4059,12 +4165,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         return adjusted.astype(np.uint8)
 
     def _build_processed_color_image(self, img_data):
-        """Build a color composite with processed channel replacing the original channel"""
+        """Build a color composite with processed channels replacing the originals.
+        Uses cleaned versions for all channels that were processed."""
         if 'color_image' not in img_data or img_data['processed'] is None:
             return None
 
         color_img = img_data['color_image']
         processed = img_data['processed']
+        processed_channels = img_data.get('processed_channels', {})
 
         # Start with a copy of the original color image
         if color_img.ndim != 3:
@@ -4075,13 +4183,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         c = min(color_img.shape[2], 3)
         composite = np.zeros((h, w, 3), dtype=np.float32)
 
-        # Map channels: index 0=Green, 1=Red, 2=Blue in display
         for i in range(c):
-            if i == self.grayscale_channel:
-                # Use the processed (cleaned) version for this channel
-                # Normalize processed to match original range for display
-                proc_norm = processed.astype(np.float32)
-                composite[:, :, i] = proc_norm
+            if i in processed_channels:
+                # Use the cleaned version for this channel
+                composite[:, :, i] = processed_channels[i].astype(np.float32)
+            elif i == self.grayscale_channel:
+                # Primary channel always uses the processed result
+                composite[:, :, i] = processed.astype(np.float32)
             else:
                 # Use original channel
                 composite[:, :, i] = color_img[:, :, i].astype(np.float32)
@@ -4143,6 +4251,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.images[img_name] = {
                 'raw_path': f,
                 'processed': None,
+                'processed_channels': {},
                 'rolling_ball_radius': self.default_rolling_ball_radius,
                 'somas': [],
                 'soma_ids': [],
@@ -4449,9 +4558,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         sharpen_enabled = self.sharpen_check.isChecked()
         sharpen_amount = self.sharpen_slider.value() / 10.0
 
-        # Log what processing steps will be applied
+        # Determine which channels to clean
+        channels_to_clean = self._get_channels_to_clean()
         process_channel = self.grayscale_channel
-        steps = [f"Channel {process_channel + 1}"]
+
+        # Log what processing steps will be applied
+        if len(channels_to_clean) > 1:
+            ch_names = [f"Ch{c + 1}" for c in channels_to_clean]
+            steps = [f"Channels {', '.join(ch_names)} (primary: Ch{process_channel + 1})"]
+        else:
+            steps = [f"Channel {process_channel + 1}"]
         if rb_enabled:
             steps.append(f"Rolling Ball (r={radius})")
         if denoise_enabled:
@@ -4467,16 +4583,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
         for img_name, img_data in selected_images:
             process_list.append((img_data['raw_path'], img_name, radius, rb_enabled,
                                  denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount,
-                                 process_channel))
+                                 channels_to_clean))
         self.thread = BackgroundRemovalThread(process_list, self.output_dir)
         self.thread.status_update.connect(self.log)
         self.thread.progress.connect(self._update_progress)
         self.thread.finished_image.connect(self._handle_processed_image)
+        self.thread.finished_extra_channels.connect(self._handle_extra_channels)
         self.thread.finished.connect(self._background_removal_finished)
         self.thread.error_occurred.connect(lambda msg: self.log(f"ERROR: {msg}"))
         self.progress_bar.setVisible(True)
         self.progress_status_label.setVisible(True)
-        if len(steps) > 1:
+        if len(channels_to_clean) > 1:
+            self.progress_status_label.setText(f"Processing {len(channels_to_clean)} channels...")
+        elif len(steps) > 1:
             self.progress_status_label.setText(f"Processing Channel {process_channel + 1}...")
         else:
             self.progress_status_label.setText(f"Extracting Channel {process_channel + 1}...")
@@ -4520,6 +4639,26 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                 self.processed_label.set_image(pixmap)
                 self.tabs.setCurrentIndex(2)
+
+    def _handle_extra_channels(self, img_name, extra_results):
+        """Store extra cleaned channel arrays for color composite display."""
+        if img_name in self.images:
+            if 'processed_channels' not in self.images[img_name]:
+                self.images[img_name]['processed_channels'] = {}
+            self.images[img_name]['processed_channels'].update(extra_results)
+            # Also store the primary channel in processed_channels for completeness
+            if self.images[img_name].get('processed') is not None:
+                self.images[img_name]['processed_channels'][self.grayscale_channel] = \
+                    self.images[img_name]['processed']
+            ch_names = [f"Ch{c + 1}" for c in sorted(extra_results.keys())]
+            self.log(f"  Extra channels cleaned for {img_name}: {', '.join(ch_names)}")
+            # Refresh color display if this is the current image
+            if img_name == self.current_image_name and self.show_color_view:
+                proc_color = self._build_processed_color_image(self.images[img_name])
+                if proc_color is not None:
+                    adjusted = self._apply_display_adjustments_color(proc_color)
+                    pixmap = self._array_to_pixmap_color(adjusted)
+                    self.processed_label.set_image(pixmap)
 
     def _update_file_list_item(self, img_name):
         for i in range(self.file_list.count()):
