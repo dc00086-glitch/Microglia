@@ -2,28 +2,43 @@
 Combined Microglia Analysis - Menu Launcher
 ============================================
 
-A simple menu that lets you pick which analyses to run, then asks for
-the file path of each selected script and runs it.  This avoids import
-errors when the scripts are not in the same directory.
+A simple menu that lets you pick which analyses to run.  All three
+analysis scripts are auto-detected from the same directory as this
+launcher — no file-picker dialogs needed.
 
-Usage: Open in Fiji script editor and click Run.
+Usage: Place this file in the same folder as:
+    - SkeletonAnalysisImageJ.py
+    - Sholl_Attempt3.py
+    - FractalAnalysis_ImageJ.py
+  Then open in Fiji script editor and click Run.
 """
 
 from ij import IJ
 from ij.gui import GenericDialog
-from javax.swing import JFileChooser
-from javax.swing.filechooser import FileNameExtensionFilter
 import sys
 import os
 
 
-def pick_script(title):
-    """Open a file chooser and return the selected .py path, or None."""
-    fc = JFileChooser()
-    fc.setDialogTitle(title)
-    fc.setFileFilter(FileNameExtensionFilter("Python scripts", ["py"]))
-    if fc.showOpenDialog(None) == JFileChooser.APPROVE_OPTION:
-        return fc.getSelectedFile().getAbsolutePath()
+# Expected script filenames (must be in the same directory as this file)
+SKELETON_SCRIPT = "SkeletonAnalysisImageJ.py"
+SHOLL_SCRIPT = "Sholl_Attempt3.py"
+FRACTAL_SCRIPT = "FractalAnalysis_ImageJ.py"
+
+
+def get_script_dir():
+    """Return the directory containing this launcher script."""
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        # Fallback: use current working directory
+        return os.getcwd()
+
+
+def find_script(script_dir, filename):
+    """Return the full path if the script exists in script_dir, else None."""
+    path = os.path.join(script_dir, filename)
+    if os.path.isfile(path):
+        return path
     return None
 
 
@@ -38,13 +53,25 @@ def run_script(path):
 
 
 def main():
+    script_dir = get_script_dir()
+
+    # Auto-detect available scripts
+    skeletonPath = find_script(script_dir, SKELETON_SCRIPT)
+    shollPath = find_script(script_dir, SHOLL_SCRIPT)
+    fractalPath = find_script(script_dir, FRACTAL_SCRIPT)
+
+    # Build status messages for dialog
+    skelStatus = " (found)" if skeletonPath else " (NOT FOUND)"
+    shollStatus = " (found)" if shollPath else " (NOT FOUND)"
+    fracStatus = " (found)" if fractalPath else " (NOT FOUND)"
+
     # --- Pick which analyses to run ---
     gd = GenericDialog("MMPS Combined Analysis")
     gd.addMessage("Select which analyses to run.\n"
-                   "You will be asked to locate each script file.")
-    gd.addCheckbox("Skeleton Analysis", True)
-    gd.addCheckbox("Sholl Analysis", True)
-    gd.addCheckbox("Fractal Analysis (box-counting)", True)
+                   "Scripts are auto-detected from:\n" + script_dir)
+    gd.addCheckbox("Skeleton Analysis" + skelStatus, skeletonPath is not None)
+    gd.addCheckbox("Sholl Analysis" + shollStatus, shollPath is not None)
+    gd.addCheckbox("Fractal Analysis (box-counting)" + fracStatus, fractalPath is not None)
     gd.addMessage("")
     gd.addCheckbox("Only analyze largest mask per cell", False)
     gd.showDialog()
@@ -60,35 +87,19 @@ def main():
     from java.lang import System
     System.setProperty("mmps.largestOnly", "true" if largestOnly else "false")
 
-    if not doSkeleton and not doSholl and not doFractal:
-        IJ.error("No analyses selected.")
-        return
-
-    # --- Ask for the file location of each selected script ---
-    skeletonPath = None
-    shollPath = None
-    fractalPath = None
-
-    if doSkeleton:
-        skeletonPath = pick_script("Locate SkeletonAnalysisImageJ.py")
-        if skeletonPath is None:
-            IJ.log("Skeleton Analysis skipped (no file selected).")
-            doSkeleton = False
-
-    if doSholl:
-        shollPath = pick_script("Locate Sholl Analysis script")
-        if shollPath is None:
-            IJ.log("Sholl Analysis skipped (no file selected).")
-            doSholl = False
-
-    if doFractal:
-        fractalPath = pick_script("Locate FractalAnalysis_ImageJ.py")
-        if fractalPath is None:
-            IJ.log("Fractal Analysis skipped (no file selected).")
-            doFractal = False
+    # Validate selections against available scripts
+    if doSkeleton and not skeletonPath:
+        IJ.log("WARNING: Skeleton Analysis selected but " + SKELETON_SCRIPT + " not found in " + script_dir)
+        doSkeleton = False
+    if doSholl and not shollPath:
+        IJ.log("WARNING: Sholl Analysis selected but " + SHOLL_SCRIPT + " not found in " + script_dir)
+        doSholl = False
+    if doFractal and not fractalPath:
+        IJ.log("WARNING: Fractal Analysis selected but " + FRACTAL_SCRIPT + " not found in " + script_dir)
+        doFractal = False
 
     if not doSkeleton and not doSholl and not doFractal:
-        IJ.error("All analyses were skipped.")
+        IJ.error("No analyses selected or scripts not found.")
         return
 
     # --- Run each selected analysis ---

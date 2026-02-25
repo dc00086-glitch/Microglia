@@ -771,7 +771,7 @@ class MorphologyCalculator:
     Calculate morphological parameters for microglia.
 
     Calculates 10 basic metrics: roundness, eccentricity, soma area,
-    mask area, perimeter, cell spread, polarity index, principal angle,
+    mask area, perimeter, average centroid distance, polarity index, principal angle,
     major axis length, and minor axis length.
     """
 
@@ -821,7 +821,7 @@ class MorphologyCalculator:
 
             extremities = np.array([top_point, bottom_point, left_point, right_point])
             distances = np.sqrt(np.sum((extremities - centroid) ** 2, axis=1))
-            params['cell_spread'] = np.mean(distances) * self.pixel_size
+            params['avg_centroid_distance'] = np.mean(distances) * self.pixel_size
 
             if soma_area_um2 is not None:
                 params['soma_area'] = soma_area_um2
@@ -832,7 +832,7 @@ class MorphologyCalculator:
             params.update(self._calculate_polarity(coords, centroid))
         else:
             params = {k: 0 for k in ['perimeter', 'mask_area', 'eccentricity',
-                                     'roundness', 'cell_spread', 'soma_area',
+                                     'roundness', 'avg_centroid_distance', 'soma_area',
                                      'polarity_index', 'principal_angle',
                                      'major_axis_um', 'minor_axis_um']}
         return params
@@ -7369,7 +7369,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             writer.writerow(['mask_filename', 'soma_filename', 'image_name', 'soma_id', 'soma_idx',
                              'soma_x', 'soma_y', 'soma_area_um2', 'cell_area_um2',
                              'pixel_size_um', 'perimeter', 'eccentricity', 'roundness',
-                             'cell_spread', 'polarity_index', 'principal_angle',
+                             'avg_centroid_distance', 'polarity_index', 'principal_angle',
                              'major_axis_um', 'minor_axis_um', 'animal_id', 'treatment'])
 
             for result in results:
@@ -7402,7 +7402,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     result.get('perimeter', 0),
                     result.get('eccentricity', 0),
                     result.get('roundness', 0),
-                    result.get('cell_spread', 0),
+                    result.get('avg_centroid_distance', 0),
                     result.get('polarity_index', 0),
                     result.get('principal_angle', 0),
                     result.get('major_axis_um', 0),

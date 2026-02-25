@@ -118,19 +118,30 @@ def addPolyFitToMaskMetrics(lStats, cal, maskMetrics, bestDegree):
     critRadii = list()
     try:
         trial = lStats.getPolynomialMaxima(0.0, 100.0, 50.0)
-        for curr in trial.toArray():
-            critVals.append(curr.rawY(cal))
-            critRadii.append(curr.rawX(cal))
-    except Exception:
+        if trial is not None:
+            for curr in trial.toArray():
+                critVals.append(curr.rawY(cal))
+                critRadii.append(curr.rawX(cal))
+    except:
         # Low-degree polynomials (e.g. degree 1) have no maxima;
-        # the LaguerreSolver throws NoDataException. Leave as NaN.
+        # the LaguerreSolver throws NoDataException (Java exception).
+        # Bare except needed to catch Java exceptions in Jython.
         pass
 
-    maskMetrics['Kurtosis (fit)'] = lStats.getKurtosis(True)
-    maskMetrics['Ramification Index (fit)'] = lStats.getRamificationIndex(True)
+    try:
+        maskMetrics['Kurtosis (fit)'] = lStats.getKurtosis(True)
+    except:
+        maskMetrics['Kurtosis (fit)'] = 'NaN'
+    try:
+        maskMetrics['Ramification Index (fit)'] = lStats.getRamificationIndex(True)
+    except:
+        maskMetrics['Ramification Index (fit)'] = 'NaN'
     maskMetrics['Critical Value'] = sum(critVals) / len(critVals) if critVals else 'NaN'
     maskMetrics['Critical Radius'] = sum(critRadii) / len(critRadii) if critRadii else 'NaN'
-    maskMetrics['Mean Value'] = lStats.getMean(True)
+    try:
+        maskMetrics['Mean Value'] = lStats.getMean(True)
+    except:
+        maskMetrics['Mean Value'] = 'NaN'
     maskMetrics['Polynomial Degree'] = bestDegree
     return maskMetrics
 
