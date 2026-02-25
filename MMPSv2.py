@@ -1030,7 +1030,10 @@ class BackgroundRemovalThread(QThread):
                                sharpen_enabled, sharpen_amount):
         """Apply the cleaning pipeline to one channel and return the result."""
         if raw_img.ndim == 3:
-            img = extract_channel(raw_img, ch_idx)
+            # Extract channel WITHOUT normalization to preserve original
+            # intensity range. extract_channel() rescales to 0-255 uint8
+            # which destroys relative intensities between channels.
+            img = raw_img[:, :, ch_idx].copy()
         else:
             img = raw_img
         img_dtype = img.dtype
