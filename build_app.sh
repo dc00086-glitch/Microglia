@@ -6,12 +6,17 @@ set -e
 
 # Copy MMPS.icns from Downloads if not already here
 if [[ ! -f MMPS.icns ]]; then
-    cp ~/Downloads/MMPS.icns .
-    echo "Copied MMPS.icns from Downloads"
+    if [[ -f ~/Downloads/MMPS.icns ]]; then
+        cp ~/Downloads/MMPS.icns .
+        echo "Copied MMPS.icns from Downloads"
+    else
+        echo "Warning: MMPS.icns not found in ~/Downloads or current directory"
+        echo "         The app will build without a custom icon."
+    fi
 fi
 
-# Build
-python3 -m PyInstaller --onefile --windowed --name "MMPS" --icon MMPS.icns MMPSv2.py
+# Build using the spec file (which now references the icon)
+python3 -m PyInstaller MMPS.spec --noconfirm
 
 echo ""
-echo "Done: dist/MMPS.app"
+echo "Done: dist/MMPS"

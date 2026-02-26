@@ -1,6 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
+import sys, os
+
+# Icon file — .icns for macOS, .ico for Windows
+if sys.platform == 'darwin':
+    ICON = 'MMPS.icns'
+else:
+    ICON = 'MMPS.ico' if os.path.exists('MMPS.ico') else None
+
 a = Analysis(
     ['MMPSv2.py'],
     pathex=[],
@@ -32,6 +40,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=ICON,
 )
 coll = COLLECT(
     exe,
