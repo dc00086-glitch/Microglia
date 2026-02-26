@@ -4027,8 +4027,26 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         self.original_label.set_image(pixmap)
                 elif current_tab == 1:  # Preview
                     if 'preview' in img_data and img_data['preview'] is not None:
-                        adjusted = self._apply_display_adjustments(img_data['preview'])
-                        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                        if use_color and 'color_image' in img_data:
+                            # Build color composite with preview channel replacing original
+                            color_img = img_data['color_image']
+                            if color_img.ndim == 3:
+                                h, w = color_img.shape[:2]
+                                c = min(color_img.shape[2], 3)
+                                composite = np.zeros((h, w, 3), dtype=np.float32)
+                                for i in range(c):
+                                    if i == self.grayscale_channel:
+                                        composite[:, :, i] = img_data['preview'].astype(np.float32)
+                                    else:
+                                        composite[:, :, i] = color_img[:, :, i].astype(np.float32)
+                                adjusted = self._apply_display_adjustments_color(composite)
+                                pixmap = self._array_to_pixmap_color(adjusted)
+                            else:
+                                adjusted = self._apply_display_adjustments(img_data['preview'])
+                                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                        else:
+                            adjusted = self._apply_display_adjustments(img_data['preview'])
+                            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         self.preview_label.set_image(pixmap)
                 elif current_tab == 2:  # Processed
                     # In outlining mode, use the queue's image, not current_image_name
