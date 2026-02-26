@@ -7027,7 +7027,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         else:
             adjusted = self._apply_display_adjustments(processed_img)
             pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
-        self.mask_label.set_image(pixmap, mask_overlay=mask_data['mask'])
+        # Show the clicked soma center as a centroid marker
+        soma_centroid = []
+        img_data = self.images.get(img_name, {})
+        soma_idx = mask_data.get('soma_idx')
+        if soma_idx is not None and soma_idx < len(img_data.get('somas', [])):
+            soma_centroid = [img_data['somas'][soma_idx]]
+        self.mask_label.set_image(pixmap, centroids=soma_centroid, mask_overlay=mask_data['mask'])
 
         # Auto-zoom to mask center
         mask_coords = np.argwhere(mask_data['mask'] > 0)
