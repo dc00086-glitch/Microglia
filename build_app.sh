@@ -15,8 +15,15 @@ if [[ ! -f MMPS.icns ]]; then
     fi
 fi
 
-# Build using the spec file (which now references the icon)
+# Build using the spec file (produces .app bundle on macOS)
 python3 -m PyInstaller MMPS.spec --noconfirm
 
 echo ""
-echo "Done: dist/MMPS"
+if [[ -d dist/MMPS.app ]]; then
+    echo "Done: dist/MMPS.app"
+    echo ""
+    echo "First launch: right-click > Open to bypass Gatekeeper."
+    echo "After that it will open normally and fast."
+else
+    echo "Done: dist/MMPS/"
+fi

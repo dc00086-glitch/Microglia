@@ -1,6 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 import sys, os
 
 # Icon file — .icns for macOS, .ico for Windows
@@ -18,7 +17,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter'],
+    excludes=['tkinter', 'matplotlib.backends.backend_tkagg'],
     noarchive=False,
     optimize=0,
 )
@@ -51,3 +50,16 @@ coll = COLLECT(
     upx_exclude=[],
     name='MMPS',
 )
+
+# macOS: create a proper .app bundle so Gatekeeper doesn't rescan on every launch
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        coll,
+        name='MMPS.app',
+        icon=ICON,
+        bundle_identifier='com.mmps.microglia',
+        info_plist={
+            'CFBundleShortVersionString': '2.0.0',
+            'NSHighResolutionCapable': True,
+        },
+    )
