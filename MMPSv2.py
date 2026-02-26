@@ -3961,7 +3961,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         else:
             self.color_toggle_btn.setText("Show Color (C)")
             self.channel_select_btn.setVisible(False)
-        self.update_display()
+        # During soma picking, use the dedicated refresh to preserve picking state
+        if self.processed_label.soma_mode:
+            self._load_image_for_soma_picking()
+        else:
+            self.update_display()
 
     def _toggle_multi_channel_ui(self, checked):
         """Show/hide the extra channel checkboxes"""
@@ -4351,8 +4355,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.images[img_name]['selected'] = is_checked
 
     def on_image_selected(self, item):
-        # During outlining or QA, don't switch images from file list clicks
-        if self.processed_label.polygon_mode or self.mask_qa_active:
+        # During outlining, soma picking, or QA, don't switch images from file list clicks
+        if self.processed_label.polygon_mode or self.processed_label.soma_mode or self.mask_qa_active:
             return
         img_name = item.data(Qt.UserRole)
         is_checked = item.checkState() == Qt.Checked
