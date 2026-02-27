@@ -1327,7 +1327,7 @@ class InteractiveImageLabel(QLabel):
         # Pass to parent (no zoom on scroll)
         event.ignore()
 
-    def _find_nearest_point(self, click_pos, threshold=15):
+    def _find_nearest_point(self, click_pos, threshold=8):
         """Find the nearest polygon point within threshold pixels"""
         # Sync from parent's authoritative list to avoid stale data
         if self.parent_widget and hasattr(self.parent_widget, 'polygon_points'):
@@ -1402,8 +1402,8 @@ class InteractiveImageLabel(QLabel):
             # Sync polygon points from parent before checking for drag
             if hasattr(self.parent_widget, 'polygon_points'):
                 self.polygon_pts = self.parent_widget.polygon_points
-            # Check for point editing first (if there are existing points)
-            if self.polygon_pts and event.button() == Qt.LeftButton:
+            # Shift+click to drag existing points (prevents accidental grabs)
+            if self.polygon_pts and event.button() == Qt.LeftButton and (event.modifiers() & Qt.ShiftModifier):
                 nearest_idx = self._find_nearest_point(event.pos())
                 if nearest_idx is not None:
                     # Start dragging this point
@@ -2635,7 +2635,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         elif mode == "Soma Outlining":
             html += "<tr><td colspan='2' style='border-bottom: 1px solid #ccc;'><b>Soma Outlining</b></td></tr>"
             shortcuts = [
-                ("Left-click", "Place outline point / drag existing point"),
+                ("Left-click", "Place outline point"),
+                ("Shift+Left-click", "Drag existing point"),
                 ("Right-click", "Finish outline"),
                 ("Double-click", "Finish outline"),
                 ("Backspace", "Remove last point"),
@@ -5246,7 +5247,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("")
         self.log("=" * 50)
         self.log("📋 REVIEW MODE - Check each outline")
-        self.log("• Drag points to adjust")
+        self.log("• Shift+drag points to adjust")
         self.log("• Press Enter or [Accept] to approve")
         self.log("• Click [Manual] to redraw from scratch")
         self.log("=" * 50)
@@ -5656,7 +5657,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)} (Auto)"
         )
         self.log(f"✓ Auto-outlined {soma_id} with {len(self.polygon_points)} points")
-        self.log("  → Drag points to adjust, then press Enter or [Accept]")
+        self.log("  → Shift+drag points to adjust, then press Enter or [Accept]")
 
         # Enable accept button for review
         self.accept_outline_btn.setEnabled(True)
