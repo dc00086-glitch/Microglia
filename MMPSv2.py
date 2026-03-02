@@ -6653,11 +6653,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
             print(f"  {soma_id}: soma={soma_area_px}px, grew to {len(go)}px (target: {largest_target_px})")
 
+            soma_masks_start = len(all_masks)
+            mask_pixel_counts = []
             for target_area_um2 in sorted_areas:
                 target_px = int(target_area_um2 / (pixel_size_um ** 2))
                 n_pixels = min(target_px, len(go))
                 n_pixels = max(n_pixels, soma_area_px)
                 n_pixels = min(n_pixels, len(go))
+
+                mask_pixel_counts.append(n_pixels)
 
                 full_mask = np.zeros((h, w), dtype=np.uint8)
                 for r, c in go[:n_pixels]:
@@ -6675,6 +6679,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     'approved': None,
                     'soma_area_um2': soma_area_um2
                 })
+
+            # Auto-reject duplicate masks for this soma: when multiple target
+            # areas produce the same pixel count (pixel-identical masks), reject
+            # all except the one with the smallest target area.
+            pixel_count_groups = {}
+            for i, n_px in enumerate(mask_pixel_counts):
+                pixel_count_groups.setdefault(n_px, []).append(i)
+            for n_px, indices in pixel_count_groups.items():
+                if len(indices) > 1:
+                    keep_idx = indices[-1]
+                    for idx in indices[:-1]:
+                        all_masks[soma_masks_start + idx]['approved'] = False
+                        print(f"    ⚠️ Auto-rejected {all_masks[soma_masks_start + idx]['area_um2']} µm² "
+                              f"(duplicate of {all_masks[soma_masks_start + keep_idx]['area_um2']} µm², both {n_px} px)")
 
         return all_masks
 
@@ -6808,11 +6826,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # min(target_px, len(growth_order)) naturally caps the mask smaller
         # If target < soma area, substitute the soma mask for that size
         soma_area_px = soma_seed_count
+        mask_pixel_counts = []
         for target_area_um2 in sorted_areas:
             target_px = int(target_area_um2 / (pixel_size_um ** 2))
             n_pixels = min(target_px, len(growth_order))
             n_pixels = max(n_pixels, soma_area_px)  # always include full soma
             n_pixels = min(n_pixels, len(growth_order))
+
+            mask_pixel_counts.append(n_pixels)
 
             mask_roi = np.zeros((h, w), dtype=np.uint8)
             for r, c in growth_order[:n_pixels]:
@@ -6833,6 +6854,21 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 'approved': None,
                 'soma_area_um2': soma_area_um2
             })
+
+        # Auto-reject duplicate masks: when multiple target areas produce the
+        # same pixel count (and thus pixel-identical masks), reject all except
+        # the one with the smallest target area.
+        pixel_count_groups = {}
+        for i, n_px in enumerate(mask_pixel_counts):
+            pixel_count_groups.setdefault(n_px, []).append(i)
+        for n_px, indices in pixel_count_groups.items():
+            if len(indices) > 1:
+                # sorted_areas is largest-first, so last index = smallest target area
+                keep_idx = indices[-1]
+                for idx in indices[:-1]:
+                    masks[idx]['approved'] = False
+                    print(f"    ⚠️ Auto-rejected {masks[idx]['area_um2']} µm² "
+                          f"(duplicate of {masks[keep_idx]['area_um2']} µm², both {n_px} px)")
 
         return masks
 
@@ -6913,10 +6949,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.log("=" * 50)
         self.log("🎯 BATCH MASK QA MODE")
+        # Report auto-rejected duplicates
+        auto_rejected = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is False)
+        if auto_rejected > 0:
+            self.log(f"⚠️ {auto_rejected} duplicate masks auto-rejected (identical to a smaller target area)")
         if reviewed_count > 0:
             self.log(f"Resuming: {reviewed_count}/{len(self.all_masks_flat)} already reviewed")
         else:
             self.log(f"Total masks to review: {len(self.all_masks_flat)}")
+        remaining = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is None)
+        self.log(f"Masks needing review: {remaining}")
         self.log("Keyboard: A=Approve, R=Reject, ←→=Navigate, Space=Approve&Next")
         self.log("=" * 50)
 
