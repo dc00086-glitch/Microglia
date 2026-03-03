@@ -478,13 +478,30 @@ def main():
     allResults = []
     processed = 0
     skipped = 0
+    batchStart = time.time()
+    total = len(maskFiles)
 
-    for maskFile in maskFiles:
+    for idx, maskFile in enumerate(maskFiles):
         maskPath = os.path.join(masksDir, maskFile)
         imgName, somaId, areaUm2 = parseMaskInfo(maskFile)
 
+        # Progress bar + ETA
+        IJ.showProgress(idx, total)
+        elapsed = time.time() - batchStart
+        if idx > 0:
+            eta = elapsed / idx * (total - idx)
+            if eta < 60:
+                etaStr = str(int(eta)) + "s"
+            elif eta < 3600:
+                etaStr = str(int(eta // 60)) + "m " + str(int(eta % 60)).zfill(2) + "s"
+            else:
+                etaStr = str(int(eta // 3600)) + "h " + str(int((eta % 3600) // 60)).zfill(2) + "m"
+            IJ.showStatus("Sholl: " + str(idx + 1) + "/" + str(total) + "  ETA: ~" + etaStr)
+        else:
+            IJ.showStatus("Sholl: " + str(idx + 1) + "/" + str(total) + "  ETA: estimating...")
+
         IJ.log("")
-        IJ.log("Processing: " + maskFile)
+        IJ.log("[" + str(idx + 1) + "/" + str(total) + "] " + maskFile)
 
         # Find corresponding soma file
         somaPath = findSomaFile(somasDir, maskFile)
@@ -563,15 +580,27 @@ def main():
             IJ.log("ERROR saving combined results: " + str(e))
             IJ.log("TIP: Close Excel or any program using the results file, then re-run.")
 
+        totalElapsed = time.time() - batchStart
+        if totalElapsed < 60:
+            elapsedStr = str(int(totalElapsed)) + "s"
+        elif totalElapsed < 3600:
+            elapsedStr = str(int(totalElapsed // 60)) + "m " + str(int(totalElapsed % 60)).zfill(2) + "s"
+        else:
+            elapsedStr = str(int(totalElapsed // 3600)) + "h " + str(int((totalElapsed % 3600) // 60)).zfill(2) + "m"
+
+        IJ.showProgress(1.0)
+        IJ.showStatus("Sholl analysis complete")
         IJ.log("")
         IJ.log("=" * 60)
-        IJ.log("COMPLETE")
+        IJ.log("COMPLETE (" + elapsedStr + ")")
         IJ.log("Processed: " + str(processed) + " masks")
         IJ.log("Skipped: " + str(skipped) + " masks")
         IJ.log("Combined results: " + combinedPath)
         IJ.log("Individual CSVs + plots in: " + shollDir)
         IJ.log("=" * 60)
     else:
+        IJ.showProgress(1.0)
+        IJ.showStatus("Sholl analysis complete")
         IJ.log("")
         IJ.log("No results collected. Check masks and soma files.")
 

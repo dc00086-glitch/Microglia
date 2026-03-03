@@ -375,10 +375,28 @@ def main():
     print("")
 
     allResults = []
+    batchStart = time.time()
+    total = len(maskFiles)
 
-    for maskFile in maskFiles:
+    for idx, maskFile in enumerate(maskFiles):
         maskPath = os.path.join(masksDirPath, maskFile)
 
+        # Progress bar + ETA
+        IJ.showProgress(idx, total)
+        elapsed = time.time() - batchStart
+        if idx > 0:
+            eta = elapsed / idx * (total - idx)
+            if eta < 60:
+                etaStr = str(int(eta)) + "s"
+            elif eta < 3600:
+                etaStr = str(int(eta // 60)) + "m " + str(int(eta % 60)).zfill(2) + "s"
+            else:
+                etaStr = str(int(eta // 3600)) + "h " + str(int((eta % 3600) // 60)).zfill(2) + "m"
+            IJ.showStatus("Skeleton: " + str(idx + 1) + "/" + str(total) + "  ETA: ~" + etaStr)
+        else:
+            IJ.showStatus("Skeleton: " + str(idx + 1) + "/" + str(total) + "  ETA: estimating...")
+
+        print("[" + str(idx + 1) + "/" + str(total) + "] " + maskFile)
         metrics = analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath)
 
         if metrics is not None:
@@ -412,12 +430,24 @@ def main():
             print("TIP: Close Excel or any program using the results file, then re-run.")
             return
 
+        totalElapsed = time.time() - batchStart
+        if totalElapsed < 60:
+            elapsedStr = str(int(totalElapsed)) + "s"
+        elif totalElapsed < 3600:
+            elapsedStr = str(int(totalElapsed // 60)) + "m " + str(int(totalElapsed % 60)).zfill(2) + "s"
+        else:
+            elapsedStr = str(int(totalElapsed // 3600)) + "h " + str(int((totalElapsed % 3600) // 60)).zfill(2) + "m"
+
+        IJ.showProgress(1.0)
+        IJ.showStatus("Skeleton analysis complete")
         print("\n" + "=" * 60)
-        print("COMPLETED: " + str(len(allResults)) + " cells processed")
+        print("COMPLETED in " + elapsedStr + ": " + str(len(allResults)) + " cells processed")
         print("Results: " + actualPath)
         print("Skeleton images saved to: " + outputDirPath)
         print("=" * 60)
     else:
+        IJ.showProgress(1.0)
+        IJ.showStatus("Skeleton analysis complete")
         print("\nERROR: No cells processed successfully")
 
 
