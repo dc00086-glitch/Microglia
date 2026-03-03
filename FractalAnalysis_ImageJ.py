@@ -24,6 +24,53 @@ import os
 import csv
 import re
 import math
+import time
+
+
+def safe_csv_open(path):
+    """Open a CSV file for writing, handling permission errors on external drives.
+
+    If the target file is locked (e.g. open in Excel) or the drive denies
+    permission, tries a timestamped fallback name in the same directory.
+    Returns (file_handle, actual_path) on success, or raises IOError.
+    """
+    # First attempt: the requested path
+    try:
+        f = open(path, 'wb')
+        return f, path
+    except IOError as e:
+        if e.errno not in (13, 30):  # Permission denied, Read-only filesystem
+            raise
+        IJ.log("WARNING: Cannot write to " + path)
+        IJ.log("  " + str(e))
+
+    # Fallback: add a timestamp to the filename
+    base, ext = os.path.splitext(path)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    fallback = base + "_" + timestamp + ext
+    try:
+        f = open(fallback, 'wb')
+        IJ.log("  -> Saving to fallback: " + os.path.basename(fallback))
+        return f, fallback
+    except IOError:
+        pass
+
+    # Last resort: write to user home directory
+    home = os.path.expanduser("~")
+    home_path = os.path.join(home, "Desktop", os.path.basename(path))
+    try:
+        f = open(home_path, 'wb')
+        IJ.log("  -> Saving to Desktop: " + home_path)
+        return f, home_path
+    except IOError:
+        pass
+
+    raise IOError(
+        "Cannot save CSV results. Please close any programs that have "
+        "the results file open (e.g. Excel), or choose a different "
+        "output directory. Tried:\n  " + path + "\n  " + fallback +
+        "\n  " + home_path
+    )
 
 
 def openImageQuiet(path):
@@ -451,6 +498,21 @@ def main():
     if not os.path.exists(resultsDir):
         os.makedirs(resultsDir)
 
+    # Pre-flight: verify we can write to the output directory
+    testFile = os.path.join(resultsDir, ".mmps_write_test")
+    try:
+        tf = open(testFile, 'wb')
+        tf.close()
+        os.remove(testFile)
+    except IOError as e:
+        IJ.error("Cannot write to output directory!\n" +
+                 resultsDir + "\n\n" + str(e) + "\n\n" +
+                 "If using an external drive, try:\n" +
+                 "  1. Eject and reconnect the drive\n" +
+                 "  2. Use Disk Utility > First Aid on the drive\n" +
+                 "  3. Choose an output folder on your internal drive instead")
+        return
+
     # Collect mask files
     maskFiles = sorted([f for f in os.listdir(masksDir)
                         if f.endswith('_mask.tif') and not f.startswith('.')])
@@ -526,10 +588,16 @@ def main():
 
         columns = idCols + fracCols + hullCols
 
-        with open(outputPath, 'wb') as f:
+        try:
+            f, outputPath = safe_csv_open(outputPath)
             writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(allResults)
+            f.close()
+        except IOError as e:
+            IJ.log("")
+            IJ.log("ERROR saving results: " + str(e))
+            IJ.log("TIP: Close Excel or any program using the results file, then re-run.")
 
         IJ.log("")
         IJ.log("=" * 60)
