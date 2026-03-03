@@ -3127,15 +3127,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         key = (qs.get('soma_id', ''), qs.get('area_um2', 0))
                         qa_state_lookup[key] = qs.get('approved')
 
+                    loaded_keys = set()  # Track (soma_id, area_um2) found on disk
                     for mf in sorted(os.listdir(self.masks_dir)):
                         m = mask_pattern.match(mf)
                         if not m:
                             continue
                         soma_id = m.group(1)
                         area_um2 = int(m.group(2))
+                        loaded_keys.add((soma_id, area_um2))
                         mask_path = os.path.join(self.masks_dir, mf)
                         try:
                             mask_arr = tifffile.imread(mask_path)
+                            # Convert from 0/255 to 0/1 binary
+                            mask_arr = (mask_arr > 0).astype(np.uint8)
                             # Find soma_idx from soma_ids list
                             soma_ids_list = self.images[img_name]['soma_ids']
                             soma_idx = soma_ids_list.index(soma_id) if soma_id in soma_ids_list else 0
@@ -3159,9 +3163,32 @@ class MicrogliaAnalysisGUI(QMainWindow):
                             })
                         except Exception as e:
                             print(f"Warning: Could not load mask {mf}: {e}")
+
+                    # Restore rejected masks whose TIFFs were deleted during QA
+                    # eviction — the session's mask_qa_state still has their records
+                    soma_ids_list = self.images[img_name]['soma_ids']
+                    n_restored = 0
+                    for qs in img_session.get('mask_qa_state', []):
+                        qs_soma_id = qs.get('soma_id', '')
+                        qs_area = qs.get('area_um2', 0)
+                        if (qs_soma_id, qs_area) in loaded_keys:
+                            continue  # already loaded from disk
+                        # This mask was in the session but not on disk (rejected & deleted)
+                        soma_idx = soma_ids_list.index(qs_soma_id) if qs_soma_id in soma_ids_list else 0
+                        self.images[img_name]['masks'].append({
+                            'image_name': img_name,
+                            'soma_idx': soma_idx,
+                            'soma_id': qs_soma_id,
+                            'area_um2': qs_area,
+                            'mask': None,  # TIFF was deleted; reload not needed for rejected masks
+                            'approved': qs.get('approved'),
+                            'soma_area_um2': outline_lookup.get(qs_soma_id, 0),
+                        })
+                        n_restored += 1
+
                     n_loaded_masks = len(self.images[img_name]['masks'])
                     if n_loaded_masks > 0:
-                        print(f"Loaded {n_loaded_masks} masks from disk for {img_name}")
+                        print(f"Loaded {n_loaded_masks} masks for {img_name} ({n_loaded_masks - n_restored} from disk, {n_restored} restored from session)")
                     else:
                         print(f"Warning: No masks found on disk for {img_name} in {self.masks_dir}")
 
