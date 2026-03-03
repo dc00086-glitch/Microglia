@@ -2362,13 +2362,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.timer_label.setAlignment(Qt.AlignCenter)
         progress_container.addWidget(self.timer_label, stretch=0)
 
-        self.eta_label = QLabel("")
-        self.eta_label.setVisible(False)
-        self.eta_label.setStyleSheet("font-family: monospace; font-size: 12pt; color: #888; padding: 0 10px;")
-        self.eta_label.setMinimumWidth(140)
-        self.eta_label.setAlignment(Qt.AlignCenter)
-        progress_container.addWidget(self.eta_label, stretch=0)
-
         layout.addLayout(progress_container)
 
         self.progress_status_label = QLabel("")
@@ -2382,10 +2375,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.process_timer.timeout.connect(self.update_timer_display)
         self.process_start_time = None
         self.timer_running = False
-
-        # ETA tracking state
-        self._eta_operation_start = None  # time.time() when operation started
-        self._eta_last_percentage = 0     # last progress percentage received
 
         # Hidden navigation buttons (for compatibility - not displayed but needed by code)
         self.prev_btn = QPushButton("< Previous")
@@ -2449,59 +2438,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.process_timer.stop()
         self.timer_running = False
         # Keep the final time visible
-
-    def _start_eta_tracking(self):
-        """Begin tracking ETA for an operation. Call at the start of any batch operation."""
-        self._eta_operation_start = time.time()
-        self._eta_last_percentage = 0
-        self.eta_label.setText("ETA: estimating...")
-        self.eta_label.setVisible(True)
-
-    def _update_eta(self, percentage):
-        """Update ETA display based on current progress percentage (0-100).
-
-        Uses elapsed time and current percentage to linearly estimate remaining time.
-        Avoids displaying ETA until at least 2% progress to reduce noise.
-        """
-        if self._eta_operation_start is None or percentage <= 0:
-            return
-
-        self._eta_last_percentage = percentage
-
-        if percentage < 2:
-            self.eta_label.setText("ETA: estimating...")
-            return
-
-        if percentage >= 100:
-            self.eta_label.setText("ETA: done")
-            return
-
-        elapsed = time.time() - self._eta_operation_start
-        if elapsed <= 0:
-            return
-
-        estimated_total = elapsed / (percentage / 100.0)
-        remaining = max(0, estimated_total - elapsed)
-
-        if remaining < 60:
-            eta_text = f"ETA: ~{int(remaining)}s"
-        elif remaining < 3600:
-            mins = int(remaining // 60)
-            secs = int(remaining % 60)
-            eta_text = f"ETA: ~{mins}m {secs:02d}s"
-        else:
-            hours = int(remaining // 3600)
-            mins = int((remaining % 3600) // 60)
-            eta_text = f"ETA: ~{hours}h {mins:02d}m"
-
-        self.eta_label.setText(eta_text)
-
-    def _stop_eta_tracking(self):
-        """Hide the ETA label and reset tracking state."""
-        self.eta_label.setVisible(False)
-        self.eta_label.setText("")
-        self._eta_operation_start = None
-        self._eta_last_percentage = 0
 
     def calculate_colocalization(self, mask, img_name):
         """
@@ -4720,13 +4656,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         else:
             self.progress_status_label.setText(f"Extracting Channel {process_channel + 1}...")
         self.process_selected_btn.setEnabled(False)
-        self._start_eta_tracking()
-        self.start_timer()
         self.thread.start()
 
     def _update_progress(self, value):
         self.progress_bar.setValue(value)
-        self._update_eta(value)
 
     def _handle_processed_image(self, output_path, img_name, processed_data):
         if img_name in self.images:
@@ -4824,11 +4757,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 break
 
     def _background_removal_finished(self):
-        self.stop_timer()
-        self._stop_eta_tracking()
+
         self.progress_bar.setVisible(False)
         self.progress_status_label.setVisible(False)
-        self.timer_label.setVisible(False)
         self.process_selected_btn.setEnabled(True)
         self.batch_pick_somas_btn.setEnabled(True)
         self.log("=" * 50)
@@ -6225,8 +6156,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
             self.progress_bar.setVisible(True)
             self.progress_status_label.setVisible(True)
-            self.start_timer()
-            self._start_eta_tracking()
 
             total_outlines = sum(len(data['soma_outlines']) for data in self.images.values()
                                  if data['selected'] and data['soma_outlines'])
@@ -6271,9 +6200,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                             self._update_checklist_row(mask_cl_path, 0, m_key, 1, 1)
 
                     current_count += len(img_data['soma_outlines'])
-                    pct = int((current_count / total_outlines) * 100)
-                    self.progress_bar.setValue(pct)
-                    self._update_eta(pct)
+                    self.progress_bar.setValue(int((current_count / total_outlines) * 100))
                 else:
                     # Independent or watershed: per-soma growth
                     territory_map = None
@@ -6310,9 +6237,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                                 self._update_checklist_row(mask_cl_path, 0, m_key, 1, 1)
 
                         current_count += 1
-                        pct = int((current_count / total_outlines) * 100)
-                        self.progress_bar.setValue(pct)
-                        self._update_eta(pct)
+                        self.progress_bar.setValue(int((current_count / total_outlines) * 100))
 
                 # Export ALL generated masks to disk immediately so they
                 # survive save/load even before QA approval
@@ -6322,11 +6247,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 img_data['status'] = 'masks_generated'
                 self._update_file_list_item(img_name)
 
-            self.stop_timer()
-            self._stop_eta_tracking()
             self.progress_bar.setVisible(False)
             self.progress_status_label.setVisible(False)
-            self.timer_label.setVisible(False)
 
             # Delete mask checklist — generation is done
             self._delete_checklist(self._get_checklist_path('mask_checklist.csv'))
@@ -6356,11 +6278,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             )
 
         except Exception as e:
-            self.stop_timer()
-            self._stop_eta_tracking()
             self.progress_bar.setVisible(False)
             self.progress_status_label.setVisible(False)
-            self.timer_label.setVisible(False)
             self.log(f"ERROR: {e}")
             import traceback
             traceback.print_exc()
@@ -7671,8 +7590,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.progress_bar.setVisible(True)
             self.progress_status_label.setVisible(True)
             self.progress_bar.setValue(0)
-            self.start_timer()
-            self._start_eta_tracking()
+            self.start_timer()  # Start the timer
 
             # Disable the calculate button during processing
             self.batch_calculate_btn.setEnabled(False)
@@ -7696,18 +7614,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.progress_bar.setVisible(False)
             self.progress_status_label.setVisible(False)
             self.stop_timer()
-            self._stop_eta_tracking()
 
     def _on_morph_progress(self, percentage, status):
         """Update progress bar and status during morphology calculation"""
         self.progress_bar.setValue(percentage)
         self.progress_status_label.setText(status)
-        self._update_eta(percentage)
 
     def _on_morph_finished(self, all_results):
         """Handle completion of morphology calculations"""
         self.stop_timer()
-        self._stop_eta_tracking()
         self.progress_bar.setVisible(False)
         self.progress_status_label.setVisible(False)
         self.batch_calculate_btn.setEnabled(True)
@@ -7780,7 +7695,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
     def _on_morph_error(self, error_msg):
         """Handle errors during morphology calculation"""
         self.stop_timer()
-        self._stop_eta_tracking()
         self.progress_bar.setVisible(False)
         self.progress_status_label.setVisible(False)
         self.timer_label.setVisible(False)
