@@ -3,7 +3,7 @@
 One-time script to recompute roundness and eccentricity for an existing
 combined_morphology.csv using the mask TIFF files on disk.
 
-Updated formulas (matching MMPSv2.py):
+Updated formulas (matching MMPSv2.12.py):
     axis_ratio   = minor_axis / major_axis
     eccentricity = sqrt(1 - axis_ratio^2)   (0 = circle, 1 = elongated)
     roundness    = (minor_axis / major_axis)^2  (0 = elongated, 1 = circle)

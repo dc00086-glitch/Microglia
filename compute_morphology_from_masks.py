@@ -3,7 +3,7 @@
 Scan a masks folder, compute all morphology metrics from the TIFF files,
 and write a fresh CSV.  No existing CSV needed.
 
-Metrics computed (matching MMPSv2.py):
+Metrics computed (matching MMPSv2.12.py):
     perimeter, mask_area, eccentricity, roundness, cell_spread,
     soma_area (from somas/ folder if available),
     polarity_index, principal_angle, major_axis_um, minor_axis_um

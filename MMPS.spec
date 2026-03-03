@@ -9,7 +9,7 @@ else:
     ICON = 'MMPS.ico' if os.path.exists('MMPS.ico') else None
 
 a = Analysis(
-    ['MMPSv2.py'],
+    ['MMPSv2.12.py'],
     pathex=[],
     binaries=[],
     datas=[],
