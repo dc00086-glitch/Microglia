@@ -28,6 +28,10 @@ import os
 import re
 import csv
 import heapq
+import time
+import json
+import glob
+import math
 import numpy as np
 import tifffile
 from scipy import ndimage
@@ -1039,48 +1043,2608 @@ def batch_compute_3d_morphology(masks_dir, voxel_size_xy, voxel_size_z,
 
 
 # ============================================================================
-# MAIN — CLI entry point for batch 3D analysis
+# PyQt5 GUI FOR 3D Z-STACK ANALYSIS
+# ============================================================================
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QListWidget, QSlider, QSpinBox,
+    QGroupBox, QMessageBox, QTextEdit, QLineEdit, QFormLayout, QTabWidget,
+    QProgressBar, QListWidgetItem, QDialog, QScrollArea, QTableWidget,
+    QTableWidgetItem, QHeaderView, QCheckBox, QComboBox, QDoubleSpinBox,
+    QSizePolicy, QShortcut
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import (
+    QPixmap, QPainter, QPen, QColor, QImage, QBrush, QKeySequence, QIcon
+)
+
+
+# ============================================================================
+# 3D PREPROCESSING WORKER THREAD
+# ============================================================================
+
+class PreprocessingThread3D(QThread):
+    """Worker thread for preprocessing Z-stacks in the background."""
+    progress = pyqtSignal(int)
+    status_update = pyqtSignal(str)
+    finished_image = pyqtSignal(str, str, object)  # (output_path, img_name, processed_stack)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, image_data_list, output_dir):
+        super().__init__()
+        self.image_data_list = image_data_list
+        self.output_dir = output_dir
+
+    def run(self):
+        total = len(self.image_data_list)
+        for i, (raw_path, img_name, rb_radius, rb_enabled,
+                denoise_enabled, denoise_size,
+                sharpen_enabled, sharpen_amount) in enumerate(self.image_data_list):
+            try:
+                self.status_update.emit(f"Processing {img_name}...")
+                stack = load_zstack(raw_path)
+                stack = ensure_grayscale_3d(stack)
+
+                rb_r = rb_radius if rb_enabled else 0
+                dn_s = denoise_size if denoise_enabled else 0
+                sh_a = sharpen_amount if sharpen_enabled else 0.0
+
+                processed = preprocess_zstack(stack, rolling_ball_radius=rb_r,
+                                              denoise_size=dn_s, sharpen_amount=sh_a)
+
+                # Save processed stack
+                out_stem = os.path.splitext(img_name)[0]
+                out_path = os.path.join(self.output_dir, f"{out_stem}_processed.tif")
+                tifffile.imwrite(out_path, processed)
+
+                self.finished_image.emit(out_path, img_name, processed)
+            except Exception as e:
+                self.error_occurred.emit(f"{img_name}: {e}")
+
+            self.progress.emit(int((i + 1) / total * 100))
+
+
+# ============================================================================
+# 3D MORPHOLOGY CALCULATION THREAD
+# ============================================================================
+
+class MorphologyThread3D(QThread):
+    """Worker thread for computing 3D morphology metrics."""
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(list)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, approved_masks, voxel_xy, voxel_z, images):
+        super().__init__()
+        self.approved_masks = approved_masks
+        self.voxel_xy = voxel_xy
+        self.voxel_z = voxel_z
+        self.images = images
+
+    def run(self):
+        try:
+            calc = Morphology3DCalculator(self.voxel_xy, self.voxel_z)
+            results = []
+            total = len(self.approved_masks)
+
+            for i, flat in enumerate(self.approved_masks):
+                mask_data = flat['mask_data']
+                img_name = flat['image_name']
+                mask_3d = mask_data.get('mask')
+
+                if mask_3d is None:
+                    continue
+
+                self.progress.emit(int((i + 1) / total * 100),
+                                   f"Analyzing {i + 1}/{total}: {mask_data.get('soma_id', '')}")
+
+                try:
+                    metrics = calc.calculate_all(mask_3d)
+                except Exception as e:
+                    metrics = calc._empty_metrics()
+                    metrics['error'] = str(e)
+
+                # Skeleton analysis
+                try:
+                    skeleton, bp, ep, n_branches = skeletonize_3d_mask(mask_3d)
+                    metrics['n_branches'] = n_branches
+                    metrics['n_branch_points'] = len(bp)
+                    metrics['n_endpoints'] = len(ep)
+                    metrics['total_branch_length_um'] = round(
+                        np.sum(skeleton) * ((self.voxel_xy + self.voxel_z) / 2), 4
+                    )
+                except Exception:
+                    metrics['n_branches'] = 0
+                    metrics['n_branch_points'] = 0
+                    metrics['n_endpoints'] = 0
+                    metrics['total_branch_length_um'] = 0
+
+                # Fractal analysis
+                try:
+                    fd, lac, _, _ = fractal_dimension_3d(mask_3d, self.voxel_xy, self.voxel_z)
+                    metrics['fractal_dimension_3d'] = fd
+                    metrics['lacunarity_3d'] = lac
+                except Exception:
+                    metrics['fractal_dimension_3d'] = 0
+                    metrics['lacunarity_3d'] = 0
+
+                row = {
+                    'image_name': os.path.splitext(img_name)[0],
+                    'soma_id': mask_data.get('soma_id', ''),
+                    'soma_idx': mask_data.get('soma_idx', 0),
+                    'target_volume_um3': mask_data.get('volume_um3', 0),
+                }
+                row.update(metrics)
+                results.append(row)
+
+            self.finished.emit(results)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+
+# ============================================================================
+# INTERACTIVE IMAGE LABEL (Z-SLICE VIEWER WITH ZOOM/PAN)
+# ============================================================================
+
+class InteractiveImageLabel3D(QLabel):
+    """Image display widget with zoom, pan, and click interaction for 3D slices."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_widget = parent
+        self.pix_source = None
+        self.centroids = []  # List of (row, col) on current slice
+        self.mask_overlay = None  # 2D mask for current slice
+        self.soma_mode = False
+        self.setMinimumSize(400, 400)
+        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.setStyleSheet("border: 2px solid palette(mid); background-color: palette(base);")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setScaledContents(False)
+        # Zoom and pan
+        self.zoom_level = 1.0
+        self.min_zoom = 0.5
+        self.max_zoom = 10.0
+        self.view_center_x = 0.5
+        self.view_center_y = 0.5
+        self.scaled_pixmap = None
+        self.setMouseTracking(True)
+        # Overlay opacity
+        self.overlay_opacity = 0.4
+        # Centroid dragging
+        self.dragging_centroid = False
+        self.dragging_centroid_idx = None
+
+    def set_image(self, qpix, centroids=None, mask_overlay=None):
+        self.pix_source = qpix
+        self.centroids = centroids or []
+        self.mask_overlay = mask_overlay
+        self._update_display()
+
+    def _update_display(self):
+        if self.pix_source is None:
+            return
+        img_w = self.pix_source.width()
+        img_h = self.pix_source.height()
+        label_w = self.size().width()
+        label_h = self.size().height()
+        if img_w == 0 or img_h == 0 or label_w == 0 or label_h == 0:
+            return
+        base_scale = min(label_w / img_w, label_h / img_h)
+        final_w = int(img_w * base_scale * self.zoom_level)
+        final_h = int(img_h * base_scale * self.zoom_level)
+        if final_w < 1 or final_h < 1:
+            return
+        self.scaled_pixmap = self.pix_source.scaled(
+            final_w, final_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.repaint()
+
+    def reset_zoom(self):
+        self.zoom_level = 1.0
+        self.view_center_x = 0.5
+        self.view_center_y = 0.5
+        self._update_display()
+
+    def zoom_to_point(self, img_row, img_col, zoom_level=3.0):
+        if self.pix_source is None:
+            return
+        img_h = self.pix_source.height()
+        img_w = self.pix_source.width()
+        if img_w > 0 and img_h > 0:
+            self.view_center_x = img_col / img_w
+            self.view_center_y = img_row / img_h
+            self.zoom_level = max(self.min_zoom, min(self.max_zoom, zoom_level))
+            self._update_display()
+            if self.parent_widget and hasattr(self.parent_widget, 'zoom_level_label'):
+                self.parent_widget.zoom_level_label.setText(f"{self.zoom_level:.1f}x")
+
+    def _get_pan_offset(self):
+        if not self.pix_source or not self.scaled_pixmap:
+            return 0, 0
+        label_w = self.size().width()
+        label_h = self.size().height()
+        pixmap_w = self.scaled_pixmap.width()
+        pixmap_h = self.scaled_pixmap.height()
+        center_offset_x = (label_w - pixmap_w) / 2
+        center_offset_y = (label_h - pixmap_h) / 2
+        pan_x = (0.5 - self.view_center_x) * pixmap_w
+        pan_y = (0.5 - self.view_center_y) * pixmap_h
+        return center_offset_x + pan_x, center_offset_y + pan_y
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self.palette().color(self.backgroundRole()))
+        if not self.pix_source or not self.scaled_pixmap:
+            painter.end()
+            return
+        offset_x, offset_y = self._get_pan_offset()
+        painter.drawPixmap(int(offset_x), int(offset_y), self.scaled_pixmap)
+
+        # Draw mask overlay
+        if self.mask_overlay is not None:
+            self._draw_mask_overlay(painter)
+
+        # Draw centroids
+        if self.centroids:
+            pen = QPen(QColor(255, 0, 0), 3)
+            painter.setPen(pen)
+            for centroid in self.centroids:
+                x, y = self._to_display_coords(centroid)
+                if 0 <= x <= self.width() and 0 <= y <= self.height():
+                    painter.drawLine(int(x - 8), int(y), int(x + 8), int(y))
+                    painter.drawLine(int(x), int(y - 8), int(x), int(y + 8))
+                    # Draw circle around centroid
+                    pen2 = QPen(QColor(255, 0, 0), 2)
+                    painter.setPen(pen2)
+                    painter.drawEllipse(int(x - 10), int(y - 10), 20, 20)
+                    painter.setPen(pen)
+
+        painter.end()
+
+    def _draw_mask_overlay(self, painter):
+        if self.mask_overlay is None or self.scaled_pixmap is None:
+            return
+        mask = self.mask_overlay
+        h, w = mask.shape[:2]
+        # Create colored overlay
+        overlay = np.zeros((h, w, 4), dtype=np.uint8)
+        overlay[mask > 0, 0] = 0    # R
+        overlay[mask > 0, 1] = 200  # G
+        overlay[mask > 0, 2] = 255  # B
+        overlay[mask > 0, 3] = int(255 * self.overlay_opacity)
+
+        overlay_img = QImage(overlay.data, w, h, 4 * w, QImage.Format_RGBA8888)
+        overlay_img = overlay_img.copy()
+        overlay_pix = QPixmap.fromImage(overlay_img)
+        # Scale to match displayed image
+        scaled_overlay = overlay_pix.scaled(
+            self.scaled_pixmap.width(), self.scaled_pixmap.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        offset_x, offset_y = self._get_pan_offset()
+        painter.drawPixmap(int(offset_x), int(offset_y), scaled_overlay)
+
+    def _to_display_coords(self, img_coords):
+        if not self.pix_source or not self.scaled_pixmap:
+            return 0, 0
+        img_h = self.pix_source.height()
+        img_w = self.pix_source.width()
+        scale_x = self.scaled_pixmap.width() / img_w if img_w > 0 else 1
+        scale_y = self.scaled_pixmap.height() / img_h if img_h > 0 else 1
+        offset_x, offset_y = self._get_pan_offset()
+        row, col = img_coords
+        disp_x = col * scale_x + offset_x
+        disp_y = row * scale_y + offset_y
+        return disp_x, disp_y
+
+    def _to_image_coords(self, display_x, display_y):
+        if not self.pix_source or not self.scaled_pixmap:
+            return None
+        img_h = self.pix_source.height()
+        img_w = self.pix_source.width()
+        scale_x = self.scaled_pixmap.width() / img_w if img_w > 0 else 1
+        scale_y = self.scaled_pixmap.height() / img_h if img_h > 0 else 1
+        offset_x, offset_y = self._get_pan_offset()
+        col = (display_x - offset_x) / scale_x
+        row = (display_y - offset_y) / scale_y
+        if 0 <= row < img_h and 0 <= col < img_w:
+            return (int(row), int(col))
+        return None
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_display()
+
+    def wheelEvent(self, event):
+        # Scroll wheel zooms
+        self.zoom_at_point(event.pos(), event.angleDelta().y() > 0)
+
+    def zoom_at_point(self, pos, zoom_in=True):
+        if not self.pix_source or not self.scaled_pixmap:
+            return
+        img_coords = self._to_image_coords(pos.x(), pos.y())
+        factor = 1.15 if zoom_in else 1 / 1.15
+        new_zoom = self.zoom_level * factor
+        new_zoom = max(self.min_zoom, min(self.max_zoom, new_zoom))
+        if img_coords:
+            img_h = self.pix_source.height()
+            img_w = self.pix_source.width()
+            if img_w > 0 and img_h > 0:
+                self.view_center_x = img_coords[1] / img_w
+                self.view_center_y = img_coords[0] / img_h
+        self.zoom_level = new_zoom
+        self._update_display()
+        if self.parent_widget and hasattr(self.parent_widget, 'zoom_level_label'):
+            self.parent_widget.zoom_level_label.setText(f"{self.zoom_level:.1f}x")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # Check for Z+click zoom
+            parent = self.parent_widget
+            if parent and hasattr(parent, 'z_key_held') and parent.z_key_held:
+                self.zoom_at_point(event.pos(), zoom_in=True)
+                return
+            # Soma picking mode
+            if self.soma_mode:
+                img_coords = self._to_image_coords(event.pos().x(), event.pos().y())
+                if img_coords and parent:
+                    parent.add_soma(img_coords)
+                return
+        elif event.button() == Qt.RightButton:
+            parent = self.parent_widget
+            if parent and hasattr(parent, 'z_key_held') and parent.z_key_held:
+                self.zoom_at_point(event.pos(), zoom_in=False)
+                return
+
+    def mouseMoveEvent(self, event):
+        pass
+
+    def mouseReleaseEvent(self, event):
+        pass
+
+
+# ============================================================================
+# MAIN GUI CLASS
+# ============================================================================
+
+class MicrogliaAnalysis3DGUI(QMainWindow):
+    """Full GUI for 3D Z-stack microglia morphology analysis."""
+
+    def __init__(self):
+        super().__init__()
+        self.images = {}
+        self.current_image_name = None
+        self.batch_mode = False
+        self.soma_picking_queue = []
+        self.output_dir = None
+        self.masks_dir = None
+        self.voxel_size_xy = 0.3
+        self.voxel_size_z = 1.0
+        self.default_rolling_ball_radius = 15
+        # Current Z-slice for viewing
+        self.current_z_slice = 0
+        # Mask generation settings
+        self.use_min_intensity = True
+        self.min_intensity_percent = 5
+        self.mask_min_volume = 500
+        self.mask_max_volume = 5000
+        self.mask_step_size = 500
+        self.mask_segmentation_method = 'none'
+        # Soma detection settings
+        self.soma_intensity_tolerance = 30
+        self.soma_max_radius_um = 8
+        # Mask QA state
+        self.all_masks_flat = []
+        self.mask_qa_idx = 0
+        self.mask_qa_active = False
+        self.last_qa_decisions = []
+        self._qa_soma_order = []
+        self._qa_finalized_somas = set()
+        self._qa_soma_window_size = 10
+        # Display
+        self.brightness_value = 0
+        self.contrast_value = 0
+        self.z_key_held = False
+        self.soma_mode = False
+        self.init_ui()
+
+    # ----------------------------------------------------------------
+    # KEY EVENTS
+    # ----------------------------------------------------------------
+
+    def keyPressEvent(self, event):
+        key = event.key()
+
+        if key == Qt.Key_Z:
+            self.z_key_held = True
+            return
+
+        if key == Qt.Key_Question:
+            self.show_shortcut_help()
+            return
+
+        if key == Qt.Key_U:
+            self._reset_current_zoom()
+            return
+
+        # Soma picking shortcuts
+        if self.processed_label.soma_mode:
+            if key == Qt.Key_Backspace:
+                self.undo_last_soma()
+                return
+            elif key in (Qt.Key_Return, Qt.Key_Enter):
+                self.done_with_current()
+                return
+            elif key == Qt.Key_Escape:
+                if self.current_image_name:
+                    img_data = self.images[self.current_image_name]
+                    if img_data['somas']:
+                        count = len(img_data['somas'])
+                        img_data['somas'].clear()
+                        img_data['soma_ids'].clear()
+                        self.log(f"Cleared {count} soma(s) on {self.current_image_name}")
+                        self._load_image_for_soma_picking()
+                return
+
+        # Mask QA shortcuts
+        if self.mask_qa_active:
+            if key == Qt.Key_A or key == Qt.Key_Space:
+                self.approve_current_mask()
+            elif key == Qt.Key_R:
+                self.reject_current_mask()
+            elif key == Qt.Key_Left:
+                self.prev_mask()
+            elif key == Qt.Key_Right:
+                self.next_mask()
+            elif key == Qt.Key_B:
+                self.undo_last_qa()
+            else:
+                super().keyPressEvent(event)
+            return
+
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key_Z:
+            self.z_key_held = False
+        else:
+            super().keyReleaseEvent(event)
+
+    def focusOutEvent(self, event):
+        self.z_key_held = False
+        super().focusOutEvent(event)
+
+    # ----------------------------------------------------------------
+    # UI INITIALIZATION
+    # ----------------------------------------------------------------
+
+    def init_ui(self):
+        self.setWindowTitle("3D Microglia Analysis - Z-Stack Batch Processing")
+        icon = _get_app_icon_3d()
+        if icon:
+            self.setWindowIcon(icon)
+
+        # Menu bar
+        menu_bar = self.menuBar()
+        session_menu = menu_bar.addMenu("Session")
+        save_action = session_menu.addAction("Save Session")
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self.save_session)
+        load_action = session_menu.addAction("Load Session")
+        load_action.setShortcut("Ctrl+O")
+        load_action.triggered.connect(self.load_session)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+        left_panel = self._create_left_panel()
+        main_layout.addWidget(left_panel)
+        right_panel = self._create_right_panel()
+        main_layout.addWidget(right_panel, 1)
+
+        from PyQt5.QtWidgets import QDesktopWidget
+        screen = QDesktopWidget().screenGeometry()
+        self.setGeometry(screen)
+        self.showMaximized()
+
+        # Global shortcuts
+        self.shortcut_zoom_reset = QShortcut(QKeySequence('U'), self)
+        self.shortcut_zoom_reset.activated.connect(self._reset_current_zoom)
+        self.shortcut_help = QShortcut(QKeySequence('?'), self)
+        self.shortcut_help.setContext(Qt.ApplicationShortcut)
+        self.shortcut_help.activated.connect(self.show_shortcut_help)
+        self.shortcut_undo_qa = QShortcut(QKeySequence('B'), self)
+        self.shortcut_undo_qa.activated.connect(self.undo_last_qa)
+
+    def _create_left_panel(self):
+        panel = QWidget()
+        panel.setFixedWidth(450)
+        layout = QVBoxLayout(panel)
+
+        # --- 1. File Selection ---
+        file_group = QGroupBox("1. File Selection")
+        file_layout = QVBoxLayout()
+
+        select_btn = QPushButton("Select Z-Stack Folder")
+        select_btn.clicked.connect(self.select_folder)
+        file_layout.addWidget(select_btn)
+
+        output_btn = QPushButton("Select Output Folder")
+        output_btn.clicked.connect(self.select_output)
+        file_layout.addWidget(output_btn)
+
+        self.file_list = QListWidget()
+        self.file_list.itemClicked.connect(self.on_image_selected)
+        self.file_list.itemChanged.connect(self.on_item_checkbox_changed)
+        file_layout.addWidget(self.file_list)
+
+        btn_layout = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        select_all_btn.clicked.connect(self.select_all_images)
+        btn_layout.addWidget(select_all_btn)
+        clear_all_btn = QPushButton("Clear All")
+        clear_all_btn.clicked.connect(self.clear_all_images)
+        btn_layout.addWidget(clear_all_btn)
+        file_layout.addLayout(btn_layout)
+
+        file_group.setLayout(file_layout)
+        layout.addWidget(file_group)
+
+        # --- 2. Parameters ---
+        param_group = QGroupBox("2. Voxel & Processing Parameters")
+        param_layout = QVBoxLayout()
+
+        form_layout = QFormLayout()
+        self.voxel_xy_input = QLineEdit(str(self.voxel_size_xy))
+        form_layout.addRow("XY pixel size (um/px):", self.voxel_xy_input)
+        self.voxel_z_input = QLineEdit(str(self.voxel_size_z))
+        form_layout.addRow("Z step size (um/slice):", self.voxel_z_input)
+        param_layout.addLayout(form_layout)
+
+        # Rolling ball
+        self.rb_check = QCheckBox("Apply Rolling Ball Background Subtraction")
+        self.rb_check.setChecked(True)
+        param_layout.addWidget(self.rb_check)
+
+        rb_layout = QHBoxLayout()
+        rb_layout.addWidget(QLabel("  Rolling ball radius:"))
+        self.rb_slider = QSlider(Qt.Horizontal)
+        self.rb_slider.setRange(5, 150)
+        self.rb_slider.setValue(15)
+        rb_layout.addWidget(self.rb_slider)
+        self.rb_spinbox = QSpinBox()
+        self.rb_spinbox.setRange(5, 150)
+        self.rb_spinbox.setValue(15)
+        self.rb_slider.valueChanged.connect(self.rb_spinbox.setValue)
+        self.rb_spinbox.valueChanged.connect(self.rb_slider.setValue)
+        rb_layout.addWidget(self.rb_spinbox)
+        param_layout.addLayout(rb_layout)
+
+        # Denoising
+        self.denoise_check = QCheckBox("Apply 3D Denoising (Median Filter)")
+        self.denoise_check.setChecked(False)
+        param_layout.addWidget(self.denoise_check)
+
+        denoise_layout = QHBoxLayout()
+        denoise_layout.addWidget(QLabel("  Denoise size:"))
+        self.denoise_spin = QSpinBox()
+        self.denoise_spin.setRange(3, 7)
+        self.denoise_spin.setValue(3)
+        self.denoise_spin.setSingleStep(2)
+        denoise_layout.addWidget(self.denoise_spin)
+        denoise_layout.addWidget(QLabel("(3=gentle, 7=strong)"))
+        denoise_layout.addStretch()
+        param_layout.addLayout(denoise_layout)
+
+        # Sharpening
+        self.sharpen_check = QCheckBox("Apply Sharpening (Unsharp Mask)")
+        self.sharpen_check.setChecked(False)
+        param_layout.addWidget(self.sharpen_check)
+
+        sharpen_layout = QHBoxLayout()
+        sharpen_layout.addWidget(QLabel("  Sharpen amount:"))
+        self.sharpen_slider = QSlider(Qt.Horizontal)
+        self.sharpen_slider.setRange(10, 50)
+        self.sharpen_slider.setValue(13)
+        sharpen_layout.addWidget(self.sharpen_slider)
+        self.sharpen_label = QLabel("1.3")
+        self.sharpen_slider.valueChanged.connect(lambda v: self.sharpen_label.setText(f"{v / 10:.1f}"))
+        sharpen_layout.addWidget(self.sharpen_label)
+        param_layout.addLayout(sharpen_layout)
+
+        self.preview_btn = QPushButton("Preview Current Z-Stack")
+        self.preview_btn.clicked.connect(self.preview_current_image)
+        param_layout.addWidget(self.preview_btn)
+
+        param_group.setLayout(param_layout)
+        layout.addWidget(param_group)
+
+        # --- 3. Batch Processing ---
+        batch_group = QGroupBox("3. Batch Processing")
+        batch_layout = QVBoxLayout()
+
+        self.process_selected_btn = QPushButton("Process Selected Z-Stacks")
+        self.process_selected_btn.clicked.connect(self.process_selected_images)
+        self.process_selected_btn.setEnabled(False)
+        batch_layout.addWidget(self.process_selected_btn)
+
+        self.batch_pick_somas_btn = QPushButton("Pick Somas (All Z-Stacks)")
+        self.batch_pick_somas_btn.clicked.connect(self.start_batch_soma_picking)
+        self.batch_pick_somas_btn.setEnabled(False)
+        batch_layout.addWidget(self.batch_pick_somas_btn)
+
+        self.batch_generate_masks_btn = QPushButton("Generate All 3D Masks")
+        self.batch_generate_masks_btn.clicked.connect(self.batch_generate_masks)
+        self.batch_generate_masks_btn.setEnabled(False)
+        batch_layout.addWidget(self.batch_generate_masks_btn)
+
+        # Clear All Masks (placed in right panel later)
+        self.clear_masks_btn = QPushButton("Clear All Masks")
+        self.clear_masks_btn.clicked.connect(self.clear_all_masks)
+        self.clear_masks_btn.setEnabled(False)
+        self.clear_masks_btn.setVisible(False)
+        self.clear_masks_btn.setStyleSheet("border: 2px solid #F44336; font-weight: bold; padding: 4px 10px;")
+
+        self.batch_qa_btn = QPushButton("QA All Masks")
+        self.batch_qa_btn.clicked.connect(self.start_batch_qa)
+        self.batch_qa_btn.setEnabled(False)
+        batch_layout.addWidget(self.batch_qa_btn)
+
+        self.undo_qa_btn = QPushButton("Undo QA (B)")
+        self.undo_qa_btn.clicked.connect(self.undo_last_qa)
+        self.undo_qa_btn.setEnabled(False)
+        self.undo_qa_btn.setStyleSheet("border: 2px solid #FF9800;")
+        self.undo_qa_btn.setVisible(False)
+
+        self.batch_calculate_btn = QPushButton("Calculate 3D Morphology")
+        self.batch_calculate_btn.clicked.connect(self.batch_calculate_morphology)
+        self.batch_calculate_btn.setEnabled(False)
+        batch_layout.addWidget(self.batch_calculate_btn)
+
+        batch_group.setLayout(batch_layout)
+        layout.addWidget(batch_group)
+
+        # --- Log ---
+        log_group = QGroupBox("Log")
+        log_layout = QVBoxLayout()
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(150)
+        log_layout.addWidget(self.log_text)
+        log_group.setLayout(log_layout)
+        layout.addWidget(log_group)
+
+        layout.addStretch()
+        return panel
+
+    def _create_right_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        # Tabs for different views
+        self.tabs = QTabWidget()
+        self.original_label = InteractiveImageLabel3D(self)
+        self.original_label.setText("Load Z-stacks to begin")
+        self.tabs.addTab(self.original_label, "Original")
+
+        self.preview_label = InteractiveImageLabel3D(self)
+        self.preview_label.setText("No preview yet")
+        self.tabs.addTab(self.preview_label, "Preview")
+
+        self.processed_label = InteractiveImageLabel3D(self)
+        self.processed_label.setText("No processed Z-stacks yet")
+        self.tabs.addTab(self.processed_label, "Processed")
+
+        self.mask_label = InteractiveImageLabel3D(self)
+        self.mask_label.setText("No masks yet")
+        self.tabs.addTab(self.mask_label, "Masks")
+
+        layout.addWidget(self.tabs, stretch=1)
+
+        # Z-slice slider
+        z_layout = QHBoxLayout()
+        z_layout.addWidget(QLabel("Z-Slice:"))
+        self.z_slider = QSlider(Qt.Horizontal)
+        self.z_slider.setRange(0, 0)
+        self.z_slider.setValue(0)
+        self.z_slider.valueChanged.connect(self._on_z_slider_changed)
+        z_layout.addWidget(self.z_slider)
+        self.z_label = QLabel("0 / 0")
+        self.z_label.setFixedWidth(80)
+        z_layout.addWidget(self.z_label)
+        layout.addLayout(z_layout)
+
+        # Display adjustment buttons
+        display_btn_layout = QHBoxLayout()
+        display_adjust_btn = QPushButton("Display Adjustments")
+        display_adjust_btn.clicked.connect(self.open_display_adjustments)
+        display_btn_layout.addWidget(display_adjust_btn)
+
+        help_btn = QPushButton("?")
+        help_btn.setFixedWidth(35)
+        help_btn.clicked.connect(self.show_shortcut_help)
+        display_btn_layout.addWidget(help_btn)
+
+        layout.addLayout(display_btn_layout)
+
+        # Mask opacity slider
+        self.opacity_widget = QWidget()
+        opacity_layout = QHBoxLayout(self.opacity_widget)
+        opacity_layout.setContentsMargins(0, 0, 0, 0)
+        opacity_layout.addWidget(QLabel("Mask Opacity:"))
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(40)
+        self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        opacity_layout.addWidget(self.opacity_slider)
+        self.opacity_value_label = QLabel("40%")
+        self.opacity_value_label.setFixedWidth(35)
+        opacity_layout.addWidget(self.opacity_value_label)
+        self.opacity_widget.setVisible(False)
+        layout.addWidget(self.opacity_widget)
+
+        # Zoom hint
+        zoom_layout = QHBoxLayout()
+        zoom_hint = QLabel("Z + Left-click: zoom in, Z + Right-click: zoom out, U: reset, ?: help")
+        zoom_hint.setStyleSheet("color: palette(dark); font-size: 10px;")
+        zoom_layout.addWidget(zoom_hint)
+        zoom_layout.addStretch()
+
+        # QA buttons placed in right panel
+        zoom_layout.addWidget(self.clear_masks_btn)
+        zoom_layout.addWidget(self.undo_qa_btn)
+
+        self.zoom_level_label = QLabel("1.0x")
+        self.zoom_level_label.setFixedWidth(50)
+        self.zoom_level_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+        zoom_layout.addWidget(self.zoom_level_label)
+        layout.addLayout(zoom_layout)
+
+        # Progress bar
+        progress_container = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setMinimumHeight(25)
+        progress_container.addWidget(self.progress_bar, stretch=3)
+
+        self.timer_label = QLabel("")
+        self.timer_label.setVisible(False)
+        self.timer_label.setStyleSheet("font-family: monospace; font-size: 12pt; padding: 0 10px;")
+        self.timer_label.setMinimumWidth(100)
+        self.timer_label.setAlignment(Qt.AlignCenter)
+        progress_container.addWidget(self.timer_label, stretch=0)
+        layout.addLayout(progress_container)
+
+        self.progress_status_label = QLabel("")
+        self.progress_status_label.setVisible(False)
+        self.progress_status_label.setStyleSheet("font-style: italic;")
+        layout.addWidget(self.progress_status_label, stretch=0)
+
+        # Timer
+        self.process_timer = QTimer()
+        self.process_timer.timeout.connect(self.update_timer_display)
+        self.process_start_time = None
+        self.timer_running = False
+
+        # Hidden navigation buttons
+        self.prev_btn = QPushButton("< Previous")
+        self.prev_btn.clicked.connect(self.navigate_previous)
+        self.prev_btn.setEnabled(False)
+        self.prev_btn.setVisible(False)
+
+        self.next_btn = QPushButton("Next >")
+        self.next_btn.clicked.connect(self.navigate_next)
+        self.next_btn.setEnabled(False)
+        self.next_btn.setVisible(False)
+
+        self.done_btn = QPushButton("Done with Current")
+        self.done_btn.clicked.connect(self.done_with_current)
+        self.done_btn.setEnabled(False)
+        self.done_btn.setVisible(False)
+
+        self.nav_status_label = QLabel("")
+        self.nav_status_label.setVisible(False)
+
+        self.approve_mask_btn = QPushButton("Approve (A)")
+        self.approve_mask_btn.clicked.connect(self.approve_current_mask)
+        self.approve_mask_btn.setEnabled(False)
+        self.approve_mask_btn.setVisible(False)
+
+        self.reject_mask_btn = QPushButton("Reject (R)")
+        self.reject_mask_btn.clicked.connect(self.reject_current_mask)
+        self.reject_mask_btn.setEnabled(False)
+        self.reject_mask_btn.setVisible(False)
+
+        # Mask QA progress bar
+        self.mask_qa_progress_bar = QProgressBar()
+        self.mask_qa_progress_bar.setVisible(False)
+        self.mask_qa_progress_bar.setMinimumHeight(20)
+        self.mask_qa_progress_bar.setFormat("%v / %m masks reviewed")
+        self.mask_qa_progress_bar.setStyleSheet(
+            "QProgressBar { text-align: center; font-weight: bold; }")
+        layout.addWidget(self.mask_qa_progress_bar)
+
+        return panel
+
+    # ----------------------------------------------------------------
+    # TIMER
+    # ----------------------------------------------------------------
+
+    def update_timer_display(self):
+        if self.process_start_time is not None:
+            elapsed = time.time() - self.process_start_time
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            self.timer_label.setText(f"{minutes:02d}:{seconds:02d}")
+
+    def start_timer(self):
+        self.process_start_time = time.time()
+        self.timer_running = True
+        self.timer_label.setVisible(True)
+        self.timer_label.setText("00:00")
+        self.process_timer.start(1000)
+
+    def stop_timer(self):
+        self.process_timer.stop()
+        self.timer_running = False
+
+    # ----------------------------------------------------------------
+    # LOGGING
+    # ----------------------------------------------------------------
+
+    def log(self, message):
+        self.log_text.append(message)
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum()
+        )
+
+    # ----------------------------------------------------------------
+    # DISPLAY HELPERS
+    # ----------------------------------------------------------------
+
+    def _array_to_pixmap(self, arr, skip_rescale=False):
+        arr_disp = arr.astype(float)
+        if not skip_rescale:
+            arr_disp -= arr_disp.min()
+            if arr_disp.max() > 0:
+                arr_disp = arr_disp / arr_disp.max() * 255
+        arr8 = arr_disp.clip(0, 255).astype(np.uint8)
+        arr8 = np.ascontiguousarray(arr8)
+        h, w = arr8.shape[:2]
+        if arr8.ndim == 2:
+            bytes_per_line = w
+            img = QImage(arr8.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
+        else:
+            bytes_per_line = 3 * w
+            img = QImage(arr8.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        img = img.copy()
+        return QPixmap.fromImage(img)
+
+    def _create_blank_pixmap(self):
+        blank = np.ones((500, 500), dtype=np.uint8) * 128
+        return self._array_to_pixmap(blank)
+
+    def _apply_display_adjustments(self, img):
+        if img is None:
+            return np.zeros((100, 100), dtype=np.uint8)
+        adjusted = img.astype(np.float64)
+        adjusted = adjusted + self.brightness_value
+        if self.contrast_value != 0:
+            factor = (259 * (self.contrast_value + 255)) / (255 * (259 - self.contrast_value))
+            adjusted = factor * (adjusted - 128) + 128
+        return np.clip(adjusted, 0, 255).astype(np.uint8)
+
+    def _get_current_z_max(self):
+        """Get the Z depth of the current image's stack."""
+        if not self.current_image_name or self.current_image_name not in self.images:
+            return 0
+        img_data = self.images[self.current_image_name]
+        stack = img_data.get('processed') or img_data.get('raw_stack')
+        if stack is not None and stack.ndim >= 3:
+            return stack.shape[0] - 1
+        return 0
+
+    def _get_slice_for_display(self, stack, z=None):
+        """Get a 2D slice from a 3D stack for display."""
+        if stack is None:
+            return np.zeros((100, 100), dtype=np.uint8)
+        if z is None:
+            z = self.current_z_slice
+        z = max(0, min(stack.shape[0] - 1, z))
+        return stack[z]
+
+    def _on_z_slider_changed(self, value):
+        self.current_z_slice = value
+        z_max = self.z_slider.maximum()
+        self.z_label.setText(f"{value} / {z_max}")
+        self._refresh_current_view()
+
+    def _refresh_current_view(self):
+        """Refresh the currently visible tab with the current Z-slice."""
+        if not self.current_image_name:
+            return
+        tab_idx = self.tabs.currentIndex()
+        img_data = self.images.get(self.current_image_name)
+        if not img_data:
+            return
+
+        if self.mask_qa_active:
+            self._show_current_mask()
+            return
+
+        if tab_idx == 0:  # Original
+            stack = img_data.get('raw_stack')
+            if stack is not None:
+                sl = self._get_slice_for_display(stack)
+                adjusted = self._apply_display_adjustments(sl)
+                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                self.original_label.set_image(pixmap)
+        elif tab_idx == 1:  # Preview
+            stack = img_data.get('preview_stack')
+            if stack is not None:
+                sl = self._get_slice_for_display(stack)
+                adjusted = self._apply_display_adjustments(sl)
+                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                self.preview_label.set_image(pixmap)
+        elif tab_idx == 2:  # Processed
+            stack = img_data.get('processed')
+            if stack is not None:
+                sl = self._get_slice_for_display(stack)
+                adjusted = self._apply_display_adjustments(sl)
+                centroids_2d = self._get_centroids_on_slice(img_data)
+                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                self.processed_label.set_image(pixmap, centroids=centroids_2d)
+        elif tab_idx == 3:  # Masks
+            if self.mask_qa_active:
+                self._show_current_mask()
+
+    def _get_centroids_on_slice(self, img_data, z_tolerance=2):
+        """Get soma centroids visible on the current Z-slice."""
+        centroids_2d = []
+        z = self.current_z_slice
+        for soma in img_data.get('somas', []):
+            sz, sy, sx = soma
+            if abs(sz - z) <= z_tolerance:
+                centroids_2d.append((sy, sx))
+        return centroids_2d
+
+    def _update_z_slider_for_image(self, img_name=None):
+        """Update Z-slider range based on current image stack depth."""
+        if img_name is None:
+            img_name = self.current_image_name
+        if not img_name or img_name not in self.images:
+            self.z_slider.setRange(0, 0)
+            self.z_label.setText("0 / 0")
+            return
+        z_max = self._get_current_z_max()
+        self.z_slider.setRange(0, z_max)
+        if self.current_z_slice > z_max:
+            self.current_z_slice = z_max // 2
+        self.z_slider.setValue(self.current_z_slice)
+        self.z_label.setText(f"{self.current_z_slice} / {z_max}")
+
+    def _reset_current_zoom(self):
+        tab_idx = self.tabs.currentIndex()
+        labels = [self.original_label, self.preview_label,
+                  self.processed_label, self.mask_label]
+        if 0 <= tab_idx < len(labels):
+            labels[tab_idx].reset_zoom()
+            self.zoom_level_label.setText("1.0x")
+
+    def _on_opacity_changed(self, value):
+        opacity = value / 100.0
+        self.opacity_value_label.setText(f"{value}%")
+        self.mask_label.overlay_opacity = opacity
+        if self.mask_qa_active:
+            self._show_current_mask()
+
+    def open_display_adjustments(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Display Adjustments")
+        layout = QVBoxLayout(dialog)
+
+        b_layout = QHBoxLayout()
+        b_layout.addWidget(QLabel("Brightness:"))
+        b_slider = QSlider(Qt.Horizontal)
+        b_slider.setRange(-100, 100)
+        b_slider.setValue(self.brightness_value)
+        b_label = QLabel(str(self.brightness_value))
+        b_slider.valueChanged.connect(lambda v: b_label.setText(str(v)))
+        b_layout.addWidget(b_slider)
+        b_layout.addWidget(b_label)
+        layout.addLayout(b_layout)
+
+        c_layout = QHBoxLayout()
+        c_layout.addWidget(QLabel("Contrast:"))
+        c_slider = QSlider(Qt.Horizontal)
+        c_slider.setRange(-100, 100)
+        c_slider.setValue(self.contrast_value)
+        c_label = QLabel(str(self.contrast_value))
+        c_slider.valueChanged.connect(lambda v: c_label.setText(str(v)))
+        c_layout.addWidget(c_slider)
+        c_layout.addWidget(c_label)
+        layout.addLayout(c_layout)
+
+        def apply_changes():
+            self.brightness_value = b_slider.value()
+            self.contrast_value = c_slider.value()
+            self._refresh_current_view()
+
+        def reset_values():
+            b_slider.setValue(0)
+            c_slider.setValue(0)
+            self.brightness_value = 0
+            self.contrast_value = 0
+            self._refresh_current_view()
+
+        btn_layout = QHBoxLayout()
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(apply_changes)
+        btn_layout.addWidget(apply_btn)
+        reset_btn = QPushButton("Reset")
+        reset_btn.clicked.connect(reset_values)
+        btn_layout.addWidget(reset_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        b_slider.valueChanged.connect(lambda: apply_changes())
+        c_slider.valueChanged.connect(lambda: apply_changes())
+
+        dialog.exec_()
+
+    def show_shortcut_help(self):
+        if self.mask_qa_active:
+            msg = (
+                "MASK QA SHORTCUTS:\n\n"
+                "A or Space  = Approve mask\n"
+                "R           = Reject mask\n"
+                "Left/Right  = Navigate masks\n"
+                "B           = Undo last QA decision\n"
+                "Z + Click   = Zoom in/out\n"
+                "U           = Reset zoom\n"
+                "Scroll      = Change Z-slice\n"
+            )
+        elif self.processed_label.soma_mode:
+            msg = (
+                "SOMA PICKING SHORTCUTS:\n\n"
+                "Click       = Place soma\n"
+                "Backspace   = Undo last soma\n"
+                "Enter       = Done with current image\n"
+                "Escape      = Clear all somas on image\n"
+                "Z + Click   = Zoom in/out\n"
+                "U           = Reset zoom\n"
+                "Scroll      = Change Z-slice\n"
+            )
+        else:
+            msg = (
+                "GENERAL SHORTCUTS:\n\n"
+                "Z + Click   = Zoom in/out\n"
+                "U           = Reset zoom\n"
+                "?           = Show this help\n"
+                "Ctrl+S      = Save session\n"
+                "Ctrl+O      = Load session\n"
+            )
+        QMessageBox.information(self, "Keyboard Shortcuts", msg)
+
+    # ----------------------------------------------------------------
+    # FILE SELECTION & LOADING
+    # ----------------------------------------------------------------
+
+    def select_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Z-Stack Folder")
+        if not folder:
+            return
+
+        exts = ['*.tif', '*.tiff', '*.TIF', '*.TIFF']
+        files = []
+        for ext in exts:
+            files.extend(glob.glob(os.path.join(folder, ext)))
+        files = list(set(files))
+
+        self.images = {}
+        self.file_list.clear()
+
+        for f in sorted(files):
+            img_name = os.path.basename(f)
+            self.images[img_name] = {
+                'raw_path': f,
+                'raw_stack': None,
+                'processed': None,
+                'rolling_ball_radius': self.default_rolling_ball_radius,
+                'somas': [],       # list of (z, y, x) tuples
+                'soma_ids': [],    # list of soma_id strings
+                'soma_masks': {},  # soma_id -> 3D binary mask
+                'masks': [],       # list of mask dicts
+                'status': 'loaded',
+                'selected': False,
+                'animal_id': '',
+                'treatment': '',
+            }
+            item = QListWidgetItem(f"  {img_name} [loaded]")
+            item.setData(Qt.UserRole, img_name)
+            item.setCheckState(Qt.Unchecked)
+            item.setForeground(QBrush(QColor(128, 128, 128)))
+            self.file_list.addItem(item)
+
+        if self.images:
+            self.process_selected_btn.setEnabled(True)
+            self.log(f"Loaded {len(self.images)} Z-stack files")
+
+            # Load and display first image
+            first_name = sorted(self.images.keys())[0]
+            self.current_image_name = first_name
+            self._load_and_display_raw(first_name)
+            self.file_list.setCurrentRow(0)
+
+    def _load_and_display_raw(self, img_name):
+        """Load raw Z-stack and display the middle slice."""
+        img_data = self.images[img_name]
+        if img_data['raw_stack'] is None:
+            try:
+                stack = load_zstack(img_data['raw_path'])
+                stack = ensure_grayscale_3d(stack)
+                img_data['raw_stack'] = stack
+            except Exception as e:
+                self.log(f"ERROR loading {img_name}: {e}")
+                return
+
+        stack = img_data['raw_stack']
+        self.current_z_slice = stack.shape[0] // 2
+        self._update_z_slider_for_image(img_name)
+
+        sl = self._get_slice_for_display(stack)
+        adjusted = self._apply_display_adjustments(sl)
+        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+        self.original_label.set_image(pixmap)
+        self.tabs.setCurrentIndex(0)
+
+    def select_output(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if folder:
+            self.output_dir = folder
+            self.masks_dir = os.path.join(folder, "masks_3d")
+            os.makedirs(self.masks_dir, exist_ok=True)
+            self.log(f"Output folder: {folder}")
+            self.log(f"3D masks will be saved to: {self.masks_dir}")
+
+    def select_all_images(self):
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            item.setCheckState(Qt.Checked)
+            img_name = item.data(Qt.UserRole)
+            self.images[img_name]['selected'] = True
+        self.log(f"Selected all {self.file_list.count()} Z-stacks")
+
+    def clear_all_images(self):
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            item.setCheckState(Qt.Unchecked)
+            img_name = item.data(Qt.UserRole)
+            self.images[img_name]['selected'] = False
+        self.log("Cleared selection")
+
+    def on_item_checkbox_changed(self, item):
+        img_name = item.data(Qt.UserRole)
+        if img_name and img_name in self.images:
+            self.images[img_name]['selected'] = (item.checkState() == Qt.Checked)
+
+    def on_image_selected(self, item):
+        if self.processed_label.soma_mode or self.mask_qa_active:
+            return
+        img_name = item.data(Qt.UserRole)
+        self.images[img_name]['selected'] = (item.checkState() == Qt.Checked)
+        self.current_image_name = img_name
+        self._display_current_image()
+
+    def _display_current_image(self):
+        if not self.current_image_name:
+            return
+        img_data = self.images[self.current_image_name]
+
+        # Load raw stack if needed
+        if img_data['raw_stack'] is None:
+            try:
+                stack = load_zstack(img_data['raw_path'])
+                stack = ensure_grayscale_3d(stack)
+                img_data['raw_stack'] = stack
+            except Exception as e:
+                self.log(f"ERROR loading: {e}")
+                return
+
+        self._update_z_slider_for_image()
+
+        # Show original
+        raw_stack = img_data['raw_stack']
+        sl = self._get_slice_for_display(raw_stack)
+        adjusted = self._apply_display_adjustments(sl)
+        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+        self.original_label.set_image(pixmap)
+
+        # Show processed if available
+        if img_data['processed'] is not None:
+            proc_sl = self._get_slice_for_display(img_data['processed'])
+            adjusted_proc = self._apply_display_adjustments(proc_sl)
+            centroids_2d = self._get_centroids_on_slice(img_data)
+            pixmap_proc = self._array_to_pixmap(adjusted_proc, skip_rescale=True)
+            self.processed_label.set_image(pixmap_proc, centroids=centroids_2d)
+
+    def _update_file_list_item(self, img_name):
+        """Update the file list display for an image."""
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            if item.data(Qt.UserRole) == img_name:
+                img_data = self.images[img_name]
+                status = img_data['status']
+                status_colors = {
+                    'loaded': QColor(128, 128, 128),
+                    'processed': QColor(0, 150, 0),
+                    'somas_picked': QColor(0, 100, 200),
+                    'masks_generated': QColor(200, 100, 0),
+                    'qa_complete': QColor(0, 200, 0),
+                    'analyzed': QColor(0, 180, 0),
+                }
+                item.setText(f"  {img_name} [{status}]")
+                item.setForeground(QBrush(status_colors.get(status, QColor(128, 128, 128))))
+                break
+
+    # ----------------------------------------------------------------
+    # PREPROCESSING
+    # ----------------------------------------------------------------
+
+    def preview_current_image(self):
+        if not self.current_image_name:
+            QMessageBox.warning(self, "Warning", "Select a Z-stack first")
+            return
+        img_data = self.images[self.current_image_name]
+
+        # Load raw if needed
+        if img_data['raw_stack'] is None:
+            try:
+                stack = load_zstack(img_data['raw_path'])
+                stack = ensure_grayscale_3d(stack)
+                img_data['raw_stack'] = stack
+            except Exception as e:
+                self.log(f"ERROR: {e}")
+                return
+
+        rb_r = self.rb_slider.value() if self.rb_check.isChecked() else 0
+        dn_s = self.denoise_spin.value() if self.denoise_check.isChecked() else 0
+        sh_a = self.sharpen_slider.value() / 10.0 if self.sharpen_check.isChecked() else 0.0
+
+        self.log(f"Previewing {self.current_image_name}...")
+        QApplication.processEvents()
+
+        try:
+            preview = preprocess_zstack(img_data['raw_stack'],
+                                        rolling_ball_radius=rb_r,
+                                        denoise_size=dn_s,
+                                        sharpen_amount=sh_a)
+            img_data['preview_stack'] = preview
+            sl = self._get_slice_for_display(preview)
+            adjusted = self._apply_display_adjustments(sl)
+            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+            self.preview_label.set_image(pixmap)
+            self.tabs.setCurrentIndex(1)
+            self.log("Preview complete")
+        except Exception as e:
+            self.log(f"ERROR in preview: {e}")
+
+    def process_selected_images(self):
+        if not self.output_dir:
+            QMessageBox.warning(self, "Warning", "Select output folder first")
+            return
+        selected = [(name, data) for name, data in self.images.items() if data['selected']]
+        if not selected:
+            QMessageBox.warning(self, "Warning", "No Z-stacks selected")
+            return
+
+        rb_r = self.rb_slider.value()
+        rb_enabled = self.rb_check.isChecked()
+        dn_enabled = self.denoise_check.isChecked()
+        dn_size = self.denoise_spin.value()
+        sh_enabled = self.sharpen_check.isChecked()
+        sh_amount = self.sharpen_slider.value() / 10.0
+
+        process_list = []
+        for img_name, img_data in selected:
+            process_list.append((img_data['raw_path'], img_name, rb_r, rb_enabled,
+                                 dn_enabled, dn_size, sh_enabled, sh_amount))
+
+        self.thread = PreprocessingThread3D(process_list, self.output_dir)
+        self.thread.status_update.connect(self.log)
+        self.thread.progress.connect(lambda v: self.progress_bar.setValue(v))
+        self.thread.finished_image.connect(self._handle_processed_image)
+        self.thread.error_occurred.connect(lambda msg: self.log(f"ERROR: {msg}"))
+        self.thread.finished.connect(self._processing_finished)
+
+        self.progress_bar.setVisible(True)
+        self.progress_status_label.setVisible(True)
+        self.progress_status_label.setText("Processing Z-stacks...")
+        self.process_selected_btn.setEnabled(False)
+        self.thread.start()
+
+    def _handle_processed_image(self, output_path, img_name, processed_stack):
+        if img_name in self.images:
+            self.images[img_name]['processed'] = processed_stack
+            self.images[img_name]['status'] = 'processed'
+            # Also load raw if not yet loaded
+            if self.images[img_name]['raw_stack'] is None:
+                try:
+                    raw = load_zstack(self.images[img_name]['raw_path'])
+                    self.images[img_name]['raw_stack'] = ensure_grayscale_3d(raw)
+                except Exception:
+                    pass
+            self._update_file_list_item(img_name)
+            if img_name == self.current_image_name:
+                self._update_z_slider_for_image()
+                sl = self._get_slice_for_display(processed_stack)
+                adjusted = self._apply_display_adjustments(sl)
+                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                self.processed_label.set_image(pixmap)
+                self.tabs.setCurrentIndex(2)
+
+    def _processing_finished(self):
+        self.progress_bar.setVisible(False)
+        self.progress_status_label.setVisible(False)
+        self.process_selected_btn.setEnabled(True)
+        self.batch_pick_somas_btn.setEnabled(True)
+        total = sum(1 for d in self.images.values() if d['status'] == 'processed')
+        self.log("=" * 50)
+        self.log(f"Processing complete! {total} Z-stacks processed.")
+        self.log("Ready for soma picking.")
+        self.log("=" * 50)
+        self._auto_save()
+        QMessageBox.information(self, "Complete",
+                                f"Processed {total} Z-stacks!\n\nReady for soma picking.")
+
+    # ----------------------------------------------------------------
+    # SOMA PICKING
+    # ----------------------------------------------------------------
+
+    def start_batch_soma_picking(self):
+        self.soma_picking_queue = [
+            name for name, data in self.images.items()
+            if data['selected'] and data['status'] in ('processed', 'somas_picked')
+        ]
+        if not self.soma_picking_queue:
+            QMessageBox.warning(self, "Warning", "No processed Z-stacks to pick somas from")
+            return
+
+        self.batch_mode = True
+        if self.current_image_name and self.current_image_name in self.soma_picking_queue:
+            pass
+        else:
+            resume_name = None
+            for name in self.soma_picking_queue:
+                if not self.images[name]['somas']:
+                    resume_name = name
+                    break
+            self.current_image_name = resume_name or self.soma_picking_queue[0]
+
+        self.processed_label.soma_mode = True
+        self.original_label.soma_mode = False
+        self.preview_label.soma_mode = False
+        self.mask_label.soma_mode = False
+        self._load_image_for_soma_picking()
+        self.prev_btn.setEnabled(True)
+        self.next_btn.setEnabled(True)
+        self.done_btn.setEnabled(True)
+        self.log("=" * 50)
+        self.log("BATCH SOMA PICKING MODE (3D)")
+        self.log(f"Click somas on: {self.current_image_name}")
+        self.log("Use Z-slider to find the soma's brightest slice")
+        self.log("Click 'Done with Current' (Enter) when finished")
+        self.log("Backspace = undo last, Escape = clear all on image")
+        self.log("=" * 50)
+
+    def _load_image_for_soma_picking(self):
+        if not self.current_image_name:
+            return
+        img_data = self.images[self.current_image_name]
+
+        # Ensure raw stack loaded
+        if img_data['raw_stack'] is None:
+            try:
+                raw = load_zstack(img_data['raw_path'])
+                img_data['raw_stack'] = ensure_grayscale_3d(raw)
+            except Exception:
+                pass
+
+        self._update_z_slider_for_image()
+
+        stack = img_data.get('processed') or img_data.get('raw_stack')
+        if stack is None:
+            return
+
+        sl = self._get_slice_for_display(stack)
+        adjusted = self._apply_display_adjustments(sl)
+        centroids_2d = self._get_centroids_on_slice(img_data)
+        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+        self.processed_label.set_image(pixmap, centroids=centroids_2d)
+        self.tabs.setCurrentIndex(2)
+
+        current_idx = self.soma_picking_queue.index(
+            self.current_image_name) if self.current_image_name in self.soma_picking_queue else -1
+        self.nav_status_label.setText(
+            f"Z-Stack {current_idx + 1}/{len(self.soma_picking_queue)}: "
+            f"{self.current_image_name} | "
+            f"Somas: {len(img_data['somas'])} | "
+            f"Z-Slice: {self.current_z_slice}"
+        )
+
+    def _snap_to_brightest_3d(self, z, y, x):
+        """Snap to brightest voxel within a small radius."""
+        if not self.current_image_name:
+            return z, y, x
+        img_data = self.images[self.current_image_name]
+        stack = img_data.get('processed') or img_data.get('raw_stack')
+        if stack is None:
+            return z, y, x
+
+        try:
+            voxel_xy = float(self.voxel_xy_input.text())
+        except ValueError:
+            voxel_xy = 0.3
+        radius_px = max(1, int(round(2.0 / voxel_xy)))
+
+        Z, H, W = stack.shape
+        best_val = -1
+        best_z, best_y, best_x = z, y, x
+
+        # Search in 3D neighborhood
+        for dz in range(-1, 2):
+            nz = z + dz
+            if nz < 0 or nz >= Z:
+                continue
+            for dy in range(-radius_px, radius_px + 1):
+                ny = y + dy
+                if ny < 0 or ny >= H:
+                    continue
+                for dx in range(-radius_px, radius_px + 1):
+                    nx = x + dx
+                    if nx < 0 or nx >= W:
+                        continue
+                    if dy ** 2 + dx ** 2 <= radius_px ** 2:
+                        val = float(stack[nz, ny, nx])
+                        if val > best_val:
+                            best_val = val
+                            best_z, best_y, best_x = nz, ny, nx
+
+        return best_z, best_y, best_x
+
+    def add_soma(self, coords):
+        """Add a soma at (row, col) on the current Z-slice."""
+        if not self.current_image_name:
+            return
+        img_data = self.images[self.current_image_name]
+        row, col = coords
+        z = self.current_z_slice
+
+        # Snap to brightest in 3D neighborhood
+        z, row, col = self._snap_to_brightest_3d(z, row, col)
+
+        soma_zyx = (z, row, col)
+        img_data['somas'].append(soma_zyx)
+        soma_id = f"soma_{z}_{row}_{col}"
+        img_data['soma_ids'].append(soma_id)
+
+        self.log(f"Soma {len(img_data['somas'])} added at Z={z}, Y={row}, X={col} | ID: {soma_id}")
+
+        # Update Z slider to snapped position
+        if z != self.current_z_slice:
+            self.current_z_slice = z
+            self.z_slider.setValue(z)
+
+        self._load_image_for_soma_picking()
+
+    def undo_last_soma(self):
+        if not self.current_image_name:
+            return
+        img_data = self.images[self.current_image_name]
+        if not img_data['somas']:
+            self.log("No somas to undo")
+            return
+        removed = img_data['somas'].pop()
+        img_data['soma_ids'].pop()
+        self.log(f"Soma removed at Z={removed[0]}, Y={removed[1]}, X={removed[2]} | Remaining: {len(img_data['somas'])}")
+        self._load_image_for_soma_picking()
+
+    def done_with_current(self):
+        if not self.current_image_name:
+            return
+        img_data = self.images[self.current_image_name]
+        if len(img_data['somas']) > 0:
+            img_data['status'] = 'somas_picked'
+            self._update_file_list_item(self.current_image_name)
+        self.navigate_next()
+
+    def navigate_next(self):
+        if not self.soma_picking_queue:
+            return
+        current_idx = self.soma_picking_queue.index(
+            self.current_image_name) if self.current_image_name in self.soma_picking_queue else -1
+        if current_idx < len(self.soma_picking_queue) - 1:
+            self.current_image_name = self.soma_picking_queue[current_idx + 1]
+            self._load_image_for_soma_picking()
+        else:
+            self._finish_soma_picking()
+
+    def navigate_previous(self):
+        if not self.soma_picking_queue:
+            return
+        current_idx = self.soma_picking_queue.index(
+            self.current_image_name) if self.current_image_name in self.soma_picking_queue else 0
+        if current_idx > 0:
+            self.current_image_name = self.soma_picking_queue[current_idx - 1]
+            self._load_image_for_soma_picking()
+
+    def _finish_soma_picking(self):
+        self.batch_mode = False
+        self.processed_label.soma_mode = False
+        self.prev_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
+        self.done_btn.setEnabled(False)
+        total_somas = sum(len(data['somas']) for data in self.images.values() if data['selected'])
+        self.batch_generate_masks_btn.setEnabled(True)
+        self.log("=" * 50)
+        self.log(f"Soma picking complete! Total somas: {total_somas}")
+        self.log("Ready for 3D mask generation.")
+        self.log("=" * 50)
+        self._auto_save()
+        QMessageBox.information(self, "Complete",
+                                f"Soma picking complete!\nTotal somas: {total_somas}\n\nReady to generate 3D masks.")
+
+    # ----------------------------------------------------------------
+    # 3D MASK GENERATION
+    # ----------------------------------------------------------------
+
+    def batch_generate_masks(self):
+        """Show settings dialog then generate 3D masks for all picked somas."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("3D Mask Generation Settings")
+        dialog.setModal(True)
+        layout = QVBoxLayout()
+
+        title = QLabel("Configure 3D Mask Generation")
+        title_font = title.font()
+        title_font.setBold(True)
+        title_font.setPointSize(12)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        # Soma detection settings
+        soma_group = QLabel("<b>Soma Detection (3D Region Growing)</b>")
+        layout.addWidget(soma_group)
+
+        soma_layout = QHBoxLayout()
+        soma_layout.addWidget(QLabel("Intensity tolerance:"))
+        tol_spin = QSpinBox()
+        tol_spin.setRange(5, 100)
+        tol_spin.setValue(self.soma_intensity_tolerance)
+        soma_layout.addWidget(tol_spin)
+        soma_layout.addWidget(QLabel("Max radius (um):"))
+        rad_spin = QDoubleSpinBox()
+        rad_spin.setRange(1.0, 50.0)
+        rad_spin.setValue(self.soma_max_radius_um)
+        rad_spin.setSingleStep(0.5)
+        soma_layout.addWidget(rad_spin)
+        layout.addLayout(soma_layout)
+
+        layout.addSpacing(10)
+
+        # Volume settings
+        size_group = QLabel("<b>Mask Volumes (um^3)</b>")
+        layout.addWidget(size_group)
+
+        size_grid = QHBoxLayout()
+        size_grid.addWidget(QLabel("Min:"))
+        min_vol_spin = QSpinBox()
+        min_vol_spin.setRange(50, 50000)
+        min_vol_spin.setSingleStep(100)
+        min_vol_spin.setValue(self.mask_min_volume)
+        min_vol_spin.setSuffix(" um^3")
+        size_grid.addWidget(min_vol_spin)
+
+        size_grid.addWidget(QLabel("Max:"))
+        max_vol_spin = QSpinBox()
+        max_vol_spin.setRange(100, 100000)
+        max_vol_spin.setSingleStep(500)
+        max_vol_spin.setValue(self.mask_max_volume)
+        max_vol_spin.setSuffix(" um^3")
+        size_grid.addWidget(max_vol_spin)
+
+        size_grid.addWidget(QLabel("Step:"))
+        step_spin = QSpinBox()
+        step_spin.setRange(50, 10000)
+        step_spin.setSingleStep(100)
+        step_spin.setValue(self.mask_step_size)
+        step_spin.setSuffix(" um^3")
+        size_grid.addWidget(step_spin)
+        layout.addLayout(size_grid)
+
+        preview_label = QLabel("")
+        preview_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+        preview_label.setWordWrap(True)
+        layout.addWidget(preview_label)
+
+        def update_size_preview():
+            mn = min_vol_spin.value()
+            mx = max_vol_spin.value()
+            st = step_spin.value()
+            if mn > mx:
+                preview_label.setText("Min must be <= Max")
+                return
+            sizes = list(range(mn, mx + 1, st))
+            if sizes[-1] != mx:
+                sizes.append(mx)
+            preview_label.setText(
+                f"Masks: {', '.join(str(s) for s in sizes)} um^3  ({len(sizes)} masks per cell)")
+
+        min_vol_spin.valueChanged.connect(lambda: update_size_preview())
+        max_vol_spin.valueChanged.connect(lambda: update_size_preview())
+        step_spin.valueChanged.connect(lambda: update_size_preview())
+        update_size_preview()
+
+        layout.addSpacing(10)
+
+        # Intensity filtering
+        intensity_group = QLabel("<b>Intensity Filtering</b>")
+        layout.addWidget(intensity_group)
+
+        min_intensity_check = QCheckBox("Use minimum intensity threshold")
+        min_intensity_check.setChecked(self.use_min_intensity)
+        layout.addWidget(min_intensity_check)
+
+        slider_layout = QHBoxLayout()
+        slider_layout.addWidget(QLabel("  Min intensity:"))
+        min_intensity_slider = QSlider(Qt.Horizontal)
+        min_intensity_slider.setRange(0, 100)
+        min_intensity_slider.setValue(self.min_intensity_percent)
+        slider_layout.addWidget(min_intensity_slider)
+        min_intensity_label = QLabel(f"{self.min_intensity_percent}%")
+        min_intensity_slider.valueChanged.connect(
+            lambda v: min_intensity_label.setText(f"{v}%"))
+        slider_layout.addWidget(min_intensity_label)
+        layout.addLayout(slider_layout)
+
+        layout.addSpacing(10)
+
+        # Segmentation method
+        seg_group = QLabel("<b>Cell Boundary Segmentation</b>")
+        layout.addWidget(seg_group)
+
+        seg_combo = QComboBox()
+        seg_combo.addItem("None (independent growth)", "none")
+        seg_combo.addItem("Competitive Growth (shared priority queue)", "competitive")
+        for idx in range(seg_combo.count()):
+            if seg_combo.itemData(idx) == self.mask_segmentation_method:
+                seg_combo.setCurrentIndex(idx)
+                break
+        layout.addWidget(seg_combo)
+
+        layout.addSpacing(10)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_btn)
+        ok_btn = QPushButton("Generate 3D Masks")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(dialog.accept)
+        ok_btn.setStyleSheet("QPushButton { border: 2px solid #4CAF50; font-weight: bold; padding: 5px; }")
+        button_layout.addWidget(ok_btn)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        dialog.setMinimumWidth(450)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        # Save settings
+        self.soma_intensity_tolerance = tol_spin.value()
+        self.soma_max_radius_um = rad_spin.value()
+        self.use_min_intensity = min_intensity_check.isChecked()
+        self.min_intensity_percent = min_intensity_slider.value()
+        self.mask_min_volume = min_vol_spin.value()
+        self.mask_max_volume = max_vol_spin.value()
+        self.mask_step_size = step_spin.value()
+        self.mask_segmentation_method = seg_combo.currentData()
+
+        self._run_mask_generation()
+
+    def _run_mask_generation(self):
+        """Execute 3D mask generation with current settings."""
+        try:
+            voxel_xy = float(self.voxel_xy_input.text())
+            voxel_z = float(self.voxel_z_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Invalid voxel dimensions")
+            return
+
+        vol_list = list(range(self.mask_min_volume, self.mask_max_volume + 1, self.mask_step_size))
+        if vol_list[-1] != self.mask_max_volume:
+            vol_list.append(self.mask_max_volume)
+
+        min_int_pct = self.min_intensity_percent if self.use_min_intensity else 0
+        seg_method = self.mask_segmentation_method
+
+        self.progress_bar.setVisible(True)
+        self.progress_status_label.setVisible(True)
+
+        total_somas = sum(len(data['somas']) for data in self.images.values()
+                          if data['selected'] and data['somas'])
+        current_count = 0
+
+        try:
+            for img_name, img_data in self.images.items():
+                if not img_data['selected'] or not img_data['somas']:
+                    continue
+
+                stack = img_data.get('processed') or img_data.get('raw_stack')
+                if stack is None:
+                    self.log(f"SKIP {img_name}: no stack data")
+                    continue
+
+                self.log(f"Generating 3D masks for {img_name}...")
+
+                # First, detect somas in 3D
+                soma_data_list = []
+                for si, soma_zyx in enumerate(img_data['somas']):
+                    soma_id = img_data['soma_ids'][si]
+                    self.progress_status_label.setText(
+                        f"Detecting soma {si + 1}/{len(img_data['somas'])}: {img_name}")
+                    QApplication.processEvents()
+
+                    soma_mask, centroid = detect_soma_3d(
+                        stack, soma_zyx,
+                        intensity_tolerance=self.soma_intensity_tolerance,
+                        max_radius_um=self.soma_max_radius_um,
+                        voxel_size_xy=voxel_xy,
+                        voxel_size_z=voxel_z
+                    )
+                    img_data['soma_masks'][soma_id] = soma_mask
+
+                    soma_data_list.append({
+                        'centroid': centroid,
+                        'soma_mask': soma_mask,
+                        'soma_id': soma_id,
+                        'soma_idx': si,
+                    })
+
+                # Generate masks
+                if seg_method == 'competitive' and len(soma_data_list) > 1:
+                    self.log(f"  Competitive 3D growth for {len(soma_data_list)} cells")
+                    self.progress_status_label.setText(f"Competitive 3D growth: {img_name}")
+                    QApplication.processEvents()
+
+                    masks = create_competitive_masks_3d(
+                        stack, soma_data_list, vol_list,
+                        voxel_xy, voxel_z, min_intensity_pct=min_int_pct
+                    )
+                    img_data['masks'].extend(masks)
+                    current_count += len(soma_data_list)
+                else:
+                    # Independent growth per soma
+                    for sdata in soma_data_list:
+                        self.progress_status_label.setText(
+                            f"3D masks: {current_count + 1}/{total_somas}")
+                        QApplication.processEvents()
+
+                        masks = create_spherical_annulus_masks(
+                            stack, sdata['centroid'], vol_list,
+                            voxel_xy, voxel_z,
+                            soma_mask=sdata['soma_mask'],
+                            min_intensity_pct=min_int_pct
+                        )
+                        for m in masks:
+                            m['soma_idx'] = sdata['soma_idx']
+                            m['soma_id'] = sdata['soma_id']
+                        img_data['masks'].extend(masks)
+                        current_count += 1
+
+                    self.progress_bar.setValue(int(current_count / total_somas * 100))
+
+                # Export masks to disk
+                if self.masks_dir:
+                    self._export_all_masks_to_disk(img_name, img_data['masks'])
+
+                img_data['status'] = 'masks_generated'
+                self._update_file_list_item(img_name)
+
+            self.progress_bar.setVisible(False)
+            self.progress_status_label.setVisible(False)
+
+            self.batch_qa_btn.setEnabled(True)
+            self.clear_masks_btn.setEnabled(True)
+            self.opacity_widget.setVisible(True)
+
+            total_masks = sum(len(data['masks']) for data in self.images.values() if data['selected'])
+
+            self.log("=" * 50)
+            self.log(f"Generated {total_masks} 3D masks total")
+            self.log(f"Mask volumes: {', '.join(str(v) for v in vol_list)} um^3")
+            self.log("Ready for QA")
+            self.log("=" * 50)
+            self._auto_save()
+
+            QMessageBox.information(self, "Success",
+                                    f"Generated {total_masks} 3D masks!\n\nReady for QA.")
+
+        except Exception as e:
+            self.progress_bar.setVisible(False)
+            self.progress_status_label.setVisible(False)
+            self.log(f"ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Failed: {e}")
+
+    def _export_all_masks_to_disk(self, img_name, masks):
+        """Export all mask volumes for an image to disk as multi-page TIFFs."""
+        if not self.masks_dir:
+            return
+        os.makedirs(self.masks_dir, exist_ok=True)
+        img_basename = os.path.splitext(img_name)[0]
+        for mask_data in masks:
+            mask_3d = mask_data.get('mask')
+            if mask_3d is None:
+                continue
+            soma_id = mask_data.get('soma_id', 'soma_0')
+            vol = mask_data.get('volume_um3', 0)
+            fname = f"{img_basename}_{soma_id}_vol{int(vol)}_mask3d.tif"
+            path = os.path.join(self.masks_dir, fname)
+            try:
+                tifffile.imwrite(path, (mask_3d * 255).astype(np.uint8))
+            except Exception as e:
+                self.log(f"  ERROR exporting {fname}: {e}")
+
+    def clear_all_masks(self):
+        """Clear all generated masks."""
+        reply = QMessageBox.question(
+            self, "Clear All Masks",
+            "Delete all generated masks? This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        for img_name, img_data in self.images.items():
+            img_data['masks'].clear()
+            if img_data['status'] in ('masks_generated', 'qa_complete'):
+                img_data['status'] = 'somas_picked'
+                self._update_file_list_item(img_name)
+
+        self.all_masks_flat.clear()
+        self.mask_qa_active = False
+        self.mask_qa_idx = 0
+        self.last_qa_decisions.clear()
+        self.batch_qa_btn.setEnabled(False)
+        self.batch_calculate_btn.setEnabled(False)
+        self.mask_qa_progress_bar.setVisible(False)
+        self.opacity_widget.setVisible(False)
+        self.clear_masks_btn.setVisible(False)
+        self.undo_qa_btn.setVisible(False)
+        self.log("All masks cleared.")
+
+    # ----------------------------------------------------------------
+    # MASK QA
+    # ----------------------------------------------------------------
+
+    def start_batch_qa(self):
+        self.all_masks_flat = []
+        for img_name, img_data in self.images.items():
+            if not img_data['selected']:
+                continue
+            for mask_data in img_data['masks']:
+                self.all_masks_flat.append({
+                    'image_name': img_name,
+                    'mask_data': mask_data,
+                })
+
+        if not self.all_masks_flat:
+            QMessageBox.warning(self, "Warning", "No masks to QA")
+            return
+
+        self.mask_qa_active = True
+        if not hasattr(self, 'last_qa_decisions'):
+            self.last_qa_decisions = []
+
+        # Build soma ordering for memory management
+        self._qa_soma_order = []
+        self._qa_finalized_somas = set()
+        seen = set()
+        for flat in self.all_masks_flat:
+            key = (flat['image_name'], flat['mask_data'].get('soma_id', ''))
+            if key not in seen:
+                seen.add(key)
+                self._qa_soma_order.append(key)
+
+        # Find first unreviewed
+        reviewed_count = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
+        first_unreviewed = 0
+        for i, flat in enumerate(self.all_masks_flat):
+            if flat['mask_data'].get('approved') is None:
+                first_unreviewed = i
+                break
+        self.mask_qa_idx = first_unreviewed
+
+        self.approve_mask_btn.setEnabled(True)
+        self.reject_mask_btn.setEnabled(True)
+        self.prev_btn.setEnabled(True)
+        self.next_btn.setEnabled(True)
+        self.done_btn.setEnabled(False)
+        self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
+        self.undo_qa_btn.setVisible(True)
+        self.clear_masks_btn.setEnabled(True)
+        self.clear_masks_btn.setVisible(True)
+
+        self.mask_qa_progress_bar.setMaximum(len(self.all_masks_flat))
+        self.mask_qa_progress_bar.setValue(reviewed_count)
+        self.mask_qa_progress_bar.setVisible(True)
+
+        self._show_current_mask()
+        self.tabs.setCurrentIndex(3)
+
+        self.log("=" * 50)
+        self.log("BATCH MASK QA MODE (3D)")
+        if reviewed_count > 0:
+            self.log(f"Resuming: {reviewed_count}/{len(self.all_masks_flat)} already reviewed")
+        else:
+            self.log(f"Total masks to review: {len(self.all_masks_flat)}")
+        self.log("A/Space=Approve, R=Reject, Left/Right=Navigate, B=Undo")
+        self.log("Use Z-slider to inspect mask in different slices")
+        self.log("=" * 50)
+
+    def _show_current_mask(self):
+        if not self.all_masks_flat or self.mask_qa_idx >= len(self.all_masks_flat):
+            return
+
+        flat_data = self.all_masks_flat[self.mask_qa_idx]
+        mask_data = flat_data['mask_data']
+        img_name = flat_data['image_name']
+        img_data = self.images.get(img_name, {})
+
+        mask_3d = mask_data.get('mask')
+        if mask_3d is None:
+            # Try reload from disk
+            if not self._reload_mask_from_disk(mask_data, img_name):
+                self.log("Cannot display mask - file not found on disk")
+                return
+            mask_3d = mask_data.get('mask')
+
+        # Switch current image if needed
+        if self.current_image_name != img_name:
+            self.current_image_name = img_name
+            self._update_z_slider_for_image()
+
+        # Find the Z-slice with the most mask voxels for initial view
+        if mask_3d is not None and mask_3d.ndim == 3:
+            z_sums = mask_3d.sum(axis=(1, 2))
+            best_z = int(np.argmax(z_sums))
+            self.current_z_slice = best_z
+            self.z_slider.setValue(best_z)
+
+        # Get the processed stack for background
+        stack = img_data.get('processed') or img_data.get('raw_stack')
+        if stack is None:
+            return
+
+        z = self.current_z_slice
+        sl = self._get_slice_for_display(stack, z)
+        adjusted = self._apply_display_adjustments(sl)
+        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+
+        # Get mask slice
+        mask_slice = None
+        if mask_3d is not None and mask_3d.ndim == 3:
+            z_clamped = max(0, min(mask_3d.shape[0] - 1, z))
+            mask_slice = mask_3d[z_clamped]
+
+        # Get soma centroid on this slice
+        soma_centroid = []
+        soma_idx = mask_data.get('soma_idx')
+        if soma_idx is not None and soma_idx < len(img_data.get('somas', [])):
+            sz, sy, sx = img_data['somas'][soma_idx]
+            if abs(sz - z) <= 2:
+                soma_centroid = [(sy, sx)]
+
+        self.mask_label.set_image(pixmap, centroids=soma_centroid, mask_overlay=mask_slice)
+
+        # Auto-zoom to mask center on this slice
+        if mask_slice is not None:
+            mask_coords = np.argwhere(mask_slice > 0)
+            if len(mask_coords) > 0:
+                center_row = float(np.mean(mask_coords[:, 0]))
+                center_col = float(np.mean(mask_coords[:, 1]))
+                self.mask_label.zoom_to_point(center_row, center_col, zoom_level=3.0)
+
+        status = mask_data.get('approved')
+        status_text = ("Approved" if status is True
+                       else "Rejected" if status is False
+                       else "Not reviewed")
+        reviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
+
+        vol = mask_data.get('volume_um3', mask_data.get('actual_volume_um3', 0))
+        self.nav_status_label.setText(
+            f"Mask {self.mask_qa_idx + 1}/{len(self.all_masks_flat)} | "
+            f"Reviewed: {reviewed}/{len(self.all_masks_flat)} | "
+            f"{img_name} | {mask_data.get('soma_id', '')} | "
+            f"Vol: {vol} um^3 | {status_text}"
+        )
+        self.mask_qa_progress_bar.setValue(reviewed)
+
+    def _reload_mask_from_disk(self, mask_data, img_name):
+        """Reload a 3D mask from its TIFF file on disk."""
+        if mask_data.get('mask') is not None:
+            return True
+        if not self.masks_dir or not os.path.isdir(self.masks_dir):
+            return False
+        img_basename = os.path.splitext(img_name)[0]
+        soma_id = mask_data.get('soma_id', '')
+        vol = mask_data.get('volume_um3', 0)
+        fname = f"{img_basename}_{soma_id}_vol{int(vol)}_mask3d.tif"
+        path = os.path.join(self.masks_dir, fname)
+        if os.path.exists(path):
+            try:
+                arr = tifffile.imread(path)
+                mask_data['mask'] = (arr > 0).astype(np.uint8)
+                return True
+            except Exception as e:
+                self.log(f"  Could not reload {fname}: {e}")
+        return False
+
+    def approve_current_mask(self):
+        if not self.mask_qa_active or self.mask_qa_idx >= len(self.all_masks_flat):
+            return
+
+        flat_data = self.all_masks_flat[self.mask_qa_idx]
+        mask_data = flat_data['mask_data']
+        mask_data['approved'] = True
+
+        current_soma_id = mask_data.get('soma_id', '')
+        current_vol = mask_data.get('volume_um3', 0)
+        current_img = flat_data['image_name']
+
+        self.log(f"APPROVED | {current_img} | {current_soma_id} | Vol: {current_vol} um^3")
+        self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': True})
+        self.undo_qa_btn.setEnabled(True)
+
+        # Auto-approve smaller masks from same soma
+        auto_approved = []
+        for i, other_flat in enumerate(self.all_masks_flat):
+            other_mask = other_flat['mask_data']
+            other_img = other_flat['image_name']
+            other_vol = other_mask.get('volume_um3', 0)
+            if (other_img == current_img and
+                    other_mask.get('soma_id') == current_soma_id and
+                    other_vol < current_vol and
+                    other_mask.get('approved') is None):
+                other_mask['approved'] = True
+                auto_approved.append((i + 1, other_vol))
+                self.last_qa_decisions.append({'flat_data': other_flat, 'was_approved': True})
+
+        if auto_approved:
+            self.log(f"   Auto-approved {len(auto_approved)} smaller masks for {current_soma_id}")
+
+        self._advance_to_next_unreviewed()
+
+    def reject_current_mask(self):
+        if not self.mask_qa_active or self.mask_qa_idx >= len(self.all_masks_flat):
+            return
+
+        flat_data = self.all_masks_flat[self.mask_qa_idx]
+        mask_data = flat_data['mask_data']
+        mask_data['approved'] = False
+
+        vol = mask_data.get('volume_um3', 0)
+        self.log(f"REJECTED | {flat_data['image_name']} | {mask_data.get('soma_id', '')} | Vol: {vol} um^3")
+        self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': False})
+        self.undo_qa_btn.setEnabled(True)
+
+        # Delete rejected mask from disk
+        self._delete_rejected_mask_tiff(flat_data['image_name'], mask_data)
+
+        self._advance_to_next_unreviewed()
+
+    def _delete_rejected_mask_tiff(self, img_name, mask_data):
+        if not self.masks_dir or not os.path.isdir(self.masks_dir):
+            return
+        img_basename = os.path.splitext(img_name)[0]
+        soma_id = mask_data.get('soma_id', '')
+        vol = mask_data.get('volume_um3', 0)
+        fname = f"{img_basename}_{soma_id}_vol{int(vol)}_mask3d.tif"
+        path = os.path.join(self.masks_dir, fname)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                self.log(f"   Deleted rejected: {fname}")
+            except Exception as e:
+                self.log(f"   Could not delete {fname}: {e}")
+
+    def _advance_to_next_unreviewed(self):
+        """Move to next unreviewed mask, or finish QA."""
+        for i in range(self.mask_qa_idx + 1, len(self.all_masks_flat)):
+            if self.all_masks_flat[i]['mask_data'].get('approved') is None:
+                self.mask_qa_idx = i
+                self._show_current_mask()
+                return
+        # All reviewed - check completion
+        self._check_qa_complete()
+
+    def next_mask(self):
+        if self.mask_qa_idx < len(self.all_masks_flat) - 1:
+            self.mask_qa_idx += 1
+            self._show_current_mask()
+
+    def prev_mask(self):
+        if self.mask_qa_idx > 0:
+            self.mask_qa_idx -= 1
+            self._show_current_mask()
+
+    def _check_qa_complete(self):
+        remaining = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is None)
+        if remaining == 0:
+            approved = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is True)
+            rejected = len(self.all_masks_flat) - approved
+
+            for img_name, img_data in self.images.items():
+                if img_data['status'] == 'masks_generated':
+                    img_data['status'] = 'qa_complete'
+                    self._update_file_list_item(img_name)
+
+            self.mask_qa_active = False
+            self.batch_calculate_btn.setEnabled(True)
+            self.mask_qa_progress_bar.setVisible(False)
+
+            self.log("=" * 50)
+            self.log(f"QA Complete! Approved: {approved}, Rejected: {rejected}")
+            self.log("Ready for 3D morphology calculation.")
+            self.log("=" * 50)
+            self._auto_save()
+
+            QMessageBox.information(self, "QA Complete",
+                                    f"QA Complete!\n\nApproved: {approved}\nRejected: {rejected}"
+                                    f"\n\nReady for 3D morphology calculation.")
+        else:
+            self._show_current_mask()
+
+    def undo_last_qa(self):
+        if not self.last_qa_decisions:
+            self.log("Nothing to undo")
+            return
+
+        decision = self.last_qa_decisions.pop()
+        flat_data = decision['flat_data']
+        mask_data = flat_data['mask_data']
+        was_approved = decision['was_approved']
+
+        mask_data['approved'] = None
+
+        vol = mask_data.get('volume_um3', 0)
+        self.log(f"UNDONE | {flat_data['image_name']} | {mask_data.get('soma_id', '')} | Vol: {vol} um^3")
+
+        # Find index
+        for i, flat in enumerate(self.all_masks_flat):
+            if flat is flat_data:
+                self.mask_qa_idx = i
+                break
+
+        self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
+
+        if self.mask_qa_active:
+            self._show_current_mask()
+
+    # ----------------------------------------------------------------
+    # 3D MORPHOLOGY CALCULATION
+    # ----------------------------------------------------------------
+
+    def batch_calculate_morphology(self):
+        try:
+            voxel_xy = float(self.voxel_xy_input.text())
+            voxel_z = float(self.voxel_z_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Invalid voxel dimensions")
+            return
+
+        # Reload evicted masks
+        reload_count = 0
+        for flat in self.all_masks_flat:
+            if flat['mask_data'].get('approved') and flat['mask_data'].get('mask') is None:
+                if self._reload_mask_from_disk(flat['mask_data'], flat['image_name']):
+                    reload_count += 1
+        if reload_count > 0:
+            self.log(f"   Reloaded {reload_count} evicted masks from disk")
+
+        approved = [f for f in self.all_masks_flat if f['mask_data'].get('approved')]
+        if not approved:
+            QMessageBox.warning(self, "Warning", "No approved masks to analyze")
+            return
+
+        self.log("=" * 50)
+        self.log(f"Calculating 3D morphology for {len(approved)} masks...")
+        self.log("=" * 50)
+
+        self.progress_bar.setVisible(True)
+        self.progress_status_label.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.start_timer()
+        self.batch_calculate_btn.setEnabled(False)
+
+        self.morph_thread = MorphologyThread3D(
+            approved, voxel_xy, voxel_z, self.images
+        )
+        self.morph_thread.progress.connect(self._on_morph_progress)
+        self.morph_thread.finished.connect(self._on_morph_finished)
+        self.morph_thread.error_occurred.connect(self._on_morph_error)
+        self.morph_thread.start()
+
+    def _on_morph_progress(self, percentage, status):
+        self.progress_bar.setValue(percentage)
+        self.progress_status_label.setText(status)
+
+    def _on_morph_finished(self, all_results):
+        self.stop_timer()
+        self.progress_bar.setVisible(False)
+        self.progress_status_label.setVisible(False)
+        self.batch_calculate_btn.setEnabled(True)
+        self.timer_label.setVisible(False)
+
+        self._save_batch_results(all_results)
+
+        for img_name, img_data in self.images.items():
+            if img_data['selected'] and img_data['status'] == 'qa_complete':
+                img_data['status'] = 'analyzed'
+                self._update_file_list_item(img_name)
+
+        self.log("=" * 50)
+        self.log(f"3D morphology calculated for {len(all_results)} cells")
+        self.log(f"Results saved to: {self.output_dir}")
+        self.log("=" * 50)
+        self._auto_save()
+
+        QMessageBox.information(self, "Success",
+                                f"3D morphology calculated for {len(all_results)} cells!\n\n"
+                                f"Results saved to:\n{self.output_dir}")
+
+    def _on_morph_error(self, error_msg):
+        self.stop_timer()
+        self.progress_bar.setVisible(False)
+        self.progress_status_label.setVisible(False)
+        self.timer_label.setVisible(False)
+        self.batch_calculate_btn.setEnabled(True)
+        self.log(f"ERROR: {error_msg}")
+        QMessageBox.critical(self, "Error", f"Morphology calculation failed:\n{error_msg}")
+
+    def _save_batch_results(self, results):
+        if not self.output_dir or not results:
+            return
+
+        # Add animal_id and treatment
+        for result in results:
+            img_name_base = result['image_name']
+            for full_name, img_data in self.images.items():
+                if os.path.splitext(full_name)[0] == img_name_base:
+                    result['animal_id'] = img_data.get('animal_id', '')
+                    result['treatment'] = img_data.get('treatment', '')
+                    break
+            else:
+                result['animal_id'] = ''
+                result['treatment'] = ''
+
+        combined_path = os.path.join(self.output_dir, "3d_morphology_results.csv")
+
+        fieldnames = [
+            'image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx',
+            'target_volume_um3', 'volume_um3', 'surface_area_um2', 'sphericity',
+            'elongation', 'cell_spread_3d_um', 'soma_volume_um3',
+            'polarity_index_3d', 'principal_azimuth', 'principal_elevation',
+            'major_axis_um', 'mid_axis_um', 'minor_axis_um',
+            'n_branches', 'n_branch_points', 'n_endpoints',
+            'total_branch_length_um', 'fractal_dimension_3d', 'lacunarity_3d',
+        ]
+
+        with open(combined_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(results)
+
+        self.log(f"Results saved to: {combined_path}")
+
+        # Per-image files
+        by_image = {}
+        for result in results:
+            img = result['image_name']
+            if img not in by_image:
+                by_image[img] = []
+            by_image[img].append(result)
+
+        for img_name, img_results in by_image.items():
+            path = os.path.join(self.output_dir, f"{img_name}_3d_morphology.csv")
+            with open(path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                writer.writeheader()
+                writer.writerows(img_results)
+
+        self.log(f"Per-image results saved for {len(by_image)} Z-stacks")
+
+    # ----------------------------------------------------------------
+    # SESSION SAVE / LOAD
+    # ----------------------------------------------------------------
+
+    def _build_session_dict(self):
+        session = {
+            'version': 1,
+            'type': '3d',
+            'output_dir': self.output_dir,
+            'masks_dir': self.masks_dir,
+            'voxel_size_xy': self.voxel_xy_input.text(),
+            'voxel_size_z': self.voxel_z_input.text(),
+            'rolling_ball_radius': self.rb_slider.value(),
+            'use_min_intensity': self.use_min_intensity,
+            'min_intensity_percent': self.min_intensity_percent,
+            'mask_min_volume': self.mask_min_volume,
+            'mask_max_volume': self.mask_max_volume,
+            'mask_step_size': self.mask_step_size,
+            'mask_segmentation_method': self.mask_segmentation_method,
+            'soma_intensity_tolerance': self.soma_intensity_tolerance,
+            'soma_max_radius_um': self.soma_max_radius_um,
+            'last_image_name': self.current_image_name,
+            'images': {},
+        }
+
+        for img_name, img_data in self.images.items():
+            processed_path = None
+            name_stem = os.path.splitext(img_name)[0]
+            if self.output_dir:
+                candidate = os.path.join(self.output_dir, f"{name_stem}_processed.tif")
+                if os.path.exists(candidate):
+                    processed_path = candidate
+
+            img_session = {
+                'raw_path': img_data['raw_path'],
+                'processed_path': processed_path,
+                'status': img_data['status'],
+                'selected': img_data['selected'],
+                'animal_id': img_data.get('animal_id', ''),
+                'treatment': img_data.get('treatment', ''),
+                'somas': [(float(s[0]), float(s[1]), float(s[2]))
+                          for s in img_data.get('somas', [])],
+                'soma_ids': img_data.get('soma_ids', []),
+            }
+
+            # Mask QA state
+            mask_qa_state = []
+            for mask in img_data.get('masks', []):
+                mask_qa_state.append({
+                    'soma_id': mask.get('soma_id', ''),
+                    'volume_um3': mask.get('volume_um3', 0),
+                    'approved': mask.get('approved'),
+                    'soma_idx': mask.get('soma_idx', 0),
+                })
+            img_session['mask_qa_state'] = mask_qa_state
+            session['images'][img_name] = img_session
+
+        return session
+
+    def save_session(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save 3D Session", "",
+            "3D Session Files (*.mmps3d_session);;All Files (*)")
+        if not path:
+            return
+        if not path.endswith('.mmps3d_session'):
+            path += '.mmps3d_session'
+        try:
+            session = self._build_session_dict()
+            with open(path, 'w') as f:
+                json.dump(session, f, indent=2)
+            self.log(f"Session saved to: {path}")
+            QMessageBox.information(self, "Session Saved", f"Session saved to:\n{path}")
+        except Exception as e:
+            self.log(f"ERROR saving: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save session:\n{e}")
+
+    def _auto_save(self):
+        if not self.output_dir or not self.images:
+            return
+        try:
+            path = os.path.join(self.output_dir, "autosave.mmps3d_session")
+            session = self._build_session_dict()
+            with open(path, 'w') as f:
+                json.dump(session, f, indent=2)
+        except Exception:
+            pass
+
+    def load_session(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load 3D Session", "",
+            "3D Session Files (*.mmps3d_session);;All Files (*)")
+        if not path:
+            return
+
+        try:
+            with open(path, 'r') as f:
+                session = json.load(f)
+
+            # Restore settings
+            self.output_dir = session.get('output_dir')
+            self.masks_dir = session.get('masks_dir')
+            self.use_min_intensity = session.get('use_min_intensity', True)
+            self.min_intensity_percent = session.get('min_intensity_percent', 5)
+            self.mask_min_volume = session.get('mask_min_volume', 500)
+            self.mask_max_volume = session.get('mask_max_volume', 5000)
+            self.mask_step_size = session.get('mask_step_size', 500)
+            self.mask_segmentation_method = session.get('mask_segmentation_method', 'none')
+            self.soma_intensity_tolerance = session.get('soma_intensity_tolerance', 30)
+            self.soma_max_radius_um = session.get('soma_max_radius_um', 8)
+
+            self.voxel_xy_input.setText(str(session.get('voxel_size_xy', '0.3')))
+            self.voxel_z_input.setText(str(session.get('voxel_size_z', '1.0')))
+            self.rb_slider.setValue(session.get('rolling_ball_radius', 15))
+
+            # Restore images
+            self.images = {}
+            self.file_list.clear()
+
+            for img_name, img_session in session.get('images', {}).items():
+                raw_path = img_session['raw_path']
+                if not os.path.exists(raw_path):
+                    self.log(f"SKIP {img_name}: raw file not found")
+                    continue
+
+                img_data = {
+                    'raw_path': raw_path,
+                    'raw_stack': None,
+                    'processed': None,
+                    'rolling_ball_radius': session.get('rolling_ball_radius', 15),
+                    'somas': [tuple(s) for s in img_session.get('somas', [])],
+                    'soma_ids': img_session.get('soma_ids', []),
+                    'soma_masks': {},
+                    'masks': [],
+                    'status': img_session.get('status', 'loaded'),
+                    'selected': img_session.get('selected', False),
+                    'animal_id': img_session.get('animal_id', ''),
+                    'treatment': img_session.get('treatment', ''),
+                }
+
+                # Reload processed stack from disk
+                proc_path = img_session.get('processed_path')
+                if proc_path and os.path.exists(proc_path):
+                    try:
+                        img_data['processed'] = tifffile.imread(proc_path)
+                    except Exception:
+                        pass
+
+                # Rebuild mask state from disk
+                for mqa in img_session.get('mask_qa_state', []):
+                    mask_data = {
+                        'soma_id': mqa.get('soma_id', ''),
+                        'volume_um3': mqa.get('volume_um3', 0),
+                        'approved': mqa.get('approved'),
+                        'soma_idx': mqa.get('soma_idx', 0),
+                        'mask': None,  # Will be reloaded from disk on demand
+                    }
+                    img_data['masks'].append(mask_data)
+
+                self.images[img_name] = img_data
+
+                item = QListWidgetItem(f"  {img_name} [{img_data['status']}]")
+                item.setData(Qt.UserRole, img_name)
+                item.setCheckState(Qt.Checked if img_data['selected'] else Qt.Unchecked)
+                self.file_list.addItem(item)
+                self._update_file_list_item(img_name)
+
+            # Restore current image
+            last_img = session.get('last_image_name')
+            if last_img and last_img in self.images:
+                self.current_image_name = last_img
+            elif self.images:
+                self.current_image_name = sorted(self.images.keys())[0]
+
+            if self.current_image_name:
+                self._load_and_display_raw(self.current_image_name)
+
+            # Enable buttons based on state
+            has_processed = any(d['status'] != 'loaded' for d in self.images.values())
+            has_somas = any(d['somas'] for d in self.images.values())
+            has_masks = any(d['masks'] for d in self.images.values())
+            has_qa = any(d['status'] == 'qa_complete' for d in self.images.values())
+
+            self.process_selected_btn.setEnabled(True)
+            self.batch_pick_somas_btn.setEnabled(has_processed)
+            self.batch_generate_masks_btn.setEnabled(has_somas)
+            self.batch_qa_btn.setEnabled(has_masks)
+            self.batch_calculate_btn.setEnabled(has_qa)
+
+            self.log(f"Session loaded: {len(self.images)} Z-stacks restored")
+            QMessageBox.information(self, "Session Loaded",
+                                    f"Loaded {len(self.images)} Z-stacks from session.")
+
+        except Exception as e:
+            self.log(f"ERROR loading session: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Failed to load session:\n{e}")
+
+
+# ============================================================================
+# APP ICON
+# ============================================================================
+
+def _get_app_icon_3d():
+    """Generate a 3D-themed microglia icon."""
+    try:
+        size = 256
+        pixmap = QPixmap(size, size)
+        pixmap.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        cx, cy = size // 2, size // 2
+
+        # Draw Z-stack layers
+        for layer in range(5):
+            offset = layer * 8
+            color = QColor(60 + layer * 20, 140 + layer * 10, 220)
+            pen = QPen(color, 2)
+            painter.setPen(pen)
+            painter.drawRect(cx - 50 + offset, cy - 50 + offset, 100, 100)
+
+        # Draw branching processes
+        branch_pen = QPen(QColor(100, 180, 255), 4)
+        branch_pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(branch_pen)
+        branches = [
+            (0, 80), (60, 70), (120, 75), (180, 80),
+            (240, 72), (300, 78),
+        ]
+        for angle_deg, length in branches:
+            angle = math.radians(angle_deg)
+            x1 = cx + int(25 * math.cos(angle))
+            y1 = cy + int(25 * math.sin(angle))
+            x2 = cx + int(length * math.cos(angle))
+            y2 = cy + int(length * math.sin(angle))
+            painter.drawLine(x1, y1, x2, y2)
+
+        # Draw soma
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(60, 140, 220)))
+        painter.drawEllipse(cx - 22, cy - 22, 44, 44)
+        painter.setBrush(QBrush(QColor(180, 220, 255)))
+        painter.drawEllipse(cx - 8, cy - 10, 14, 14)
+
+        # "3D" text
+        painter.setPen(QPen(QColor(255, 200, 50), 2))
+        font = painter.font()
+        font.setPointSize(24)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(cx + 30, cy + 50, "3D")
+
+        painter.end()
+        return QIcon(pixmap)
+    except Exception:
+        return None
+
+
+# ============================================================================
+# MAIN
 # ============================================================================
 
 def main():
-    """Interactive CLI for batch 3D microglia morphology analysis."""
-    try:
-        from PyQt5.QtWidgets import QApplication, QFileDialog, QInputDialog
-        app = QApplication(sys.argv)
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
 
-        masks_dir = QFileDialog.getExistingDirectory(
-            None, "Select 3D masks folder (contains *_mask3d.tif files)",
-            options=QFileDialog.DontUseNativeDialog
-        )
-        if not masks_dir:
-            print("No masks folder selected – exiting.")
-            return
+    icon = _get_app_icon_3d()
+    if icon:
+        app.setWindowIcon(icon)
 
-        voxel_xy, ok = QInputDialog.getDouble(
-            None, "XY Pixel Size", "Enter XY pixel size (µm/px):",
-            0.3, 0.01, 10.0, 4
-        )
-        if not ok:
-            print("Cancelled – exiting.")
-            return
-
-        voxel_z, ok = QInputDialog.getDouble(
-            None, "Z Step Size", "Enter Z step size (µm/slice):",
-            1.0, 0.01, 50.0, 4
-        )
-        if not ok:
-            print("Cancelled – exiting.")
-            return
-
-    except ImportError:
-        if len(sys.argv) < 4:
-            print("Usage: python 3DMicroglia.py <masks_dir> <voxel_xy> <voxel_z>")
-            return
-        masks_dir = sys.argv[1]
-        voxel_xy = float(sys.argv[2])
-        voxel_z = float(sys.argv[3])
-
-    batch_compute_3d_morphology(masks_dir, voxel_xy, voxel_z)
+    window = MicrogliaAnalysis3DGUI()
+    window.show()
+    sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
