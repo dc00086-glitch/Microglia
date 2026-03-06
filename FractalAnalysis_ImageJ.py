@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Batch Fractal Analysis (Box-Counting) for MMPS-exported masks.
 

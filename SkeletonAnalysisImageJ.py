@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from ij import IJ, ImagePlus
 from ij.gui import GenericDialog
 from ij.measure import Calibration, ResultsTable

@@ -1,5 +1,4 @@
-
-
+# -*- coding: utf-8 -*-
 """Install appropriate packages if not already installed"""
 
 import sys

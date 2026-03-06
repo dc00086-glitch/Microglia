@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Scan a masks folder, compute all morphology metrics from the TIFF files,
 and write a fresh CSV.  No existing CSV needed.

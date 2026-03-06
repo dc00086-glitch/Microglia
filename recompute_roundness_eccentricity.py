@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 One-time script to recompute roundness and eccentricity for an existing
 combined_morphology.csv using the mask TIFF files on disk.

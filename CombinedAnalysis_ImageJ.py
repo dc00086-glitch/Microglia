@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Combined Microglia Analysis - Menu Launcher
 ============================================
