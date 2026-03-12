@@ -1942,6 +1942,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         load_action.setToolTip("Resume a previously saved session")
         load_action.triggered.connect(self.load_session)
 
+        session_menu.addSeparator()
+        cluster_action = session_menu.addAction("Generate Cluster Script...")
+        cluster_action.setToolTip("Export a standalone Python script for mask generation on a compute cluster")
+        cluster_action.triggered.connect(self.export_cluster_script)
+
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
@@ -2960,6 +2965,647 @@ class MicrogliaAnalysisGUI(QMainWindow):
         except Exception as e:
             self.log(f"ERROR saving session: {e}")
             QMessageBox.critical(self, "Error", f"Failed to save session:\n{e}")
+
+    def export_cluster_script(self):
+        """Export a standalone Python script for mask generation on a compute cluster."""
+        # Validate that we have enough data
+        has_outlines = any(
+            img_data.get('soma_outlines') and img_data['selected']
+            for img_data in self.images.values()
+        )
+        if not self.images:
+            QMessageBox.warning(self, "Warning", "No images loaded. Load images first.")
+            return
+        if not has_outlines:
+            QMessageBox.warning(self, "Warning",
+                "No soma outlines found.\n\n"
+                "Complete soma picking and outlining before generating a cluster script.")
+            return
+
+        # Gather settings
+        try:
+            pixel_size = float(self.pixel_size_input.text())
+        except ValueError:
+            pixel_size = 0.316
+
+        area_list = list(range(self.mask_min_area, self.mask_max_area + 1, self.mask_step_size))
+        if area_list[-1] != self.mask_max_area:
+            area_list.append(self.mask_max_area)
+
+        seg_method = self.mask_segmentation_method
+
+        # Build per-image soma data
+        image_data = {}
+        for img_name, img_data in self.images.items():
+            if not img_data['selected'] or not img_data.get('soma_outlines'):
+                continue
+            somas = []
+            for outline in img_data['soma_outlines']:
+                somas.append({
+                    'soma_idx': outline['soma_idx'],
+                    'soma_id': outline['soma_id'],
+                    'centroid': [float(outline['centroid'][0]), float(outline['centroid'][1])],
+                    'soma_area_um2': outline.get('soma_area_um2', 0),
+                    'polygon_points': [[float(p[0]), float(p[1])] for p in outline.get('polygon_points', [])],
+                })
+            image_data[img_name] = {
+                'processed_filename': os.path.splitext(img_name)[0] + '_processed.tif',
+                'somas': somas,
+            }
+
+        # Ask where to save
+        default_name = "cluster_mask_generation.py"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Cluster Script", default_name,
+            "Python Files (*.py);;All Files (*)"
+        )
+        if not path:
+            return
+
+        # Build the script content
+        settings = {
+            'pixel_size_um': pixel_size,
+            'area_list_um2': area_list,
+            'segmentation_method': seg_method,
+            'use_min_intensity': self.use_min_intensity,
+            'min_intensity_percent': self.min_intensity_percent,
+        }
+
+        script = self._build_cluster_script(settings, image_data)
+
+        try:
+            with open(path, 'w') as f:
+                f.write(script)
+            self.log(f"Cluster script saved to: {path}")
+
+            n_images = len(image_data)
+            n_somas = sum(len(d['somas']) for d in image_data.values())
+            n_masks = n_somas * len(area_list)
+            QMessageBox.information(self, "Cluster Script Exported",
+                f"Script saved to:\n{path}\n\n"
+                f"Images: {n_images}\n"
+                f"Somas: {n_somas}\n"
+                f"Masks to generate: {n_masks}\n"
+                f"Mask sizes: {', '.join(str(a) for a in area_list)} µm²\n"
+                f"Segmentation: {seg_method}\n\n"
+                f"Upload to your cluster along with the _processed.tif files,\n"
+                f"then run:\n"
+                f"  python {os.path.basename(path)} --input-dir /path/to/processed/tifs")
+        except Exception as e:
+            self.log(f"ERROR saving cluster script: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save script:\n{e}")
+
+    def _build_cluster_script(self, settings, image_data):
+        """Build the standalone Python script string for cluster mask generation."""
+        settings_json = json.dumps(settings, indent=4)
+        image_data_json = json.dumps(image_data, indent=4)
+
+        script = '''#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Cluster Mask Generation Script
+Generated by MMPS on {timestamp}
+
+This script generates cell masks from processed microscopy images.
+It is self-contained and requires only: numpy, tifffile, scipy, opencv-python
+
+Usage:
+    # Process all images:
+    python {script_name} --input-dir /path/to/processed/tifs
+
+    # Process a single image (for SLURM array jobs):
+    python {script_name} --input-dir /path/to/processed/tifs --image-index 0
+
+    # SLURM array job example:
+    # sbatch --array=0-{max_index} job.sh
+    # In job.sh:
+    #   python {script_name} --input-dir $INPUT_DIR --image-index $SLURM_ARRAY_TASK_ID
+
+Required files in --input-dir:
+    - *_processed.tif files (one per image)
+
+Output:
+    - masks/ folder with *_mask.tif files
+    - masks_results.csv with mask metadata
+"""
+
+import os
+import sys
+import json
+import argparse
+import time
+import numpy as np
+import tifffile
+from matplotlib.path import Path as mplPath
+
+try:
+    import cv2
+except ImportError:
+    print("WARNING: opencv-python not available. Watershed segmentation will not work.")
+    cv2 = None
+
+# ============================================================================
+# SETTINGS (from MMPS session)
+# ============================================================================
+
+SETTINGS = {settings_json}
+
+IMAGE_DATA = {image_data_json}
+
+# ============================================================================
+# MASK GENERATION ALGORITHMS
+# ============================================================================
+
+def polygon_to_mask(polygon_points, shape):
+    """Convert polygon points to a binary mask."""
+    if len(polygon_points) < 3:
+        return np.zeros(shape, dtype=np.uint8)
+    poly_array = np.array([[p[1], p[0]] for p in polygon_points])
+    h, w = shape[:2]
+    yy, xx = np.mgrid[:h, :w]
+    points = np.c_[xx.ravel(), yy.ravel()]
+    path = mplPath(poly_array)
+    mask = path.contains_points(points).reshape(h, w)
+    return mask.astype(np.uint8)
+
+
+def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
+                              pixel_size_um, img_name, use_min_intensity, min_intensity_percent):
+    """Create masks for ALL somas using competitive priority region growing.
+
+    All somas grow simultaneously from a single shared priority queue.
+    Each pixel is claimed by whichever soma reaches it first (brightest-
+    neighbor-first). This naturally creates territory boundaries along
+    intensity valleys between cells.
+    """
+    import heapq
+
+    h, w = processed_img.shape
+    sorted_areas = sorted(area_list_um2, reverse=True)
+    largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
+
+    intensity_floor = 0.0
+    if use_min_intensity and min_intensity_percent > 0:
+        img_max = processed_img.max()
+        if img_max > 0:
+            intensity_floor = img_max * (min_intensity_percent / 100.0)
+
+    roi = processed_img.astype(np.float64)
+    owner_map = np.full((h, w), -1, dtype=np.int32)
+    visited = np.zeros((h, w), dtype=bool)
+    heap = []
+
+    n_somas = len(soma_outlines_data)
+    growth_orders = [[] for _ in range(n_somas)]
+    soma_seed_counts = [0] * n_somas
+
+    for si, soma_data in enumerate(soma_outlines_data):
+        centroid = soma_data['centroid']
+        cy, cx = int(centroid[0]), int(centroid[1])
+        cy = max(0, min(h - 1, cy))
+        cx = max(0, min(w - 1, cx))
+        soma_outline = soma_data.get('outline')
+
+        seeded = False
+        if soma_outline is not None and soma_outline.shape == (h, w):
+            soma_ys, soma_xs = np.where(soma_outline > 0)
+            for sr, sc in zip(soma_ys, soma_xs):
+                if not visited[sr, sc]:
+                    visited[sr, sc] = True
+                    owner_map[sr, sc] = si
+                    growth_orders[si].append((sr, sc))
+                    soma_seed_counts[si] += 1
+            for sr, sc in zip(soma_ys, soma_xs):
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = sr + dr, sc + dc
+                    if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                        if roi[nr, nc] >= intensity_floor:
+                            visited[nr, nc] = True
+                            owner_map[nr, nc] = si
+                            heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
+            seeded = True
+
+        if not seeded:
+            if not visited[cy, cx]:
+                visited[cy, cx] = True
+                owner_map[cy, cx] = si
+                growth_orders[si].append((cy, cx))
+                soma_seed_counts[si] = 1
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = cy + dr, cx + dc
+                    if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                        if roi[nr, nc] >= intensity_floor:
+                            visited[nr, nc] = True
+                            owner_map[nr, nc] = si
+                            heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
+
+    soma_done = [False] * n_somas
+    while heap:
+        neg_intensity, r, c, si = heapq.heappop(heap)
+        if owner_map[r, c] != si:
+            continue
+        if len(growth_orders[si]) >= largest_target_px:
+            soma_done[si] = True
+            if all(soma_done):
+                break
+            continue
+        growth_orders[si].append((r, c))
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                if roi[nr, nc] >= intensity_floor:
+                    visited[nr, nc] = True
+                    owner_map[nr, nc] = si
+                    heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
+
+    all_masks = []
+    for si, soma_data in enumerate(soma_outlines_data):
+        soma_idx = soma_data['soma_idx']
+        soma_id = soma_data['soma_id']
+        soma_area_um2 = soma_data.get('soma_area_um2', 0)
+        soma_area_px = soma_seed_counts[si]
+        go = growth_orders[si]
+
+        print(f"  {{soma_id}}: soma={{soma_area_px}}px, grew to {{len(go)}}px (target: {{largest_target_px}})")
+
+        soma_masks_start = len(all_masks)
+        mask_pixel_counts = []
+        for target_area_um2 in sorted_areas:
+            target_px = int(target_area_um2 / (pixel_size_um ** 2))
+            n_pixels = min(target_px, len(go))
+            n_pixels = max(n_pixels, soma_area_px)
+            n_pixels = min(n_pixels, len(go))
+            mask_pixel_counts.append(n_pixels)
+
+            full_mask = np.zeros((h, w), dtype=np.uint8)
+            for r, c in go[:n_pixels]:
+                full_mask[r, c] = 1
+
+            actual_area_um2 = n_pixels * (pixel_size_um ** 2)
+            print(f"    {{target_area_um2}} um2: {{n_pixels}} px = {{actual_area_um2:.1f}} um2 actual")
+
+            all_masks.append({{
+                'image_name': img_name,
+                'soma_idx': soma_idx,
+                'soma_id': soma_id,
+                'area_um2': target_area_um2,
+                'mask': full_mask,
+                'soma_area_um2': soma_area_um2,
+            }})
+
+        # Auto-reject duplicate masks
+        pixel_count_groups = {{}}
+        for i, n_px in enumerate(mask_pixel_counts):
+            pixel_count_groups.setdefault(n_px, []).append(i)
+        for n_px, indices in pixel_count_groups.items():
+            if len(indices) > 1:
+                keep_idx = indices[-1]
+                for idx in indices[:-1]:
+                    all_masks[soma_masks_start + idx]['duplicate'] = True
+                    print(f"    Auto-rejected {{all_masks[soma_masks_start + idx]['area_um2']}} um2 "
+                          f"(duplicate of {{all_masks[soma_masks_start + keep_idx]['area_um2']}} um2, both {{n_px}} px)")
+
+    return all_masks
+
+
+def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_id,
+                          processed_img, img_name, soma_area_um2,
+                          soma_outline_mask=None, territory_map=None,
+                          use_min_intensity=False, min_intensity_percent=0):
+    """Create nested cell masks using priority region growing from the soma outline."""
+    import heapq
+
+    masks = []
+    cy, cx = int(centroid[0]), int(centroid[1])
+
+    sorted_areas = sorted(area_list_um2, reverse=True)
+    largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
+
+    min_roi_radius = int(np.sqrt(largest_target_px / np.pi) * 3)
+    roi_size = max(200, min_roi_radius)
+
+    y_min = max(0, cy - roi_size)
+    y_max = min(processed_img.shape[0], cy + roi_size)
+    x_min = max(0, cx - roi_size)
+    x_max = min(processed_img.shape[1], cx + roi_size)
+
+    roi = processed_img[y_min:y_max, x_min:x_max].astype(np.float64)
+    cy_roi, cx_roi = cy - y_min, cx - x_min
+    h, w = roi.shape
+
+    cy_roi = max(0, min(h - 1, cy_roi))
+    cx_roi = max(0, min(w - 1, cx_roi))
+
+    intensity_floor = 0.0
+    if use_min_intensity and min_intensity_percent > 0:
+        roi_max = roi.max()
+        if roi_max > 0:
+            intensity_floor = roi_max * (min_intensity_percent / 100.0)
+
+    territory_roi = None
+    my_label = 0
+    if territory_map is not None:
+        territory_roi = territory_map[y_min:y_max, x_min:x_max]
+        my_label = territory_roi[cy_roi, cx_roi]
+        if my_label <= 0:
+            for dr in range(-3, 4):
+                for dc in range(-3, 4):
+                    nr, nc = cy_roi + dr, cx_roi + dc
+                    if 0 <= nr < h and 0 <= nc < w and territory_roi[nr, nc] > 0:
+                        my_label = territory_roi[nr, nc]
+                        break
+                if my_label > 0:
+                    break
+
+    def _in_territory(r, c):
+        if territory_roi is None:
+            return True
+        return territory_roi[r, c] == my_label or territory_roi[r, c] <= 0
+
+    visited = np.zeros((h, w), dtype=bool)
+    growth_order = []
+    heap = []
+
+    soma_seed_count = 0
+    if soma_outline_mask is not None:
+        outline_roi = soma_outline_mask[y_min:y_max, x_min:x_max]
+        soma_ys, soma_xs = np.where(outline_roi > 0)
+        for sr, sc in zip(soma_ys, soma_xs):
+            if not visited[sr, sc]:
+                visited[sr, sc] = True
+                growth_order.append((sr, sc))
+                soma_seed_count += 1
+        for sr, sc in zip(soma_ys, soma_xs):
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = sr + dr, sc + dc
+                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
+                        visited[nr, nc] = True
+                        heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+
+    if soma_seed_count == 0:
+        visited[cy_roi, cx_roi] = True
+        growth_order.append((cy_roi, cx_roi))
+        soma_seed_count = 1
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = cy_roi + dr, cx_roi + dc
+            if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
+                    visited[nr, nc] = True
+                    heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+
+    while heap and len(growth_order) < largest_target_px:
+        neg_intensity, r, c = heapq.heappop(heap)
+        growth_order.append((r, c))
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
+                    visited[nr, nc] = True
+                    heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+
+    print(f"  {{soma_id}}: soma={{soma_seed_count}}px, grew to {{len(growth_order)}}px (target: {{largest_target_px}})")
+
+    soma_area_px = soma_seed_count
+    mask_pixel_counts = []
+    for target_area_um2 in sorted_areas:
+        target_px = int(target_area_um2 / (pixel_size_um ** 2))
+        n_pixels = min(target_px, len(growth_order))
+        n_pixels = max(n_pixels, soma_area_px)
+        n_pixels = min(n_pixels, len(growth_order))
+        mask_pixel_counts.append(n_pixels)
+
+        mask_roi = np.zeros((h, w), dtype=np.uint8)
+        for r, c in growth_order[:n_pixels]:
+            mask_roi[r, c] = 1
+
+        full_mask = np.zeros(processed_img.shape, dtype=np.uint8)
+        full_mask[y_min:y_max, x_min:x_max] = mask_roi
+
+        actual_area_um2 = n_pixels * (pixel_size_um ** 2)
+        print(f"    {{target_area_um2}} um2: {{n_pixels}} px = {{actual_area_um2:.1f}} um2 actual")
+
+        masks.append({{
+            'image_name': img_name,
+            'soma_idx': soma_idx,
+            'soma_id': soma_id,
+            'area_um2': target_area_um2,
+            'mask': full_mask,
+            'soma_area_um2': soma_area_um2,
+        }})
+
+    # Auto-reject duplicates
+    pixel_count_groups = {{}}
+    for i, n_px in enumerate(mask_pixel_counts):
+        pixel_count_groups.setdefault(n_px, []).append(i)
+    for n_px, indices in pixel_count_groups.items():
+        if len(indices) > 1:
+            keep_idx = indices[-1]
+            for idx in indices[:-1]:
+                masks[idx]['duplicate'] = True
+                print(f"    Auto-rejected {{masks[idx]['area_um2']}} um2 "
+                      f"(duplicate of {{masks[keep_idx]['area_um2']}} um2, both {{n_px}} px)")
+
+    return masks
+
+
+def build_watershed_territory_map(processed_img, soma_outlines, pixel_size_um):
+    """Build watershed territory map assigning each pixel to the nearest soma basin."""
+    if cv2 is None:
+        print("ERROR: opencv-python required for watershed segmentation")
+        sys.exit(1)
+
+    h, w = processed_img.shape
+    img_norm = processed_img.astype(np.float64)
+    imin, imax = img_norm.min(), img_norm.max()
+    if imax > imin:
+        img_norm = (img_norm - imin) / (imax - imin) * 255.0
+    img_u8 = img_norm.astype(np.uint8)
+
+    grad_x = cv2.Sobel(img_u8, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(img_u8, cv2.CV_64F, 0, 1, ksize=3)
+    gradient = np.sqrt(grad_x ** 2 + grad_y ** 2)
+    gradient = (gradient / (gradient.max() + 1e-10) * 255).astype(np.uint8)
+
+    markers = np.zeros((h, w), dtype=np.int32)
+    for i, soma_data in enumerate(soma_outlines):
+        label = i + 1
+        centroid = soma_data['centroid']
+        cy, cx = int(centroid[0]), int(centroid[1])
+        cy = max(0, min(h - 1, cy))
+        cx = max(0, min(w - 1, cx))
+        outline_mask = soma_data.get('outline')
+        if outline_mask is not None and outline_mask.shape == (h, w):
+            markers[outline_mask > 0] = label
+        else:
+            cv2.circle(markers, (cx, cy), max(3, int(5 / pixel_size_um)), label, -1)
+
+    grad_color = cv2.cvtColor(gradient, cv2.COLOR_GRAY2BGR)
+    cv2.watershed(grad_color, markers)
+
+    territory = markers.copy()
+    territory[territory < 0] = 0
+    return territory
+
+
+# ============================================================================
+# MAIN PROCESSING
+# ============================================================================
+
+def process_image(img_name, img_info, input_dir, output_dir, settings):
+    """Process a single image: generate all masks and save to disk."""
+    pixel_size = settings['pixel_size_um']
+    area_list = settings['area_list_um2']
+    seg_method = settings['segmentation_method']
+    use_min_intensity = settings['use_min_intensity']
+    min_intensity_percent = settings['min_intensity_percent']
+
+    # Load processed image
+    processed_path = os.path.join(input_dir, img_info['processed_filename'])
+    if not os.path.exists(processed_path):
+        print(f"ERROR: Processed image not found: {{processed_path}}")
+        return []
+
+    print(f"Loading {{img_info['processed_filename']}}...")
+    processed_img = tifffile.imread(processed_path)
+    if processed_img.ndim == 3:
+        from skimage import color
+        processed_img = (color.rgb2gray(processed_img) * 255).astype(np.uint8)
+
+    h, w = processed_img.shape
+    print(f"  Image size: {{w}}x{{h}}")
+
+    # Reconstruct soma outline masks from polygon points
+    soma_outlines = []
+    for soma in img_info['somas']:
+        outline_mask = None
+        if soma.get('polygon_points') and len(soma['polygon_points']) >= 3:
+            outline_mask = polygon_to_mask(soma['polygon_points'], processed_img.shape)
+        soma_outlines.append({{
+            'soma_idx': soma['soma_idx'],
+            'soma_id': soma['soma_id'],
+            'centroid': soma['centroid'],
+            'soma_area_um2': soma.get('soma_area_um2', 0),
+            'outline': outline_mask,
+        }})
+
+    print(f"  Somas: {{len(soma_outlines)}}")
+    print(f"  Segmentation: {{seg_method}}")
+
+    # Generate masks
+    if seg_method == 'competitive':
+        print(f"  Using competitive growth for {{len(soma_outlines)}} cells")
+        masks = create_competitive_masks(
+            processed_img, soma_outlines, area_list, pixel_size, img_name,
+            use_min_intensity, min_intensity_percent
+        )
+    else:
+        territory_map = None
+        if seg_method == 'watershed':
+            print(f"  Computing watershed territories...")
+            territory_map = build_watershed_territory_map(
+                processed_img, soma_outlines, pixel_size
+            )
+
+        masks = []
+        for soma_data in soma_outlines:
+            m = create_annulus_masks(
+                soma_data['centroid'], area_list, pixel_size,
+                soma_data['soma_idx'], soma_data['soma_id'],
+                processed_img, img_name, soma_data.get('soma_area_um2', 0),
+                soma_outline_mask=soma_data.get('outline'),
+                territory_map=territory_map,
+                use_min_intensity=use_min_intensity,
+                min_intensity_percent=min_intensity_percent,
+            )
+            masks.extend(m)
+
+    # Save masks to disk
+    masks_dir = os.path.join(output_dir, 'masks')
+    os.makedirs(masks_dir, exist_ok=True)
+
+    img_basename = os.path.splitext(img_name)[0]
+    saved_count = 0
+    for mask_data in masks:
+        if mask_data.get('duplicate'):
+            continue
+        mask = mask_data['mask']
+        if mask is None or not np.any(mask):
+            continue
+
+        mask_filename = f"{{img_basename}}_{{mask_data['soma_id']}}_area{{int(mask_data['area_um2'])}}_mask.tif"
+        mask_path = os.path.join(masks_dir, mask_filename)
+
+        mask_8bit = (mask > 0).astype(np.uint8) * 255
+        tifffile.imwrite(
+            mask_path, mask_8bit,
+            resolution=(1.0 / pixel_size, 1.0 / pixel_size),
+            metadata={{'unit': 'um'}}
+        )
+        saved_count += 1
+
+    print(f"  Saved {{saved_count}} masks to {{masks_dir}}")
+    return masks
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Cluster Mask Generation for MMPS')
+    parser.add_argument('--input-dir', required=True,
+                        help='Directory containing _processed.tif files')
+    parser.add_argument('--output-dir', default=None,
+                        help='Output directory (default: same as input-dir)')
+    parser.add_argument('--image-index', type=int, default=None,
+                        help='Process only this image index (for SLURM array jobs)')
+    args = parser.parse_args()
+
+    if args.output_dir is None:
+        args.output_dir = args.input_dir
+
+    image_names = list(IMAGE_DATA.keys())
+
+    if args.image_index is not None:
+        if args.image_index < 0 or args.image_index >= len(image_names):
+            print(f"ERROR: --image-index {{args.image_index}} out of range (0-{{len(image_names) - 1}})")
+            sys.exit(1)
+        image_names = [image_names[args.image_index]]
+
+    print("=" * 60)
+    print("MMPS Cluster Mask Generation")
+    print(f"Images to process: {{len(image_names)}}")
+    print(f"Pixel size: {{SETTINGS['pixel_size_um']}} um")
+    print(f"Mask sizes: {{SETTINGS['area_list_um2']}} um2")
+    print(f"Segmentation: {{SETTINGS['segmentation_method']}}")
+    print("=" * 60)
+
+    total_masks = 0
+    start_time = time.time()
+
+    for img_name in image_names:
+        img_info = IMAGE_DATA[img_name]
+        print(f"\\nProcessing {{img_name}}...")
+        t0 = time.time()
+        masks = process_image(img_name, img_info, args.input_dir, args.output_dir, SETTINGS)
+        elapsed = time.time() - t0
+        total_masks += len([m for m in masks if not m.get('duplicate')])
+        print(f"  Done in {{elapsed:.1f}}s")
+
+    total_time = time.time() - start_time
+    print(f"\\n{{\"=\" * 60}}")
+    print(f"Complete! Generated {{total_masks}} masks in {{total_time:.1f}}s")
+    print(f"{{\"=\" * 60}}")
+
+
+if __name__ == '__main__':
+    main()
+'''.format(
+            timestamp=time.strftime('%Y-%m-%d %H:%M:%S'),
+            script_name=os.path.basename(path) if path else 'cluster_mask_generation.py',
+            max_index=max(0, len(image_data) - 1),
+            settings_json=settings_json,
+            image_data_json=image_data_json,
+        )
+
+        return script
 
     def _auto_save(self):
         """Silently auto-save the session to the output directory."""
