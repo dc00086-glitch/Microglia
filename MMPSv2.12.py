@@ -948,12 +948,13 @@ class MorphologyCalculationThread(QThread):
     finished = pyqtSignal(list)  # list of results
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, approved_masks, pixel_size, use_imagej, images):
+    def __init__(self, approved_masks, pixel_size, use_imagej, images, output_dir=None):
         super().__init__()
         self.approved_masks = approved_masks
         self.pixel_size = pixel_size
         self.use_imagej = use_imagej
         self.images = images
+        self.output_dir = output_dir
 
     def run(self):
         import sys
@@ -969,7 +970,6 @@ class MorphologyCalculationThread(QThread):
 
             for i, flat_data in enumerate(self.approved_masks):
                 mask_data = flat_data['mask_data']
-                processed_img = flat_data['processed_img']
                 img_name = flat_data['image_name']
 
                 self.progress.emit(
@@ -979,6 +979,15 @@ class MorphologyCalculationThread(QThread):
 
                 # Find soma centroid and area from original image data
                 img_data = self.images[img_name]
+
+                # Get processed image, reloading from disk if needed
+                processed_img = img_data.get('processed')
+                if processed_img is None and self.output_dir:
+                    name_stem = os.path.splitext(img_name)[0]
+                    processed_path = os.path.join(self.output_dir, f"{name_stem}_processed.tif")
+                    if os.path.exists(processed_path):
+                        processed_img = tifffile.imread(processed_path)
+                        img_data['processed'] = processed_img
                 soma_centroid = img_data['somas'][mask_data['soma_idx']]
                 soma_area_um2 = mask_data.get('soma_area_um2', None)
 
@@ -3236,7 +3245,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     self.all_masks_flat.append({
                         'image_name': iname,
                         'mask_data': mask_data,
-                        'processed_img': idata['processed'],
                     })
 
             # Rebuild soma ordering for sliding window memory management
@@ -4399,6 +4407,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
             return
         try:
             img_data = self.images[self.current_image_name]
+
+            # Reload processed image from disk if it was freed to save RAM
+            if img_data.get('processed') is None and img_data.get('status') not in (None, 'loaded'):
+                self._ensure_processed_loaded(self.current_image_name)
+
             raw_img = load_tiff_image(img_data['raw_path'])
 
             # Always store color image for toggle functionality
@@ -6162,18 +6175,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
                                  if data['selected'] and data['soma_outlines'])
             current_count = 0
 
-            # Create mask_checklist.csv to track generation progress
-            mask_cl_path = self._get_checklist_path('mask_checklist.csv')
-            if mask_cl_path:
-                cl_rows = []
-                for iname, idata in self.images.items():
-                    if not idata['selected'] or not idata['soma_outlines']:
-                        continue
-                    for sd in idata['soma_outlines']:
-                        for area_val in area_list:
-                            mask_key = f"{iname}_{sd['soma_id']}_area{area_val}"
-                            cl_rows.append([mask_key, '0'])
-                self._write_checklist(mask_cl_path, cl_rows, ['Mask', 'Generated'])
+            # Create TEMPMASKCHECKLIST folder for per-image checklists
+            temp_cl_dir = None
+            if self.output_dir:
+                temp_cl_dir = os.path.join(self.output_dir, 'TEMPMASKCHECKLIST')
+                os.makedirs(temp_cl_dir, exist_ok=True)
 
             seg_method = self.mask_segmentation_method
 
@@ -6182,6 +6188,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     continue
 
                 self.log(f"Generating masks for {img_name}...")
+
+                # Write per-image checklist CSV into TEMPMASKCHECKLIST
+                img_cl_path = None
+                if temp_cl_dir:
+                    img_basename = os.path.splitext(img_name)[0]
+                    img_cl_path = os.path.join(temp_cl_dir, f"{img_basename}_mask_checklist.csv")
+                    cl_rows = []
+                    for sd in img_data['soma_outlines']:
+                        for area_val in area_list:
+                            mask_key = f"{img_name}_{sd['soma_id']}_area{area_val}"
+                            cl_rows.append([mask_key, '0'])
+                    self._write_checklist(img_cl_path, cl_rows, ['Mask', 'Generated'])
 
                 if seg_method == 'competitive':
                     # Competitive growth: all somas grow simultaneously
@@ -6195,10 +6213,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     )
                     img_data['masks'].extend(masks)
 
-                    if mask_cl_path and os.path.exists(mask_cl_path):
+                    if img_cl_path and os.path.exists(img_cl_path):
                         for m in masks:
                             m_key = f"{img_name}_{m['soma_id']}_area{m['area_um2']}"
-                            self._update_checklist_row(mask_cl_path, 0, m_key, 1, 1)
+                            self._update_checklist_row(img_cl_path, 0, m_key, 1, 1)
 
                     current_count += len(img_data['soma_outlines'])
                     self.progress_bar.setValue(int((current_count / total_outlines) * 100))
@@ -6232,10 +6250,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         img_data['masks'].extend(masks)
 
                         # Mark each generated mask in the checklist
-                        if mask_cl_path and os.path.exists(mask_cl_path):
+                        if img_cl_path and os.path.exists(img_cl_path):
                             for m in masks:
                                 m_key = f"{img_name}_{soma_id}_area{m['area_um2']}"
-                                self._update_checklist_row(mask_cl_path, 0, m_key, 1, 1)
+                                self._update_checklist_row(img_cl_path, 0, m_key, 1, 1)
 
                         current_count += 1
                         self.progress_bar.setValue(int((current_count / total_outlines) * 100))
@@ -6245,14 +6263,34 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 if self.masks_dir and os.path.isdir(self.masks_dir):
                     self._export_all_masks_to_disk(img_name, img_data['masks'])
 
+                # Free mask arrays from RAM — they are now safely on disk
+                for mask_data in img_data['masks']:
+                    mask_data['mask'] = None
+
+                # Free processed image and color image from RAM for this image
+                # They can be reloaded from disk on demand
+                img_data['processed'] = None
+                img_data['color_image'] = None
+                img_data.pop('color_image', None)
+
+                # Delete per-image checklist — this image is done
+                if img_cl_path and os.path.exists(img_cl_path):
+                    self._delete_checklist(img_cl_path)
+
                 img_data['status'] = 'masks_generated'
                 self._update_file_list_item(img_name)
+                self.log(f"  Freed RAM for {img_name} (masks saved to disk)")
 
             self.progress_bar.setVisible(False)
             self.progress_status_label.setVisible(False)
 
-            # Delete mask checklist — generation is done
-            self._delete_checklist(self._get_checklist_path('mask_checklist.csv'))
+            # Delete TEMPMASKCHECKLIST folder — all images are done
+            if temp_cl_dir and os.path.isdir(temp_cl_dir):
+                import shutil
+                try:
+                    shutil.rmtree(temp_cl_dir)
+                except Exception:
+                    pass
 
             self.batch_qa_btn.setEnabled(True)
             self.clear_masks_btn.setEnabled(True)
@@ -6452,6 +6490,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log(f"Redoing masks for {img_name}: {regen_min}-{regen_max} µm², "
                  f"step {regen_step}, intensity {regen_intensity}%")
 
+        # Ensure processed image is loaded (may have been freed to save RAM)
+        processed_img = self._ensure_processed_loaded(img_name)
+        if processed_img is None:
+            QMessageBox.warning(self, "Error", f"Cannot reload processed image for {img_name}")
+            return
+
         for soma_data in img_data['soma_outlines']:
             centroid = soma_data['centroid']
             soma_idx = soma_data['soma_idx']
@@ -6461,7 +6505,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
             masks = self._create_annulus_masks(
                 centroid, area_list, pixel_size, soma_idx, soma_id,
-                img_data['processed'], img_name, soma_area_um2,
+                processed_img, img_name, soma_area_um2,
                 soma_outline_mask=soma_outline
             )
             img_data['masks'].extend(masks)
@@ -6484,7 +6528,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.all_masks_flat.append({
                     'image_name': img_name,
                     'mask_data': mask_data,
-                    'processed_img': img_data['processed'],
                 })
 
         # Rebuild soma ordering after regeneration
@@ -6910,7 +6953,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.all_masks_flat.append({
                     'image_name': img_name,
                     'mask_data': mask_data,
-                    'processed_img': img_data['processed']
                 })
 
         if not self.all_masks_flat:
@@ -7034,6 +7076,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
             self.log(f"   💾 Finalized {soma_id} — freed mask arrays from memory")
 
+        # Free processed images for images where all somas have been finalized
+        for img_name in set(k[0] for k in self._qa_finalized_somas):
+            # Check if all somas for this image are finalized
+            all_finalized = all(
+                k in self._qa_finalized_somas
+                for k in self._qa_soma_order if k[0] == img_name
+            )
+            if all_finalized and img_name in self.images:
+                img_data = self.images[img_name]
+                if img_data.get('processed') is not None:
+                    img_data['processed'] = None
+                    img_data.pop('color_image', None)
+                    self.log(f"   💾 Freed processed image for {img_name}")
+
         # Trim undo history: remove decisions for finalized somas
         self.last_qa_decisions = [
             d for d in self.last_qa_decisions
@@ -7084,14 +7140,43 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.log(f"   ⚠️ Could not reload mask {mask_filename}: {e}")
         return False
 
+    def _ensure_processed_loaded(self, img_name):
+        """Ensure the processed image for img_name is loaded in memory.
+
+        Reloads from disk if it was freed to save RAM. Returns the processed array
+        or None if it cannot be loaded.
+        """
+        img_data = self.images.get(img_name)
+        if img_data is None:
+            return None
+        if img_data.get('processed') is not None:
+            return img_data['processed']
+
+        # Try to reload from the _processed.tif file on disk
+        name_stem = os.path.splitext(img_name)[0]
+        if self.output_dir:
+            processed_path = os.path.join(self.output_dir, f"{name_stem}_processed.tif")
+            if os.path.exists(processed_path):
+                try:
+                    img_data['processed'] = tifffile.imread(processed_path)
+                    return img_data['processed']
+                except Exception as e:
+                    self.log(f"   ⚠️ Could not reload processed image {name_stem}: {e}")
+        return None
+
     def _show_current_mask(self):
         if not self.all_masks_flat or self.mask_qa_idx >= len(self.all_masks_flat):
             return
 
         flat_data = self.all_masks_flat[self.mask_qa_idx]
         mask_data = flat_data['mask_data']
-        processed_img = flat_data['processed_img']
         img_name = flat_data['image_name']
+
+        # Reload processed image from disk if it was freed to save RAM
+        processed_img = self._ensure_processed_loaded(img_name)
+        if processed_img is None:
+            self.log(f"⚠️ Cannot display mask — processed image not found for {img_name}")
+            return
 
         # Reload mask from disk if it was evicted from memory
         if mask_data.get('mask') is None:
@@ -7556,14 +7641,24 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
             self.log(f"all_masks_flat has {len(self.all_masks_flat)} entries")
 
-            # Reload any evicted mask arrays from disk before analysis
+            # Reload any evicted mask arrays and processed images from disk before analysis
             reload_count = 0
+            processed_reload_count = 0
+            reloaded_images = set()
             for flat in self.all_masks_flat:
                 if flat['mask_data'].get('approved') and flat['mask_data'].get('mask') is None:
                     if self._reload_mask_from_disk(flat['mask_data'], flat['image_name']):
                         reload_count += 1
+                # Ensure processed image is loaded for each image with approved masks
+                if flat['mask_data'].get('approved') and flat['image_name'] not in reloaded_images:
+                    reloaded_images.add(flat['image_name'])
+                    if self._ensure_processed_loaded(flat['image_name']) is not None:
+                        if self.images[flat['image_name']].get('processed') is not None:
+                            processed_reload_count += 1
             if reload_count > 0:
                 self.log(f"   Reloaded {reload_count} evicted masks from disk for analysis")
+            if processed_reload_count > 0:
+                self.log(f"   Reloaded {processed_reload_count} processed images from disk for analysis")
 
             approved_masks = [flat for flat in self.all_masks_flat if flat['mask_data']['approved']]
             total = len(approved_masks)
@@ -7598,7 +7693,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
             # Create and start worker thread (no ImageJ needed)
             self.morph_thread = MorphologyCalculationThread(
-                approved_masks, pixel_size, use_imagej=False, images=self.images
+                approved_masks, pixel_size, use_imagej=False, images=self.images,
+                output_dir=self.output_dir
             )
 
             # Connect signals
