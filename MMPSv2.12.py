@@ -3179,8 +3179,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def _build_cluster_script(self, settings, image_data, path=None):
         """Build the standalone Python script string for cluster mask generation."""
-        settings_json = json.dumps(settings, indent=4)
-        image_data_json = json.dumps(image_data, indent=4)
+        # Convert JSON to valid Python literals (true->True, false->False, null->None)
+        settings_json = json.dumps(settings, indent=4).replace(': true', ': True').replace(': false', ': False').replace(': null', ': None')
+        image_data_json = json.dumps(image_data, indent=4).replace(': true', ': True').replace(': false', ': False').replace(': null', ': None')
 
         script = '''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
