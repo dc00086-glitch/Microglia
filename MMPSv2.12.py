@@ -3058,6 +3058,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def export_cluster_script(self):
         """Export a standalone Python script for mask generation on a compute cluster."""
+        try:
+            self._export_cluster_script_impl()
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"ERROR in cluster script export: {e}\n{tb}")
+            QMessageBox.critical(self, "Error",
+                f"Failed to generate cluster script:\n{e}\n\nSee log for details.")
+
+    def _export_cluster_script_impl(self):
+        """Internal implementation of cluster script export."""
         # Validate that we have enough data
         has_outlines = any(
             img_data.get('soma_outlines') and img_data['selected']

@@ -48,7 +48,22 @@ def load_zstack(filepath):
     Returns:
         np.ndarray of shape (Z, H, W) as uint8 or uint16 grayscale.
     """
-    stack = tifffile.imread(filepath)
+    try:
+        stack = tifffile.imread(filepath)
+    except Exception as _tiff_err:
+        # Fallback to PIL for LZW/compressed TIFFs when imagecodecs is missing
+        from PIL import Image
+        img = Image.open(filepath)
+        frames = []
+        try:
+            while True:
+                frames.append(np.array(img))
+                img.seek(img.tell() + 1)
+        except EOFError:
+            pass
+        if not frames:
+            raise ValueError(f"Could not read any frames from {filepath}") from _tiff_err
+        stack = np.stack(frames, axis=0)
 
     if stack.ndim == 2:
         # Single slice — wrap in Z dimension

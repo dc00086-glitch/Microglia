@@ -2,6 +2,7 @@ PyQt5>=5.15
 numpy
 Pillow
 tifffile
+imagecodecs
 scikit-image
 scipy
 matplotlib
