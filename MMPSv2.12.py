@@ -948,13 +948,14 @@ class MorphologyCalculationThread(QThread):
     finished = pyqtSignal(list)  # list of results
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, approved_masks, pixel_size, use_imagej, images, output_dir=None):
+    def __init__(self, approved_masks, pixel_size, use_imagej, images, output_dir=None, pixel_size_map=None):
         super().__init__()
         self.approved_masks = approved_masks
         self.pixel_size = pixel_size
         self.use_imagej = use_imagej
         self.images = images
         self.output_dir = output_dir
+        self.pixel_size_map = pixel_size_map or {}
 
     def run(self):
         import sys
@@ -995,7 +996,8 @@ class MorphologyCalculationThread(QThread):
                 import time
                 start = time.time()
 
-                calculator = MorphologyCalculator(processed_img, self.pixel_size, use_imagej=self.use_imagej)
+                img_pixel_size = self.pixel_size_map.get(img_name, self.pixel_size)
+                calculator = MorphologyCalculator(processed_img, img_pixel_size, use_imagej=self.use_imagej)
                 params = calculator.calculate_all_parameters(mask_data['mask'], soma_centroid, soma_area_um2)
 
                 elapsed = time.time() - start
@@ -1962,6 +1964,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mode_3d_action.setToolTip("Open the 3D Z-stack analysis window")
         self.mode_3d_action.triggered.connect(self._toggle_3d_mode)
 
+        # Advanced menu
+        advanced_menu = menu_bar.addMenu("Advanced")
+        per_image_px_action = advanced_menu.addAction("Set Per-Image Pixel Size...")
+        per_image_px_action.setToolTip("Override pixel size for individual images")
+        per_image_px_action.triggered.connect(self._set_per_image_pixel_size)
+
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
@@ -2732,10 +2740,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         label = self._get_active_label()
         if not label or label.measure_pt1 is None or label.measure_pt2 is None:
             return ""
-        try:
-            pixel_size = float(self.pixel_size_input.text())
-        except (ValueError, AttributeError):
-            pixel_size = 0.316
+        pixel_size = self._get_pixel_size(self.current_image_name)
 
         pt1 = label.measure_pt1
         pt2 = label.measure_pt2
@@ -2911,6 +2916,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 'animal_id': img_data.get('animal_id', ''),
                 'treatment': img_data.get('treatment', ''),
                 'rolling_ball_radius': img_data.get('rolling_ball_radius', 50),
+                'pixel_size': img_data.get('pixel_size'),
                 'somas': [(float(s[0]), float(s[1])) for s in img_data.get('somas', [])],
                 'soma_ids': img_data.get('soma_ids', []),
                 'soma_outlines': [],
@@ -2998,10 +3004,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             return
 
         # Gather settings
-        try:
-            pixel_size = float(self.pixel_size_input.text())
-        except ValueError:
-            pixel_size = 0.316
+        pixel_size = self._get_pixel_size()
 
         area_list = list(range(self.mask_min_area, self.mask_max_area + 1, self.mask_step_size))
         if area_list[-1] != self.mask_max_area:
@@ -3023,10 +3026,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     'soma_area_um2': outline.get('soma_area_um2', 0),
                     'polygon_points': [[float(p[0]), float(p[1])] for p in outline.get('polygon_points', [])],
                 })
-            image_data[img_name] = {
+            # Include per-image pixel size if set
+            img_entry = {
                 'processed_filename': os.path.splitext(img_name)[0] + '_processed.tif',
                 'somas': somas,
             }
+            per_img_px = img_data.get('pixel_size')
+            if per_img_px is not None:
+                img_entry['pixel_size'] = per_img_px
+            image_data[img_name] = img_entry
 
         # Ask where to save
         default_name = "cluster_mask_generation.py"
@@ -3469,7 +3477,8 @@ def build_watershed_territory_map(processed_img, soma_outlines, pixel_size_um):
 
 def process_image(img_name, img_info, input_dir, output_dir, settings):
     """Process a single image: generate all masks and save to disk."""
-    pixel_size = settings['pixel_size_um']
+    # Use per-image pixel size if available, otherwise global
+    pixel_size = img_info.get('pixel_size', settings['pixel_size_um'])
     area_list = settings['area_list_um2']
     seg_method = settings['segmentation_method']
     use_min_intensity = settings['use_min_intensity']
@@ -3692,6 +3701,132 @@ if __name__ == '__main__':
                 self._3d_window = None
             self.log("3D Z-Stack Analysis window closed")
 
+    def _get_pixel_size(self, img_name=None):
+        """Get the pixel size for an image, falling back to the global setting.
+
+        Args:
+            img_name: Image name to look up. If None, returns the global pixel size.
+
+        Returns:
+            float pixel size in µm/px.
+        """
+        if img_name and img_name in self.images:
+            per_image = self.images[img_name].get('pixel_size')
+            if per_image is not None:
+                return per_image
+        try:
+            return float(self.pixel_size_input.text())
+        except (ValueError, AttributeError):
+            return 0.316
+
+    def _set_per_image_pixel_size(self):
+        """Show a dialog to set pixel size overrides for individual images."""
+        if not self.images:
+            QMessageBox.warning(self, "Warning", "No images loaded.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Per-Image Pixel Size")
+        dialog.setModal(True)
+        layout = QVBoxLayout()
+
+        info = QLabel(
+            "Override pixel size for individual images.\n"
+            "Leave blank to use the global pixel size."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Global pixel size display
+        global_px = self.pixel_size_input.text()
+        global_label = QLabel(f"Global pixel size: {global_px} µm/px")
+        global_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(global_label)
+
+        layout.addSpacing(5)
+
+        # Table of images with pixel size inputs
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["Image", "Pixel Size (µm/px)"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        table.setColumnWidth(1, 150)
+
+        image_names = list(self.images.keys())
+        table.setRowCount(len(image_names))
+
+        inputs = {}
+        for row, img_name in enumerate(image_names):
+            # Image name (read-only)
+            name_item = QTableWidgetItem(os.path.splitext(img_name)[0])
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 0, name_item)
+
+            # Pixel size input
+            per_image = self.images[img_name].get('pixel_size')
+            line_edit = QLineEdit()
+            line_edit.setPlaceholderText(f"{global_px} (global)")
+            if per_image is not None:
+                line_edit.setText(str(per_image))
+            table.setCellWidget(row, 1, line_edit)
+            inputs[img_name] = line_edit
+
+        layout.addWidget(table)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+
+        clear_btn = QPushButton("Clear All Overrides")
+        clear_btn.clicked.connect(lambda: [inp.clear() for inp in inputs.values()])
+        btn_layout.addWidget(clear_btn)
+
+        btn_layout.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        ok_btn = QPushButton("Apply")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(dialog.accept)
+        ok_btn.setStyleSheet("QPushButton { font-weight: bold; }")
+        btn_layout.addWidget(ok_btn)
+
+        layout.addLayout(btn_layout)
+        dialog.setLayout(layout)
+        dialog.setMinimumWidth(500)
+        dialog.setMinimumHeight(400)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        # Apply the pixel sizes
+        changed = 0
+        for img_name, line_edit in inputs.items():
+            text = line_edit.text().strip()
+            if text:
+                try:
+                    val = float(text)
+                    if val > 0:
+                        self.images[img_name]['pixel_size'] = val
+                        changed += 1
+                    else:
+                        self.images[img_name]['pixel_size'] = None
+                except ValueError:
+                    self.images[img_name]['pixel_size'] = None
+            else:
+                self.images[img_name]['pixel_size'] = None
+
+        overrides = {name: data['pixel_size'] for name, data in self.images.items()
+                     if data.get('pixel_size') is not None}
+        if overrides:
+            self.log(f"Per-image pixel sizes set for {len(overrides)} image(s):")
+            for name, px in overrides.items():
+                self.log(f"  {os.path.splitext(name)[0]}: {px} µm/px")
+        elif changed == 0:
+            self.log("All per-image pixel size overrides cleared (using global)")
+
     def _auto_save(self):
         """Silently auto-save the session to the output directory."""
         if not self.output_dir or not self.images:
@@ -3844,6 +3979,7 @@ if __name__ == '__main__':
                     'selected': img_session.get('selected', False),
                     'animal_id': img_session.get('animal_id', ''),
                     'treatment': img_session.get('treatment', ''),
+                    'pixel_size': img_session.get('pixel_size'),
                 }
 
                 # If processed image wasn't found, downgrade status
@@ -5034,7 +5170,8 @@ if __name__ == '__main__':
                 'status': 'loaded',
                 'selected': False,
                 'animal_id': '',
-                'treatment': ''
+                'treatment': '',
+                'pixel_size': None,
             }
             item = QListWidgetItem(f"☐ ⚪ {img_name} [loaded]")
             item.setData(Qt.UserRole, img_name)
@@ -5592,10 +5729,7 @@ if __name__ == '__main__':
             gray = extract_channel(img_data['color_image'], self.grayscale_channel)
         else:
             return coords
-        try:
-            pixel_size = float(self.pixel_size_input.text())
-        except (ValueError, AttributeError):
-            pixel_size = 0.3
+        pixel_size = self._get_pixel_size(self.current_image_name)
         radius_px = max(1, int(round(2.0 / pixel_size)))
         row, col = int(coords[0]), int(coords[1])
         h, w = gray.shape[:2]
@@ -6229,7 +6363,7 @@ if __name__ == '__main__':
         soma_id = img_data['soma_ids'][soma_idx]
 
         # Calculate soma area from the outline
-        pixel_size = float(self.pixel_size_input.text())
+        pixel_size = self._get_pixel_size(img_name)
         soma_area_um2 = np.sum(mask) * (pixel_size ** 2)
 
         img_data['soma_outlines'].append({
@@ -6477,7 +6611,7 @@ if __name__ == '__main__':
 
             # Create mask from points
             mask = self._polygon_to_mask(points, outline_img.shape)
-            pixel_size = float(self.pixel_size_input.text())
+            pixel_size = self._get_pixel_size(img_name)
             soma_area_um2 = np.sum(mask) * (pixel_size ** 2)
 
             # Save outline
@@ -6870,7 +7004,7 @@ if __name__ == '__main__':
 
         # Now proceed with mask generation
         try:
-            pixel_size = float(self.pixel_size_input.text())
+            pixel_size = self._get_pixel_size()
 
             # Build area list from user settings
             area_list = list(range(self.mask_min_area, self.mask_max_area + 1, self.mask_step_size))
@@ -6898,6 +7032,11 @@ if __name__ == '__main__':
 
                 self.log(f"Generating masks for {img_name}...")
 
+                # Use per-image pixel size if set
+                img_pixel_size = self._get_pixel_size(img_name)
+                if img_pixel_size != pixel_size:
+                    self.log(f"  Using per-image pixel size: {img_pixel_size} µm/px")
+
                 # Write per-image checklist CSV into TEMPMASKCHECKLIST
                 img_cl_path = None
                 if temp_cl_dir:
@@ -6918,7 +7057,7 @@ if __name__ == '__main__':
 
                     masks = self._create_competitive_masks(
                         img_data['processed'], img_data['soma_outlines'],
-                        area_list, pixel_size, img_name
+                        area_list, img_pixel_size, img_name
                     )
                     img_data['masks'].extend(masks)
 
@@ -6937,7 +7076,7 @@ if __name__ == '__main__':
                         self.progress_status_label.setText(f"Watershed: {img_name}")
                         QApplication.processEvents()
                         territory_map = self._build_watershed_territory_map(
-                            img_data['processed'], img_data['soma_outlines'], pixel_size
+                            img_data['processed'], img_data['soma_outlines'], img_pixel_size
                         )
 
                     for soma_data in img_data['soma_outlines']:
@@ -6951,7 +7090,7 @@ if __name__ == '__main__':
                         QApplication.processEvents()
 
                         masks = self._create_annulus_masks(
-                            centroid, area_list, pixel_size, soma_idx, soma_id,
+                            centroid, area_list, img_pixel_size, soma_idx, soma_id,
                             img_data['processed'], img_name, soma_area_um2,
                             soma_outline_mask=soma_outline,
                             territory_map=territory_map
@@ -7167,10 +7306,7 @@ if __name__ == '__main__':
         if area_list[-1] != regen_max:
             area_list.append(regen_max)
 
-        try:
-            pixel_size = float(self.pixel_size_input.text())
-        except ValueError:
-            pixel_size = 0.316
+        pixel_size = self._get_pixel_size(img_name)
 
         # Delete old mask files from disk for this image
         if self.masks_dir and os.path.isdir(self.masks_dir):
@@ -8051,10 +8187,7 @@ if __name__ == '__main__':
             return
 
         # Get pixel size
-        try:
-            pixel_size = float(self.pixel_size_input.text())
-        except:
-            pixel_size = 0.316  # default
+        pixel_size = self._get_pixel_size(img_name)
 
         # Save as TIFF with calibration
         try:
@@ -8081,10 +8214,7 @@ if __name__ == '__main__':
 
         img_basename = os.path.splitext(img_name)[0]
 
-        try:
-            pixel_size = float(self.pixel_size_input.text())
-        except (ValueError, AttributeError):
-            pixel_size = 0.316
+        pixel_size = self._get_pixel_size(img_name)
 
         exported = 0
         for mask_data in masks:
@@ -8343,7 +8473,7 @@ if __name__ == '__main__':
 
     def batch_calculate_morphology(self):
         try:
-            pixel_size = float(self.pixel_size_input.text())
+            pixel_size = self._get_pixel_size()
 
             # No ImageJ required for simple characteristics
             # Complex analysis (Sholl, Skeleton) will be done separately in ImageJ
@@ -8400,10 +8530,15 @@ if __name__ == '__main__':
             # Disable the calculate button during processing
             self.batch_calculate_btn.setEnabled(False)
 
+            # Build per-image pixel size map
+            pixel_size_map = {}
+            for img_name, img_data in self.images.items():
+                pixel_size_map[img_name] = self._get_pixel_size(img_name)
+
             # Create and start worker thread (no ImageJ needed)
             self.morph_thread = MorphologyCalculationThread(
                 approved_masks, pixel_size, use_imagej=False, images=self.images,
-                output_dir=self.output_dir
+                output_dir=self.output_dir, pixel_size_map=pixel_size_map
             )
 
             # Connect signals
