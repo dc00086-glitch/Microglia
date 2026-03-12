@@ -5176,6 +5176,11 @@ if __name__ == '__main__':
     def update_display(self):
         """Update the display with current brightness/contrast settings"""
         try:
+            # In 3D mode, delegate to the 3D display path
+            if self.mode_3d:
+                self._display_current_image_3d()
+                return
+
             # Refresh the current image display
             if self.current_image_name and self.current_image_name in self.images:
                 current_tab = self.tabs.currentIndex()
@@ -5466,13 +5471,19 @@ if __name__ == '__main__':
             self.file_list.setCurrentRow(0)
             self.log(f"Displaying: {first_image_name}")
 
+    def _to_grayscale_3d(self, stack):
+        """Convert a Z-stack to grayscale using the selected channel."""
+        if stack.ndim == 4 and _HAS_3D:
+            return extract_channel_3d(stack, self.grayscale_channel)
+        return ensure_grayscale_3d(stack)
+
     def _load_and_display_raw_3d(self, img_name):
         """Load raw Z-stack and display the middle slice."""
         img_data = self.images[img_name]
         if img_data.get('raw_stack') is None:
             try:
                 stack = load_zstack(img_data['raw_path'])
-                stack = ensure_grayscale_3d(stack)
+                stack = self._to_grayscale_3d(stack)
                 img_data['raw_stack'] = stack
             except Exception as e:
                 self.log(f"ERROR loading {img_name}: {e}")
@@ -5617,7 +5628,7 @@ if __name__ == '__main__':
             if img_data.get('raw_stack') is None:
                 try:
                     stack = load_zstack(img_data['raw_path'])
-                    stack = ensure_grayscale_3d(stack)
+                    stack = self._to_grayscale_3d(stack)
                     img_data['raw_stack'] = stack
                 except Exception as e:
                     self.log(f"ERROR loading: {e}")
@@ -5801,7 +5812,7 @@ if __name__ == '__main__':
         if img_data.get('raw_stack') is None:
             try:
                 stack = load_zstack(img_data['raw_path'])
-                stack = ensure_grayscale_3d(stack)
+                stack = self._to_grayscale_3d(stack)
                 img_data['raw_stack'] = stack
             except Exception as e:
                 self.log(f"ERROR: {e}")
@@ -6031,10 +6042,11 @@ if __name__ == '__main__':
             finished_image = pyqtSignal(str, str, object)
             error_occurred = pyqtSignal(str)
 
-            def __init__(self, image_data_list, output_dir):
+            def __init__(self, image_data_list, output_dir, channel_idx=0):
                 super().__init__()
                 self.image_data_list = image_data_list
                 self.output_dir = output_dir
+                self.channel_idx = channel_idx
 
             def run(self):
                 total = len(self.image_data_list)
@@ -6043,7 +6055,10 @@ if __name__ == '__main__':
                     try:
                         self.status_update.emit(f"Processing {img_name}...")
                         stack = load_zstack(raw_path)
-                        stack = ensure_grayscale_3d(stack)
+                        if stack.ndim == 4 and _HAS_3D:
+                            stack = extract_channel_3d(stack, self.channel_idx)
+                        else:
+                            stack = ensure_grayscale_3d(stack)
                         rb_r2 = rb_radius if rb_on else 0
                         dn_s2 = dn_sz if dn_on else 0
                         sh_a2 = sh_amt if sh_on else 0.0
@@ -6057,7 +6072,7 @@ if __name__ == '__main__':
                         self.error_occurred.emit(f"{img_name}: {e}")
                     self.progress.emit(int((i + 1) / total * 100))
 
-        self._preprocess_thread_3d = _PreprocessThread3D(process_list, self.output_dir)
+        self._preprocess_thread_3d = _PreprocessThread3D(process_list, self.output_dir, self.grayscale_channel)
         self._preprocess_thread_3d.status_update.connect(self.log)
         self._preprocess_thread_3d.progress.connect(lambda v: self.progress_bar.setValue(v))
         self._preprocess_thread_3d.finished_image.connect(self._handle_processed_image_3d)
@@ -6077,7 +6092,7 @@ if __name__ == '__main__':
             if self.images[img_name].get('raw_stack') is None:
                 try:
                     raw = load_zstack(self.images[img_name]['raw_path'])
-                    self.images[img_name]['raw_stack'] = ensure_grayscale_3d(raw)
+                    self.images[img_name]['raw_stack'] = self._to_grayscale_3d(raw)
                 except Exception:
                     pass
             self._update_file_list_item(img_name)
@@ -6208,7 +6223,7 @@ if __name__ == '__main__':
         if img_data.get('raw_stack') is None:
             try:
                 raw = load_zstack(img_data['raw_path'])
-                img_data['raw_stack'] = ensure_grayscale_3d(raw)
+                img_data['raw_stack'] = self._to_grayscale_3d(raw)
             except Exception:
                 pass
         self._update_z_slider_for_image()
