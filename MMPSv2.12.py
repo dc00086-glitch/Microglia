@@ -3713,9 +3713,9 @@ def main():
         print(f"  Done in {{elapsed:.1f}}s")
 
     total_time = time.time() - start_time
-    print(f"\\n{{\"=\" * 60}}")
+    print("\\n" + "=" * 60)
     print(f"Complete! Generated {{total_masks}} masks in {{total_time:.1f}}s")
-    print(f"{{\"=\" * 60}}")
+    print("=" * 60)
 
 
 if __name__ == '__main__':
