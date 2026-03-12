@@ -55,6 +55,25 @@ except Exception:
     _HAS_3D = False
 
 
+def safe_tiff_read(filepath):
+    """Read a TIFF via tifffile, falling back to PIL if imagecodecs is missing."""
+    try:
+        return tifffile.imread(filepath)
+    except Exception:
+        img = Image.open(filepath)
+        # For multi-page TIFFs (Z-stacks), read all frames
+        frames = []
+        try:
+            while True:
+                frames.append(np.array(img))
+                img.seek(img.tell() + 1)
+        except EOFError:
+            pass
+        if len(frames) == 1:
+            return frames[0]
+        return np.stack(frames, axis=0)
+
+
 def load_tiff_image(filepath):
     """Load TIFF image using PIL to handle all compression types"""
     img = Image.open(filepath)
@@ -1014,7 +1033,7 @@ class MorphologyCalculationThread(QThread):
                     name_stem = os.path.splitext(img_name)[0]
                     processed_path = os.path.join(self.output_dir, f"{name_stem}_processed.tif")
                     if os.path.exists(processed_path):
-                        processed_img = tifffile.imread(processed_path)
+                        processed_img = safe_tiff_read(processed_path)
                         img_data['processed'] = processed_img
                 soma_centroid = img_data['somas'][mask_data['soma_idx']]
                 soma_area_um2 = mask_data.get('soma_area_um2', None)
@@ -4147,7 +4166,7 @@ if __name__ == '__main__':
                 processed_path = img_session.get('processed_path')
                 if processed_path and os.path.exists(processed_path):
                     try:
-                        processed_data = tifffile.imread(processed_path)
+                        processed_data = safe_tiff_read(processed_path)
                     except Exception:
                         processed_data = None
 
@@ -4156,7 +4175,7 @@ if __name__ == '__main__':
                 for ch_str, ch_path in img_session.get('extra_channel_paths', {}).items():
                     if os.path.exists(ch_path):
                         try:
-                            processed_channels[int(ch_str)] = tifffile.imread(ch_path)
+                            processed_channels[int(ch_str)] = safe_tiff_read(ch_path)
                         except Exception:
                             pass
 
@@ -4260,7 +4279,7 @@ if __name__ == '__main__':
                         loaded_keys.add((soma_id, size_val))
                         mask_path = os.path.join(self.masks_dir, mf)
                         try:
-                            mask_arr = tifffile.imread(mask_path)
+                            mask_arr = safe_tiff_read(mask_path)
                             mask_arr = (mask_arr > 0).astype(np.uint8)
                             soma_ids_list = self.images[img_name]['soma_ids']
                             soma_idx = soma_ids_list.index(soma_id) if soma_id in soma_ids_list else 0
@@ -8598,7 +8617,7 @@ if __name__ == '__main__':
         path = os.path.join(self.masks_dir, fname)
         if os.path.exists(path):
             try:
-                arr = tifffile.imread(path)
+                arr = safe_tiff_read(path)
                 mask_data['mask'] = (arr > 0).astype(np.uint8)
                 return True
             except Exception as e:
@@ -8799,7 +8818,7 @@ if __name__ == '__main__':
 
         if os.path.exists(mask_path):
             try:
-                mask_arr = tifffile.imread(mask_path)
+                mask_arr = safe_tiff_read(mask_path)
                 # Convert back from 0/255 to 0/1
                 mask_data['mask'] = (mask_arr > 0).astype(np.uint8)
                 return True
@@ -8825,7 +8844,7 @@ if __name__ == '__main__':
             processed_path = os.path.join(self.output_dir, f"{name_stem}_processed.tif")
             if os.path.exists(processed_path):
                 try:
-                    img_data['processed'] = tifffile.imread(processed_path)
+                    img_data['processed'] = safe_tiff_read(processed_path)
                     return img_data['processed']
                 except Exception as e:
                     self.log(f"   ⚠️ Could not reload processed image {name_stem}: {e}")
