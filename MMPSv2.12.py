@@ -27,6 +27,33 @@ import json
 import csv
 import math
 
+# --- 3D Z-stack functions (imported from 3DMicroglia.py) ---
+try:
+    import importlib.util as _ilu
+    _3d_script = os.path.join(
+        getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__))),
+        "3DMicroglia.py",
+    )
+    _spec3d = _ilu.spec_from_file_location("ThreeDMicroglia", _3d_script)
+    _mod3d = _ilu.module_from_spec(_spec3d)
+    _spec3d.loader.exec_module(_mod3d)
+    # Pull standalone 3D functions into module scope
+    load_zstack = _mod3d.load_zstack
+    ensure_grayscale_3d = _mod3d.ensure_grayscale_3d
+    extract_channel_3d = _mod3d.extract_channel_3d
+    preprocess_zstack = _mod3d.preprocess_zstack
+    detect_soma_3d = _mod3d.detect_soma_3d
+    create_spherical_annulus_masks = _mod3d.create_spherical_annulus_masks
+    create_competitive_masks_3d = _mod3d.create_competitive_masks_3d
+    Morphology3DCalculator = _mod3d.Morphology3DCalculator
+    skeletonize_3d_mask = _mod3d.skeletonize_3d_mask
+    sholl_analysis_3d = _mod3d.sholl_analysis_3d
+    fractal_dimension_3d = _mod3d.fractal_dimension_3d
+    export_mask_3d = _mod3d.export_mask_3d
+    _HAS_3D = True
+except Exception:
+    _HAS_3D = False
+
 
 def load_tiff_image(filepath):
     """Load TIFF image using PIL to handle all compression types"""
@@ -1824,6 +1851,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.measure_mode = False
         self.measure_point1 = None  # (row, col) image coords
         self.measure_point2 = None
+        # --- 3D Z-stack mode state ---
+        self.mode_3d = False
+        self.current_z_slice = 0
+        self.voxel_size_z = 1.0
+        self.mask_min_volume = 500
+        self.mask_max_volume = 5000
+        self.soma_intensity_tolerance = 30
+        self.soma_max_radius_um = 8.0
         self.init_ui()
 
     def keyPressEvent(self, event):
@@ -2031,7 +2066,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         param_layout = QVBoxLayout()
         form_layout = QFormLayout()
         self.pixel_size_input = QLineEdit(str(self.pixel_size))
-        form_layout.addRow("Pixel size (μm/px):", self.pixel_size_input)
+        self.pixel_size_label = QLabel("Pixel size (μm/px):")
+        form_layout.addRow(self.pixel_size_label, self.pixel_size_input)
+        # 3D voxel Z input (hidden until 3D mode enabled)
+        self.voxel_z_input = QLineEdit(str(self.voxel_size_z))
+        self.voxel_z_label = QLabel("Z step size (μm/slice):")
+        form_layout.addRow(self.voxel_z_label, self.voxel_z_input)
+        self.voxel_z_label.setVisible(False)
+        self.voxel_z_input.setVisible(False)
         param_layout.addLayout(form_layout)
 
         # Channel selection for processing
@@ -2305,6 +2347,22 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Give tabs most of the space (stretch factor)
         layout.addWidget(self.tabs, stretch=1)
+
+        # Z-slice slider (hidden until 3D mode enabled)
+        self.z_slider_widget = QWidget()
+        z_layout = QHBoxLayout(self.z_slider_widget)
+        z_layout.setContentsMargins(0, 0, 0, 0)
+        z_layout.addWidget(QLabel("Z-Slice:"))
+        self.z_slider = QSlider(Qt.Horizontal)
+        self.z_slider.setRange(0, 0)
+        self.z_slider.setValue(0)
+        self.z_slider.valueChanged.connect(self._on_z_slider_changed)
+        z_layout.addWidget(self.z_slider)
+        self.z_label = QLabel("0 / 0")
+        self.z_label.setFixedWidth(80)
+        z_layout.addWidget(self.z_label)
+        self.z_slider_widget.setVisible(False)
+        layout.addWidget(self.z_slider_widget)
 
         # Display adjustments buttons in a row
         display_btn_layout = QHBoxLayout()
@@ -2883,6 +2941,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
             'grayscale_channel': self.grayscale_channel,
             'last_completed_step': last_step,
             'last_image_name': self.current_image_name,
+            'mode_3d': self.mode_3d,
+            'voxel_size_z': self.voxel_z_input.text() if self.mode_3d else None,
+            'mask_min_volume': self.mask_min_volume,
+            'mask_max_volume': self.mask_max_volume,
+            'soma_intensity_tolerance': self.soma_intensity_tolerance,
+            'soma_max_radius_um': self.soma_max_radius_um,
             'images': {}
         }
 
@@ -2917,11 +2981,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 'treatment': img_data.get('treatment', ''),
                 'rolling_ball_radius': img_data.get('rolling_ball_radius', 50),
                 'pixel_size': img_data.get('pixel_size'),
-                'somas': [(float(s[0]), float(s[1])) for s in img_data.get('somas', [])],
+                'somas': [tuple(float(c) for c in s) for s in img_data.get('somas', [])],
                 'soma_ids': img_data.get('soma_ids', []),
                 'soma_outlines': [],
             }
-            # Save soma outlines with full metadata
+            # Save soma outlines with full metadata (2D only)
             for outline in img_data.get('soma_outlines', []):
                 outline_data = {
                     'soma_idx': outline.get('soma_idx', 0),
@@ -2935,11 +2999,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
             # Record which masks exist on disk and their approval state
             mask_qa_state = []
             for mask in img_data.get('masks', []):
-                mask_qa_state.append({
+                mqa = {
                     'soma_id': mask.get('soma_id', ''),
-                    'area_um2': mask.get('area_um2', 0),
                     'approved': mask.get('approved'),
-                })
+                    'soma_idx': mask.get('soma_idx', 0),
+                }
+                if self.mode_3d:
+                    mqa['volume_um3'] = mask.get('volume_um3', 0)
+                else:
+                    mqa['area_um2'] = mask.get('area_um2', 0)
+                mask_qa_state.append(mqa)
             img_session['mask_qa_state'] = mask_qa_state
 
             if self.masks_dir:
@@ -2958,14 +3027,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def save_session(self):
         """Save the entire project state to a JSON file"""
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Session", "", "Session Files (*.mmps_session);;All Files (*)"
-        )
+        ext = '.mmps3d_session' if self.mode_3d else '.mmps_session'
+        filt = f"Session Files (*{ext});;All Files (*)"
+        path, _ = QFileDialog.getSaveFileName(self, "Save Session", "", filt)
         if not path:
             return
 
-        if not path.endswith('.mmps_session'):
-            path += '.mmps_session'
+        if not path.endswith(ext):
+            path += ext
 
         try:
             session = self._build_session_dict()
@@ -3657,49 +3726,170 @@ if __name__ == '__main__':
             self._display_current_image()
 
     def _toggle_3d_mode(self, checked):
-        """Open or close the 3D Z-stack analysis window from the Mode menu."""
+        """Toggle 3D Z-stack analysis mode within the same GUI."""
+        if checked and not _HAS_3D:
+            QMessageBox.warning(self, "Error",
+                "3DMicroglia.py not found.\n\n"
+                "Make sure 3DMicroglia.py is in the same folder as MMPS.")
+            self.mode_3d_action.setChecked(False)
+            return
+
+        if checked and self.images:
+            reply = QMessageBox.question(
+                self, "Switch to 3D Mode",
+                "Switching to 3D mode will clear current images.\nContinue?",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                self.mode_3d_action.setChecked(False)
+                return
+            self.images.clear()
+            self.file_list.clear()
+            self.current_image_name = None
+            self.all_masks_flat.clear()
+
+        self.mode_3d = checked
+
+        # Show/hide 3D-specific UI
+        self.z_slider_widget.setVisible(checked)
+        self.voxel_z_label.setVisible(checked)
+        self.voxel_z_input.setVisible(checked)
         if checked:
-            try:
-                # Import the 3D GUI from 3DMicroglia.py
-                # Use importlib to handle the numeric filename
-                import importlib.util
-                # Check PyInstaller bundle dir first, then script dir
-                if getattr(sys, 'frozen', False):
-                    script_dir = sys._MEIPASS
-                else:
-                    script_dir = os.path.dirname(os.path.abspath(__file__))
-                spec = importlib.util.spec_from_file_location(
-                    "ThreeDMicroglia",
-                    os.path.join(script_dir, "3DMicroglia.py")
-                )
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-
-                self._3d_window = module.MicrogliaAnalysis3DGUI()
-                self._3d_window.setWindowTitle("MMPS — 3D Z-Stack Analysis")
-                self._3d_window.show()
-
-                # Uncheck when the 3D window is closed
-                self._3d_window.destroyed.connect(
-                    lambda: self.mode_3d_action.setChecked(False)
-                )
-
-                self.log("3D Z-Stack Analysis window opened")
-
-            except FileNotFoundError:
-                QMessageBox.warning(self, "Error",
-                    "3DMicroglia.py not found.\n\n"
-                    "Make sure 3DMicroglia.py is in the same folder as MMPS.")
-                self.mode_3d_action.setChecked(False)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to open 3D mode:\n{e}")
-                self.mode_3d_action.setChecked(False)
+            self.pixel_size_label.setText("XY pixel size (μm/px):")
+            self.setWindowTitle("Microglia Analysis - 3D Z-Stack Mode")
         else:
-            # Close the 3D window if it exists
-            if hasattr(self, '_3d_window') and self._3d_window is not None:
-                self._3d_window.close()
-                self._3d_window = None
-            self.log("3D Z-Stack Analysis window closed")
+            self.pixel_size_label.setText("Pixel size (μm/px):")
+            self.setWindowTitle("Microglia Analysis - Multi-Image Batch Processing")
+
+        self.log(f"{'3D Z-Stack' if checked else '2D'} mode {'enabled' if checked else 'restored'}")
+
+    # ----------------------------------------------------------------
+    # 3D DISPLAY HELPERS
+    # ----------------------------------------------------------------
+
+    def _get_current_z_max(self):
+        """Get the Z depth of the current image's stack."""
+        if not self.current_image_name or self.current_image_name not in self.images:
+            return 0
+        img_data = self.images[self.current_image_name]
+        stack = img_data.get('processed') or img_data.get('raw_stack')
+        if stack is not None and stack.ndim >= 3:
+            return stack.shape[0] - 1
+        return 0
+
+    def _get_slice_for_display(self, stack, z=None):
+        """Get a 2D slice from a 3D stack for display."""
+        if stack is None:
+            return np.zeros((100, 100), dtype=np.uint8)
+        if z is None:
+            z = self.current_z_slice
+        z = max(0, min(stack.shape[0] - 1, z))
+        return stack[z]
+
+    def _on_z_slider_changed(self, value):
+        self.current_z_slice = value
+        z_max = self.z_slider.maximum()
+        self.z_label.setText(f"{value} / {z_max}")
+        self._refresh_3d_view()
+
+    def _refresh_3d_view(self):
+        """Refresh the currently visible tab with the current Z-slice."""
+        if not self.mode_3d or not self.current_image_name:
+            return
+        img_data = self.images.get(self.current_image_name)
+        if not img_data:
+            return
+
+        if self.mask_qa_active:
+            self._show_current_mask()
+            return
+
+        tab_idx = self.tabs.currentIndex()
+        if tab_idx == 0:  # Original
+            stack = img_data.get('raw_stack')
+            if stack is not None:
+                sl = self._get_slice_for_display(stack)
+                adjusted = self._apply_display_adjustments(sl)
+                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                self.original_label.set_image(pixmap)
+        elif tab_idx == 1:  # Preview
+            stack = img_data.get('preview_stack')
+            if stack is not None:
+                sl = self._get_slice_for_display(stack)
+                adjusted = self._apply_display_adjustments(sl)
+                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                self.preview_label.set_image(pixmap)
+        elif tab_idx == 2:  # Processed
+            stack = img_data.get('processed')
+            if stack is not None:
+                sl = self._get_slice_for_display(stack)
+                adjusted = self._apply_display_adjustments(sl)
+                centroids_2d = self._get_centroids_on_slice_3d(img_data)
+                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                self.processed_label.set_image(pixmap, centroids=centroids_2d)
+        elif tab_idx == 3:  # Masks
+            if self.mask_qa_active:
+                self._show_current_mask()
+
+    def _get_centroids_on_slice_3d(self, img_data, z_tolerance=2):
+        """Get soma centroids visible on the current Z-slice."""
+        centroids_2d = []
+        z = self.current_z_slice
+        for soma in img_data.get('somas', []):
+            if len(soma) == 3:
+                sz, sy, sx = soma
+                if abs(sz - z) <= z_tolerance:
+                    centroids_2d.append((sy, sx))
+        return centroids_2d
+
+    def _update_z_slider_for_image(self, img_name=None):
+        """Update Z-slider range based on current image stack depth."""
+        if img_name is None:
+            img_name = self.current_image_name
+        if not img_name or img_name not in self.images:
+            self.z_slider.setRange(0, 0)
+            self.z_label.setText("0 / 0")
+            return
+        z_max = self._get_current_z_max()
+        self.z_slider.setRange(0, z_max)
+        if self.current_z_slice > z_max:
+            self.current_z_slice = z_max // 2
+        self.z_slider.setValue(self.current_z_slice)
+        self.z_label.setText(f"{self.current_z_slice} / {z_max}")
+
+    def _snap_to_brightest_3d(self, z, y, x):
+        """Snap to brightest voxel within a small 3D radius."""
+        if not self.current_image_name:
+            return z, y, x
+        img_data = self.images[self.current_image_name]
+        stack = img_data.get('processed') or img_data.get('raw_stack')
+        if stack is None:
+            return z, y, x
+        try:
+            voxel_xy = float(self.pixel_size_input.text())
+        except ValueError:
+            voxel_xy = 0.3
+        radius_px = max(1, int(round(2.0 / voxel_xy)))
+        Z, H, W = stack.shape
+        best_val = -1
+        best_z, best_y, best_x = z, y, x
+        for dz in range(-1, 2):
+            nz = z + dz
+            if nz < 0 or nz >= Z:
+                continue
+            for dy in range(-radius_px, radius_px + 1):
+                ny = y + dy
+                if ny < 0 or ny >= H:
+                    continue
+                for dx in range(-radius_px, radius_px + 1):
+                    nx = x + dx
+                    if nx < 0 or nx >= W:
+                        continue
+                    if dy ** 2 + dx ** 2 <= radius_px ** 2:
+                        val = float(stack[nz, ny, nx])
+                        if val > best_val:
+                            best_val = val
+                            best_z, best_y, best_x = nz, ny, nx
+        return best_z, best_y, best_x
 
     def _get_pixel_size(self, img_name=None):
         """Get the pixel size for an image, falling back to the global setting.
@@ -3842,7 +4032,8 @@ if __name__ == '__main__':
     def load_session(self):
         """Restore a previously saved session"""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Session", "", "Session Files (*.mmps_session);;All Files (*)"
+            self, "Load Session", "",
+            "Session Files (*.mmps_session *.mmps3d_session);;All Files (*)"
         )
         if not path:
             return
@@ -3893,6 +4084,29 @@ if __name__ == '__main__':
             pixel_size = session.get('pixel_size', '0.316')
             self.pixel_size_input.setText(str(pixel_size))
             self.default_rolling_ball_radius = session.get('rolling_ball_radius', 50)
+
+            # Restore 3D mode state
+            is_3d = session.get('mode_3d', False)
+            if is_3d and not _HAS_3D:
+                QMessageBox.warning(self, "Warning", "This is a 3D session but 3DMicroglia.py was not found.")
+                return
+            self.mode_3d = is_3d
+            self.mode_3d_action.setChecked(is_3d)
+            self.z_slider_widget.setVisible(is_3d)
+            self.voxel_z_label.setVisible(is_3d)
+            self.voxel_z_input.setVisible(is_3d)
+            if is_3d:
+                vz = session.get('voxel_size_z', '1.0')
+                self.voxel_z_input.setText(str(vz))
+                self.pixel_size_label.setText("XY pixel size (um/px):")
+                self.setWindowTitle("Microglia Analysis - 3D Z-Stack Mode")
+                self.mask_min_volume = session.get('mask_min_volume', 500)
+                self.mask_max_volume = session.get('mask_max_volume', 5000)
+                self.soma_intensity_tolerance = session.get('soma_intensity_tolerance', 30)
+                self.soma_max_radius_um = session.get('soma_max_radius_um', 8.0)
+            else:
+                self.pixel_size_label.setText("Pixel size (um/px):")
+                self.setWindowTitle("Microglia Analysis - Multi-Image Batch Processing")
 
             if self.colocalization_mode:
                 self.show_color_view = True
@@ -3966,14 +4180,12 @@ if __name__ == '__main__':
                             'soma_area_um2': 0,
                         })
 
-                self.images[img_name] = {
+                img_dict = {
                     'raw_path': img_session['raw_path'],
                     'processed': processed_data,
-                    'processed_channels': processed_channels,
                     'rolling_ball_radius': img_session.get('rolling_ball_radius', 50),
                     'somas': [tuple(s) for s in img_session.get('somas', [])],
                     'soma_ids': img_session.get('soma_ids', []),
-                    'soma_outlines': restored_outlines,
                     'masks': [],
                     'status': img_session.get('status', 'loaded'),
                     'selected': img_session.get('selected', False),
@@ -3981,6 +4193,18 @@ if __name__ == '__main__':
                     'treatment': img_session.get('treatment', ''),
                     'pixel_size': img_session.get('pixel_size'),
                 }
+                if is_3d:
+                    img_dict['raw_stack'] = None
+                    img_dict['soma_masks'] = {}
+                    # In 3D, processed is a stack - reload from disk
+                    if processed_data is not None and processed_data.ndim >= 3:
+                        img_dict['processed'] = processed_data
+                    else:
+                        img_dict['processed'] = None
+                else:
+                    img_dict['processed_channels'] = processed_channels
+                    img_dict['soma_outlines'] = restored_outlines
+                self.images[img_name] = img_dict
 
                 # If processed image wasn't found, downgrade status
                 # But don't downgrade qa_complete — masks on disk are still valid
@@ -3991,50 +4215,62 @@ if __name__ == '__main__':
                 orig_status = img_session.get('status', 'loaded')
                 if orig_status in ('masks_generated', 'qa_complete', 'analyzed') and self.masks_dir and os.path.isdir(self.masks_dir):
                     img_basename = os.path.splitext(img_name)[0]
-                    mask_pattern = re.compile(
-                        re.escape(img_basename) + r'_(soma_\d+_\d+)_area(\d+)_mask\.tif$'
-                    )
+                    if is_3d:
+                        # 3D mask pattern: {img}_{soma_z_y_x}_vol{N}_mask3d.tif
+                        mask_pattern = re.compile(
+                            re.escape(img_basename) + r'_(soma_\d+_\d+_\d+)_vol(\d+)_mask3d\.tif$'
+                        )
+                    else:
+                        mask_pattern = re.compile(
+                            re.escape(img_basename) + r'_(soma_\d+_\d+)_area(\d+)_mask\.tif$'
+                        )
                     # Build a lookup of soma outlines for soma_area_um2
                     outline_lookup = {}
-                    for ol in restored_outlines:
-                        outline_lookup[ol.get('soma_id', '')] = ol.get('soma_area_um2', 0)
+                    if not is_3d:
+                        for ol in restored_outlines:
+                            outline_lookup[ol.get('soma_id', '')] = ol.get('soma_area_um2', 0)
 
                     # Build approval state lookup from session
                     qa_state_lookup = {}
                     for qs in img_session.get('mask_qa_state', []):
-                        key = (qs.get('soma_id', ''), qs.get('area_um2', 0))
+                        if is_3d:
+                            key = (qs.get('soma_id', ''), qs.get('volume_um3', 0))
+                        else:
+                            key = (qs.get('soma_id', ''), qs.get('area_um2', 0))
                         qa_state_lookup[key] = qs.get('approved')
 
-                    loaded_keys = set()  # Track (soma_id, area_um2) found on disk
+                    loaded_keys = set()
                     for mf in sorted(os.listdir(self.masks_dir)):
                         m = mask_pattern.match(mf)
                         if not m:
                             continue
                         soma_id = m.group(1)
-                        area_um2 = int(m.group(2))
-                        loaded_keys.add((soma_id, area_um2))
+                        size_val = int(m.group(2))
+                        loaded_keys.add((soma_id, size_val))
                         mask_path = os.path.join(self.masks_dir, mf)
                         try:
                             mask_arr = tifffile.imread(mask_path)
-                            # Convert from 0/255 to 0/1 binary
                             mask_arr = (mask_arr > 0).astype(np.uint8)
-                            # Find soma_idx from soma_ids list
                             soma_ids_list = self.images[img_name]['soma_ids']
                             soma_idx = soma_ids_list.index(soma_id) if soma_id in soma_ids_list else 0
-                            # Restore approval state: use saved state if available,
-                            # default to True for qa_complete/analyzed, None for masks_generated
-                            saved_approval = qa_state_lookup.get((soma_id, area_um2))
+                            saved_approval = qa_state_lookup.get((soma_id, size_val))
                             if saved_approval is not None:
                                 approval = saved_approval
                             elif orig_status in ('qa_complete', 'analyzed'):
                                 approval = True
                             else:
                                 approval = None
-                            self.images[img_name]['masks'].append({
+                            mask_entry = {
                                 'image_name': img_name,
                                 'soma_idx': soma_idx,
                                 'soma_id': soma_id,
-                                'area_um2': area_um2,
+                                'mask': mask_arr,
+                                'approved': approval,
+                            }
+                            if is_3d:
+                                mask_entry['volume_um3'] = size_val
+                            else:
+                                mask_entry['area_um2'] = size_val
                                 'mask': mask_arr,
                                 'approved': approval,
                                 'soma_area_um2': outline_lookup.get(soma_id, 0),
@@ -5130,22 +5366,23 @@ if __name__ == '__main__':
         return composite
 
     def select_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Image Folder"
-        )
+        title = "Select Z-Stack Folder" if self.mode_3d else "Select Image Folder"
+        folder = QFileDialog.getExistingDirectory(self, title)
         if not folder:
             return
 
         # Apply current colocalization mode settings to display
-        if self.colocalization_mode:
+        if self.colocalization_mode and not self.mode_3d:
             self.show_color_view = True
             self.color_toggle_btn.setText("Show Grayscale (C)")
             self.channel_select_btn.setVisible(True)
 
         # Include both lowercase and uppercase extensions for macOS compatibility
-        exts = ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg',
-                '*.TIF', '*.TIFF', '*.PNG', '*.JPG', '*.JPEG']
+        if self.mode_3d:
+            exts = ['*.tif', '*.tiff', '*.TIF', '*.TIFF']
+        else:
+            exts = ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg',
+                    '*.TIF', '*.TIFF', '*.PNG', '*.JPG', '*.JPEG']
         files = []
         for ext in exts:
             files.extend(glob.glob(os.path.join(folder, ext)))
@@ -5158,14 +5395,12 @@ if __name__ == '__main__':
 
         for f in sorted(files):
             img_name = os.path.basename(f)
-            self.images[img_name] = {
+            img_dict = {
                 'raw_path': f,
                 'processed': None,
-                'processed_channels': {},
                 'rolling_ball_radius': self.default_rolling_ball_radius,
                 'somas': [],
                 'soma_ids': [],
-                'soma_outlines': [],
                 'masks': [],
                 'status': 'loaded',
                 'selected': False,
@@ -5173,7 +5408,14 @@ if __name__ == '__main__':
                 'treatment': '',
                 'pixel_size': None,
             }
-            item = QListWidgetItem(f"☐ ⚪ {img_name} [loaded]")
+            if self.mode_3d:
+                img_dict['raw_stack'] = None
+                img_dict['soma_masks'] = {}
+            else:
+                img_dict['processed_channels'] = {}
+                img_dict['soma_outlines'] = []
+            self.images[img_name] = img_dict
+            item = QListWidgetItem(f"  {img_name} [loaded]")
             item.setData(Qt.UserRole, img_name)
             item.setCheckState(Qt.Unchecked)
             item.setForeground(QBrush(QColor(128, 128, 128)))  # Gray for loaded
@@ -5181,18 +5423,40 @@ if __name__ == '__main__':
 
         if self.images:
             self.process_selected_btn.setEnabled(True)
-            self.log(f"Loaded {len(self.images)} images")
-            # self.update_workflow_status()
+            kind = "Z-stack files" if self.mode_3d else "images"
+            self.log(f"Loaded {len(self.images)} {kind}")
 
             # Automatically load and display the first image
             first_image_name = sorted(self.images.keys())[0]
             self.current_image_name = first_image_name
-            self._display_current_image()
 
-            # Select the first item in the list
+            if self.mode_3d:
+                self._load_and_display_raw_3d(first_image_name)
+            else:
+                self._display_current_image()
+
             self.file_list.setCurrentRow(0)
-
             self.log(f"Displaying: {first_image_name}")
+
+    def _load_and_display_raw_3d(self, img_name):
+        """Load raw Z-stack and display the middle slice."""
+        img_data = self.images[img_name]
+        if img_data.get('raw_stack') is None:
+            try:
+                stack = load_zstack(img_data['raw_path'])
+                stack = ensure_grayscale_3d(stack)
+                img_data['raw_stack'] = stack
+            except Exception as e:
+                self.log(f"ERROR loading {img_name}: {e}")
+                return
+        stack = img_data['raw_stack']
+        self.current_z_slice = stack.shape[0] // 2
+        self._update_z_slider_for_image(img_name)
+        sl = self._get_slice_for_display(stack)
+        adjusted = self._apply_display_adjustments(sl)
+        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+        self.original_label.set_image(pixmap)
+        self.tabs.setCurrentIndex(0)
 
     def select_output(self):
         folder = QFileDialog.getExistingDirectory(
@@ -5201,7 +5465,10 @@ if __name__ == '__main__':
         )
         if folder:
             self.output_dir = folder
-            self.masks_dir = os.path.join(folder, "masks")
+            if self.mode_3d:
+                self.masks_dir = os.path.join(folder, "masks_3d")
+            else:
+                self.masks_dir = os.path.join(folder, "masks")
             self.somas_dir = os.path.join(folder, "somas")
             os.makedirs(self.masks_dir, exist_ok=True)
             os.makedirs(self.somas_dir, exist_ok=True)
@@ -5245,8 +5512,10 @@ if __name__ == '__main__':
         is_checked = item.checkState() == Qt.Checked
         self.images[img_name]['selected'] = is_checked
         self.current_image_name = img_name
-        self._display_current_image()
-        # self.update_workflow_status()
+        if self.mode_3d:
+            self._display_current_image_3d()
+        else:
+            self._display_current_image()
 
     def _display_current_image(self):
         if not self.current_image_name or self.current_image_name not in self.images:
@@ -5307,6 +5576,40 @@ if __name__ == '__main__':
                     self.processed_label.setText("Not processed yet")
         except Exception as e:
             self.log(f"ERROR displaying image: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def _display_current_image_3d(self):
+        """Display current Z-stack image in 3D mode."""
+        if not self.current_image_name or self.current_image_name not in self.images:
+            return
+        try:
+            img_data = self.images[self.current_image_name]
+            # Load raw stack if needed
+            if img_data.get('raw_stack') is None:
+                try:
+                    stack = load_zstack(img_data['raw_path'])
+                    stack = ensure_grayscale_3d(stack)
+                    img_data['raw_stack'] = stack
+                except Exception as e:
+                    self.log(f"ERROR loading: {e}")
+                    return
+            self._update_z_slider_for_image()
+            # Show original slice
+            raw_stack = img_data['raw_stack']
+            sl = self._get_slice_for_display(raw_stack)
+            adjusted = self._apply_display_adjustments(sl)
+            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+            self.original_label.set_image(pixmap)
+            # Show processed slice if available
+            if img_data['processed'] is not None:
+                proc_sl = self._get_slice_for_display(img_data['processed'])
+                adjusted_proc = self._apply_display_adjustments(proc_sl)
+                centroids_2d = self._get_centroids_on_slice_3d(img_data)
+                pixmap_proc = self._array_to_pixmap(adjusted_proc, skip_rescale=True)
+                self.processed_label.set_image(pixmap_proc, centroids=centroids_2d)
+        except Exception as e:
+            self.log(f"ERROR displaying 3D image: {str(e)}")
             import traceback
             traceback.print_exc()
 
@@ -5411,6 +5714,11 @@ if __name__ == '__main__':
         if not self.current_image_name:
             QMessageBox.warning(self, "Warning", "Select an image first")
             return
+
+        if self.mode_3d:
+            self._preview_current_image_3d()
+            return
+
         img_data = self.images[self.current_image_name]
         raw_img = load_tiff_image(img_data['raw_path'])
         # Extract only the selected channel for processing
@@ -5459,6 +5767,37 @@ if __name__ == '__main__':
             steps.append("no processing")
         self.log(f"Preview {self.current_image_name}: {', '.join(steps)}")
 
+    def _preview_current_image_3d(self):
+        """Preview 3D preprocessing on the current Z-stack."""
+        img_data = self.images[self.current_image_name]
+        if img_data.get('raw_stack') is None:
+            try:
+                stack = load_zstack(img_data['raw_path'])
+                stack = ensure_grayscale_3d(stack)
+                img_data['raw_stack'] = stack
+            except Exception as e:
+                self.log(f"ERROR: {e}")
+                return
+        rb_r = self.rb_slider.value() if self.rb_check.isChecked() else 0
+        dn_s = self.denoise_spin.value() if self.denoise_check.isChecked() else 0
+        sh_a = self.sharpen_slider.value() / 10.0 if self.sharpen_check.isChecked() else 0.0
+        self.log(f"Previewing 3D: {self.current_image_name}...")
+        QApplication.processEvents()
+        try:
+            preview = preprocess_zstack(img_data['raw_stack'],
+                                        rolling_ball_radius=rb_r,
+                                        denoise_size=dn_s,
+                                        sharpen_amount=sh_a)
+            img_data['preview_stack'] = preview
+            sl = self._get_slice_for_display(preview)
+            adjusted = self._apply_display_adjustments(sl)
+            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+            self.preview_label.set_image(pixmap)
+            self.tabs.setCurrentIndex(1)
+            self.log("3D Preview complete")
+        except Exception as e:
+            self.log(f"ERROR in 3D preview: {e}")
+
     def process_selected_images(self):
         if not self.output_dir:
             QMessageBox.warning(self, "Warning", "Select output folder first")
@@ -5467,6 +5806,11 @@ if __name__ == '__main__':
         if not selected_images:
             QMessageBox.warning(self, "Warning", "No images selected")
             return
+
+        if self.mode_3d:
+            self._process_selected_images_3d(selected_images)
+            return
+
         radius = self.rb_slider.value()
         rb_enabled = self.rb_check.isChecked()
         denoise_enabled = self.denoise_check.isChecked()
@@ -5632,6 +5976,105 @@ if __name__ == '__main__':
             "All selected images processed!\n\nYou can now pick somas."
         )
 
+    # ----------------------------------------------------------------
+    # 3D PROCESSING PIPELINE
+    # ----------------------------------------------------------------
+
+    def _process_selected_images_3d(self, selected_images):
+        """Process selected Z-stacks using 3D preprocessing."""
+        rb_r = self.rb_slider.value()
+        rb_enabled = self.rb_check.isChecked()
+        dn_enabled = self.denoise_check.isChecked()
+        dn_size = self.denoise_spin.value()
+        sh_enabled = self.sharpen_check.isChecked()
+        sh_amount = self.sharpen_slider.value() / 10.0
+
+        process_list = []
+        for img_name, img_data in selected_images:
+            process_list.append((img_data['raw_path'], img_name, rb_r, rb_enabled,
+                                 dn_enabled, dn_size, sh_enabled, sh_amount))
+
+        # Use the 3D preprocessing thread from 3DMicroglia
+        from PyQt5.QtCore import QThread, pyqtSignal
+
+        class _PreprocessThread3D(QThread):
+            progress = pyqtSignal(int)
+            status_update = pyqtSignal(str)
+            finished_image = pyqtSignal(str, str, object)
+            error_occurred = pyqtSignal(str)
+
+            def __init__(self, image_data_list, output_dir):
+                super().__init__()
+                self.image_data_list = image_data_list
+                self.output_dir = output_dir
+
+            def run(self):
+                total = len(self.image_data_list)
+                for i, (raw_path, img_name, rb_radius, rb_on,
+                        dn_on, dn_sz, sh_on, sh_amt) in enumerate(self.image_data_list):
+                    try:
+                        self.status_update.emit(f"Processing {img_name}...")
+                        stack = load_zstack(raw_path)
+                        stack = ensure_grayscale_3d(stack)
+                        rb_r2 = rb_radius if rb_on else 0
+                        dn_s2 = dn_sz if dn_on else 0
+                        sh_a2 = sh_amt if sh_on else 0.0
+                        processed = preprocess_zstack(stack, rolling_ball_radius=rb_r2,
+                                                      denoise_size=dn_s2, sharpen_amount=sh_a2)
+                        out_stem = os.path.splitext(img_name)[0]
+                        out_path = os.path.join(self.output_dir, f"{out_stem}_processed.tif")
+                        tifffile.imwrite(out_path, processed)
+                        self.finished_image.emit(out_path, img_name, processed)
+                    except Exception as e:
+                        self.error_occurred.emit(f"{img_name}: {e}")
+                    self.progress.emit(int((i + 1) / total * 100))
+
+        self._preprocess_thread_3d = _PreprocessThread3D(process_list, self.output_dir)
+        self._preprocess_thread_3d.status_update.connect(self.log)
+        self._preprocess_thread_3d.progress.connect(lambda v: self.progress_bar.setValue(v))
+        self._preprocess_thread_3d.finished_image.connect(self._handle_processed_image_3d)
+        self._preprocess_thread_3d.error_occurred.connect(lambda msg: self.log(f"ERROR: {msg}"))
+        self._preprocess_thread_3d.finished.connect(self._processing_finished_3d)
+
+        self.progress_bar.setVisible(True)
+        self.progress_status_label.setVisible(True)
+        self.progress_status_label.setText("Processing Z-stacks...")
+        self.process_selected_btn.setEnabled(False)
+        self._preprocess_thread_3d.start()
+
+    def _handle_processed_image_3d(self, output_path, img_name, processed_stack):
+        if img_name in self.images:
+            self.images[img_name]['processed'] = processed_stack
+            self.images[img_name]['status'] = 'processed'
+            if self.images[img_name].get('raw_stack') is None:
+                try:
+                    raw = load_zstack(self.images[img_name]['raw_path'])
+                    self.images[img_name]['raw_stack'] = ensure_grayscale_3d(raw)
+                except Exception:
+                    pass
+            self._update_file_list_item(img_name)
+            if img_name == self.current_image_name:
+                self._update_z_slider_for_image()
+                sl = self._get_slice_for_display(processed_stack)
+                adjusted = self._apply_display_adjustments(sl)
+                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                self.processed_label.set_image(pixmap)
+                self.tabs.setCurrentIndex(2)
+
+    def _processing_finished_3d(self):
+        self.progress_bar.setVisible(False)
+        self.progress_status_label.setVisible(False)
+        self.process_selected_btn.setEnabled(True)
+        self.batch_pick_somas_btn.setEnabled(True)
+        total = sum(1 for d in self.images.values() if d['status'] == 'processed')
+        self.log("=" * 50)
+        self.log(f"Processing complete! {total} Z-stacks processed.")
+        self.log("Ready for soma picking.")
+        self.log("=" * 50)
+        self._auto_save()
+        QMessageBox.information(self, "Complete",
+                                f"Processed {total} Z-stacks!\n\nReady for soma picking.")
+
     def update_workflow_status(self):
         selected = [name for name, data in self.images.items() if data['selected']]
         if not selected:
@@ -5677,16 +6120,29 @@ if __name__ == '__main__':
         self.prev_btn.setEnabled(True)
         self.next_btn.setEnabled(True)
         self.done_btn.setEnabled(True)
-        self.log("=" * 50)
-        self.log("🎯 BATCH SOMA PICKING MODE")
-        self.log(f"Click somas on: {self.current_image_name}")
-        self.log("Click 'Done with Current' when finished with this image")
-        self.log("=" * 50)
+        if self.mode_3d:
+            self.log("=" * 50)
+            self.log("BATCH SOMA PICKING MODE (3D)")
+            self.log(f"Click somas on: {self.current_image_name}")
+            self.log("Use Z-slider to find the soma's brightest slice")
+            self.log("Click 'Done with Current' (Enter) when finished")
+            self.log("Backspace = undo last, Escape = clear all on image")
+            self.log("=" * 50)
+        else:
+            self.log("=" * 50)
+            self.log("BATCH SOMA PICKING MODE")
+            self.log(f"Click somas on: {self.current_image_name}")
+            self.log("Click 'Done with Current' when finished with this image")
+            self.log("=" * 50)
 
     def _load_image_for_soma_picking(self):
         if not self.current_image_name:
             return
         img_data = self.images[self.current_image_name]
+
+        if self.mode_3d:
+            self._load_image_for_soma_picking_3d()
+            return
 
         # Show color or grayscale based on toggle, with display adjustments
         if self.show_color_view and 'color_image' in img_data:
@@ -5715,6 +6171,35 @@ if __name__ == '__main__':
         self.nav_status_label.setText(
             f"Image {current_idx + 1}/{len(self.soma_picking_queue)}: {self.current_image_name} | "
             f"Somas: {len(img_data['somas'])}"
+        )
+
+    def _load_image_for_soma_picking_3d(self):
+        """Load Z-stack for 3D soma picking."""
+        img_data = self.images[self.current_image_name]
+        # Ensure raw stack loaded
+        if img_data.get('raw_stack') is None:
+            try:
+                raw = load_zstack(img_data['raw_path'])
+                img_data['raw_stack'] = ensure_grayscale_3d(raw)
+            except Exception:
+                pass
+        self._update_z_slider_for_image()
+        stack = img_data.get('processed') or img_data.get('raw_stack')
+        if stack is None:
+            return
+        sl = self._get_slice_for_display(stack)
+        adjusted = self._apply_display_adjustments(sl)
+        centroids_2d = self._get_centroids_on_slice_3d(img_data)
+        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+        self.processed_label.set_image(pixmap, centroids=centroids_2d)
+        self.tabs.setCurrentIndex(2)
+        current_idx = self.soma_picking_queue.index(
+            self.current_image_name) if self.current_image_name in self.soma_picking_queue else -1
+        self.nav_status_label.setText(
+            f"Z-Stack {current_idx + 1}/{len(self.soma_picking_queue)}: "
+            f"{self.current_image_name} | "
+            f"Somas: {len(img_data['somas'])} | "
+            f"Z-Slice: {self.current_z_slice}"
         )
 
     def _snap_to_brightest(self, coords):
@@ -5752,6 +6237,22 @@ if __name__ == '__main__':
         if not self.current_image_name:
             return
         img_data = self.images[self.current_image_name]
+
+        if self.mode_3d:
+            row, col = coords
+            z = self.current_z_slice
+            z, row, col = self._snap_to_brightest_3d(z, row, col)
+            soma_zyx = (z, row, col)
+            img_data['somas'].append(soma_zyx)
+            soma_id = f"soma_{z}_{row}_{col}"
+            img_data['soma_ids'].append(soma_id)
+            self.log(f"Soma {len(img_data['somas'])} added at Z={z}, Y={row}, X={col} | ID: {soma_id}")
+            if z != self.current_z_slice:
+                self.current_z_slice = z
+                self.z_slider.setValue(z)
+            self._load_image_for_soma_picking()
+            return
+
         coords = self._snap_to_brightest(coords)
         img_data['somas'].append(coords)
         soma_id = f"soma_{coords[0]}_{coords[1]}"
@@ -6816,6 +7317,9 @@ if __name__ == '__main__':
         QMessageBox.information(self, "Complete", "All somas outlined!\n\nReady to generate masks.")
 
     def batch_generate_masks(self):
+        if self.mode_3d:
+            self._batch_generate_masks_3d()
+            return
         # Show mask generation settings dialog first
         dialog = QDialog(self)
         dialog.setWindowTitle("Mask Generation Settings")
@@ -7788,6 +8292,310 @@ if __name__ == '__main__':
 
         return masks
 
+    # ----------------------------------------------------------------
+    # 3D MASK GENERATION
+    # ----------------------------------------------------------------
+
+    def _batch_generate_masks_3d(self):
+        """Show 3D mask generation settings dialog then generate masks."""
+        from PyQt5.QtWidgets import QDoubleSpinBox
+        dialog = QDialog(self)
+        dialog.setWindowTitle("3D Mask Generation Settings")
+        dialog.setModal(True)
+        layout = QVBoxLayout()
+
+        title = QLabel("Configure 3D Mask Generation")
+        title_font = title.font()
+        title_font.setBold(True)
+        title_font.setPointSize(12)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        # Soma detection settings
+        layout.addWidget(QLabel("<b>Soma Detection (3D Region Growing)</b>"))
+        soma_layout = QHBoxLayout()
+        soma_layout.addWidget(QLabel("Intensity tolerance:"))
+        tol_spin = QSpinBox()
+        tol_spin.setRange(5, 100)
+        tol_spin.setValue(self.soma_intensity_tolerance)
+        soma_layout.addWidget(tol_spin)
+        soma_layout.addWidget(QLabel("Max radius (um):"))
+        rad_spin = QDoubleSpinBox()
+        rad_spin.setRange(1.0, 50.0)
+        rad_spin.setValue(self.soma_max_radius_um)
+        rad_spin.setSingleStep(0.5)
+        soma_layout.addWidget(rad_spin)
+        layout.addLayout(soma_layout)
+        layout.addSpacing(10)
+
+        # Volume settings
+        layout.addWidget(QLabel("<b>Mask Volumes (um^3)</b>"))
+        size_grid = QHBoxLayout()
+        size_grid.addWidget(QLabel("Min:"))
+        min_vol_spin = QSpinBox()
+        min_vol_spin.setRange(50, 50000)
+        min_vol_spin.setSingleStep(100)
+        min_vol_spin.setValue(self.mask_min_volume)
+        min_vol_spin.setSuffix(" um^3")
+        size_grid.addWidget(min_vol_spin)
+        size_grid.addWidget(QLabel("Max:"))
+        max_vol_spin = QSpinBox()
+        max_vol_spin.setRange(100, 100000)
+        max_vol_spin.setSingleStep(500)
+        max_vol_spin.setValue(self.mask_max_volume)
+        max_vol_spin.setSuffix(" um^3")
+        size_grid.addWidget(max_vol_spin)
+        size_grid.addWidget(QLabel("Step:"))
+        step_spin = QSpinBox()
+        step_spin.setRange(50, 10000)
+        step_spin.setSingleStep(100)
+        step_spin.setValue(self.mask_step_size)
+        step_spin.setSuffix(" um^3")
+        size_grid.addWidget(step_spin)
+        layout.addLayout(size_grid)
+
+        preview_label = QLabel("")
+        preview_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+        preview_label.setWordWrap(True)
+        layout.addWidget(preview_label)
+
+        def update_size_preview():
+            mn = min_vol_spin.value()
+            mx = max_vol_spin.value()
+            st = step_spin.value()
+            if mn > mx:
+                preview_label.setText("Min must be <= Max")
+                return
+            sizes = list(range(mn, mx + 1, st))
+            if sizes[-1] != mx:
+                sizes.append(mx)
+            preview_label.setText(
+                f"Masks: {', '.join(str(s) for s in sizes)} um^3  ({len(sizes)} masks per cell)")
+
+        min_vol_spin.valueChanged.connect(lambda: update_size_preview())
+        max_vol_spin.valueChanged.connect(lambda: update_size_preview())
+        step_spin.valueChanged.connect(lambda: update_size_preview())
+        update_size_preview()
+        layout.addSpacing(10)
+
+        # Intensity filtering
+        layout.addWidget(QLabel("<b>Intensity Filtering</b>"))
+        min_intensity_check = QCheckBox("Use minimum intensity threshold")
+        min_intensity_check.setChecked(self.use_min_intensity)
+        layout.addWidget(min_intensity_check)
+        slider_layout = QHBoxLayout()
+        slider_layout.addWidget(QLabel("  Min intensity:"))
+        min_intensity_slider = QSlider(Qt.Horizontal)
+        min_intensity_slider.setRange(0, 100)
+        min_intensity_slider.setValue(self.min_intensity_percent)
+        slider_layout.addWidget(min_intensity_slider)
+        min_int_label = QLabel(f"{self.min_intensity_percent}%")
+        min_intensity_slider.valueChanged.connect(lambda v: min_int_label.setText(f"{v}%"))
+        slider_layout.addWidget(min_int_label)
+        layout.addLayout(slider_layout)
+        layout.addSpacing(10)
+
+        # Segmentation method
+        layout.addWidget(QLabel("<b>Cell Boundary Segmentation</b>"))
+        seg_combo = QComboBox()
+        seg_combo.addItem("None (independent growth)", "none")
+        seg_combo.addItem("Competitive Growth (shared priority queue)", "competitive")
+        for idx in range(seg_combo.count()):
+            if seg_combo.itemData(idx) == self.mask_segmentation_method:
+                seg_combo.setCurrentIndex(idx)
+                break
+        layout.addWidget(seg_combo)
+        layout.addSpacing(10)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_btn)
+        ok_btn = QPushButton("Generate 3D Masks")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(dialog.accept)
+        ok_btn.setStyleSheet("QPushButton { border: 2px solid #4CAF50; font-weight: bold; padding: 5px; }")
+        button_layout.addWidget(ok_btn)
+        layout.addLayout(button_layout)
+        dialog.setLayout(layout)
+        dialog.setMinimumWidth(450)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        # Save settings
+        self.soma_intensity_tolerance = tol_spin.value()
+        self.soma_max_radius_um = rad_spin.value()
+        self.use_min_intensity = min_intensity_check.isChecked()
+        self.min_intensity_percent = min_intensity_slider.value()
+        self.mask_min_volume = min_vol_spin.value()
+        self.mask_max_volume = max_vol_spin.value()
+        self.mask_step_size = step_spin.value()
+        self.mask_segmentation_method = seg_combo.currentData()
+
+        self._run_mask_generation_3d()
+
+    def _run_mask_generation_3d(self):
+        """Execute 3D mask generation with current settings."""
+        try:
+            voxel_xy = float(self.pixel_size_input.text())
+            voxel_z = float(self.voxel_z_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Invalid voxel dimensions")
+            return
+
+        vol_list = list(range(self.mask_min_volume, self.mask_max_volume + 1, self.mask_step_size))
+        if vol_list[-1] != self.mask_max_volume:
+            vol_list.append(self.mask_max_volume)
+
+        min_int_pct = self.min_intensity_percent if self.use_min_intensity else 0
+        seg_method = self.mask_segmentation_method
+
+        self.progress_bar.setVisible(True)
+        self.progress_status_label.setVisible(True)
+
+        total_somas = sum(len(data['somas']) for data in self.images.values()
+                          if data['selected'] and data['somas'])
+        current_count = 0
+
+        try:
+            for img_name, img_data in self.images.items():
+                if not img_data['selected'] or not img_data['somas']:
+                    continue
+
+                stack = img_data.get('processed') or img_data.get('raw_stack')
+                if stack is None:
+                    self.log(f"SKIP {img_name}: no stack data")
+                    continue
+
+                self.log(f"Generating 3D masks for {img_name}...")
+
+                # Detect somas in 3D
+                soma_data_list = []
+                for si, soma_zyx in enumerate(img_data['somas']):
+                    soma_id = img_data['soma_ids'][si]
+                    self.progress_status_label.setText(
+                        f"Detecting soma {si + 1}/{len(img_data['somas'])}: {img_name}")
+                    QApplication.processEvents()
+
+                    soma_mask, centroid = detect_soma_3d(
+                        stack, soma_zyx,
+                        intensity_tolerance=self.soma_intensity_tolerance,
+                        max_radius_um=self.soma_max_radius_um,
+                        voxel_size_xy=voxel_xy,
+                        voxel_size_z=voxel_z
+                    )
+                    if 'soma_masks' not in img_data:
+                        img_data['soma_masks'] = {}
+                    img_data['soma_masks'][soma_id] = soma_mask
+
+                    soma_data_list.append({
+                        'centroid': centroid,
+                        'soma_mask': soma_mask,
+                        'soma_id': soma_id,
+                        'soma_idx': si,
+                    })
+
+                # Generate masks
+                if seg_method == 'competitive' and len(soma_data_list) > 1:
+                    self.log(f"  Competitive 3D growth for {len(soma_data_list)} cells")
+                    self.progress_status_label.setText(f"Competitive 3D growth: {img_name}")
+                    QApplication.processEvents()
+                    masks = create_competitive_masks_3d(
+                        stack, soma_data_list, vol_list,
+                        voxel_xy, voxel_z, min_intensity_pct=min_int_pct
+                    )
+                    img_data['masks'].extend(masks)
+                    current_count += len(soma_data_list)
+                else:
+                    for sdata in soma_data_list:
+                        self.progress_status_label.setText(
+                            f"3D masks: {current_count + 1}/{total_somas}")
+                        QApplication.processEvents()
+                        masks = create_spherical_annulus_masks(
+                            stack, sdata['centroid'], vol_list,
+                            voxel_xy, voxel_z,
+                            soma_mask=sdata['soma_mask'],
+                            min_intensity_pct=min_int_pct
+                        )
+                        for m in masks:
+                            m['soma_idx'] = sdata['soma_idx']
+                            m['soma_id'] = sdata['soma_id']
+                        img_data['masks'].extend(masks)
+                        current_count += 1
+                    self.progress_bar.setValue(int(current_count / total_somas * 100))
+
+                # Export masks to disk
+                if self.masks_dir:
+                    self._export_3d_masks_to_disk(img_name, img_data['masks'])
+
+                img_data['status'] = 'masks_generated'
+                self._update_file_list_item(img_name)
+
+            self.progress_bar.setVisible(False)
+            self.progress_status_label.setVisible(False)
+            self.batch_qa_btn.setEnabled(True)
+            self.clear_masks_btn.setEnabled(True)
+            self.opacity_widget.setVisible(True)
+
+            total_masks = sum(len(data['masks']) for data in self.images.values() if data['selected'])
+            self.log("=" * 50)
+            self.log(f"Generated {total_masks} 3D masks total")
+            self.log(f"Mask volumes: {', '.join(str(v) for v in vol_list)} um^3")
+            self.log("Ready for QA")
+            self.log("=" * 50)
+            self._auto_save()
+            QMessageBox.information(self, "Success",
+                                    f"Generated {total_masks} 3D masks!\n\nReady for QA.")
+
+        except Exception as e:
+            self.progress_bar.setVisible(False)
+            self.progress_status_label.setVisible(False)
+            self.log(f"ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Failed: {e}")
+
+    def _export_3d_masks_to_disk(self, img_name, masks):
+        """Export 3D mask volumes to disk as multi-page TIFFs."""
+        if not self.masks_dir:
+            return
+        os.makedirs(self.masks_dir, exist_ok=True)
+        img_basename = os.path.splitext(img_name)[0]
+        for mask_data in masks:
+            mask_3d = mask_data.get('mask')
+            if mask_3d is None:
+                continue
+            soma_id = mask_data.get('soma_id', 'soma_0')
+            vol = mask_data.get('volume_um3', 0)
+            fname = f"{img_basename}_{soma_id}_vol{int(vol)}_mask3d.tif"
+            path = os.path.join(self.masks_dir, fname)
+            try:
+                tifffile.imwrite(path, (mask_3d * 255).astype(np.uint8))
+            except Exception as e:
+                self.log(f"  ERROR exporting {fname}: {e}")
+
+    def _reload_3d_mask_from_disk(self, mask_data, img_name):
+        """Reload a 3D mask from its TIFF file on disk."""
+        if mask_data.get('mask') is not None:
+            return True
+        if not self.masks_dir or not os.path.isdir(self.masks_dir):
+            return False
+        img_basename = os.path.splitext(img_name)[0]
+        soma_id = mask_data.get('soma_id', '')
+        vol = mask_data.get('volume_um3', 0)
+        fname = f"{img_basename}_{soma_id}_vol{int(vol)}_mask3d.tif"
+        path = os.path.join(self.masks_dir, fname)
+        if os.path.exists(path):
+            try:
+                arr = tifffile.imread(path)
+                mask_data['mask'] = (arr > 0).astype(np.uint8)
+                return True
+            except Exception as e:
+                self.log(f"  Could not reload {fname}: {e}")
+        return False
+
     def start_batch_qa(self):
         # Flatten all masks from all images
         self.all_masks_flat = []
@@ -7814,7 +8622,7 @@ if __name__ == '__main__':
         self._qa_finalized_somas = set()
         seen_somas = set()
         for flat in self.all_masks_flat:
-            key = (flat['image_name'], flat['mask_data']['soma_id'])
+            key = (flat['image_name'], flat['mask_data'].get('soma_id', ''))
             if key not in seen_somas:
                 seen_somas.add(key)
                 self._qa_soma_order.append(key)
@@ -7838,7 +8646,12 @@ if __name__ == '__main__':
             cl_rows = []
             for flat in self.all_masks_flat:
                 md = flat['mask_data']
-                key = f"{flat['image_name']}_{md['soma_id']}_area{md['area_um2']}"
+                if self.mode_3d:
+                    size_val = md.get('volume_um3', 0)
+                    key = f"{flat['image_name']}_{md.get('soma_id', '')}_vol{size_val}"
+                else:
+                    size_val = md.get('area_um2', 0)
+                    key = f"{flat['image_name']}_{md.get('soma_id', '')}_area{size_val}"
                 passed = 1 if md.get('approved') is not None else 0
                 cl_rows.append([key, str(passed)])
             self._write_checklist(qa_cl_path, cl_rows, ['Mask', 'Passed QA'])
@@ -8016,21 +8829,25 @@ if __name__ == '__main__':
         flat_data = self.all_masks_flat[self.mask_qa_idx]
         mask_data = flat_data['mask_data']
         img_name = flat_data['image_name']
+        img_data = self.images.get(img_name, {})
+
+        if self.mode_3d:
+            self._show_current_mask_3d(flat_data, mask_data, img_name, img_data)
+            return
 
         # Reload processed image from disk if it was freed to save RAM
         processed_img = self._ensure_processed_loaded(img_name)
         if processed_img is None:
-            self.log(f"⚠️ Cannot display mask — processed image not found for {img_name}")
+            self.log(f"Cannot display mask - processed image not found for {img_name}")
             return
 
         # Reload mask from disk if it was evicted from memory
         if mask_data.get('mask') is None:
             if not self._reload_mask_from_disk(mask_data, img_name):
-                self.log(f"⚠️ Cannot display mask — file not found on disk")
+                self.log(f"Cannot display mask - file not found on disk")
                 return
 
         # Display in color or grayscale based on toggle
-        img_data = self.images.get(img_name, {})
         # Ensure color_image is loaded for color toggle
         if 'color_image' not in img_data and 'raw_path' in img_data:
             try:
@@ -8052,7 +8869,6 @@ if __name__ == '__main__':
             pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
         # Show the clicked soma center as a centroid marker
         soma_centroid = []
-        img_data = self.images.get(img_name, {})
         soma_idx = mask_data.get('soma_idx')
         if soma_idx is not None and soma_idx < len(img_data.get('somas', [])):
             soma_centroid = [img_data['somas'][soma_idx]]
@@ -8066,17 +8882,86 @@ if __name__ == '__main__':
             self.mask_label.zoom_to_point(center_row, center_col, zoom_level=3.0)
 
         status = mask_data.get('approved')
-        status_text = "✓ Approved" if status is True else "✗ Rejected" if status is False else "⏳ Not reviewed"
+        status_text = "Approved" if status is True else "Rejected" if status is False else "Not reviewed"
         reviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
 
         self.nav_status_label.setText(
             f"Mask {self.mask_qa_idx + 1}/{len(self.all_masks_flat)} | "
             f"Reviewed: {reviewed}/{len(self.all_masks_flat)} | "
-            f"{img_name} | {mask_data['soma_id']} | "
-            f"Area: {mask_data['area_um2']} µm² | {status_text}"
+            f"{img_name} | {mask_data.get('soma_id', '')} | "
+            f"Area: {mask_data.get('area_um2', 0)} um^2 | {status_text}"
         )
 
         # Update progress bar
+        self.mask_qa_progress_bar.setValue(reviewed)
+
+    def _show_current_mask_3d(self, flat_data, mask_data, img_name, img_data):
+        """Display current mask in 3D QA mode."""
+        mask_3d = mask_data.get('mask')
+        if mask_3d is None:
+            if not self._reload_3d_mask_from_disk(mask_data, img_name):
+                self.log("Cannot display mask - file not found on disk")
+                return
+            mask_3d = mask_data.get('mask')
+
+        # Switch current image if needed
+        if self.current_image_name != img_name:
+            self.current_image_name = img_name
+            self._update_z_slider_for_image()
+
+        # Find Z-slice with most mask voxels
+        if mask_3d is not None and mask_3d.ndim == 3:
+            z_sums = mask_3d.sum(axis=(1, 2))
+            best_z = int(np.argmax(z_sums))
+            self.current_z_slice = best_z
+            self.z_slider.setValue(best_z)
+
+        # Get processed stack for background
+        stack = img_data.get('processed') or img_data.get('raw_stack')
+        if stack is None:
+            return
+
+        z = self.current_z_slice
+        sl = self._get_slice_for_display(stack, z)
+        adjusted = self._apply_display_adjustments(sl)
+        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+
+        # Get mask slice
+        mask_slice = None
+        if mask_3d is not None and mask_3d.ndim == 3:
+            z_clamped = max(0, min(mask_3d.shape[0] - 1, z))
+            mask_slice = mask_3d[z_clamped]
+
+        # Get soma centroid on this slice
+        soma_centroid = []
+        soma_idx = mask_data.get('soma_idx')
+        if soma_idx is not None and soma_idx < len(img_data.get('somas', [])):
+            soma = img_data['somas'][soma_idx]
+            if len(soma) == 3:
+                sz, sy, sx = soma
+                if abs(sz - z) <= 2:
+                    soma_centroid = [(sy, sx)]
+
+        self.mask_label.set_image(pixmap, centroids=soma_centroid, mask_overlay=mask_slice)
+
+        # Auto-zoom to mask center on this slice
+        if mask_slice is not None:
+            mask_coords = np.argwhere(mask_slice > 0)
+            if len(mask_coords) > 0:
+                center_row = float(np.mean(mask_coords[:, 0]))
+                center_col = float(np.mean(mask_coords[:, 1]))
+                self.mask_label.zoom_to_point(center_row, center_col, zoom_level=3.0)
+
+        status = mask_data.get('approved')
+        status_text = "Approved" if status is True else "Rejected" if status is False else "Not reviewed"
+        reviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
+        vol = mask_data.get('volume_um3', mask_data.get('actual_volume_um3', 0))
+        self.nav_status_label.setText(
+            f"Mask {self.mask_qa_idx + 1}/{len(self.all_masks_flat)} | "
+            f"Reviewed: {reviewed}/{len(self.all_masks_flat)} | "
+            f"{img_name} | {mask_data.get('soma_id', '')} | "
+            f"Vol: {vol} um^3 | {status_text}"
+        )
         self.mask_qa_progress_bar.setValue(reviewed)
 
     def approve_current_mask(self):
@@ -8087,49 +8972,63 @@ if __name__ == '__main__':
         mask_data = flat_data['mask_data']
         mask_data['approved'] = True
 
-        current_soma_id = mask_data['soma_id']
-        current_area = mask_data['area_um2']
+        current_soma_id = mask_data.get('soma_id', '')
         current_img = flat_data['image_name']
 
-        self.log(f"✅ APPROVED | {current_img} | {current_soma_id} | Area: {current_area} µm²")
+        # Use volume for 3D, area for 2D
+        if self.mode_3d:
+            current_size = mask_data.get('volume_um3', 0)
+            size_key = 'volume_um3'
+            size_unit = 'um^3'
+        else:
+            current_size = mask_data.get('area_um2', 0)
+            size_key = 'area_um2'
+            size_unit = 'um^2'
+
+        self.log(f"APPROVED | {current_img} | {current_soma_id} | {size_key}: {current_size} {size_unit}")
 
         # Record decision for undo
         self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': True})
 
-        # Export mask immediately upon approval
-        self._export_approved_mask(flat_data)
+        # Export mask immediately upon approval (2D only; 3D already exported)
+        if not self.mode_3d:
+            self._export_approved_mask(flat_data)
 
         # Auto-approve ALL smaller masks from the SAME soma in the SAME image
         auto_approved = []
         for i, other_flat in enumerate(self.all_masks_flat):
             other_mask = other_flat['mask_data']
             other_img = other_flat['image_name']
+            other_size = other_mask.get(size_key, 0)
 
-            # Must be: same image, same soma, smaller area, not yet reviewed
+            # Must be: same image, same soma, smaller size, not yet reviewed
             if (other_img == current_img and
-                    other_mask['soma_id'] == current_soma_id and
-                    other_mask['area_um2'] < current_area and
-                    other_mask['approved'] is None):
+                    other_mask.get('soma_id') == current_soma_id and
+                    other_size < current_size and
+                    other_mask.get('approved') is None):
                 other_mask['approved'] = True
-                auto_approved.append((i + 1, other_mask['area_um2']))
-                # Record auto-approval for undo
+                auto_approved.append((i + 1, other_size))
                 self.last_qa_decisions.append({'flat_data': other_flat, 'was_approved': True})
-                # Export auto-approved masks too
-                self._export_approved_mask(other_flat)
+                if not self.mode_3d:
+                    self._export_approved_mask(other_flat)
 
         if auto_approved:
-            self.log(f"   ⚡ Auto-approved {len(auto_approved)} smaller masks for {current_soma_id}:")
-            for mask_num, area in auto_approved:
-                self.log(f"      Mask #{mask_num} ({area} µm²)")
+            self.log(f"   Auto-approved {len(auto_approved)} smaller masks for {current_soma_id}")
 
         # Update mask_qa_checklist.csv
         qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
         if qa_cl_path and os.path.exists(qa_cl_path):
-            self._update_checklist_row(qa_cl_path, 0,
-                f"{current_img}_{current_soma_id}_area{current_area}", 1, 1)
-            for _, area in auto_approved:
-                self._update_checklist_row(qa_cl_path, 0,
-                    f"{current_img}_{current_soma_id}_area{area}", 1, 1)
+            if self.mode_3d:
+                cl_key = f"{current_img}_{current_soma_id}_vol{current_size}"
+            else:
+                cl_key = f"{current_img}_{current_soma_id}_area{current_size}"
+            self._update_checklist_row(qa_cl_path, 0, cl_key, 1, 1)
+            for _, sz in auto_approved:
+                if self.mode_3d:
+                    auto_key = f"{current_img}_{current_soma_id}_vol{sz}"
+                else:
+                    auto_key = f"{current_img}_{current_soma_id}_area{sz}"
+                self._update_checklist_row(qa_cl_path, 0, auto_key, 1, 1)
 
         # Auto-save every 5 QA decisions
         if len(self.last_qa_decisions) % 5 == 0:
@@ -8328,12 +9227,21 @@ if __name__ == '__main__':
         # Record decision for undo
         self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': False})
 
-        self.log(f"✗ Rejected: {mask_data['soma_id']} ({mask_data['area_um2']} µm²)")
+        if self.mode_3d:
+            vol = mask_data.get('volume_um3', 0)
+            self.log(f"Rejected: {mask_data.get('soma_id', '')} ({vol} um^3)")
+            # Delete rejected 3D mask from disk
+            self._delete_rejected_3d_mask(flat_data['image_name'], mask_data)
+        else:
+            self.log(f"Rejected: {mask_data.get('soma_id', '')} ({mask_data.get('area_um2', 0)} um^2)")
 
         # Update mask_qa_checklist.csv
         qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
         if qa_cl_path and os.path.exists(qa_cl_path):
-            key = f"{flat_data['image_name']}_{mask_data['soma_id']}_area{mask_data['area_um2']}"
+            if self.mode_3d:
+                key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_vol{mask_data.get('volume_um3', 0)}"
+            else:
+                key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{mask_data.get('area_um2', 0)}"
             self._update_checklist_row(qa_cl_path, 0, key, 1, 1)
 
         if self.mask_qa_idx < len(self.all_masks_flat) - 1:
@@ -8364,6 +9272,22 @@ if __name__ == '__main__':
                 return
             self.mask_qa_idx -= 1
             self._show_current_mask()
+
+    def _delete_rejected_3d_mask(self, img_name, mask_data):
+        """Delete a rejected 3D mask TIFF from disk."""
+        if not self.masks_dir or not os.path.isdir(self.masks_dir):
+            return
+        img_basename = os.path.splitext(img_name)[0]
+        soma_id = mask_data.get('soma_id', '')
+        vol = mask_data.get('volume_um3', 0)
+        fname = f"{img_basename}_{soma_id}_vol{int(vol)}_mask3d.tif"
+        path = os.path.join(self.masks_dir, fname)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                self.log(f"   Deleted rejected: {fname}")
+            except Exception as e:
+                self.log(f"   Could not delete {fname}: {e}")
 
     def _check_qa_complete(self):
         all_reviewed = all(flat['mask_data']['approved'] is not None for flat in self.all_masks_flat)
@@ -8472,6 +9396,9 @@ if __name__ == '__main__':
             self.tabs.setCurrentIndex(3)
 
     def batch_calculate_morphology(self):
+        if self.mode_3d:
+            self._batch_calculate_morphology_3d()
+            return
         try:
             pixel_size = self._get_pixel_size()
 
@@ -8929,6 +9856,198 @@ if __name__ == '__main__':
                 writer.writerows(img_results)
 
         self.log(f"Per-image results saved for {len(by_image)} images")
+
+    # ----------------------------------------------------------------
+    # 3D MORPHOLOGY CALCULATION
+    # ----------------------------------------------------------------
+
+    def _batch_calculate_morphology_3d(self):
+        """Calculate 3D morphology metrics for approved masks."""
+        try:
+            voxel_xy = float(self.pixel_size_input.text())
+            voxel_z = float(self.voxel_z_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Invalid voxel dimensions")
+            return
+
+        # Reload evicted masks
+        reload_count = 0
+        for flat in self.all_masks_flat:
+            if flat['mask_data'].get('approved') and flat['mask_data'].get('mask') is None:
+                if self._reload_3d_mask_from_disk(flat['mask_data'], flat['image_name']):
+                    reload_count += 1
+        if reload_count > 0:
+            self.log(f"   Reloaded {reload_count} evicted masks from disk")
+
+        approved = [f for f in self.all_masks_flat if f['mask_data'].get('approved')]
+        if not approved:
+            QMessageBox.warning(self, "Warning", "No approved masks to analyze")
+            return
+
+        self.log("=" * 50)
+        self.log(f"Calculating 3D morphology for {len(approved)} masks...")
+        self.log("=" * 50)
+
+        self.progress_bar.setVisible(True)
+        self.progress_status_label.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.start_timer()
+        self.batch_calculate_btn.setEnabled(False)
+
+        # Use a worker thread
+        from PyQt5.QtCore import QThread, pyqtSignal
+
+        class _MorphThread3D(QThread):
+            progress = pyqtSignal(int, str)
+            finished = pyqtSignal(list)
+            error_occurred = pyqtSignal(str)
+
+            def __init__(self, approved_masks, vxy, vz):
+                super().__init__()
+                self.approved_masks = approved_masks
+                self.vxy = vxy
+                self.vz = vz
+
+            def run(self):
+                try:
+                    calc = Morphology3DCalculator(self.vxy, self.vz)
+                    results = []
+                    total = len(self.approved_masks)
+                    for i, flat in enumerate(self.approved_masks):
+                        mask_data = flat['mask_data']
+                        img_name = flat['image_name']
+                        mask_3d = mask_data.get('mask')
+                        if mask_3d is None:
+                            continue
+                        self.progress.emit(int((i + 1) / total * 100),
+                                           f"Analyzing {i + 1}/{total}: {mask_data.get('soma_id', '')}")
+                        try:
+                            metrics = calc.calculate_all(mask_3d)
+                        except Exception as e:
+                            metrics = calc._empty_metrics()
+                            metrics['error'] = str(e)
+                        # Skeleton analysis
+                        try:
+                            skeleton, bp, ep, n_branches = skeletonize_3d_mask(mask_3d)
+                            metrics['n_branches'] = n_branches
+                            metrics['n_branch_points'] = len(bp)
+                            metrics['n_endpoints'] = len(ep)
+                            metrics['total_branch_length_um'] = round(
+                                np.sum(skeleton) * ((self.vxy + self.vz) / 2), 4)
+                        except Exception:
+                            metrics['n_branches'] = 0
+                            metrics['n_branch_points'] = 0
+                            metrics['n_endpoints'] = 0
+                            metrics['total_branch_length_um'] = 0
+                        # Fractal analysis
+                        try:
+                            fd, lac, _, _ = fractal_dimension_3d(mask_3d, self.vxy, self.vz)
+                            metrics['fractal_dimension_3d'] = fd
+                            metrics['lacunarity_3d'] = lac
+                        except Exception:
+                            metrics['fractal_dimension_3d'] = 0
+                            metrics['lacunarity_3d'] = 0
+                        row = {
+                            'image_name': os.path.splitext(img_name)[0],
+                            'soma_id': mask_data.get('soma_id', ''),
+                            'soma_idx': mask_data.get('soma_idx', 0),
+                            'target_volume_um3': mask_data.get('volume_um3', 0),
+                        }
+                        row.update(metrics)
+                        results.append(row)
+                    self.finished.emit(results)
+                except Exception as e:
+                    self.error_occurred.emit(str(e))
+
+        self._morph_thread_3d = _MorphThread3D(approved, voxel_xy, voxel_z)
+        self._morph_thread_3d.progress.connect(self._on_morph_3d_progress)
+        self._morph_thread_3d.finished.connect(self._on_morph_3d_finished)
+        self._morph_thread_3d.error_occurred.connect(self._on_morph_3d_error)
+        self._morph_thread_3d.start()
+
+    def _on_morph_3d_progress(self, percentage, status):
+        self.progress_bar.setValue(percentage)
+        self.progress_status_label.setText(status)
+
+    def _on_morph_3d_finished(self, all_results):
+        self.stop_timer()
+        self.progress_bar.setVisible(False)
+        self.progress_status_label.setVisible(False)
+        self.batch_calculate_btn.setEnabled(True)
+        self.timer_label.setVisible(False)
+
+        self._save_3d_results(all_results)
+
+        for img_name, img_data in self.images.items():
+            if img_data['selected'] and img_data['status'] == 'qa_complete':
+                img_data['status'] = 'analyzed'
+                self._update_file_list_item(img_name)
+
+        self.log("=" * 50)
+        self.log(f"3D morphology calculated for {len(all_results)} cells")
+        self.log(f"Results saved to: {self.output_dir}")
+        self.log("=" * 50)
+        self._auto_save()
+        QMessageBox.information(self, "Success",
+                                f"3D morphology calculated for {len(all_results)} cells!\n\n"
+                                f"Results saved to:\n{self.output_dir}")
+
+    def _on_morph_3d_error(self, error_msg):
+        self.stop_timer()
+        self.progress_bar.setVisible(False)
+        self.progress_status_label.setVisible(False)
+        self.timer_label.setVisible(False)
+        self.batch_calculate_btn.setEnabled(True)
+        self.log(f"ERROR: {error_msg}")
+        QMessageBox.critical(self, "Error", f"Morphology calculation failed:\n{error_msg}")
+
+    def _save_3d_results(self, results):
+        """Save 3D morphology results to CSV."""
+        if not self.output_dir or not results:
+            return
+
+        for result in results:
+            img_name_base = result['image_name']
+            for full_name, img_data in self.images.items():
+                if os.path.splitext(full_name)[0] == img_name_base:
+                    result['animal_id'] = img_data.get('animal_id', '')
+                    result['treatment'] = img_data.get('treatment', '')
+                    break
+            else:
+                result['animal_id'] = ''
+                result['treatment'] = ''
+
+        combined_path = os.path.join(self.output_dir, "3d_morphology_results.csv")
+        fieldnames = [
+            'image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx',
+            'target_volume_um3', 'volume_um3', 'surface_area_um2', 'sphericity',
+            'elongation', 'cell_spread_3d_um', 'soma_volume_um3',
+            'polarity_index_3d', 'principal_azimuth', 'principal_elevation',
+            'major_axis_um', 'mid_axis_um', 'minor_axis_um',
+            'n_branches', 'n_branch_points', 'n_endpoints',
+            'total_branch_length_um', 'fractal_dimension_3d', 'lacunarity_3d',
+        ]
+        with open(combined_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(results)
+        self.log(f"Results saved to: {combined_path}")
+
+        # Per-image files
+        by_image = {}
+        for result in results:
+            img = result['image_name']
+            if img not in by_image:
+                by_image[img] = []
+            by_image[img].append(result)
+
+        for img_name, img_results in by_image.items():
+            path = os.path.join(self.output_dir, f"{img_name}_3d_morphology.csv")
+            with open(path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                writer.writeheader()
+                writer.writerows(img_results)
+        self.log(f"Per-image results saved for {len(by_image)} Z-stacks")
 
 
 def _generate_microglia_icon():
