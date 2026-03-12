@@ -4271,10 +4271,8 @@ if __name__ == '__main__':
                                 mask_entry['volume_um3'] = size_val
                             else:
                                 mask_entry['area_um2'] = size_val
-                                'mask': mask_arr,
-                                'approved': approval,
-                                'soma_area_um2': outline_lookup.get(soma_id, 0),
-                            })
+                            mask_entry['soma_area_um2'] = outline_lookup.get(soma_id, 0)
+                            self.images[img_name]['masks'].append(mask_entry)
                         except Exception as e:
                             print(f"Warning: Could not load mask {mf}: {e}")
 
