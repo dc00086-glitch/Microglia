@@ -6049,28 +6049,36 @@ if __name__ == '__main__':
                 self.channel_idx = channel_idx
 
             def run(self):
-                total = len(self.image_data_list)
-                for i, (raw_path, img_name, rb_radius, rb_on,
-                        dn_on, dn_sz, sh_on, sh_amt) in enumerate(self.image_data_list):
-                    try:
-                        self.status_update.emit(f"Processing {img_name}...")
-                        stack = load_zstack(raw_path)
-                        if stack.ndim == 4 and _HAS_3D:
-                            stack = extract_channel_3d(stack, self.channel_idx)
-                        else:
-                            stack = ensure_grayscale_3d(stack)
-                        rb_r2 = rb_radius if rb_on else 0
-                        dn_s2 = dn_sz if dn_on else 0
-                        sh_a2 = sh_amt if sh_on else 0.0
-                        processed = preprocess_zstack(stack, rolling_ball_radius=rb_r2,
-                                                      denoise_size=dn_s2, sharpen_amount=sh_a2)
-                        out_stem = os.path.splitext(img_name)[0]
-                        out_path = os.path.join(self.output_dir, f"{out_stem}_processed.tif")
-                        tifffile.imwrite(out_path, processed)
-                        self.finished_image.emit(out_path, img_name, processed)
-                    except Exception as e:
-                        self.error_occurred.emit(f"{img_name}: {e}")
-                    self.progress.emit(int((i + 1) / total * 100))
+                try:
+                    total = len(self.image_data_list)
+                    for i, (raw_path, img_name, rb_radius, rb_on,
+                            dn_on, dn_sz, sh_on, sh_amt) in enumerate(self.image_data_list):
+                        try:
+                            self.status_update.emit(f"Processing {img_name}...")
+                            stack = load_zstack(raw_path)
+                            self.status_update.emit(f"  Loaded {img_name}: shape={stack.shape}, dtype={stack.dtype}")
+                            if stack.ndim == 4 and _HAS_3D:
+                                stack = extract_channel_3d(stack, self.channel_idx)
+                                self.status_update.emit(f"  Extracted channel {self.channel_idx + 1}: shape={stack.shape}")
+                            else:
+                                stack = ensure_grayscale_3d(stack)
+                            rb_r2 = rb_radius if rb_on else 0
+                            dn_s2 = dn_sz if dn_on else 0
+                            sh_a2 = sh_amt if sh_on else 0.0
+                            processed = preprocess_zstack(stack, rolling_ball_radius=rb_r2,
+                                                          denoise_size=dn_s2, sharpen_amount=sh_a2)
+                            out_stem = os.path.splitext(img_name)[0]
+                            out_path = os.path.join(self.output_dir, f"{out_stem}_processed.tif")
+                            tifffile.imwrite(out_path, processed)
+                            self.finished_image.emit(out_path, img_name, processed)
+                        except Exception as e:
+                            import traceback
+                            tb = traceback.format_exc()
+                            self.error_occurred.emit(f"{img_name}: {e}\n{tb}")
+                        self.progress.emit(int((i + 1) / total * 100))
+                except Exception as e:
+                    import traceback
+                    self.error_occurred.emit(f"Fatal 3D processing error: {e}\n{traceback.format_exc()}")
 
         self._preprocess_thread_3d = _PreprocessThread3D(process_list, self.output_dir, self.grayscale_channel)
         self._preprocess_thread_3d.status_update.connect(self.log)
@@ -6086,23 +6094,27 @@ if __name__ == '__main__':
         self._preprocess_thread_3d.start()
 
     def _handle_processed_image_3d(self, output_path, img_name, processed_stack):
-        if img_name in self.images:
-            self.images[img_name]['processed'] = processed_stack
-            self.images[img_name]['status'] = 'processed'
-            if self.images[img_name].get('raw_stack') is None:
-                try:
-                    raw = load_zstack(self.images[img_name]['raw_path'])
-                    self.images[img_name]['raw_stack'] = self._to_grayscale_3d(raw)
-                except Exception:
-                    pass
-            self._update_file_list_item(img_name)
-            if img_name == self.current_image_name:
-                self._update_z_slider_for_image()
-                sl = self._get_slice_for_display(processed_stack)
-                adjusted = self._apply_display_adjustments(sl)
-                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
-                self.processed_label.set_image(pixmap)
-                self.tabs.setCurrentIndex(2)
+        try:
+            if img_name in self.images:
+                self.images[img_name]['processed'] = processed_stack
+                self.images[img_name]['status'] = 'processed'
+                if self.images[img_name].get('raw_stack') is None:
+                    try:
+                        raw = load_zstack(self.images[img_name]['raw_path'])
+                        self.images[img_name]['raw_stack'] = self._to_grayscale_3d(raw)
+                    except Exception:
+                        pass
+                self._update_file_list_item(img_name)
+                if img_name == self.current_image_name:
+                    self._update_z_slider_for_image()
+                    sl = self._get_slice_for_display(processed_stack)
+                    adjusted = self._apply_display_adjustments(sl)
+                    pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                    self.processed_label.set_image(pixmap)
+                    self.tabs.setCurrentIndex(2)
+        except Exception as e:
+            import traceback
+            self.log(f"ERROR handling processed 3D image {img_name}: {e}\n{traceback.format_exc()}")
 
     def _processing_finished_3d(self):
         self.progress_bar.setVisible(False)
