@@ -3153,7 +3153,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             'min_intensity_percent': self.min_intensity_percent,
         }
 
-        script = self._build_cluster_script(settings, image_data)
+        script = self._build_cluster_script(settings, image_data, path)
 
         try:
             with open(path, 'w') as f:
@@ -3177,7 +3177,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.log(f"ERROR saving cluster script: {e}")
             QMessageBox.critical(self, "Error", f"Failed to save script:\n{e}")
 
-    def _build_cluster_script(self, settings, image_data):
+    def _build_cluster_script(self, settings, image_data, path=None):
         """Build the standalone Python script string for cluster mask generation."""
         settings_json = json.dumps(settings, indent=4)
         image_data_json = json.dumps(image_data, indent=4)
