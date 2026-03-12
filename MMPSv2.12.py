@@ -1947,6 +1947,21 @@ class MicrogliaAnalysisGUI(QMainWindow):
         cluster_action.setToolTip("Export a standalone Python script for mask generation on a compute cluster")
         cluster_action.triggered.connect(self.export_cluster_script)
 
+        # Mode menu
+        mode_menu = menu_bar.addMenu("Mode")
+
+        self.coloc_action = mode_menu.addAction("Colocalization")
+        self.coloc_action.setCheckable(True)
+        self.coloc_action.setChecked(self.colocalization_mode)
+        self.coloc_action.setToolTip("Enable colocalization analysis (multi-channel color images)")
+        self.coloc_action.triggered.connect(self._toggle_colocalization_mode)
+
+        self.mode_3d_action = mode_menu.addAction("3D Z-Stack Analysis")
+        self.mode_3d_action.setCheckable(True)
+        self.mode_3d_action.setChecked(False)
+        self.mode_3d_action.setToolTip("Open the 3D Z-stack analysis window")
+        self.mode_3d_action.triggered.connect(self._toggle_3d_mode)
+
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
@@ -3607,6 +3622,76 @@ if __name__ == '__main__':
 
         return script
 
+    def _toggle_colocalization_mode(self, checked):
+        """Toggle colocalization mode on/off from the Mode menu."""
+        self.colocalization_mode = checked
+        self.coloc_action.setChecked(checked)
+
+        if checked:
+            self.log("=" * 50)
+            self.log("COLOCALIZATION MODE ENABLED")
+            self.log("Images will be displayed in color")
+            self.log("Use 'Channel Display' button to select which channels to show")
+            self.log("Press C to toggle between color and grayscale")
+            self.log("=" * 50)
+            self.show_color_view = True
+            self.color_toggle_btn.setText("Show Grayscale (C)")
+            self.channel_select_btn.setVisible(True)
+        else:
+            self.log("Colocalization mode disabled")
+            self.show_color_view = False
+            self.color_toggle_btn.setText("Show Color (C)")
+            self.channel_select_btn.setVisible(False)
+
+        # Refresh display if an image is loaded
+        if self.current_image_name:
+            self._display_current_image()
+
+    def _toggle_3d_mode(self, checked):
+        """Open or close the 3D Z-stack analysis window from the Mode menu."""
+        if checked:
+            try:
+                # Import the 3D GUI from 3DMicroglia.py
+                # Use importlib to handle the numeric filename
+                import importlib.util
+                # Check PyInstaller bundle dir first, then script dir
+                if getattr(sys, 'frozen', False):
+                    script_dir = sys._MEIPASS
+                else:
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                spec = importlib.util.spec_from_file_location(
+                    "ThreeDMicroglia",
+                    os.path.join(script_dir, "3DMicroglia.py")
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+                self._3d_window = module.MicrogliaAnalysis3DGUI()
+                self._3d_window.setWindowTitle("MMPS — 3D Z-Stack Analysis")
+                self._3d_window.show()
+
+                # Uncheck when the 3D window is closed
+                self._3d_window.destroyed.connect(
+                    lambda: self.mode_3d_action.setChecked(False)
+                )
+
+                self.log("3D Z-Stack Analysis window opened")
+
+            except FileNotFoundError:
+                QMessageBox.warning(self, "Error",
+                    "3DMicroglia.py not found.\n\n"
+                    "Make sure 3DMicroglia.py is in the same folder as MMPS.")
+                self.mode_3d_action.setChecked(False)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to open 3D mode:\n{e}")
+                self.mode_3d_action.setChecked(False)
+        else:
+            # Close the 3D window if it exists
+            if hasattr(self, '_3d_window') and self._3d_window is not None:
+                self._3d_window.close()
+                self._3d_window = None
+            self.log("3D Z-Stack Analysis window closed")
+
     def _auto_save(self):
         """Silently auto-save the session to the output directory."""
         if not self.output_dir or not self.images:
@@ -3659,6 +3744,7 @@ if __name__ == '__main__':
             self.output_dir = session.get('output_dir')
             self.masks_dir = session.get('masks_dir')
             self.colocalization_mode = session.get('colocalization_mode', False)
+            self.coloc_action.setChecked(self.colocalization_mode)
             self.use_min_intensity = session.get('use_min_intensity', True)
             self.min_intensity_percent = session.get('min_intensity_percent', 5)
             self.mask_min_area = session.get('mask_min_area', 100)
@@ -4915,34 +5001,11 @@ if __name__ == '__main__':
         if not folder:
             return
 
-        # Ask about colocalization mode
-        reply = QMessageBox.question(
-            self, 'Colocalization Analysis',
-            'Do you want to perform colocalization analysis?\n\n'
-            'If YES: Images will be displayed in color showing all channels.\n'
-            'Colocalization metrics will be calculated for selected cells.\n\n'
-            'If NO: Images will be converted to grayscale for standard analysis.',
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        self.colocalization_mode = (reply == QMessageBox.Yes)
-
+        # Apply current colocalization mode settings to display
         if self.colocalization_mode:
-            self.log("=" * 50)
-            self.log("COLOCALIZATION MODE ENABLED")
-            self.log("Images will be displayed in color")
-            self.log("Use 'Channel Display' button to select which channels to show")
-            self.log("Press C to toggle between color and grayscale")
-            self.log("Grayscale conversion will occur when outlining begins")
-            self.log("=" * 50)
-            # Auto-enable color view in colocalization mode
             self.show_color_view = True
             self.color_toggle_btn.setText("Show Grayscale (C)")
             self.channel_select_btn.setVisible(True)
-        else:
-            self.show_color_view = False
-            self.color_toggle_btn.setText("Show Color (C)")
-            self.channel_select_btn.setVisible(False)
 
         # Include both lowercase and uppercase extensions for macOS compatibility
         exts = ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg',
