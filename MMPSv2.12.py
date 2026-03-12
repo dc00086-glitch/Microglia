@@ -6150,6 +6150,15 @@ if __name__ == '__main__':
         return self.images[self.current_image_name]['processed']
 
     def start_batch_soma_picking(self):
+        try:
+            self._start_batch_soma_picking_impl()
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"ERROR in soma picking: {e}\n{tb}")
+            QMessageBox.critical(self, "Error", f"Failed to start soma picking:\n{e}\n\nSee log for details.")
+
+    def _start_batch_soma_picking_impl(self):
         self.soma_picking_queue = [name for name, data in self.images.items()
                                    if data['selected'] and data['status'] in ('processed', 'somas_picked')]
         if not self.soma_picking_queue:
