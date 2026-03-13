@@ -5667,10 +5667,15 @@ if __name__ == '__main__':
                 if self.somas_dir:
                     os.makedirs(self.somas_dir, exist_ok=True)
 
-            # Pre-scan masks directory once (instead of per-image os.listdir)
-            all_mask_files = []
-            if self.masks_dir and os.path.isdir(self.masks_dir):
-                self.log("Scanning masks directory...")
+            # Check if we can skip the expensive directory scan by using mask_qa_state
+            # from the session JSON (which already has all mask metadata)
+            has_qa_state = any(
+                img_s.get('mask_qa_state') for img_s in session['images'].values()
+                if img_s.get('status', 'loaded') in ('masks_generated', 'qa_complete', 'analyzed')
+            )
+            all_mask_files = None  # lazy: only scan if needed
+            if not has_qa_state and self.masks_dir and os.path.isdir(self.masks_dir):
+                self.log("Scanning masks directory (no QA state in session)...")
                 QApplication.processEvents()
                 all_mask_files = sorted(os.listdir(self.masks_dir))
 
@@ -5780,93 +5785,73 @@ if __name__ == '__main__':
                 # Restore mask metadata WITHOUT reading TIFFs (lazy loading)
                 # Mask pixel data is loaded on demand via _reload_mask_from_disk
                 orig_status = img_session.get('status', 'loaded')
-                if orig_status in ('masks_generated', 'qa_complete', 'analyzed') and self.masks_dir and os.path.isdir(self.masks_dir):
-                    img_basename = os.path.splitext(img_name)[0]
-                    if is_3d:
-                        mask_pattern = re.compile(
-                            re.escape(img_basename) + r'_(soma_\d+_\d+_\d+)_vol(\d+)_mask3d\.tif$'
-                        )
-                    else:
-                        mask_pattern = re.compile(
-                            re.escape(img_basename) + r'_(soma_\d+_\d+)_area(\d+)_mask\.tif$'
-                        )
+                if orig_status in ('masks_generated', 'qa_complete', 'analyzed') and self.masks_dir:
                     # Build a lookup of soma outlines for soma_area_um2
                     outline_lookup = {}
                     if not is_3d:
                         for ol in restored_outlines:
                             outline_lookup[ol.get('soma_id', '')] = ol.get('soma_area_um2', 0)
-
-                    # Build approval state lookup from session
-                    qa_state_lookup = {}
-                    qa_duplicate_lookup = {}
-                    for qs in img_session.get('mask_qa_state', []):
-                        if is_3d:
-                            key = (qs.get('soma_id', ''), qs.get('volume_um3', 0))
-                        else:
-                            key = (qs.get('soma_id', ''), qs.get('area_um2', 0))
-                        qa_state_lookup[key] = qs.get('approved')
-                        qa_duplicate_lookup[key] = qs.get('duplicate', False)
-
-                    # Use pre-scanned directory listing instead of per-image os.listdir
-                    loaded_keys = set()
                     soma_ids_list = self.images[img_name]['soma_ids']
-                    for mf in all_mask_files:
-                        m = mask_pattern.match(mf)
-                        if not m:
-                            continue
-                        soma_id = m.group(1)
-                        size_val = int(m.group(2))
-                        loaded_keys.add((soma_id, size_val))
-                        soma_idx = soma_ids_list.index(soma_id) if soma_id in soma_ids_list else 0
-                        saved_approval = qa_state_lookup.get((soma_id, size_val))
-                        if saved_approval is not None:
-                            approval = saved_approval
-                        elif orig_status in ('qa_complete', 'analyzed'):
-                            approval = True
-                        else:
-                            approval = None
-                        is_dup = qa_duplicate_lookup.get((soma_id, size_val), False)
-                        mask_entry = {
-                            'image_name': img_name,
-                            'soma_idx': soma_idx,
-                            'soma_id': soma_id,
-                            'mask': None,  # Lazy: loaded on demand via _reload_mask_from_disk
-                            'approved': approval,
-                            'duplicate': is_dup,
-                        }
+
+                    mask_qa_state = img_session.get('mask_qa_state', [])
+                    if mask_qa_state:
+                        # FAST PATH: reconstruct masks directly from session metadata
+                        # No directory scan needed — all info is in the JSON
+                        for qs in mask_qa_state:
+                            qs_soma_id = qs.get('soma_id', '')
+                            soma_idx = qs.get('soma_idx', 0)
+                            if soma_idx == 0 and qs_soma_id in soma_ids_list:
+                                soma_idx = soma_ids_list.index(qs_soma_id)
+                            mask_entry = {
+                                'image_name': img_name,
+                                'soma_idx': soma_idx,
+                                'soma_id': qs_soma_id,
+                                'mask': None,  # Lazy: loaded on demand
+                                'approved': qs.get('approved'),
+                                'duplicate': qs.get('duplicate', False),
+                                'soma_area_um2': outline_lookup.get(qs_soma_id, 0),
+                            }
+                            if is_3d:
+                                mask_entry['volume_um3'] = qs.get('volume_um3', 0)
+                            else:
+                                mask_entry['area_um2'] = qs.get('area_um2', 0)
+                            self.images[img_name]['masks'].append(mask_entry)
+                    elif all_mask_files is not None and os.path.isdir(self.masks_dir):
+                        # FALLBACK: old session without mask_qa_state — scan directory
+                        img_basename = os.path.splitext(img_name)[0]
                         if is_3d:
-                            mask_entry['volume_um3'] = size_val
+                            mask_pattern = re.compile(
+                                re.escape(img_basename) + r'_(soma_\d+_\d+_\d+)_vol(\d+)_mask3d\.tif$'
+                            )
                         else:
-                            mask_entry['area_um2'] = size_val
-                        mask_entry['soma_area_um2'] = outline_lookup.get(soma_id, 0)
-                        self.images[img_name]['masks'].append(mask_entry)
+                            mask_pattern = re.compile(
+                                re.escape(img_basename) + r'_(soma_\d+_\d+)_area(\d+)_mask\.tif$'
+                            )
+                        for mf in all_mask_files:
+                            m = mask_pattern.match(mf)
+                            if not m:
+                                continue
+                            soma_id = m.group(1)
+                            size_val = int(m.group(2))
+                            soma_idx = soma_ids_list.index(soma_id) if soma_id in soma_ids_list else 0
+                            approval = True if orig_status in ('qa_complete', 'analyzed') else None
+                            mask_entry = {
+                                'image_name': img_name,
+                                'soma_idx': soma_idx,
+                                'soma_id': soma_id,
+                                'mask': None,
+                                'approved': approval,
+                                'duplicate': False,
+                            }
+                            if is_3d:
+                                mask_entry['volume_um3'] = size_val
+                            else:
+                                mask_entry['area_um2'] = size_val
+                            mask_entry['soma_area_um2'] = outline_lookup.get(soma_id, 0)
+                            self.images[img_name]['masks'].append(mask_entry)
 
-                    # Restore rejected masks whose TIFFs were deleted during QA
-                    # eviction — the session's mask_qa_state still has their records
-                    soma_ids_list = self.images[img_name]['soma_ids']
-                    n_restored = 0
-                    for qs in img_session.get('mask_qa_state', []):
-                        qs_soma_id = qs.get('soma_id', '')
-                        qs_area = qs.get('area_um2', 0)
-                        if (qs_soma_id, qs_area) in loaded_keys:
-                            continue  # already loaded from disk
-                        # This mask was in the session but not on disk (rejected & deleted)
-                        soma_idx = soma_ids_list.index(qs_soma_id) if qs_soma_id in soma_ids_list else 0
-                        self.images[img_name]['masks'].append({
-                            'image_name': img_name,
-                            'soma_idx': soma_idx,
-                            'soma_id': qs_soma_id,
-                            'area_um2': qs_area,
-                            'mask': None,  # TIFF was deleted; reload not needed for rejected masks
-                            'approved': qs.get('approved'),
-                            'duplicate': qs.get('duplicate', False),
-                            'soma_area_um2': outline_lookup.get(qs_soma_id, 0),
-                        })
-                        n_restored += 1
-
-                    n_loaded_masks = len(self.images[img_name]['masks'])
-                    if n_loaded_masks == 0:
-                        print(f"Warning: No masks found on disk for {img_name} in {self.masks_dir}")
+                    if len(self.images[img_name]['masks']) == 0:
+                        print(f"Warning: No masks found for {img_name}")
 
                 status = self.images[img_name]['status']
                 status_colors = {
@@ -5933,8 +5918,8 @@ if __name__ == '__main__':
             n_with_outlines = sum(1 for d in self.images.values() if d['soma_outlines'])
             n_with_processed = sum(1 for d in self.images.values() if d['processed'] is not None)
 
-            # Count mask files from pre-scanned directory listing
-            n_mask_files = len([f for f in all_mask_files if f.endswith('_mask.tif')])
+            # Count masks from restored image data (no directory scan needed)
+            n_mask_files = sum(len(d['masks']) for d in self.images.values())
 
             # Determine last completed step
             last_step = session.get('last_completed_step', self._determine_last_completed_step())
