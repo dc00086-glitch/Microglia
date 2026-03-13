@@ -2731,6 +2731,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f.write(slurm_script)
         os.chmod(slurm_path, 0o755)
 
+        # --- Generate the merge script ---
+        merge_script = self._build_merge_script(analyses)
+        merge_path = os.path.join(save_dir, "merge_results.py")
+        with open(merge_path, 'w') as f:
+            f.write(merge_script)
+
         # --- Generate a README ---
         readme = self._build_cluster_readme(analyses, fiji_path)
         readme_path = os.path.join(save_dir, "CLUSTER_README.txt")
@@ -2738,8 +2744,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f.write(readme)
 
         self.log(f"Cluster scripts saved to: {save_dir}")
-        self.log(f"  - mmps_imagej_cluster.py  (Jython analysis script)")
-        self.log(f"  - submit_imagej.sh        (SLURM job script)")
+        self.log(f"  - mmps_imagej_cluster.py  (Jython analysis script - runs per image)")
+        self.log(f"  - submit_imagej.sh        (SLURM array job launcher)")
+        self.log(f"  - merge_results.py        (combines per-image CSVs)")
         self.log(f"  - CLUSTER_README.txt      (instructions)")
 
         analyses_str = ", ".join(a.title() for a in analyses)
@@ -2752,7 +2759,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f"  - Your Fiji.app installation\n"
             f"  - The masks/ folder from your MMPS output\n"
             f"  - The somas/ folder (needed for Sholl)\n\n"
-            f"Then run:  sbatch submit_imagej.sh /path/to/mmps_output"
+            f"Then run:  bash submit_imagej.sh /path/to/mmps_output\n\n"
+            f"This submits one SLURM task per image (all at once),\n"
+            f"then a merge job that combines per-image CSVs."
         )
 
         QMessageBox.information(self, "Cluster Scripts Generated",
@@ -2760,7 +2769,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f"Analyses: {analyses_str}\n\n"
             f"Upload to your cluster with your Fiji installation,\n"
             f"masks/ and somas/ folders, then run:\n\n"
-            f"  sbatch submit_imagej.sh /path/to/mmps_output")
+            f"  bash submit_imagej.sh /path/to/mmps_output\n\n"
+            f"This submits a SLURM array job (one task per image)\n"
+            f"plus a merge job that combines results when done.")
 
     def _build_imagej_wrapper_script(self, pixel_size, upscale_factor, sholl_step, largest_only, analyses):
         """Build the Jython script that runs all selected analyses headlessly."""
@@ -3020,10 +3031,10 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
     return metrics
 
 
-def runSkeletonBatch(masksDir, outputDir, maskFiles):
+def runSkeletonBatch(masksDir, outputDir, maskFiles, imageName="all"):
     """Run skeleton analysis on all mask files."""
     print("=" * 60)
-    print("SKELETON ANALYSIS")
+    print("SKELETON ANALYSIS - " + imageName)
     print("=" * 60)
 
     skelDir = os.path.join(outputDir, "skeleton_results")
@@ -3048,7 +3059,7 @@ def runSkeletonBatch(masksDir, outputDir, maskFiles):
             allResults.append(metrics)
 
     if allResults:
-        outputPath = os.path.join(skelDir, "Skeleton_Analysis_Results.csv")
+        outputPath = os.path.join(skelDir, "Skeleton_Results_" + imageName + ".csv")
         idCols = ['cell_name', 'mask_file', 'skeleton_file', 'pixel_size_um', 'upscale_factor']
         maskCols = ['mask_area_um2', 'mask_perimeter_um', 'mask_circularity',
                     'mask_aspect_ratio', 'mask_roundness', 'mask_solidity']
@@ -3328,10 +3339,10 @@ def runConvexHullAnalysis(maskPath, pixelSize):
     }}
 
 
-def runFractalBatch(masksDir, outputDir, maskFiles):
+def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all"):
     """Run fractal + hull analysis on all mask files."""
     print("=" * 60)
-    print("FRACTAL / CONVEX HULL ANALYSIS")
+    print("FRACTAL / CONVEX HULL ANALYSIS - " + imageName)
     print("=" * 60)
 
     resultsDir = os.path.join(outputDir, "fractal_results")
@@ -3375,7 +3386,7 @@ def runFractalBatch(masksDir, outputDir, maskFiles):
             print("  ERROR: " + str(e))
 
     if allResults:
-        outputPath = os.path.join(resultsDir, "Fractal_Analysis_Results.csv")
+        outputPath = os.path.join(resultsDir, "Fractal_Results_" + imageName + ".csv")
         idCols = ['cell_name', 'image_name', 'soma_id', 'mask_area_um2', 'mask_file']
         fracCols = ['fractal_dimension', 'fractal_r_squared',
                     'fractal_lacunarity_mean', 'fractal_lacunarity_small',
@@ -3565,10 +3576,10 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
     return maskMetrics
 
 
-def runShollBatch(masksDir, somasDir, outputDir, maskFiles):
+def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all"):
     """Run Sholl analysis on all mask files."""
     print("=" * 60)
-    print("SHOLL ANALYSIS")
+    print("SHOLL ANALYSIS - " + imageName)
     print("=" * 60)
 
     shollDir = os.path.join(outputDir, "sholl_results")
@@ -3630,7 +3641,7 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles):
             print("  ERROR: " + str(e))
 
     if allResults:
-        combinedPath = os.path.join(shollDir, "Sholl_All_Results.csv")
+        combinedPath = os.path.join(shollDir, "Sholl_Results_" + imageName + ".csv")
         allKeys = list(allResults[0].keys())
         for r in allResults:
             for k in r.keys():
@@ -3649,18 +3660,37 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles):
 
 
 # ============================================================================
+# IMAGE DISCOVERY
+# ============================================================================
+
+def discoverImages(masksDir):
+    """Discover unique image names from mask filenames.
+    Returns a sorted list of unique image name prefixes."""
+    images = set()
+    for f in os.listdir(masksDir):
+        if not f.endswith('_mask.tif') or f.startswith('.'):
+            continue
+        m = re.match(r'^(.+?)_(soma_\\d+_\\d+)_area(\\d+)_mask\\.tif$', f)
+        if m:
+            images.add(m.group(1))
+    return sorted(images)
+
+
+def getMasksForImage(allMaskFiles, imageName):
+    """Filter mask files belonging to a specific image."""
+    prefix = imageName + "_soma_"
+    return [f for f in allMaskFiles if f.startswith(prefix)]
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
-# Get the output directory from the script parameter
+# Get parameters from the script invocation
 #@ String mmps_output_dir
+#@ String image_index
 
-print("=" * 60)
-print("MMPS CLUSTER ImageJ ANALYSIS")
-print("Output directory: " + mmps_output_dir)
-print("Analyses: " + str(ANALYSES))
-print("Pixel size: " + str(PIXEL_SIZE) + " um/px")
-print("=" * 60)
+image_index = int(image_index)
 
 masksDir = os.path.join(mmps_output_dir, "masks")
 somasDir = os.path.join(mmps_output_dir, "somas")
@@ -3669,91 +3699,96 @@ if not os.path.isdir(masksDir):
     print("ERROR: No 'masks' folder found in: " + mmps_output_dir)
     sys.exit(1)
 
-# Collect mask files
-maskFiles = sorted([f for f in os.listdir(masksDir)
-                    if f.endswith('_mask.tif') and not f.startswith('.')])
-if len(maskFiles) == 0:
+# Discover all unique images and select this task's image
+allImages = discoverImages(masksDir)
+if len(allImages) == 0:
     print("ERROR: No mask files found in: " + masksDir)
     sys.exit(1)
+
+if image_index < 0 or image_index >= len(allImages):
+    print("ERROR: image_index " + str(image_index) + " out of range (0-" + str(len(allImages) - 1) + ")")
+    sys.exit(1)
+
+imageName = allImages[image_index]
+
+# Collect mask files for this image only
+allMaskFiles = sorted([f for f in os.listdir(masksDir)
+                       if f.endswith('_mask.tif') and not f.startswith('.')])
+maskFiles = getMasksForImage(allMaskFiles, imageName)
 
 if LARGEST_ONLY:
     totalBefore = len(maskFiles)
     maskFiles = filterLargestMasks(maskFiles)
     print("Largest-only filter: " + str(totalBefore) + " -> " + str(len(maskFiles)) + " masks")
 
-print("Found " + str(len(maskFiles)) + " mask files")
-print("")
+print("=" * 60)
+print("MMPS CLUSTER ImageJ ANALYSIS")
+print("Image " + str(image_index + 1) + "/" + str(len(allImages)) + ": " + imageName)
+print("Masks for this image: " + str(len(maskFiles)))
+print("Analyses: " + str(ANALYSES))
+print("Pixel size: " + str(PIXEL_SIZE) + " um/px")
+print("=" * 60)
+
+if len(maskFiles) == 0:
+    print("No masks for this image, nothing to do.")
+    sys.exit(0)
 
 totalStart = time.time()
 
 if "skeleton" in ANALYSES:
-    runSkeletonBatch(masksDir, mmps_output_dir, maskFiles)
+    runSkeletonBatch(masksDir, mmps_output_dir, maskFiles, imageName)
     print("")
 
 if "fractal" in ANALYSES:
-    runFractalBatch(masksDir, mmps_output_dir, maskFiles)
+    runFractalBatch(masksDir, mmps_output_dir, maskFiles, imageName)
     print("")
 
 if "sholl" in ANALYSES:
     if not os.path.isdir(somasDir):
         print("WARNING: No 'somas' folder found - skipping Sholl analysis")
     else:
-        runShollBatch(masksDir, somasDir, mmps_output_dir, maskFiles)
+        runShollBatch(masksDir, somasDir, mmps_output_dir, maskFiles, imageName)
     print("")
 
 print("=" * 60)
-print("ALL ANALYSES COMPLETE in " + formatTime(time.time() - totalStart))
+print("IMAGE COMPLETE: " + imageName + " in " + formatTime(time.time() - totalStart))
 print("=" * 60)
 '''
         return script
 
     def _build_slurm_script(self, fiji_path, wrapper_path, partition, wall_time, mem, cpus, job_name, module_load):
-        """Build the SLURM submission script."""
+        """Build the SLURM array job submission script."""
         wrapper_basename = os.path.basename(wrapper_path)
         module_line = f"\n{module_load}" if module_load else ""
 
         script = f'''#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --partition={partition}
-#SBATCH --time={wall_time}
-#SBATCH --mem={mem}
-#SBATCH --cpus-per-task={cpus}
-#SBATCH --output=mmps_imagej_%j.out
-#SBATCH --error=mmps_imagej_%j.err
-
 # =============================================================================
-# MMPS ImageJ Cluster Analysis - SLURM Job Script
+# MMPS ImageJ Cluster Analysis - SLURM Array Job Launcher
 # Generated by MMPS on {time.strftime("%Y-%m-%d %H:%M:%S")}
+#
+# This script discovers how many images you have, then submits:
+#   1. A SLURM array job (one task per image, all submitted together)
+#   2. A merge job that combines per-image CSVs after all tasks finish
+#
+# Usage:
+#   bash submit_imagej.sh /path/to/mmps_output
 # =============================================================================
 
-# Usage:
-#   sbatch submit_imagej.sh /path/to/mmps_output
-#
-# The mmps_output directory should contain:
-#   masks/  - mask TIFF files from MMPS
-#   somas/  - soma TIFF files from MMPS (needed for Sholl)
+set -e
 
 if [ $# -lt 1 ]; then
-    echo "Usage: sbatch submit_imagej.sh /path/to/mmps_output"
+    echo "Usage: bash submit_imagej.sh /path/to/mmps_output"
     exit 1
 fi
 
-MMPS_OUTPUT_DIR="$1"
+MMPS_OUTPUT_DIR="$(cd "$1" && pwd)"
 FIJI="{fiji_path}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-{module_line}
-echo "======================================"
-echo "MMPS ImageJ Cluster Analysis"
-echo "Output dir: $MMPS_OUTPUT_DIR"
-echo "Fiji: $FIJI"
-echo "Script: $SCRIPT_DIR/{wrapper_basename}"
-echo "Started: $(date)"
-echo "======================================"
 
 # Verify Fiji exists
 if [ ! -x "$FIJI" ]; then
     echo "ERROR: Fiji not found or not executable at: $FIJI"
-    echo "Please set the correct path in this script or upload Fiji.app to the cluster."
+    echo "Please set the correct path in this script."
     exit 1
 fi
 
@@ -3763,14 +3798,159 @@ if [ ! -d "$MMPS_OUTPUT_DIR/masks" ]; then
     exit 1
 fi
 
-# Run the analysis
-"$FIJI" --headless --run "$SCRIPT_DIR/{wrapper_basename}" \\
-    "mmps_output_dir=\'$MMPS_OUTPUT_DIR\'"
+# Discover unique image names from mask filenames
+NUM_IMAGES=$(ls "$MMPS_OUTPUT_DIR/masks/"*_mask.tif 2>/dev/null \\
+    | xargs -n1 basename \\
+    | sed 's/_soma_[0-9]*_[0-9]*_area[0-9]*_mask\\.tif$//' \\
+    | sort -u \\
+    | wc -l)
 
+if [ "$NUM_IMAGES" -eq 0 ]; then
+    echo "ERROR: No mask files found in $MMPS_OUTPUT_DIR/masks/"
+    exit 1
+fi
+
+MAX_INDEX=$((NUM_IMAGES - 1))
+
+echo "======================================"
+echo "MMPS ImageJ Cluster Analysis"
+echo "Output dir: $MMPS_OUTPUT_DIR"
+echo "Images found: $NUM_IMAGES"
+echo "Fiji: $FIJI"
+echo "======================================"
+
+# --- Submit the array job (one task per image) ---
+ARRAY_JOB_ID=$(sbatch --parsable \\
+    --job-name={job_name} \\
+    --partition={partition} \\
+    --time={wall_time} \\
+    --mem={mem} \\
+    --cpus-per-task={cpus} \\
+    --array=0-${{MAX_INDEX}} \\
+    --output=mmps_imagej_%A_%a.out \\
+    --error=mmps_imagej_%A_%a.err \\
+    --wrap="{module_line}
+\\"$FIJI\\" --headless --run \\"$SCRIPT_DIR/{wrapper_basename}\\" \\
+    \\"mmps_output_dir=\'$MMPS_OUTPUT_DIR\',image_index=\'\$SLURM_ARRAY_TASK_ID\\'\\"
+")
+
+echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
+
+# --- Submit the merge job (runs after all array tasks complete) ---
+MERGE_JOB_ID=$(sbatch --parsable \\
+    --job-name={job_name}_merge \\
+    --partition={partition} \\
+    --time=00:10:00 \\
+    --mem=2G \\
+    --cpus-per-task=1 \\
+    --dependency=afterok:$ARRAY_JOB_ID \\
+    --output=mmps_imagej_merge_%j.out \\
+    --error=mmps_imagej_merge_%j.err \\
+    --wrap="python3 \\"$SCRIPT_DIR/merge_results.py\\" \\"$MMPS_OUTPUT_DIR\\""
+)
+
+echo "Submitted merge job:  $MERGE_JOB_ID (runs after array completes)"
 echo ""
-echo "======================================"
-echo "Finished: $(date)"
-echo "======================================"
+echo "Monitor with:  squeue -u \\$USER"
+echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
+'''
+        return script
+
+    def _build_merge_script(self, analyses):
+        """Build the Python3 script that merges per-image CSVs after all array tasks complete."""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        script = f'''#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MMPS Merge Results Script
+Generated by MMPS on {timestamp}
+
+Combines per-image CSV files from array job tasks into single result files.
+Called automatically by the SLURM merge job after all array tasks complete.
+
+Usage:
+    python3 merge_results.py /path/to/mmps_output
+"""
+
+import os
+import sys
+import glob
+import csv
+
+
+def merge_csvs(results_dir, pattern, output_name):
+    """Merge multiple CSVs matching pattern into one combined CSV."""
+    csv_files = sorted(glob.glob(os.path.join(results_dir, pattern)))
+    if not csv_files:
+        print(f"  No files matching {{pattern}} in {{results_dir}}")
+        return 0
+
+    all_rows = []
+    all_headers = []
+
+    for csv_file in csv_files:
+        with open(csv_file, 'r') as f:
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames or []
+            for h in headers:
+                if h not in all_headers:
+                    all_headers.append(h)
+            for row in reader:
+                all_rows.append(row)
+
+    output_path = os.path.join(results_dir, output_name)
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=all_headers, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print(f"  Merged {{len(csv_files)}} files -> {{output_path}} ({{len(all_rows)}} rows)")
+    return len(all_rows)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 merge_results.py /path/to/mmps_output")
+        sys.exit(1)
+
+    mmps_output = sys.argv[1]
+    print("=" * 60)
+    print("MMPS MERGE RESULTS")
+    print(f"Output directory: {{mmps_output}}")
+    print("=" * 60)
+
+    total_rows = 0
+'''
+        if "skeleton" in analyses:
+            script += '''
+    skel_dir = os.path.join(mmps_output, "skeleton_results")
+    if os.path.isdir(skel_dir):
+        print("\\nMerging Skeleton results...")
+        total_rows += merge_csvs(skel_dir, "Skeleton_Results_*.csv", "Skeleton_Analysis_Results.csv")
+'''
+        if "fractal" in analyses:
+            script += '''
+    frac_dir = os.path.join(mmps_output, "fractal_results")
+    if os.path.isdir(frac_dir):
+        print("\\nMerging Fractal results...")
+        total_rows += merge_csvs(frac_dir, "Fractal_Results_*.csv", "Fractal_Analysis_Results.csv")
+'''
+        if "sholl" in analyses:
+            script += '''
+    sholl_dir = os.path.join(mmps_output, "sholl_results")
+    if os.path.isdir(sholl_dir):
+        print("\\nMerging Sholl results...")
+        total_rows += merge_csvs(sholl_dir, "Sholl_Results_*.csv", "Sholl_All_Results.csv")
+'''
+        script += '''
+    print("")
+    print("=" * 60)
+    print(f"MERGE COMPLETE: {total_rows} total rows")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
 '''
         return script
 
@@ -3784,12 +3964,23 @@ Generated by MMPS on {time.strftime("%Y-%m-%d %H:%M:%S")}
 Analyses: {analyses_str}
 
 FILES GENERATED:
-  mmps_imagej_cluster.py  - Jython script (runs inside Fiji headlessly)
-  submit_imagej.sh        - SLURM job submission script
+  mmps_imagej_cluster.py  - Jython script (runs per image inside headless Fiji)
+  submit_imagej.sh        - SLURM array job launcher
+  merge_results.py        - Merges per-image CSVs into combined results
   CLUSTER_README.txt      - This file
 
+HOW IT WORKS:
+  The launcher script automatically:
+  1. Counts the unique images in your masks/ folder
+  2. Submits a SLURM array job (one task per image, all at once)
+  3. Submits a merge job that waits for all tasks to finish,
+     then combines per-image CSVs into final result files
+
+  Each image runs as an independent SLURM task — if you have 50 images
+  and 50 nodes available, all 50 run simultaneously.
+
 SETUP:
-  1. Upload these files to your cluster
+  1. Upload these 3 scripts to your cluster (same directory)
   2. Upload your Fiji.app installation to the cluster
      (or use an existing installation)
   3. Upload your MMPS output folder containing:
@@ -3799,14 +3990,18 @@ SETUP:
      Current setting: {fiji_path}
 
 RUNNING:
-  sbatch submit_imagej.sh /path/to/mmps_output
+  bash submit_imagej.sh /path/to/mmps_output
 
-  Or run directly without SLURM:
-  {fiji_path} --headless --run mmps_imagej_cluster.py \\
-      "mmps_output_dir='/path/to/mmps_output'"
+  This submits all jobs at once. Monitor with:
+    squeue -u $USER
 
 OUTPUT:
-  Results will be saved inside your mmps_output directory:
+  Per-image results (one CSV per image):
+  - skeleton_results/Skeleton_Results_<image>.csv
+  - fractal_results/Fractal_Results_<image>.csv
+  - sholl_results/Sholl_Results_<image>.csv
+
+  Combined results (merged after all tasks complete):
   - skeleton_results/Skeleton_Analysis_Results.csv
   - fractal_results/Fractal_Analysis_Results.csv
   - sholl_results/Sholl_All_Results.csv
@@ -3815,9 +4010,12 @@ TROUBLESHOOTING:
   - If Fiji can't find Java, add "module load java/11" (or similar)
     to the Module Load field before generating scripts
   - If you get memory errors, increase the --mem SLURM setting
-  - Check mmps_imagej_*.out and mmps_imagej_*.err for logs
+  - Check mmps_imagej_<jobid>_<taskid>.out for per-image logs
+  - Check mmps_imagej_merge_<jobid>.out for merge job logs
   - Sholl analysis requires the SNT plugin (included in standard Fiji)
   - Skeleton analysis requires the AnalyzeSkeleton plugin (included in standard Fiji)
+  - To re-run the merge manually:
+      python3 merge_results.py /path/to/mmps_output
 """
 
     def update_timer_display(self):
