@@ -5889,14 +5889,14 @@ if __name__ == '__main__':
                         break
                 self.process_selected_btn.setEnabled(True)
 
-            # Rebuild all_masks_flat from loaded masks (sorted largest-first per soma)
+            # Rebuild all_masks_flat from loaded masks (sorted by soma pick order, then largest-first)
             self.all_masks_flat = []
             size_key = 'volume_um3' if is_3d else 'area_um2'
             for iname, idata in self.images.items():
                 if not idata['selected']:
                     continue
                 sorted_masks = sorted(idata['masks'],
-                                      key=lambda m: (m.get('soma_id', ''), -m.get(size_key, 0)))
+                                      key=lambda m: (m.get('soma_idx', 0), -m.get(size_key, 0)))
                 for mask_data in sorted_masks:
                     self.all_masks_flat.append({
                         'image_name': iname,
@@ -10190,11 +10190,11 @@ if __name__ == '__main__':
         for img_name, img_data in self.images.items():
             if not img_data['selected']:
                 continue
-            # Sort masks per soma: largest area first so QA flows big→small
-            # (fixes ordering corruption from alphabetical filename sorts)
+            # Sort masks: by soma pick order (soma_idx), then largest area first
+            # within each soma so QA flows big→small
             size_key = 'volume_um3' if self.mode_3d else 'area_um2'
             sorted_masks = sorted(img_data['masks'],
-                                  key=lambda m: (m.get('soma_id', ''), -m.get(size_key, 0)))
+                                  key=lambda m: (m.get('soma_idx', 0), -m.get(size_key, 0)))
             for mask_data in sorted_masks:
                 self.all_masks_flat.append({
                     'image_name': img_name,
