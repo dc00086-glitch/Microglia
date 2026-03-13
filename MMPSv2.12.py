@@ -4415,6 +4415,30 @@ TROUBLESHOOTING:
                 writer.writerow(header)
                 writer.writerows(rows)
 
+    def _flush_qa_checklist(self):
+        """Flush deferred QA checklist updates to disk in one batch write."""
+        if not hasattr(self, '_qa_checklist_dirty') or not self._qa_checklist_dirty:
+            return
+        qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
+        if not qa_cl_path or not os.path.exists(qa_cl_path):
+            self._qa_checklist_dirty.clear()
+            return
+        rows = []
+        header = None
+        with open(qa_cl_path, 'r') as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            rows = [row for row in reader]
+        for row in rows:
+            if row[0] in self._qa_checklist_dirty:
+                row[1] = str(self._qa_checklist_dirty[row[0]])
+        if header:
+            with open(qa_cl_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(rows)
+        self._qa_checklist_dirty.clear()
+
     def _delete_checklist(self, path):
         """Delete a checklist CSV if it exists."""
         if path and os.path.exists(path):
@@ -10177,20 +10201,44 @@ if __name__ == '__main__':
             self.last_qa_decisions = []
 
         # Build soma ordering for sliding window memory management
+        # and soma->masks index for O(1) lookup instead of O(n) scans
         self._qa_soma_order = []
+        self._qa_soma_order_index = {}  # soma_key -> position in _qa_soma_order
         self._qa_finalized_somas = set()
+        self._qa_soma_mask_index = {}  # (img, soma_id) -> [list of flat indices]
         seen_somas = set()
-        for flat in self.all_masks_flat:
+        for i, flat in enumerate(self.all_masks_flat):
             key = (flat['image_name'], flat['mask_data'].get('soma_id', ''))
             if key not in seen_somas:
                 seen_somas.add(key)
+                self._qa_soma_order_index[key] = len(self._qa_soma_order)
                 self._qa_soma_order.append(key)
+            self._qa_soma_mask_index.setdefault(key, []).append(i)
+
+        # Per-image soma count for fast "all somas finalized?" check
+        self._qa_image_soma_count = {}
+        for key in self._qa_soma_order:
+            self._qa_image_soma_count[key[0]] = self._qa_image_soma_count.get(key[0], 0) + 1
+
+        # Build running counters for O(1) status display (avoid O(n) scans)
+        self._qa_auto_rejected_count = 0
+        self._qa_approved_count = 0
+        self._qa_user_rejected_count = 0
+        for f in self.all_masks_flat:
+            md = f['mask_data']
+            if md.get('duplicate'):
+                self._qa_auto_rejected_count += 1
+            elif md.get('approved') is True:
+                self._qa_approved_count += 1
+            elif md.get('approved') is False:
+                self._qa_user_rejected_count += 1
+
+        # Deferred checklist: track updates in memory, flush with auto-save
+        self._qa_checklist_dirty = {}
 
         # Find first unreviewed mask to resume from
-        auto_rejected_count = sum(1 for f in self.all_masks_flat if f['mask_data'].get('duplicate'))
-        manually_reviewed_count = sum(1 for f in self.all_masks_flat
-                                      if f['mask_data'].get('approved') is not None
-                                      and not f['mask_data'].get('duplicate'))
+        auto_rejected_count = self._qa_auto_rejected_count
+        manually_reviewed_count = self._qa_approved_count + self._qa_user_rejected_count
         reviewed_count = auto_rejected_count + manually_reviewed_count
         first_unreviewed = 0
         for i, flat in enumerate(self.all_masks_flat):
@@ -10267,9 +10315,8 @@ if __name__ == '__main__':
         current_flat = self.all_masks_flat[self.mask_qa_idx]
         current_soma_key = (current_flat['image_name'], current_flat['mask_data']['soma_id'])
 
-        try:
-            current_soma_idx = self._qa_soma_order.index(current_soma_key)
-        except ValueError:
+        current_soma_idx = self._qa_soma_order_index.get(current_soma_key)
+        if current_soma_idx is None:
             return
 
         # Everything before this index should be evicted
@@ -10285,31 +10332,32 @@ if __name__ == '__main__':
             self._qa_finalized_somas.add(soma_key)
             img_name, soma_id = soma_key
 
-            for flat in self.all_masks_flat:
-                if flat['image_name'] != img_name or flat['mask_data']['soma_id'] != soma_id:
-                    continue
-                mask_data = flat['mask_data']
-                # Delete rejected mask TIFFs from disk
+            # Use soma index for O(masks_per_soma) instead of O(all_masks)
+            for idx in self._qa_soma_mask_index.get(soma_key, []):
+                mask_data = self.all_masks_flat[idx]['mask_data']
                 if mask_data.get('approved') is False:
                     self._delete_rejected_mask_tiff(img_name, mask_data)
-                # Free the mask array from memory (metadata kept for bookkeeping)
                 mask_data['mask'] = None
 
             self.log(f"   💾 Finalized {soma_id} — freed mask arrays from memory")
 
         # Free processed images for images where all somas have been finalized
-        for img_name in set(k[0] for k in self._qa_finalized_somas):
-            # Check if all somas for this image are finalized
-            all_finalized = all(
-                k in self._qa_finalized_somas
-                for k in self._qa_soma_order if k[0] == img_name
-            )
-            if all_finalized and img_name in self.images:
-                img_data = self.images[img_name]
-                if img_data.get('processed') is not None:
-                    img_data['processed'] = None
-                    img_data.pop('color_image', None)
-                    self.log(f"   💾 Freed processed image for {img_name}")
+        # Only check images that had somas evicted in this call
+        for soma_idx in range(max(0, evict_before)):
+            soma_key = self._qa_soma_order[soma_idx]
+            img_name = soma_key[0]
+            if img_name not in self.images:
+                continue
+            img_data = self.images[img_name]
+            if img_data.get('processed') is None:
+                continue  # already freed
+            # Check using per-image soma count
+            img_somas = self._qa_image_soma_count.get(img_name, 0)
+            img_finalized = sum(1 for k in self._qa_finalized_somas if k[0] == img_name)
+            if img_finalized >= img_somas:
+                img_data['processed'] = None
+                img_data.pop('color_image', None)
+                self.log(f"   💾 Freed processed image for {img_name}")
 
         # Trim undo history: remove decisions for finalized somas
         self.last_qa_decisions = [
@@ -10446,20 +10494,19 @@ if __name__ == '__main__':
 
         status = mask_data.get('approved')
         status_text = "Approved" if status is True else "Rejected" if status is False else "Not reviewed"
-        manually_reviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is True)
-        auto_rejected = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is False and f['mask_data'].get('duplicate'))
-        user_rejected = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is False and not f['mask_data'].get('duplicate'))
+        auto_rejected = self._qa_auto_rejected_count
+        reviewed = self._qa_approved_count + self._qa_user_rejected_count
         masks_needing_review = len(self.all_masks_flat) - auto_rejected
 
         self.nav_status_label.setText(
             f"Mask {self.mask_qa_idx + 1 - auto_rejected}/{masks_needing_review} | "
-            f"Reviewed: {manually_reviewed + user_rejected}/{masks_needing_review} | "
+            f"Reviewed: {reviewed}/{masks_needing_review} | "
             f"{img_name} | {mask_data.get('soma_id', '')} | "
             f"Area: {mask_data.get('area_um2', 0)} um^2 | {status_text}"
         )
 
         # Update progress bar
-        self.mask_qa_progress_bar.setValue(manually_reviewed + user_rejected)
+        self.mask_qa_progress_bar.setValue(reviewed)
 
     def _show_current_mask_3d(self, flat_data, mask_data, img_name, img_data):
         """Display current mask in 3D QA mode."""
@@ -10520,18 +10567,17 @@ if __name__ == '__main__':
 
         status = mask_data.get('approved')
         status_text = "Approved" if status is True else "Rejected" if status is False else "Not reviewed"
-        manually_reviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is True)
-        auto_rejected = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is False and f['mask_data'].get('duplicate'))
-        user_rejected = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is False and not f['mask_data'].get('duplicate'))
+        auto_rejected = self._qa_auto_rejected_count
+        reviewed = self._qa_approved_count + self._qa_user_rejected_count
         masks_needing_review = len(self.all_masks_flat) - auto_rejected
         vol = mask_data.get('volume_um3', mask_data.get('actual_volume_um3', 0))
         self.nav_status_label.setText(
             f"Mask {self.mask_qa_idx + 1 - auto_rejected}/{masks_needing_review} | "
-            f"Reviewed: {manually_reviewed + user_rejected}/{masks_needing_review} | "
+            f"Reviewed: {reviewed}/{masks_needing_review} | "
             f"{img_name} | {mask_data.get('soma_id', '')} | "
             f"Vol: {vol} um^3 | {status_text}"
         )
-        self.mask_qa_progress_bar.setValue(manually_reviewed + user_rejected)
+        self.mask_qa_progress_bar.setValue(reviewed)
 
     def approve_current_mask(self):
         if not self.mask_qa_active or self.mask_qa_idx >= len(self.all_masks_flat):
@@ -10558,49 +10604,48 @@ if __name__ == '__main__':
 
         # Record decision for undo
         self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': True})
+        self._qa_approved_count += 1
 
         # Export mask immediately upon approval (2D only; 3D already exported)
         if not self.mode_3d:
             self._export_approved_mask(flat_data)
 
+        # Mark in deferred checklist
+        if self.mode_3d:
+            cl_key = f"{current_img}_{current_soma_id}_vol{current_size}"
+        else:
+            cl_key = f"{current_img}_{current_soma_id}_area{current_size}"
+        self._qa_checklist_dirty[cl_key] = 1
+
         # Auto-approve ALL smaller masks from the SAME soma in the SAME image
+        # Uses soma index for O(masks_per_soma) instead of O(all_masks)
         auto_approved = []
-        for i, other_flat in enumerate(self.all_masks_flat):
+        soma_key = (current_img, current_soma_id)
+        for idx in self._qa_soma_mask_index.get(soma_key, []):
+            other_flat = self.all_masks_flat[idx]
             other_mask = other_flat['mask_data']
-            other_img = other_flat['image_name']
             other_size = other_mask.get(size_key, 0)
 
-            # Must be: same image, same soma, smaller size, not yet reviewed
-            if (other_img == current_img and
-                    other_mask.get('soma_id') == current_soma_id and
-                    other_size < current_size and
-                    other_mask.get('approved') is None):
+            if other_size < current_size and other_mask.get('approved') is None:
                 other_mask['approved'] = True
-                auto_approved.append((i + 1, other_size))
+                auto_approved.append((idx + 1, other_size))
                 self.last_qa_decisions.append({'flat_data': other_flat, 'was_approved': True})
+                self._qa_approved_count += 1
                 if not self.mode_3d:
                     self._export_approved_mask(other_flat)
+                # Mark in deferred checklist
+                if self.mode_3d:
+                    auto_key = f"{current_img}_{current_soma_id}_vol{other_size}"
+                else:
+                    auto_key = f"{current_img}_{current_soma_id}_area{other_size}"
+                self._qa_checklist_dirty[auto_key] = 1
 
         if auto_approved:
             self.log(f"   Auto-approved {len(auto_approved)} smaller masks for {current_soma_id}")
 
-        # Update mask_qa_checklist.csv
-        qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
-        if qa_cl_path and os.path.exists(qa_cl_path):
-            if self.mode_3d:
-                cl_key = f"{current_img}_{current_soma_id}_vol{current_size}"
-            else:
-                cl_key = f"{current_img}_{current_soma_id}_area{current_size}"
-            self._update_checklist_row(qa_cl_path, 0, cl_key, 1, 1)
-            for _, sz in auto_approved:
-                if self.mode_3d:
-                    auto_key = f"{current_img}_{current_soma_id}_vol{sz}"
-                else:
-                    auto_key = f"{current_img}_{current_soma_id}_area{sz}"
-                self._update_checklist_row(qa_cl_path, 0, auto_key, 1, 1)
-
-        # Auto-save every 5 QA decisions
-        if len(self.last_qa_decisions) % 5 == 0:
+        # Auto-save every 50 QA decisions (flush checklist + session)
+        if len(self.last_qa_decisions) % 50 == 0:
+            self._flush_qa_checklist()
             self._auto_save()
 
         # Move to next unreviewed mask
@@ -10774,8 +10819,9 @@ if __name__ == '__main__':
                 self._show_current_mask()
                 return
 
-        # If we get here, check if all masks are reviewed
-        all_reviewed = all(flat['mask_data']['approved'] is not None for flat in self.all_masks_flat)
+        # If we get here, check if all masks are reviewed (O(1) via counters)
+        total_decided = self._qa_auto_rejected_count + self._qa_approved_count + self._qa_user_rejected_count
+        all_reviewed = total_decided >= len(self.all_masks_flat)
 
         if all_reviewed:
             self._check_qa_complete()
@@ -10795,23 +10841,21 @@ if __name__ == '__main__':
 
         # Record decision for undo
         self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': False})
+        self._qa_user_rejected_count += 1
 
         if self.mode_3d:
             vol = mask_data.get('volume_um3', 0)
             self.log(f"Rejected: {mask_data.get('soma_id', '')} ({vol} um^3)")
-            # Delete rejected 3D mask from disk
             self._delete_rejected_3d_mask(flat_data['image_name'], mask_data)
         else:
             self.log(f"Rejected: {mask_data.get('soma_id', '')} ({mask_data.get('area_um2', 0)} um^2)")
 
-        # Update mask_qa_checklist.csv
-        qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
-        if qa_cl_path and os.path.exists(qa_cl_path):
-            if self.mode_3d:
-                key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_vol{mask_data.get('volume_um3', 0)}"
-            else:
-                key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{mask_data.get('area_um2', 0)}"
-            self._update_checklist_row(qa_cl_path, 0, key, 1, 1)
+        # Mark in deferred checklist
+        if self.mode_3d:
+            key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_vol{mask_data.get('volume_um3', 0)}"
+        else:
+            key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{mask_data.get('area_um2', 0)}"
+        self._qa_checklist_dirty[key] = 1
 
         if self.mask_qa_idx < len(self.all_masks_flat) - 1:
             self.mask_qa_idx += 1
@@ -10859,7 +10903,11 @@ if __name__ == '__main__':
                 self.log(f"   Could not delete {fname}: {e}")
 
     def _check_qa_complete(self):
-        all_reviewed = all(flat['mask_data']['approved'] is not None for flat in self.all_masks_flat)
+        # Flush any pending checklist updates before finishing
+        self._flush_qa_checklist()
+
+        total_decided = self._qa_auto_rejected_count + self._qa_approved_count + self._qa_user_rejected_count
+        all_reviewed = total_decided >= len(self.all_masks_flat)
 
         if all_reviewed:
             self.mask_qa_active = False
@@ -10931,8 +10979,12 @@ if __name__ == '__main__':
         # Mask files are kept on disk (written during generation) —
         # only the in-memory approval state is reset.
 
-        # Reset approval state
+        # Reset approval state and decrement running counters
         was = "approved" if decision['was_approved'] else "rejected"
+        if decision['was_approved']:
+            self._qa_approved_count = max(0, self._qa_approved_count - 1)
+        else:
+            self._qa_user_rejected_count = max(0, self._qa_user_rejected_count - 1)
         mask_data['approved'] = None
 
         # Revert image status if needed
