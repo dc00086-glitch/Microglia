@@ -3022,6 +3022,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     'soma_id': mask.get('soma_id', ''),
                     'approved': mask.get('approved'),
                     'soma_idx': mask.get('soma_idx', 0),
+                    'duplicate': mask.get('duplicate', False),
                 }
                 if self.mode_3d:
                     mqa['volume_um3'] = mask.get('volume_um3', 0)
@@ -4263,12 +4264,14 @@ if __name__ == '__main__':
 
                     # Build approval state lookup from session
                     qa_state_lookup = {}
+                    qa_duplicate_lookup = {}
                     for qs in img_session.get('mask_qa_state', []):
                         if is_3d:
                             key = (qs.get('soma_id', ''), qs.get('volume_um3', 0))
                         else:
                             key = (qs.get('soma_id', ''), qs.get('area_um2', 0))
                         qa_state_lookup[key] = qs.get('approved')
+                        qa_duplicate_lookup[key] = qs.get('duplicate', False)
 
                     loaded_keys = set()
                     for mf in sorted(os.listdir(self.masks_dir)):
@@ -4291,12 +4294,14 @@ if __name__ == '__main__':
                                 approval = True
                             else:
                                 approval = None
+                            is_dup = qa_duplicate_lookup.get((soma_id, size_val), False)
                             mask_entry = {
                                 'image_name': img_name,
                                 'soma_idx': soma_idx,
                                 'soma_id': soma_id,
                                 'mask': mask_arr,
                                 'approved': approval,
+                                'duplicate': is_dup,
                             }
                             if is_3d:
                                 mask_entry['volume_um3'] = size_val
@@ -4325,6 +4330,7 @@ if __name__ == '__main__':
                             'area_um2': qs_area,
                             'mask': None,  # TIFF was deleted; reload not needed for rejected masks
                             'approved': qs.get('approved'),
+                            'duplicate': qs.get('duplicate', False),
                             'soma_area_um2': outline_lookup.get(qs_soma_id, 0),
                         })
                         n_restored += 1
