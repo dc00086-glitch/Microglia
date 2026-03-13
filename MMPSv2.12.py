@@ -10454,6 +10454,17 @@ if __name__ == '__main__':
         if not self.all_masks_flat or self.mask_qa_idx >= len(self.all_masks_flat):
             return
 
+        # Skip auto-rejected duplicates — find the next non-duplicate mask
+        while self.mask_qa_idx < len(self.all_masks_flat):
+            candidate = self.all_masks_flat[self.mask_qa_idx]['mask_data']
+            if candidate.get('duplicate', False) and candidate.get('approved') is False:
+                self.mask_qa_idx += 1
+            else:
+                break
+        if self.mask_qa_idx >= len(self.all_masks_flat):
+            self._check_qa_complete()
+            return
+
         flat_data = self.all_masks_flat[self.mask_qa_idx]
         mask_data = flat_data['mask_data']
         img_name = flat_data['image_name']
@@ -10854,11 +10865,17 @@ if __name__ == '__main__':
 
         flat_data = self.all_masks_flat[self.mask_qa_idx]
         mask_data = flat_data['mask_data']
+
+        # Guard against double-counting: if this mask was already auto-rejected
+        # as a duplicate, don't count it again as a user rejection
+        was_already_rejected = mask_data.get('duplicate', False) and mask_data.get('approved') is False
         mask_data['approved'] = False
 
         # Record decision for undo
-        self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': False})
-        self._qa_user_rejected_count += 1
+        self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': False,
+                                       'was_already_rejected': was_already_rejected})
+        if not was_already_rejected:
+            self._qa_user_rejected_count += 1
 
         if self.mode_3d:
             vol = mask_data.get('volume_um3', 0)
@@ -10874,11 +10891,8 @@ if __name__ == '__main__':
             key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{mask_data.get('area_um2', 0)}"
         self._qa_checklist_dirty[key] = 1
 
-        if self.mask_qa_idx < len(self.all_masks_flat) - 1:
-            self.mask_qa_idx += 1
-            self._show_current_mask()
-        else:
-            self._check_qa_complete()
+        # Use _advance_to_next_unreviewed to skip over auto-rejected duplicates
+        self._advance_to_next_unreviewed()
 
         # Evict old somas outside the sliding window to free memory
         self._evict_old_qa_masks()
@@ -10894,13 +10908,21 @@ if __name__ == '__main__':
         if not self.mask_qa_active:
             return
         if self.mask_qa_idx > 0:
-            # Check if the previous mask's soma has been finalized
-            prev_flat = self.all_masks_flat[self.mask_qa_idx - 1]
+            # Skip backwards past auto-rejected duplicates
+            target = self.mask_qa_idx - 1
+            while target > 0:
+                candidate = self.all_masks_flat[target]['mask_data']
+                if candidate.get('duplicate', False) and candidate.get('approved') is False:
+                    target -= 1
+                else:
+                    break
+            # Check if the target mask's soma has been finalized
+            prev_flat = self.all_masks_flat[target]
             prev_key = (prev_flat['image_name'], prev_flat['mask_data']['soma_id'])
             if prev_key in self._qa_finalized_somas:
-                self.log("⚠️ Cannot go back further — those masks have been finalized to save memory")
+                self.log("Cannot go back further - those masks have been finalized to save memory")
                 return
-            self.mask_qa_idx -= 1
+            self.mask_qa_idx = target
             self._show_current_mask()
 
     def _delete_rejected_3d_mask(self, img_name, mask_data):
@@ -11001,7 +11023,9 @@ if __name__ == '__main__':
         if decision['was_approved']:
             self._qa_approved_count = max(0, self._qa_approved_count - 1)
         else:
-            self._qa_user_rejected_count = max(0, self._qa_user_rejected_count - 1)
+            # Don't decrement if this was an already-auto-rejected duplicate
+            if not decision.get('was_already_rejected', False):
+                self._qa_user_rejected_count = max(0, self._qa_user_rejected_count - 1)
         mask_data['approved'] = None
 
         # Revert image status if needed
