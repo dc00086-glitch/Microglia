@@ -994,7 +994,7 @@ class MorphologyCalculationThread(QThread):
     finished = pyqtSignal(list)  # list of results
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, approved_masks, pixel_size, use_imagej, images, output_dir=None, pixel_size_map=None):
+    def __init__(self, approved_masks, pixel_size, use_imagej, images, output_dir=None, pixel_size_map=None, masks_dir=None):
         super().__init__()
         self.approved_masks = approved_masks
         self.pixel_size = pixel_size
@@ -1002,6 +1002,7 @@ class MorphologyCalculationThread(QThread):
         self.images = images
         self.output_dir = output_dir
         self.pixel_size_map = pixel_size_map or {}
+        self.masks_dir = masks_dir
 
     def run(self):
         import sys
@@ -1037,6 +1038,23 @@ class MorphologyCalculationThread(QThread):
                         img_data['processed'] = processed_img
                 soma_centroid = img_data['somas'][mask_data['soma_idx']]
                 soma_area_um2 = mask_data.get('soma_area_um2', None)
+
+                # Reload mask from disk if lazy-loaded (mask=None)
+                if mask_data.get('mask') is None and self.masks_dir:
+                    img_basename = os.path.splitext(img_name)[0]
+                    soma_id = mask_data['soma_id']
+                    area_um2 = mask_data.get('area_um2', 0)
+                    mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+                    mask_path = os.path.join(self.masks_dir, mask_filename)
+                    if os.path.exists(mask_path):
+                        mask_arr = safe_tiff_read(mask_path)
+                        mask_data['mask'] = (mask_arr > 0).astype(np.uint8)
+                if mask_data.get('mask') is None:
+                    self.progress.emit(
+                        int((i + 1) / total * 100),
+                        f"Skipping {mask_data['soma_id']} (mask not found on disk)"
+                    )
+                    continue
 
                 # Time tracking for diagnostics
                 import time
@@ -4541,7 +4559,7 @@ TROUBLESHOOTING:
         try:
             session = self._build_session_dict()
             with open(path, 'w') as f:
-                json.dump(session, f, indent=2)
+                json.dump(session, f, separators=(',', ':'))
 
             last_step = session.get('last_completed_step', 'none')
             step_name = self._get_step_display_name(last_step)
@@ -5539,7 +5557,7 @@ if __name__ == '__main__':
             path = os.path.join(self.output_dir, "autosave.mmps_session")
             session = self._build_session_dict()
             with open(path, 'w') as f:
-                json.dump(session, f, indent=2)
+                json.dump(session, f, separators=(',', ':'))
         except Exception:
             pass  # Silent - never interrupt the user's workflow
 
@@ -5553,8 +5571,21 @@ if __name__ == '__main__':
             return
 
         try:
-            with open(path, 'r') as f:
-                session = json.load(f)
+            # Use fastest available JSON parser
+            self.log("Loading session file...")
+            QApplication.processEvents()
+            try:
+                import orjson
+                with open(path, 'rb') as f:
+                    session = orjson.loads(f.read())
+            except ImportError:
+                try:
+                    import ujson
+                    with open(path, 'r') as f:
+                        session = ujson.load(f)
+                except ImportError:
+                    with open(path, 'r') as f:
+                        session = json.load(f)
 
             if session.get('version', 1) < 2:
                 QMessageBox.warning(self, "Warning", "Incompatible session file version.")
@@ -5636,14 +5667,37 @@ if __name__ == '__main__':
                 if self.somas_dir:
                     os.makedirs(self.somas_dir, exist_ok=True)
 
+            # Pre-scan masks directory once (instead of per-image os.listdir)
+            all_mask_files = []
+            if self.masks_dir and os.path.isdir(self.masks_dir):
+                self.log("Scanning masks directory...")
+                QApplication.processEvents()
+                all_mask_files = sorted(os.listdir(self.masks_dir))
+
             # Restore images
             from PyQt5.QtGui import QColor, QBrush
+            from PyQt5.QtWidgets import QProgressDialog
             self.images = {}
             self.file_list.clear()
+
+            n_total = len(session['images']) - len(missing)
+            progress = QProgressDialog("Restoring images...", "Cancel", 0, max(n_total, 1), self)
+            progress.setWindowTitle("Loading Session")
+            progress.setMinimumDuration(500)  # only show if load takes > 500ms
+            progress.setWindowModality(Qt.WindowModal)
+            img_counter = 0
 
             for img_name, img_session in session['images'].items():
                 if img_name in missing:
                     continue
+
+                img_counter += 1
+                progress.setValue(img_counter)
+                progress.setLabelText(f"Restoring {img_name}... ({img_counter}/{n_total})")
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    self.log("Session load cancelled by user.")
+                    break
 
                 # Try to reload processed image from disk
                 processed_data = None
@@ -5670,15 +5724,13 @@ if __name__ == '__main__':
                         # New format: full outline dict
                         polygon_pts = [tuple(pt) for pt in outline_data.get('polygon_points', [])]
                         centroid = tuple(outline_data['centroid']) if outline_data.get('centroid') else None
-                        # Reconstruct the outline mask from polygon points if we have the processed image
-                        outline_mask = None
-                        if polygon_pts and len(polygon_pts) >= 3 and processed_data is not None:
-                            outline_mask = self._polygon_to_mask(polygon_pts, processed_data.shape)
+                        # Defer outline mask reconstruction — will be recomputed on
+                        # demand from polygon_points when needed (mask generation, display)
                         restored_outlines.append({
                             'soma_idx': outline_data['soma_idx'],
                             'soma_id': outline_data['soma_id'],
                             'centroid': centroid,
-                            'outline': outline_mask,
+                            'outline': None,
                             'polygon_points': polygon_pts,
                             'soma_area_um2': outline_data.get('soma_area_um2', 0),
                         })
@@ -5725,12 +5777,12 @@ if __name__ == '__main__':
                 if processed_data is None and img_session.get('status') not in ('loaded', 'masks_generated', 'qa_complete', 'analyzed'):
                     self.images[img_name]['status'] = 'loaded'
 
-                # Load mask TIFFs from disk for masks_generated/qa_complete/analyzed images
+                # Restore mask metadata WITHOUT reading TIFFs (lazy loading)
+                # Mask pixel data is loaded on demand via _reload_mask_from_disk
                 orig_status = img_session.get('status', 'loaded')
                 if orig_status in ('masks_generated', 'qa_complete', 'analyzed') and self.masks_dir and os.path.isdir(self.masks_dir):
                     img_basename = os.path.splitext(img_name)[0]
                     if is_3d:
-                        # 3D mask pattern: {img}_{soma_z_y_x}_vol{N}_mask3d.tif
                         mask_pattern = re.compile(
                             re.escape(img_basename) + r'_(soma_\d+_\d+_\d+)_vol(\d+)_mask3d\.tif$'
                         )
@@ -5755,44 +5807,39 @@ if __name__ == '__main__':
                         qa_state_lookup[key] = qs.get('approved')
                         qa_duplicate_lookup[key] = qs.get('duplicate', False)
 
+                    # Use pre-scanned directory listing instead of per-image os.listdir
                     loaded_keys = set()
-                    for mf in sorted(os.listdir(self.masks_dir)):
+                    soma_ids_list = self.images[img_name]['soma_ids']
+                    for mf in all_mask_files:
                         m = mask_pattern.match(mf)
                         if not m:
                             continue
                         soma_id = m.group(1)
                         size_val = int(m.group(2))
                         loaded_keys.add((soma_id, size_val))
-                        mask_path = os.path.join(self.masks_dir, mf)
-                        try:
-                            mask_arr = safe_tiff_read(mask_path)
-                            mask_arr = (mask_arr > 0).astype(np.uint8)
-                            soma_ids_list = self.images[img_name]['soma_ids']
-                            soma_idx = soma_ids_list.index(soma_id) if soma_id in soma_ids_list else 0
-                            saved_approval = qa_state_lookup.get((soma_id, size_val))
-                            if saved_approval is not None:
-                                approval = saved_approval
-                            elif orig_status in ('qa_complete', 'analyzed'):
-                                approval = True
-                            else:
-                                approval = None
-                            is_dup = qa_duplicate_lookup.get((soma_id, size_val), False)
-                            mask_entry = {
-                                'image_name': img_name,
-                                'soma_idx': soma_idx,
-                                'soma_id': soma_id,
-                                'mask': mask_arr,
-                                'approved': approval,
-                                'duplicate': is_dup,
-                            }
-                            if is_3d:
-                                mask_entry['volume_um3'] = size_val
-                            else:
-                                mask_entry['area_um2'] = size_val
-                            mask_entry['soma_area_um2'] = outline_lookup.get(soma_id, 0)
-                            self.images[img_name]['masks'].append(mask_entry)
-                        except Exception as e:
-                            print(f"Warning: Could not load mask {mf}: {e}")
+                        soma_idx = soma_ids_list.index(soma_id) if soma_id in soma_ids_list else 0
+                        saved_approval = qa_state_lookup.get((soma_id, size_val))
+                        if saved_approval is not None:
+                            approval = saved_approval
+                        elif orig_status in ('qa_complete', 'analyzed'):
+                            approval = True
+                        else:
+                            approval = None
+                        is_dup = qa_duplicate_lookup.get((soma_id, size_val), False)
+                        mask_entry = {
+                            'image_name': img_name,
+                            'soma_idx': soma_idx,
+                            'soma_id': soma_id,
+                            'mask': None,  # Lazy: loaded on demand via _reload_mask_from_disk
+                            'approved': approval,
+                            'duplicate': is_dup,
+                        }
+                        if is_3d:
+                            mask_entry['volume_um3'] = size_val
+                        else:
+                            mask_entry['area_um2'] = size_val
+                        mask_entry['soma_area_um2'] = outline_lookup.get(soma_id, 0)
+                        self.images[img_name]['masks'].append(mask_entry)
 
                     # Restore rejected masks whose TIFFs were deleted during QA
                     # eviction — the session's mask_qa_state still has their records
@@ -5818,9 +5865,7 @@ if __name__ == '__main__':
                         n_restored += 1
 
                     n_loaded_masks = len(self.images[img_name]['masks'])
-                    if n_loaded_masks > 0:
-                        print(f"Loaded {n_loaded_masks} masks for {img_name} ({n_loaded_masks - n_restored} from disk, {n_restored} restored from session)")
-                    else:
+                    if n_loaded_masks == 0:
                         print(f"Warning: No masks found on disk for {img_name} in {self.masks_dir}")
 
                 status = self.images[img_name]['status']
@@ -5840,6 +5885,8 @@ if __name__ == '__main__':
                 item.setCheckState(Qt.Checked if img_session.get('selected') else Qt.Unchecked)
                 item.setForeground(QBrush(QColor(color_hex)))
                 self.file_list.addItem(item)
+
+            progress.close()
 
             # Load and display the last viewed image (or first if not saved)
             if self.images:
@@ -5886,10 +5933,8 @@ if __name__ == '__main__':
             n_with_outlines = sum(1 for d in self.images.values() if d['soma_outlines'])
             n_with_processed = sum(1 for d in self.images.values() if d['processed'] is not None)
 
-            # Count mask files found on disk
-            n_mask_files = 0
-            if self.masks_dir and os.path.isdir(self.masks_dir):
-                n_mask_files = len([f for f in os.listdir(self.masks_dir) if f.endswith('_mask.tif')])
+            # Count mask files from pre-scanned directory listing
+            n_mask_files = len([f for f in all_mask_files if f.endswith('_mask.tif')])
 
             # Determine last completed step
             last_step = session.get('last_completed_step', self._determine_last_completed_step())
@@ -11058,7 +11103,8 @@ if __name__ == '__main__':
             # Create and start worker thread (no ImageJ needed)
             self.morph_thread = MorphologyCalculationThread(
                 approved_masks, pixel_size, use_imagej=False, images=self.images,
-                output_dir=self.output_dir, pixel_size_map=pixel_size_map
+                output_dir=self.output_dir, pixel_size_map=pixel_size_map,
+                masks_dir=self.masks_dir
             )
 
             # Connect signals
