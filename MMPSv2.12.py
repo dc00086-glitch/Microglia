@@ -2586,7 +2586,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         fiji_layout = QVBoxLayout()
         fiji_desc = QLabel("Path to Fiji on the cluster:")
         fiji_layout.addWidget(fiji_desc)
-        self.cluster_fiji_path = QLineEdit("$HOME/Fiji.app/ImageJ-linux64")
+        self.cluster_fiji_path = QLineEdit("$SCRATCH/ImageJFiji/Fiji.app/ImageJ-linux64")
         fiji_layout.addWidget(self.cluster_fiji_path)
         fiji_group.setLayout(fiji_layout)
         layout.addWidget(fiji_group)
