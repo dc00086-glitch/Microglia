@@ -8176,6 +8176,7 @@ if __name__ == '__main__':
                     keep_idx = indices[-1]
                     for idx in indices[:-1]:
                         all_masks[soma_masks_start + idx]['approved'] = False
+                        all_masks[soma_masks_start + idx]['duplicate'] = True
                         print(f"    ⚠️ Auto-rejected {all_masks[soma_masks_start + idx]['area_um2']} µm² "
                               f"(duplicate of {all_masks[soma_masks_start + keep_idx]['area_um2']} µm², both {n_px} px)")
 
@@ -8352,6 +8353,7 @@ if __name__ == '__main__':
                 keep_idx = indices[-1]
                 for idx in indices[:-1]:
                     masks[idx]['approved'] = False
+                    masks[idx]['duplicate'] = True
                     print(f"    ⚠️ Auto-rejected {masks[idx]['area_um2']} µm² "
                           f"(duplicate of {masks[keep_idx]['area_um2']} µm², both {n_px} px)")
 
@@ -8693,7 +8695,11 @@ if __name__ == '__main__':
                 self._qa_soma_order.append(key)
 
         # Find first unreviewed mask to resume from
-        reviewed_count = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
+        auto_rejected_count = sum(1 for f in self.all_masks_flat if f['mask_data'].get('duplicate'))
+        manually_reviewed_count = sum(1 for f in self.all_masks_flat
+                                      if f['mask_data'].get('approved') is not None
+                                      and not f['mask_data'].get('duplicate'))
+        reviewed_count = auto_rejected_count + manually_reviewed_count
         first_unreviewed = 0
         for i, flat in enumerate(self.all_masks_flat):
             if flat['mask_data'].get('approved') is None:
@@ -8702,7 +8708,7 @@ if __name__ == '__main__':
         self.mask_qa_idx = first_unreviewed
 
         # If resuming, finalize somas that are already far behind
-        if reviewed_count > 0:
+        if manually_reviewed_count > 0:
             self._evict_old_qa_masks()
 
         # Create mask_qa_checklist.csv to track QA progress
@@ -8717,7 +8723,7 @@ if __name__ == '__main__':
                 else:
                     size_val = md.get('area_um2', 0)
                     key = f"{flat['image_name']}_{md.get('soma_id', '')}_area{size_val}"
-                passed = 1 if md.get('approved') is not None else 0
+                passed = 1 if md.get('approved') is True else 0
                 cl_rows.append([key, str(passed)])
             self._write_checklist(qa_cl_path, cl_rows, ['Mask', 'Passed QA'])
 
@@ -8732,9 +8738,11 @@ if __name__ == '__main__':
         self.clear_masks_btn.setEnabled(True)
         self.clear_masks_btn.setVisible(True)
 
-        # Show and init progress bar
-        self.mask_qa_progress_bar.setMaximum(len(self.all_masks_flat))
-        self.mask_qa_progress_bar.setValue(reviewed_count)
+        # Show and init progress bar — base it on masks that actually need
+        # human review (total minus auto-rejected duplicates).
+        masks_needing_review = len(self.all_masks_flat) - auto_rejected_count
+        self.mask_qa_progress_bar.setMaximum(masks_needing_review)
+        self.mask_qa_progress_bar.setValue(manually_reviewed_count)
         self.mask_qa_progress_bar.setVisible(True)
 
         self._show_current_mask()
@@ -8742,14 +8750,12 @@ if __name__ == '__main__':
 
         self.log("=" * 50)
         self.log("🎯 BATCH MASK QA MODE")
+        self.log(f"Total masks generated: {len(self.all_masks_flat)}")
         # Report auto-rejected duplicates
-        auto_rejected = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is False)
-        if auto_rejected > 0:
-            self.log(f"⚠️ {auto_rejected} duplicate masks auto-rejected (identical to a smaller target area)")
-        if reviewed_count > 0:
-            self.log(f"Resuming: {reviewed_count}/{len(self.all_masks_flat)} already reviewed")
-        else:
-            self.log(f"Total masks to review: {len(self.all_masks_flat)}")
+        if auto_rejected_count > 0:
+            self.log(f"⚠️ {auto_rejected_count} duplicate masks auto-rejected (identical to a smaller target area)")
+        if manually_reviewed_count > 0:
+            self.log(f"Resuming: {manually_reviewed_count}/{masks_needing_review} manually reviewed")
         remaining = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is None)
         self.log(f"Masks needing review: {remaining}")
         self.log("Keyboard: A=Approve, R=Reject, ←→=Navigate, Space=Approve&Next")
@@ -8948,17 +8954,20 @@ if __name__ == '__main__':
 
         status = mask_data.get('approved')
         status_text = "Approved" if status is True else "Rejected" if status is False else "Not reviewed"
-        reviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
+        manually_reviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is True)
+        auto_rejected = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is False and f['mask_data'].get('duplicate'))
+        user_rejected = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is False and not f['mask_data'].get('duplicate'))
+        masks_needing_review = len(self.all_masks_flat) - auto_rejected
 
         self.nav_status_label.setText(
-            f"Mask {self.mask_qa_idx + 1}/{len(self.all_masks_flat)} | "
-            f"Reviewed: {reviewed}/{len(self.all_masks_flat)} | "
+            f"Mask {self.mask_qa_idx + 1 - auto_rejected}/{masks_needing_review} | "
+            f"Reviewed: {manually_reviewed + user_rejected}/{masks_needing_review} | "
             f"{img_name} | {mask_data.get('soma_id', '')} | "
             f"Area: {mask_data.get('area_um2', 0)} um^2 | {status_text}"
         )
 
         # Update progress bar
-        self.mask_qa_progress_bar.setValue(reviewed)
+        self.mask_qa_progress_bar.setValue(manually_reviewed + user_rejected)
 
     def _show_current_mask_3d(self, flat_data, mask_data, img_name, img_data):
         """Display current mask in 3D QA mode."""
@@ -9019,15 +9028,18 @@ if __name__ == '__main__':
 
         status = mask_data.get('approved')
         status_text = "Approved" if status is True else "Rejected" if status is False else "Not reviewed"
-        reviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is not None)
+        manually_reviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is True)
+        auto_rejected = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is False and f['mask_data'].get('duplicate'))
+        user_rejected = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is False and not f['mask_data'].get('duplicate'))
+        masks_needing_review = len(self.all_masks_flat) - auto_rejected
         vol = mask_data.get('volume_um3', mask_data.get('actual_volume_um3', 0))
         self.nav_status_label.setText(
-            f"Mask {self.mask_qa_idx + 1}/{len(self.all_masks_flat)} | "
-            f"Reviewed: {reviewed}/{len(self.all_masks_flat)} | "
+            f"Mask {self.mask_qa_idx + 1 - auto_rejected}/{masks_needing_review} | "
+            f"Reviewed: {manually_reviewed + user_rejected}/{masks_needing_review} | "
             f"{img_name} | {mask_data.get('soma_id', '')} | "
             f"Vol: {vol} um^3 | {status_text}"
         )
-        self.mask_qa_progress_bar.setValue(reviewed)
+        self.mask_qa_progress_bar.setValue(manually_reviewed + user_rejected)
 
     def approve_current_mask(self):
         if not self.mask_qa_active or self.mask_qa_idx >= len(self.all_masks_flat):
