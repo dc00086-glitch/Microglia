@@ -2364,6 +2364,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_label.setText("No masks yet")
         self.tabs.addTab(self.mask_label, "Masks")
 
+        # --- Cluster tab ---
+        self.cluster_tab = self._create_cluster_tab()
+        self.tabs.addTab(self.cluster_tab, "Cluster")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
         # Give tabs most of the space (stretch factor)
         layout.addWidget(self.tabs, stretch=1)
 
@@ -2531,6 +2536,1289 @@ class MicrogliaAnalysisGUI(QMainWindow):
         layout.addWidget(self.mask_qa_progress_bar)
 
         return panel
+
+    # ------------------------------------------------------------------
+    # Cluster Tab
+    # ------------------------------------------------------------------
+
+    def _on_tab_changed(self, index):
+        """Sync pixel size to the Cluster tab when it becomes active."""
+        if hasattr(self, 'cluster_pixel_size') and self.tabs.tabText(index) == "Cluster":
+            try:
+                current_px = self._get_pixel_size()
+                self.cluster_pixel_size.setText(str(current_px))
+            except Exception:
+                pass
+
+    def _create_cluster_tab(self):
+        """Create the Cluster tab for generating HPC job scripts."""
+        from PyQt5.QtWidgets import QScrollArea
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
+        # --- Header ---
+        header = QLabel("Generate Cluster Scripts for ImageJ Analysis")
+        header.setStyleSheet("font-size: 14pt; font-weight: bold; padding: 8px 0;")
+        layout.addWidget(header)
+
+        desc = QLabel(
+            "Generate a self-contained Python script and SLURM job file to run\n"
+            "Skeleton, Fractal/Hull, and Sholl analyses on an HPC cluster using\n"
+            "headless Fiji. Upload the script, your Fiji installation, masks/, and\n"
+            "somas/ folders to the cluster."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: palette(dark); padding-bottom: 8px;")
+        layout.addWidget(desc)
+
+        # --- Fiji Path ---
+        fiji_group = QGroupBox("Fiji Installation")
+        fiji_layout = QVBoxLayout()
+        fiji_desc = QLabel("Path to Fiji on the cluster (will be embedded in the job script):")
+        fiji_desc.setWordWrap(True)
+        fiji_layout.addWidget(fiji_desc)
+        fiji_path_row = QHBoxLayout()
+        self.cluster_fiji_path = QLineEdit("$HOME/Fiji.app/ImageJ-linux64")
+        self.cluster_fiji_path.setPlaceholderText("/path/to/Fiji.app/ImageJ-linux64")
+        fiji_path_row.addWidget(self.cluster_fiji_path)
+        fiji_layout.addLayout(fiji_path_row)
+        fiji_group.setLayout(fiji_layout)
+        layout.addWidget(fiji_group)
+
+        # --- Analysis Selection ---
+        analysis_group = QGroupBox("Analyses to Run")
+        analysis_layout = QVBoxLayout()
+        self.cluster_do_skeleton = QCheckBox("Skeleton Analysis")
+        self.cluster_do_skeleton.setChecked(True)
+        self.cluster_do_skeleton.setToolTip("Branch count, junction count, skeleton length, etc.")
+        analysis_layout.addWidget(self.cluster_do_skeleton)
+        self.cluster_do_fractal = QCheckBox("Fractal / Convex Hull Analysis")
+        self.cluster_do_fractal.setChecked(True)
+        self.cluster_do_fractal.setToolTip("Box-counting fractal dimension, lacunarity, hull metrics")
+        analysis_layout.addWidget(self.cluster_do_fractal)
+        self.cluster_do_sholl = QCheckBox("Sholl Analysis")
+        self.cluster_do_sholl.setChecked(True)
+        self.cluster_do_sholl.setToolTip("Intersection counts, ramification index, regression coefficients")
+        analysis_layout.addWidget(self.cluster_do_sholl)
+        analysis_group.setLayout(analysis_layout)
+        layout.addWidget(analysis_group)
+
+        # --- Parameters ---
+        param_group = QGroupBox("Parameters")
+        param_layout = QFormLayout()
+        self.cluster_pixel_size = QLineEdit("0.316")
+        param_layout.addRow("Pixel size (um/px):", self.cluster_pixel_size)
+        self.cluster_upscale_factor = QLineEdit("2")
+        self.cluster_upscale_factor.setToolTip("Skeleton upscale factor (2 for 20x, 1 for 40x)")
+        param_layout.addRow("Upscale factor:", self.cluster_upscale_factor)
+        self.cluster_sholl_step = QLineEdit("0")
+        self.cluster_sholl_step.setToolTip("Sholl step size in um (0 = continuous / pixel-level)")
+        param_layout.addRow("Sholl step size (um):", self.cluster_sholl_step)
+        self.cluster_largest_only = QCheckBox("Only analyze largest mask per cell")
+        self.cluster_largest_only.setChecked(True)
+        param_layout.addRow("", self.cluster_largest_only)
+        param_group.setLayout(param_layout)
+        layout.addWidget(param_group)
+
+        # --- SLURM Settings ---
+        slurm_group = QGroupBox("SLURM Job Settings")
+        slurm_layout = QFormLayout()
+        self.cluster_partition = QLineEdit("general")
+        slurm_layout.addRow("Partition:", self.cluster_partition)
+        self.cluster_time = QLineEdit("04:00:00")
+        slurm_layout.addRow("Wall time:", self.cluster_time)
+        self.cluster_mem = QLineEdit("8G")
+        slurm_layout.addRow("Memory:", self.cluster_mem)
+        self.cluster_cpus = QLineEdit("1")
+        slurm_layout.addRow("CPUs per task:", self.cluster_cpus)
+        self.cluster_job_name = QLineEdit("mmps_imagej")
+        slurm_layout.addRow("Job name:", self.cluster_job_name)
+        self.cluster_module_load = QLineEdit("")
+        self.cluster_module_load.setPlaceholderText("e.g. module load java/11")
+        self.cluster_module_load.setToolTip("Optional module load command(s) before running Fiji")
+        slurm_layout.addRow("Module load:", self.cluster_module_load)
+        slurm_group.setLayout(slurm_layout)
+        layout.addWidget(slurm_group)
+
+        # --- Generate Button ---
+        self.cluster_generate_btn = QPushButton("Generate Cluster Scripts")
+        self.cluster_generate_btn.setStyleSheet(
+            "font-size: 13pt; font-weight: bold; padding: 10px; "
+            "background-color: #4CAF50; color: white; border-radius: 5px;"
+        )
+        self.cluster_generate_btn.clicked.connect(self.export_imagej_cluster_scripts)
+        layout.addWidget(self.cluster_generate_btn)
+
+        # --- Output info ---
+        self.cluster_output_label = QLabel("")
+        self.cluster_output_label.setWordWrap(True)
+        self.cluster_output_label.setStyleSheet("padding: 8px; color: palette(dark);")
+        layout.addWidget(self.cluster_output_label)
+
+        layout.addStretch()
+        scroll.setWidget(container)
+        return scroll
+
+    def export_imagej_cluster_scripts(self):
+        """Export cluster scripts for running ImageJ analyses on HPC."""
+        try:
+            self._export_imagej_cluster_scripts_impl()
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"ERROR generating ImageJ cluster scripts: {e}\n{tb}")
+            QMessageBox.critical(self, "Error",
+                f"Failed to generate cluster scripts:\n{e}\n\nSee log for details.")
+
+    def _export_imagej_cluster_scripts_impl(self):
+        """Internal implementation for generating ImageJ cluster scripts."""
+        do_skeleton = self.cluster_do_skeleton.isChecked()
+        do_fractal = self.cluster_do_fractal.isChecked()
+        do_sholl = self.cluster_do_sholl.isChecked()
+
+        if not do_skeleton and not do_fractal and not do_sholl:
+            QMessageBox.warning(self, "Warning", "Select at least one analysis to run.")
+            return
+
+        # Validate parameters
+        try:
+            pixel_size = float(self.cluster_pixel_size.text())
+            upscale_factor = int(self.cluster_upscale_factor.text())
+            sholl_step = float(self.cluster_sholl_step.text())
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Invalid numeric parameter. Check pixel size, upscale factor, and sholl step.")
+            return
+
+        largest_only = self.cluster_largest_only.isChecked()
+        fiji_path = self.cluster_fiji_path.text().strip()
+        partition = self.cluster_partition.text().strip() or "general"
+        wall_time = self.cluster_time.text().strip() or "04:00:00"
+        mem = self.cluster_mem.text().strip() or "8G"
+        cpus = self.cluster_cpus.text().strip() or "1"
+        job_name = self.cluster_job_name.text().strip() or "mmps_imagej"
+        module_load = self.cluster_module_load.text().strip()
+
+        # Ask where to save
+        save_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory for Cluster Scripts")
+        if not save_dir:
+            return
+
+        analyses = []
+        if do_skeleton:
+            analyses.append("skeleton")
+        if do_fractal:
+            analyses.append("fractal")
+        if do_sholl:
+            analyses.append("sholl")
+
+        # --- Generate the headless Jython wrapper script ---
+        wrapper_script = self._build_imagej_wrapper_script(
+            pixel_size, upscale_factor, sholl_step, largest_only, analyses
+        )
+        wrapper_path = os.path.join(save_dir, "mmps_imagej_cluster.py")
+        with open(wrapper_path, 'w') as f:
+            f.write(wrapper_script)
+
+        # --- Generate the SLURM job script ---
+        slurm_script = self._build_slurm_script(
+            fiji_path, wrapper_path, partition, wall_time, mem, cpus, job_name, module_load
+        )
+        slurm_path = os.path.join(save_dir, "submit_imagej.sh")
+        with open(slurm_path, 'w') as f:
+            f.write(slurm_script)
+        os.chmod(slurm_path, 0o755)
+
+        # --- Generate a README ---
+        readme = self._build_cluster_readme(analyses, fiji_path)
+        readme_path = os.path.join(save_dir, "CLUSTER_README.txt")
+        with open(readme_path, 'w') as f:
+            f.write(readme)
+
+        self.log(f"Cluster scripts saved to: {save_dir}")
+        self.log(f"  - mmps_imagej_cluster.py  (Jython analysis script)")
+        self.log(f"  - submit_imagej.sh        (SLURM job script)")
+        self.log(f"  - CLUSTER_README.txt      (instructions)")
+
+        analyses_str = ", ".join(a.title() for a in analyses)
+        self.cluster_output_label.setText(
+            f"Scripts saved to:\n{save_dir}\n\n"
+            f"Analyses: {analyses_str}\n"
+            f"Pixel size: {pixel_size} um/px\n"
+            f"Upscale factor: {upscale_factor}x\n\n"
+            f"Upload to your cluster along with:\n"
+            f"  - Your Fiji.app installation\n"
+            f"  - The masks/ folder from your MMPS output\n"
+            f"  - The somas/ folder (needed for Sholl)\n\n"
+            f"Then run:  sbatch submit_imagej.sh /path/to/mmps_output"
+        )
+
+        QMessageBox.information(self, "Cluster Scripts Generated",
+            f"Scripts saved to:\n{save_dir}\n\n"
+            f"Analyses: {analyses_str}\n\n"
+            f"Upload to your cluster with your Fiji installation,\n"
+            f"masks/ and somas/ folders, then run:\n\n"
+            f"  sbatch submit_imagej.sh /path/to/mmps_output")
+
+    def _build_imagej_wrapper_script(self, pixel_size, upscale_factor, sholl_step, largest_only, analyses):
+        """Build the Jython script that runs all selected analyses headlessly."""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        script = f'''# -*- coding: utf-8 -*-
+"""
+MMPS ImageJ Cluster Analysis Script
+Generated by MMPS on {timestamp}
+
+This Jython script runs inside headless Fiji on an HPC cluster.
+It performs batch Skeleton, Fractal/Hull, and/or Sholl analyses
+on MMPS-exported mask files.
+
+Usage (called by the SLURM job script):
+    ImageJ-linux64 --headless --run mmps_imagej_cluster.py \\
+        "mmps_output_dir=/path/to/mmps_output"
+
+The mmps_output_dir should contain:
+    masks/   - *_mask.tif files
+    somas/   - *_soma.tif files (for Sholl)
+"""
+
+from ij import IJ
+from ij.measure import Calibration, ResultsTable
+from ij.process import ImageProcessor
+
+import os
+import sys
+import csv
+import re
+import math
+import time
+
+
+# ============================================================================
+# PARAMETERS (embedded from MMPS session)
+# ============================================================================
+
+PIXEL_SIZE = {pixel_size}
+UPSCALE_FACTOR = {upscale_factor}
+SHOLL_STEP = {sholl_step}
+LARGEST_ONLY = {largest_only}
+ANALYSES = {analyses}
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def openImageQuiet(path):
+    """Open an image without the Bio-Formats options dialog."""
+    try:
+        from loci.plugins import BF
+        import loci.plugins
+        ImporterOptions = getattr(loci.plugins, 'in').ImporterOptions
+        opts = ImporterOptions()
+        opts.setId(path)
+        opts.setWindowless(True)
+        imps = BF.openImagePlus(opts)
+        if imps and len(imps) > 0:
+            return imps[0]
+        return None
+    except Exception:
+        return IJ.openImage(path)
+
+
+def parseMaskInfo(maskFilename):
+    """Extract image name, soma ID, and area from mask filename."""
+    m = re.match(r'^(.+?)_(soma_\\d+_\\d+)_area(\\d+)_mask\\.tif$', maskFilename)
+    if m:
+        return m.group(1), m.group(2), int(m.group(3))
+    return maskFilename, 'unknown', 0
+
+
+def getCellName(maskFilename):
+    """Get a clean cell name from mask filename."""
+    name = re.sub(r'_area[3-8]\\d{{2}}_mask\\.tif$', '', maskFilename)
+    if name == maskFilename:
+        name = re.sub(r'_area\\d+_mask\\.tif$', '', maskFilename)
+    if name == maskFilename or name.endswith('_mask'):
+        name = re.sub(r'_mask\\.tif$', '', maskFilename)
+    return name
+
+
+def filterLargestMasks(maskFiles):
+    """Keep only the largest area mask per cell."""
+    best = {{}}
+    for f in maskFiles:
+        imgName, somaId, area = parseMaskInfo(f)
+        key = (imgName, somaId)
+        if key not in best or area > best[key][0]:
+            best[key] = (area, f)
+    kept = set(v[1] for v in best.values())
+    return [f for f in maskFiles if f in kept]
+
+
+def formatTime(seconds):
+    """Format elapsed time as human-readable string."""
+    if seconds < 60:
+        return str(int(seconds)) + "s"
+    elif seconds < 3600:
+        return str(int(seconds // 60)) + "m " + str(int(seconds % 60)).zfill(2) + "s"
+    else:
+        return str(int(seconds // 3600)) + "h " + str(int((seconds % 3600) // 60)).zfill(2) + "m"
+
+
+# ============================================================================
+# SKELETON ANALYSIS
+# ============================================================================
+
+def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
+    """Analyze skeleton of a single mask image."""
+    from sc.fiji.analyzeSkeleton import AnalyzeSkeleton_
+
+    mask = openImageQuiet(maskPath)
+    if mask is None:
+        print("  ERROR: Could not open mask")
+        return None
+
+    cal = Calibration(mask)
+    cal.pixelWidth = pixelSize
+    cal.pixelHeight = pixelSize
+    cal.setUnit("micron")
+    mask.setCalibration(cal)
+
+    maskProcessor = mask.getProcessor()
+    maskWidth = mask.getWidth()
+    maskHeight = mask.getHeight()
+    maskPixelCount = 0
+    for y in range(maskHeight):
+        for x in range(maskWidth):
+            if maskProcessor.getPixel(x, y) > 0:
+                maskPixelCount += 1
+    maskArea = maskPixelCount * (pixelSize * pixelSize)
+
+    IJ.setThreshold(mask, 1, 255)
+    IJ.run(mask, "Set Measurements...", "area perimeter shape redirect=None decimal=3")
+    IJ.run(mask, "Measure", "")
+    rt = ResultsTable.getResultsTable()
+    maskPerimeter = rt.getValue("Perim.", 0)
+    maskCircularity = rt.getValue("Circ.", 0)
+    maskAR = rt.getValue("AR", 0)
+    maskRound = rt.getValue("Round", 0)
+    maskSolidity = rt.getValue("Solidity", 0)
+    rt.reset()
+
+    skel = mask.duplicate()
+    if scaleFactor > 1:
+        newWidth = int(mask.getWidth() * scaleFactor)
+        newHeight = int(mask.getHeight() * scaleFactor)
+        IJ.run(skel, "Size...", "width=" + str(newWidth) + " height=" + str(newHeight) + " interpolation=None")
+        scaledPixelSize = pixelSize / float(scaleFactor)
+        scaledCal = Calibration(skel)
+        scaledCal.pixelWidth = scaledPixelSize
+        scaledCal.pixelHeight = scaledPixelSize
+        scaledCal.setUnit("micron")
+        skel.setCalibration(scaledCal)
+
+    IJ.setThreshold(skel, 1, 255)
+    IJ.run(skel, "Convert to Mask", "")
+    IJ.run(skel, "Skeletonize (2D/3D)", "")
+    IJ.run(skel, "Select None", "")
+
+    baseName = os.path.basename(maskPath)
+    cellName = getCellName(baseName)
+
+    skelPath = os.path.join(outputDirPath, cellName + "_skeleton.tif")
+    IJ.save(skel, skelPath)
+
+    analyzer = AnalyzeSkeleton_()
+    analyzer.setup("", skel)
+    result = analyzer.run(AnalyzeSkeleton_.SHORTEST_BRANCH, True, True, None, True, False)
+
+    branches = result.getBranches()
+    junctions = result.getJunctions()
+    endPoints = result.getEndPoints()
+    junctionVoxels = result.getJunctionVoxels()
+    slabVoxels = result.getSlabs()
+    triplePoints = result.getTriples()
+    quadruplePoints = result.getQuadruples()
+    maxBranchLength = result.getMaximumBranchLength()
+    shortestPathList = result.getShortestPathList()
+
+    numBranches = int(branches[0]) if len(branches) > 0 else 0
+    numSlabVoxels = int(slabVoxels[0]) if len(slabVoxels) > 0 else 0
+
+    try:
+        avgBranchLengthArray = result.getAverageBranchLength()
+        if avgBranchLengthArray is not None and len(avgBranchLengthArray) > 0:
+            avgBranchLength = float(avgBranchLengthArray[0])
+        else:
+            avgBranchLength = 0.0
+    except:
+        if numBranches > 0 and numSlabVoxels > 0:
+            effectivePx = pixelSize / float(scaleFactor) if scaleFactor > 1 else pixelSize
+            avgBranchLength = (numSlabVoxels * effectivePx) / float(numBranches)
+        else:
+            avgBranchLength = 0.0
+
+    longestShortestPath = 0.0
+    try:
+        if shortestPathList and len(shortestPathList) > 0:
+            if hasattr(shortestPathList[0], '__len__') and len(shortestPathList[0]) > 0:
+                longestShortestPath = float(max(shortestPathList[0]))
+            elif shortestPathList[0]:
+                longestShortestPath = float(shortestPathList[0])
+    except:
+        longestShortestPath = 0.0
+
+    if avgBranchLength > 0 and numBranches > 0:
+        totalSkeletonLength = avgBranchLength * numBranches
+    else:
+        effectivePx = pixelSize / float(scaleFactor) if scaleFactor > 1 else pixelSize
+        totalSkeletonLength = numSlabVoxels * effectivePx
+
+    skelProcessor = skel.getProcessor()
+    skelWidth = skel.getWidth()
+    skelHeight = skel.getHeight()
+    skelPixelCount = 0
+    for y in range(skelHeight):
+        for x in range(skelWidth):
+            if skelProcessor.getPixel(x, y) > 0:
+                skelPixelCount += 1
+    effectivePx = pixelSize / float(scaleFactor) if scaleFactor > 1 else pixelSize
+    skeletonArea = skelPixelCount * (effectivePx * effectivePx)
+
+    metrics = {{
+        'mask_file': os.path.basename(maskPath),
+        'cell_name': cellName,
+        'skeleton_file': os.path.basename(skelPath),
+        'pixel_size_um': pixelSize,
+        'upscale_factor': scaleFactor,
+        'mask_area_um2': maskArea,
+        'mask_perimeter_um': maskPerimeter,
+        'mask_circularity': maskCircularity,
+        'mask_aspect_ratio': maskAR,
+        'mask_roundness': maskRound,
+        'mask_solidity': maskSolidity,
+        'num_branches': numBranches,
+        'num_junctions': int(junctions[0]) if len(junctions) > 0 else 0,
+        'num_end_points': int(endPoints[0]) if len(endPoints) > 0 else 0,
+        'num_junction_voxels': int(junctionVoxels[0]) if len(junctionVoxels) > 0 else 0,
+        'num_slab_voxels': numSlabVoxels,
+        'num_triple_points': int(triplePoints[0]) if len(triplePoints) > 0 else 0,
+        'num_quadruple_points': int(quadruplePoints[0]) if len(quadruplePoints) > 0 else 0,
+        'max_branch_length_um': float(maxBranchLength[0]) if len(maxBranchLength) > 0 else 0,
+        'avg_branch_length_um': avgBranchLength,
+        'longest_shortest_path_um': longestShortestPath,
+        'total_skeleton_length_um': totalSkeletonLength,
+        'skeleton_area_um2': skeletonArea,
+        'branching_density': skeletonArea / maskArea if maskArea > 0 else 0,
+    }}
+
+    mask.close()
+    skel.close()
+    return metrics
+
+
+def runSkeletonBatch(masksDir, outputDir, maskFiles):
+    """Run skeleton analysis on all mask files."""
+    print("=" * 60)
+    print("SKELETON ANALYSIS")
+    print("=" * 60)
+
+    skelDir = os.path.join(outputDir, "skeleton_results")
+    if not os.path.exists(skelDir):
+        os.makedirs(skelDir)
+
+    allResults = []
+    batchStart = time.time()
+    total = len(maskFiles)
+
+    for idx, maskFile in enumerate(maskFiles):
+        maskPath = os.path.join(masksDir, maskFile)
+        elapsed = time.time() - batchStart
+        if idx > 0:
+            eta = formatTime(elapsed / idx * (total - idx))
+        else:
+            eta = "estimating..."
+        print("[" + str(idx + 1) + "/" + str(total) + "] " + maskFile + "  ETA: " + eta)
+
+        metrics = analyzeSkeleton(maskPath, PIXEL_SIZE, UPSCALE_FACTOR, skelDir)
+        if metrics is not None:
+            allResults.append(metrics)
+
+    if allResults:
+        outputPath = os.path.join(skelDir, "Skeleton_Analysis_Results.csv")
+        idCols = ['cell_name', 'mask_file', 'skeleton_file', 'pixel_size_um', 'upscale_factor']
+        maskCols = ['mask_area_um2', 'mask_perimeter_um', 'mask_circularity',
+                    'mask_aspect_ratio', 'mask_roundness', 'mask_solidity']
+        skelCols = ['num_branches', 'num_junctions', 'num_end_points',
+                    'num_junction_voxels', 'num_slab_voxels', 'num_triple_points',
+                    'num_quadruple_points', 'max_branch_length_um',
+                    'avg_branch_length_um', 'longest_shortest_path_um',
+                    'total_skeleton_length_um', 'skeleton_area_um2', 'branching_density']
+        columns = idCols + maskCols + skelCols
+        f = open(outputPath, 'wb')
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(allResults)
+        f.close()
+        print("Skeleton results saved: " + outputPath)
+
+    print("Skeleton analysis done: " + str(len(allResults)) + " masks in " + formatTime(time.time() - batchStart))
+    return allResults
+
+
+# ============================================================================
+# FRACTAL / CONVEX HULL ANALYSIS
+# ============================================================================
+
+def runFractalAnalysis(maskPath, pixelSize):
+    """Box-counting fractal dimension and lacunarity."""
+    imp = openImageQuiet(maskPath)
+    if imp is None:
+        return None
+
+    ip = imp.getProcessor()
+    w = imp.getWidth()
+    h = imp.getHeight()
+
+    foreground = []
+    totalFG = 0
+    for y in range(h):
+        row = []
+        for x in range(w):
+            val = ip.getPixel(x, y) > 0
+            row.append(val)
+            if val:
+                totalFG += 1
+        foreground.append(row)
+    imp.close()
+
+    if totalFG == 0:
+        return None
+
+    maxDim = min(w, h)
+    boxSizes = []
+    s = 2
+    while s <= maxDim // 2:
+        boxSizes.append(s)
+        s *= 2
+    extra = []
+    for i in range(len(boxSizes) - 1):
+        mid = int(round((boxSizes[i] + boxSizes[i + 1]) / 2.0))
+        if mid not in boxSizes:
+            extra.append(mid)
+    boxSizes = sorted(set(boxSizes + extra))
+
+    if len(boxSizes) < 3:
+        return None
+
+    logInvS = []
+    logN = []
+    lacunarities = []
+
+    for s in boxSizes:
+        nBoxes = 0
+        counts = []
+        for by in range(0, h, s):
+            for bx in range(0, w, s):
+                cnt = 0
+                for dy in range(min(s, h - by)):
+                    for dx in range(min(s, w - bx)):
+                        if foreground[by + dy][bx + dx]:
+                            cnt += 1
+                counts.append(cnt)
+                if cnt > 0:
+                    nBoxes += 1
+        if nBoxes == 0:
+            continue
+        logInvS.append(math.log(1.0 / s))
+        logN.append(math.log(nBoxes))
+        n = len(counts)
+        meanC = sum(counts) / float(n)
+        if meanC > 0:
+            varC = sum((c - meanC) ** 2 for c in counts) / float(n)
+            lac = varC / (meanC ** 2) + 1.0
+        else:
+            lac = float('nan')
+        lacunarities.append(lac)
+
+    if len(logInvS) < 3:
+        return None
+
+    n = len(logInvS)
+    sx = sum(logInvS)
+    sy = sum(logN)
+    sxx = sum(x * x for x in logInvS)
+    sxy = sum(logInvS[i] * logN[i] for i in range(n))
+    denom = n * sxx - sx * sx
+    if abs(denom) < 1e-12:
+        fractalDim = float('nan')
+        rSquared = float('nan')
+    else:
+        fractalDim = (n * sxy - sx * sy) / denom
+        intercept = (sy - fractalDim * sx) / n
+        yMean = sy / n
+        ssTot = sum((y - yMean) ** 2 for y in logN)
+        ssRes = sum((logN[i] - (fractalDim * logInvS[i] + intercept)) ** 2 for i in range(n))
+        rSquared = 1.0 - ssRes / ssTot if ssTot > 0 else float('nan')
+
+    validLac = [l for l in lacunarities if l == l]
+    avgLacunarity = sum(validLac) / len(validLac) if validLac else float('nan')
+    fgArea = totalFG * (pixelSize ** 2)
+
+    metrics = {{
+        'fractal_dimension': round(fractalDim, 6) if fractalDim == fractalDim else 'NaN',
+        'fractal_r_squared': round(rSquared, 6) if rSquared == rSquared else 'NaN',
+        'fractal_lacunarity_mean': round(avgLacunarity, 6) if avgLacunarity == avgLacunarity else 'NaN',
+        'fractal_num_scales': len(boxSizes),
+        'fractal_foreground_pixels': totalFG,
+        'fractal_foreground_area_um2': round(fgArea, 4),
+    }}
+    if len(lacunarities) >= 2:
+        metrics['fractal_lacunarity_small'] = round(lacunarities[0], 6) if lacunarities[0] == lacunarities[0] else 'NaN'
+        metrics['fractal_lacunarity_large'] = round(lacunarities[-1], 6) if lacunarities[-1] == lacunarities[-1] else 'NaN'
+    return metrics
+
+
+def _grahamScanHull(points):
+    """Graham scan convex hull."""
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    points = sorted(set(points))
+    if len(points) <= 1:
+        return list(points)
+    lower = []
+    for p in points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def runConvexHullAnalysis(maskPath, pixelSize):
+    """Convex hull metrics for a binary cell mask."""
+    from ij.plugin.filter import ThresholdToSelection
+
+    imp = openImageQuiet(maskPath)
+    if imp is None:
+        return None
+
+    ip = imp.getProcessor()
+    w = imp.getWidth()
+    h = imp.getHeight()
+
+    totalFG = 0
+    boundary = []
+    for y in range(h):
+        for x in range(w):
+            if ip.getPixel(x, y) > 0:
+                totalFG += 1
+                isBoundary = False
+                for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    ny, nx = y + dy, x + dx
+                    if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                        isBoundary = True
+                        break
+                    if ip.getPixel(nx, ny) == 0:
+                        isBoundary = True
+                        break
+                if isBoundary:
+                    boundary.append((x, y))
+
+    if totalFG == 0:
+        imp.close()
+        return None
+
+    hullX = None
+    hullY = None
+    try:
+        ip.setThreshold(1, 255, ip.NO_LUT_UPDATE)
+        roi = ThresholdToSelection.run(imp)
+        if roi is not None:
+            hullPoly = roi.getConvexHull()
+            if hullPoly is not None:
+                nPts = hullPoly.npoints
+                if nPts >= 3:
+                    hullX = [float(hullPoly.xpoints[i]) for i in range(nPts)]
+                    hullY = [float(hullPoly.ypoints[i]) for i in range(nPts)]
+    except Exception:
+        pass
+
+    if hullX is None:
+        if len(boundary) < 3:
+            imp.close()
+            return None
+        hullVerts = _grahamScanHull(boundary)
+        if len(hullVerts) < 3:
+            imp.close()
+            return None
+        hullX = [float(v[0]) for v in hullVerts]
+        hullY = [float(v[1]) for v in hullVerts]
+
+    imp.close()
+    nPoints = len(hullX)
+
+    hullArea = 0.0
+    for i in range(nPoints):
+        j = (i + 1) % nPoints
+        hullArea += hullX[i] * hullY[j]
+        hullArea -= hullX[j] * hullY[i]
+    hullArea = abs(hullArea) / 2.0
+    if hullArea == 0:
+        return None
+
+    hullPerimeter = 0.0
+    for i in range(nPoints):
+        j = (i + 1) % nPoints
+        dx = hullX[j] - hullX[i]
+        dy = hullY[j] - hullY[i]
+        hullPerimeter += math.sqrt(dx * dx + dy * dy)
+
+    hullCircularity = 4.0 * math.pi * hullArea / (hullPerimeter * hullPerimeter) if hullPerimeter > 0 else float('nan')
+    density = totalFG / hullArea
+
+    maxSpan = 0.0
+    maxI, maxJ = 0, 0
+    for i in range(nPoints):
+        for j in range(i + 1, nPoints):
+            dx = hullX[j] - hullX[i]
+            dy = hullY[j] - hullY[i]
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist > maxSpan:
+                maxSpan = dist
+                maxI = i
+                maxJ = j
+
+    if maxSpan > 0:
+        axDx = hullX[maxJ] - hullX[maxI]
+        axDy = hullY[maxJ] - hullY[maxI]
+        axLen = math.sqrt(axDx * axDx + axDy * axDy)
+        perpX = -axDy / axLen
+        perpY = axDx / axLen
+        minProj = float('inf')
+        maxProj = float('-inf')
+        for i in range(nPoints):
+            proj = (hullX[i] - hullX[maxI]) * perpX + (hullY[i] - hullY[maxI]) * perpY
+            if proj < minProj:
+                minProj = proj
+            if proj > maxProj:
+                maxProj = proj
+        perpWidth = maxProj - minProj
+        spanRatio = maxSpan / perpWidth if perpWidth > 0 else float('nan')
+    else:
+        spanRatio = float('nan')
+
+    return {{
+        'hull_area_px': round(hullArea, 4),
+        'hull_area_um2': round(hullArea * pixelSize * pixelSize, 4),
+        'hull_perimeter_px': round(hullPerimeter, 4),
+        'hull_perimeter_um': round(hullPerimeter * pixelSize, 4),
+        'hull_circularity': round(hullCircularity, 6) if hullCircularity == hullCircularity else 'NaN',
+        'hull_density': round(density, 6),
+        'hull_max_span_px': round(maxSpan, 4),
+        'hull_max_span_um': round(maxSpan * pixelSize, 4),
+        'hull_span_ratio': round(spanRatio, 6) if spanRatio == spanRatio else 'NaN',
+    }}
+
+
+def runFractalBatch(masksDir, outputDir, maskFiles):
+    """Run fractal + hull analysis on all mask files."""
+    print("=" * 60)
+    print("FRACTAL / CONVEX HULL ANALYSIS")
+    print("=" * 60)
+
+    resultsDir = os.path.join(outputDir, "fractal_results")
+    if not os.path.exists(resultsDir):
+        os.makedirs(resultsDir)
+
+    allResults = []
+    batchStart = time.time()
+    total = len(maskFiles)
+
+    for idx, maskFile in enumerate(maskFiles):
+        maskPath = os.path.join(masksDir, maskFile)
+        imgName, somaId, areaUm2 = parseMaskInfo(maskFile)
+        cellName = getCellName(maskFile)
+        elapsed = time.time() - batchStart
+        if idx > 0:
+            eta = formatTime(elapsed / idx * (total - idx))
+        else:
+            eta = "estimating..."
+        print("[" + str(idx + 1) + "/" + str(total) + "] " + maskFile + "  ETA: " + eta)
+
+        try:
+            fracMetrics = runFractalAnalysis(maskPath, PIXEL_SIZE)
+            hullMetrics = runConvexHullAnalysis(maskPath, PIXEL_SIZE)
+            if fracMetrics is not None:
+                row = {{
+                    'cell_name': cellName,
+                    'image_name': imgName,
+                    'soma_id': somaId,
+                    'mask_area_um2': areaUm2,
+                    'mask_file': maskFile,
+                }}
+                row.update(fracMetrics)
+                if hullMetrics is not None:
+                    row.update(hullMetrics)
+                allResults.append(row)
+                print("  OK (D=" + str(fracMetrics['fractal_dimension']) + ")")
+            else:
+                print("  FAILED (empty mask or too few scales)")
+        except Exception as e:
+            print("  ERROR: " + str(e))
+
+    if allResults:
+        outputPath = os.path.join(resultsDir, "Fractal_Analysis_Results.csv")
+        idCols = ['cell_name', 'image_name', 'soma_id', 'mask_area_um2', 'mask_file']
+        fracCols = ['fractal_dimension', 'fractal_r_squared',
+                    'fractal_lacunarity_mean', 'fractal_lacunarity_small',
+                    'fractal_lacunarity_large', 'fractal_num_scales',
+                    'fractal_foreground_pixels', 'fractal_foreground_area_um2']
+        hullCols = ['hull_area_px', 'hull_area_um2', 'hull_perimeter_px', 'hull_perimeter_um',
+                    'hull_circularity', 'hull_density', 'hull_max_span_px', 'hull_max_span_um',
+                    'hull_span_ratio']
+        columns = idCols + fracCols + hullCols
+        f = open(outputPath, 'wb')
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(allResults)
+        f.close()
+        print("Fractal results saved: " + outputPath)
+
+    print("Fractal analysis done: " + str(len(allResults)) + " masks in " + formatTime(time.time() - batchStart))
+    return allResults
+
+
+# ============================================================================
+# SHOLL ANALYSIS
+# ============================================================================
+
+def getSomaCentroid(somaPath):
+    """Calculate centroid from a binary soma mask TIFF."""
+    somaImp = openImageQuiet(somaPath)
+    if somaImp is None:
+        return None
+    ip = somaImp.getProcessor()
+    w = ip.getWidth()
+    h = ip.getHeight()
+    sumX = 0.0
+    sumY = 0.0
+    count = 0
+    for y in range(h):
+        for x in range(w):
+            if ip.getPixel(x, y) > 0:
+                sumX += x
+                sumY += y
+                count += 1
+    somaImp.close()
+    if count == 0:
+        return None
+    return (int(round(sumX / count)), int(round(sumY / count)))
+
+
+def getSomaRadius(somaPath, centroid, pixelSize):
+    """Estimate soma radius in calibrated units from the soma mask."""
+    somaImp = openImageQuiet(somaPath)
+    if somaImp is None or centroid is None:
+        return 0.0, 0.0
+    ip = somaImp.getProcessor()
+    count = 0
+    w = ip.getWidth()
+    h = ip.getHeight()
+    for y in range(h):
+        for x in range(w):
+            if ip.getPixel(x, y) > 0:
+                count += 1
+    somaImp.close()
+    areaUm2 = count * (pixelSize ** 2)
+    radiusUm = math.sqrt(areaUm2 / math.pi) if count > 0 else 0.0
+    return radiusUm, areaUm2
+
+
+def findSomaFile(somasDir, maskFilename):
+    """Find the soma file corresponding to a mask file."""
+    base = re.sub(r'_area\\d+_mask\\.tif$', '', maskFilename)
+    somaFilename = base + '_soma.tif'
+    somaPath = os.path.join(somasDir, somaFilename)
+    if os.path.exists(somaPath):
+        return somaPath
+    return None
+
+
+def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, maskName, somaAreaUm2):
+    """Run Sholl analysis on one cell mask."""
+    from sc.fiji.snt.analysis.sholl import Profile, ShollUtils
+    from sc.fiji.snt.analysis.sholl.math import LinearProfileStats
+    from sc.fiji.snt.analysis.sholl.math import NormalizedProfileStats
+    from sc.fiji.snt.analysis.sholl.math import ShollStats
+    from sc.fiji.snt.analysis.sholl.parsers import ImageParser2D
+
+    cellName = os.path.splitext(maskName)[0]
+
+    imp = openImageQuiet(maskPath)
+    if imp is None:
+        return None
+
+    cal = Calibration(imp)
+    cal.pixelWidth = pixelSize
+    cal.pixelHeight = pixelSize
+    cal.setUnit("um")
+    imp.setCalibration(cal)
+
+    imp.getProcessor().setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
+
+    parser = ImageParser2D(imp)
+    parser.setRadiiSpan(0, ImageParser2D.MEAN)
+    parser.setPosition(1, 1, 1)
+
+    cx, cy = centroid
+    parser.setCenter(cx, cy)
+    parser.setRadii(startRad, stepSize, parser.maxPossibleRadius())
+    parser.setHemiShells('none')
+    parser.parse()
+
+    if not parser.successful():
+        imp.close()
+        return None
+
+    profile = parser.getProfile()
+    if profile.isEmpty():
+        imp.close()
+        return None
+
+    profile.trimZeroCounts()
+    lStats = LinearProfileStats(profile)
+    nStatsSemiLog = NormalizedProfileStats(profile, ShollStats.AREA, 128)
+    nStatsLogLog = NormalizedProfileStats(profile, ShollStats.AREA, 256)
+
+    cal = Calibration(imp)
+
+    maskMetrics = {{
+        'Mask Name': maskName,
+        'Soma Area (um2)': somaAreaUm2,
+        'Primary Branches': lStats.getPrimaryBranches(False),
+        'Intersecting Radii': lStats.getIntersectingRadii(False),
+        'Sum of Intersections': lStats.getSum(False),
+        'Mean of Intersections': lStats.getMean(False),
+        'Median of Intersections': lStats.getMedian(False),
+        'Skewness (sampled)': lStats.getSkewness(False),
+        'Kurtosis (sampled)': lStats.getKurtosis(False),
+        'Maximum Number of Intersections': lStats.getMax(False),
+        'Max Intersection Radius': lStats.getXvalues()[lStats.getIndexOfInters(False, float(lStats.getMax(False)))],
+        'Ramification Index (sampled)': lStats.getRamificationIndex(False),
+        'Centroid Radius': lStats.getCentroid(False).rawX(cal),
+        'Centroid Value': lStats.getCentroid(False).rawY(cal),
+        'Enclosing Radius': lStats.getEnclosingRadius(False),
+        'Regression Coefficient (semi-log)': nStatsSemiLog.getSlope(),
+        'Regression Coefficient (Log-log)': nStatsLogLog.getSlope(),
+        'Regression Intercept (semi-log)': nStatsSemiLog.getIntercept(),
+        'Regression Intercept (Log-log)': nStatsLogLog.getIntercept(),
+    }}
+
+    # P10-P90
+    nStatsSemiLog.restrictRegToPercentile(10, 90)
+    nStatsLogLog.restrictRegToPercentile(10, 90)
+    maskMetrics['Regression Coefficient (semi-log)[P10-P90]'] = nStatsSemiLog.getSlope()
+    maskMetrics['Regression Coefficient (Log-log)[P10-P90]'] = nStatsLogLog.getSlope()
+    maskMetrics['Regression Intercept (Semi-log)[P10-P90]'] = nStatsSemiLog.getIntercept()
+    maskMetrics['Regression Intercept (Log-log)[P10-P90]'] = nStatsLogLog.getIntercept()
+
+    # Polynomial fit
+    bestDegree = lStats.findBestFit(1, 30, 0.7, 0.05)
+    if bestDegree != -1:
+        lStats.fitPolynomial(bestDegree)
+        try:
+            maskMetrics['Kurtosis (fit)'] = lStats.getKurtosis(True)
+        except:
+            maskMetrics['Kurtosis (fit)'] = 'NaN'
+        try:
+            maskMetrics['Ramification Index (fit)'] = lStats.getRamificationIndex(True)
+        except:
+            maskMetrics['Ramification Index (fit)'] = 'NaN'
+        try:
+            maskMetrics['Mean Value'] = lStats.getMean(True)
+        except:
+            maskMetrics['Mean Value'] = 'NaN'
+        maskMetrics['Polynomial Degree'] = bestDegree
+
+        critVals = []
+        critRadii = []
+        try:
+            trial = lStats.getPolynomialMaxima(0.0, 100.0, 50.0)
+            if trial is not None:
+                for curr in trial.toArray():
+                    critVals.append(curr.rawY(cal))
+                    critRadii.append(curr.rawX(cal))
+        except:
+            pass
+        maskMetrics['Critical Value'] = sum(critVals) / len(critVals) if critVals else 'NaN'
+        maskMetrics['Critical Radius'] = sum(critRadii) / len(critRadii) if critRadii else 'NaN'
+
+    imp.close()
+    return maskMetrics
+
+
+def runShollBatch(masksDir, somasDir, outputDir, maskFiles):
+    """Run Sholl analysis on all mask files."""
+    print("=" * 60)
+    print("SHOLL ANALYSIS")
+    print("=" * 60)
+
+    shollDir = os.path.join(outputDir, "sholl_results")
+    if not os.path.exists(shollDir):
+        os.makedirs(shollDir)
+
+    allResults = []
+    processed = 0
+    skipped = 0
+    batchStart = time.time()
+    total = len(maskFiles)
+
+    for idx, maskFile in enumerate(maskFiles):
+        maskPath = os.path.join(masksDir, maskFile)
+        imgName, somaId, areaUm2 = parseMaskInfo(maskFile)
+
+        elapsed = time.time() - batchStart
+        if idx > 0:
+            eta = formatTime(elapsed / idx * (total - idx))
+        else:
+            eta = "estimating..."
+        print("[" + str(idx + 1) + "/" + str(total) + "] " + maskFile + "  ETA: " + eta)
+
+        somaPath = findSomaFile(somasDir, maskFile)
+        if somaPath is None:
+            print("  WARNING: No soma file found - skipping")
+            skipped += 1
+            continue
+
+        centroid = getSomaCentroid(somaPath)
+        if centroid is None:
+            print("  WARNING: Could not calculate centroid - skipping")
+            skipped += 1
+            continue
+
+        somaResult = getSomaRadius(somaPath, centroid, PIXEL_SIZE)
+        somaRadiusUm = somaResult[0]
+        somaAreaUm2 = somaResult[1]
+        startRad = somaRadiusUm
+
+        try:
+            metrics = analyzeOneSholl(
+                maskPath, centroid, startRad, SHOLL_STEP, PIXEL_SIZE,
+                shollDir, maskFile, somaAreaUm2
+            )
+            if metrics is not None:
+                metrics['Image Name'] = imgName
+                metrics['Soma ID'] = somaId
+                metrics['Mask Area (um2)'] = areaUm2
+                metrics['Centroid X (px)'] = centroid[0]
+                metrics['Centroid Y (px)'] = centroid[1]
+                metrics['Start Radius (um)'] = startRad
+                allResults.append(metrics)
+                processed += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            skipped += 1
+            print("  ERROR: " + str(e))
+
+    if allResults:
+        combinedPath = os.path.join(shollDir, "Sholl_All_Results.csv")
+        allKeys = list(allResults[0].keys())
+        for r in allResults:
+            for k in r.keys():
+                if k not in allKeys:
+                    allKeys.append(k)
+        f = open(combinedPath, 'wb')
+        writer = csv.writer(f)
+        writer.writerow(allKeys)
+        for r in allResults:
+            writer.writerow([r.get(k, '') for k in allKeys])
+        f.close()
+        print("Sholl results saved: " + combinedPath)
+
+    print("Sholl analysis done: " + str(processed) + " processed, " + str(skipped) + " skipped in " + formatTime(time.time() - batchStart))
+    return allResults
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+# Get the output directory from the script parameter
+#@ String mmps_output_dir
+
+print("=" * 60)
+print("MMPS CLUSTER ImageJ ANALYSIS")
+print("Output directory: " + mmps_output_dir)
+print("Analyses: " + str(ANALYSES))
+print("Pixel size: " + str(PIXEL_SIZE) + " um/px")
+print("=" * 60)
+
+masksDir = os.path.join(mmps_output_dir, "masks")
+somasDir = os.path.join(mmps_output_dir, "somas")
+
+if not os.path.isdir(masksDir):
+    print("ERROR: No 'masks' folder found in: " + mmps_output_dir)
+    sys.exit(1)
+
+# Collect mask files
+maskFiles = sorted([f for f in os.listdir(masksDir)
+                    if f.endswith('_mask.tif') and not f.startswith('.')])
+if len(maskFiles) == 0:
+    print("ERROR: No mask files found in: " + masksDir)
+    sys.exit(1)
+
+if LARGEST_ONLY:
+    totalBefore = len(maskFiles)
+    maskFiles = filterLargestMasks(maskFiles)
+    print("Largest-only filter: " + str(totalBefore) + " -> " + str(len(maskFiles)) + " masks")
+
+print("Found " + str(len(maskFiles)) + " mask files")
+print("")
+
+totalStart = time.time()
+
+if "skeleton" in ANALYSES:
+    runSkeletonBatch(masksDir, mmps_output_dir, maskFiles)
+    print("")
+
+if "fractal" in ANALYSES:
+    runFractalBatch(masksDir, mmps_output_dir, maskFiles)
+    print("")
+
+if "sholl" in ANALYSES:
+    if not os.path.isdir(somasDir):
+        print("WARNING: No 'somas' folder found - skipping Sholl analysis")
+    else:
+        runShollBatch(masksDir, somasDir, mmps_output_dir, maskFiles)
+    print("")
+
+print("=" * 60)
+print("ALL ANALYSES COMPLETE in " + formatTime(time.time() - totalStart))
+print("=" * 60)
+'''
+        return script
+
+    def _build_slurm_script(self, fiji_path, wrapper_path, partition, wall_time, mem, cpus, job_name, module_load):
+        """Build the SLURM submission script."""
+        wrapper_basename = os.path.basename(wrapper_path)
+        module_line = f"\n{module_load}" if module_load else ""
+
+        script = f'''#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH --partition={partition}
+#SBATCH --time={wall_time}
+#SBATCH --mem={mem}
+#SBATCH --cpus-per-task={cpus}
+#SBATCH --output=mmps_imagej_%j.out
+#SBATCH --error=mmps_imagej_%j.err
+
+# =============================================================================
+# MMPS ImageJ Cluster Analysis - SLURM Job Script
+# Generated by MMPS on {time.strftime("%Y-%m-%d %H:%M:%S")}
+# =============================================================================
+
+# Usage:
+#   sbatch submit_imagej.sh /path/to/mmps_output
+#
+# The mmps_output directory should contain:
+#   masks/  - mask TIFF files from MMPS
+#   somas/  - soma TIFF files from MMPS (needed for Sholl)
+
+if [ $# -lt 1 ]; then
+    echo "Usage: sbatch submit_imagej.sh /path/to/mmps_output"
+    exit 1
+fi
+
+MMPS_OUTPUT_DIR="$1"
+FIJI="{fiji_path}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+{module_line}
+echo "======================================"
+echo "MMPS ImageJ Cluster Analysis"
+echo "Output dir: $MMPS_OUTPUT_DIR"
+echo "Fiji: $FIJI"
+echo "Script: $SCRIPT_DIR/{wrapper_basename}"
+echo "Started: $(date)"
+echo "======================================"
+
+# Verify Fiji exists
+if [ ! -x "$FIJI" ]; then
+    echo "ERROR: Fiji not found or not executable at: $FIJI"
+    echo "Please set the correct path in this script or upload Fiji.app to the cluster."
+    exit 1
+fi
+
+# Verify masks directory exists
+if [ ! -d "$MMPS_OUTPUT_DIR/masks" ]; then
+    echo "ERROR: No masks/ directory found in $MMPS_OUTPUT_DIR"
+    exit 1
+fi
+
+# Run the analysis
+"$FIJI" --headless --run "$SCRIPT_DIR/{wrapper_basename}" \\
+    "mmps_output_dir=\'$MMPS_OUTPUT_DIR\'"
+
+echo ""
+echo "======================================"
+echo "Finished: $(date)"
+echo "======================================"
+'''
+        return script
+
+    def _build_cluster_readme(self, analyses, fiji_path):
+        """Build the README instructions file."""
+        analyses_str = ", ".join(a.title() for a in analyses)
+        return f"""MMPS ImageJ Cluster Analysis - Instructions
+============================================
+Generated by MMPS on {time.strftime("%Y-%m-%d %H:%M:%S")}
+
+Analyses: {analyses_str}
+
+FILES GENERATED:
+  mmps_imagej_cluster.py  - Jython script (runs inside Fiji headlessly)
+  submit_imagej.sh        - SLURM job submission script
+  CLUSTER_README.txt      - This file
+
+SETUP:
+  1. Upload these files to your cluster
+  2. Upload your Fiji.app installation to the cluster
+     (or use an existing installation)
+  3. Upload your MMPS output folder containing:
+     - masks/  (the mask TIFF files)
+     - somas/  (the soma TIFF files, needed for Sholl analysis)
+  4. Make sure the Fiji path in submit_imagej.sh is correct
+     Current setting: {fiji_path}
+
+RUNNING:
+  sbatch submit_imagej.sh /path/to/mmps_output
+
+  Or run directly without SLURM:
+  {fiji_path} --headless --run mmps_imagej_cluster.py \\
+      "mmps_output_dir='/path/to/mmps_output'"
+
+OUTPUT:
+  Results will be saved inside your mmps_output directory:
+  - skeleton_results/Skeleton_Analysis_Results.csv
+  - fractal_results/Fractal_Analysis_Results.csv
+  - sholl_results/Sholl_All_Results.csv
+
+TROUBLESHOOTING:
+  - If Fiji can't find Java, add "module load java/11" (or similar)
+    to the Module Load field before generating scripts
+  - If you get memory errors, increase the --mem SLURM setting
+  - Check mmps_imagej_*.out and mmps_imagej_*.err for logs
+  - Sholl analysis requires the SNT plugin (included in standard Fiji)
+  - Skeleton analysis requires the AnalyzeSkeleton plugin (included in standard Fiji)
+"""
 
     def update_timer_display(self):
         """Update the timer display during processing"""
