@@ -1998,11 +1998,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         load_action.setToolTip("Resume a previously saved session")
         load_action.triggered.connect(self.load_session)
 
-        session_menu.addSeparator()
-        cluster_action = session_menu.addAction("Generate Cluster Script...")
-        cluster_action.setToolTip("Export a standalone Python script for mask generation on a compute cluster")
-        cluster_action.triggered.connect(self.export_cluster_script)
-
         # Mode menu
         mode_menu = menu_bar.addMenu("Mode")
 
@@ -2023,6 +2018,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
         per_image_px_action = advanced_menu.addAction("Set Per-Image Pixel Size...")
         per_image_px_action.setToolTip("Override pixel size for individual images")
         per_image_px_action.triggered.connect(self._set_per_image_pixel_size)
+
+        # Cluster menu
+        cluster_menu = menu_bar.addMenu("Cluster")
+        mask_gen_action = cluster_menu.addAction("Generate Mask Generation Script...")
+        mask_gen_action.setToolTip("Export a standalone Python script for mask generation on a compute cluster")
+        mask_gen_action.triggered.connect(self.export_cluster_script)
+        imagej_action = cluster_menu.addAction("Generate ImageJ Analysis Script...")
+        imagej_action.setToolTip("Export Fiji scripts for Skeleton, Fractal/Hull, and Sholl analysis on a cluster")
+        imagej_action.triggered.connect(self._open_imagej_cluster_dialog)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -2364,11 +2368,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_label.setText("No masks yet")
         self.tabs.addTab(self.mask_label, "Masks")
 
-        # --- Cluster tab ---
-        self.cluster_tab = self._create_cluster_tab()
-        self.tabs.addTab(self.cluster_tab, "Cluster")
-        self.tabs.currentChanged.connect(self._on_tab_changed)
-
         # Give tabs most of the space (stretch factor)
         layout.addWidget(self.tabs, stretch=1)
 
@@ -2541,34 +2540,24 @@ class MicrogliaAnalysisGUI(QMainWindow):
     # Cluster Tab
     # ------------------------------------------------------------------
 
-    def _on_tab_changed(self, index):
-        """Sync pixel size to the Cluster tab when it becomes active."""
-        if hasattr(self, 'cluster_pixel_size') and self.tabs.tabText(index) == "Cluster":
-            try:
-                current_px = self._get_pixel_size()
-                self.cluster_pixel_size.setText(str(current_px))
-            except Exception:
-                pass
+    def _open_imagej_cluster_dialog(self):
+        """Open a dialog for generating ImageJ HPC cluster scripts."""
+        from PyQt5.QtWidgets import QDialog, QScrollArea
 
-    def _create_cluster_tab(self):
-        """Create the Cluster tab for generating HPC job scripts."""
-        from PyQt5.QtWidgets import QScrollArea
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Generate ImageJ Cluster Scripts")
+        dlg.setMinimumSize(500, 650)
+        dlg_layout = QVBoxLayout(dlg)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         container = QWidget()
         layout = QVBoxLayout(container)
 
-        # --- Header ---
-        header = QLabel("Generate Cluster Scripts for ImageJ Analysis")
-        header.setStyleSheet("font-size: 14pt; font-weight: bold; padding: 8px 0;")
-        layout.addWidget(header)
-
         desc = QLabel(
-            "Generate a self-contained Python script and SLURM job file to run\n"
+            "Generate a self-contained Jython script and SLURM array job to run\n"
             "Skeleton, Fractal/Hull, and Sholl analyses on an HPC cluster using\n"
-            "headless Fiji. Upload the script, your Fiji installation, masks/, and\n"
-            "somas/ folders to the cluster."
+            "headless Fiji. One SLURM task per image, all submitted at once."
         )
         desc.setWordWrap(True)
         desc.setStyleSheet("color: palette(dark); padding-bottom: 8px;")
@@ -2577,14 +2566,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # --- Fiji Path ---
         fiji_group = QGroupBox("Fiji Installation")
         fiji_layout = QVBoxLayout()
-        fiji_desc = QLabel("Path to Fiji on the cluster (will be embedded in the job script):")
-        fiji_desc.setWordWrap(True)
+        fiji_desc = QLabel("Path to Fiji on the cluster:")
         fiji_layout.addWidget(fiji_desc)
-        fiji_path_row = QHBoxLayout()
         self.cluster_fiji_path = QLineEdit("$HOME/Fiji.app/ImageJ-linux64")
-        self.cluster_fiji_path.setPlaceholderText("/path/to/Fiji.app/ImageJ-linux64")
-        fiji_path_row.addWidget(self.cluster_fiji_path)
-        fiji_layout.addLayout(fiji_path_row)
+        fiji_layout.addWidget(self.cluster_fiji_path)
         fiji_group.setLayout(fiji_layout)
         layout.addWidget(fiji_group)
 
@@ -2593,15 +2578,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         analysis_layout = QVBoxLayout()
         self.cluster_do_skeleton = QCheckBox("Skeleton Analysis")
         self.cluster_do_skeleton.setChecked(True)
-        self.cluster_do_skeleton.setToolTip("Branch count, junction count, skeleton length, etc.")
         analysis_layout.addWidget(self.cluster_do_skeleton)
         self.cluster_do_fractal = QCheckBox("Fractal / Convex Hull Analysis")
         self.cluster_do_fractal.setChecked(True)
-        self.cluster_do_fractal.setToolTip("Box-counting fractal dimension, lacunarity, hull metrics")
         analysis_layout.addWidget(self.cluster_do_fractal)
         self.cluster_do_sholl = QCheckBox("Sholl Analysis")
         self.cluster_do_sholl.setChecked(True)
-        self.cluster_do_sholl.setToolTip("Intersection counts, ramification index, regression coefficients")
         analysis_layout.addWidget(self.cluster_do_sholl)
         analysis_group.setLayout(analysis_layout)
         layout.addWidget(analysis_group)
@@ -2609,13 +2591,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # --- Parameters ---
         param_group = QGroupBox("Parameters")
         param_layout = QFormLayout()
-        self.cluster_pixel_size = QLineEdit("0.316")
+        try:
+            px = str(self._get_pixel_size())
+        except Exception:
+            px = "0.316"
+        self.cluster_pixel_size = QLineEdit(px)
         param_layout.addRow("Pixel size (um/px):", self.cluster_pixel_size)
         self.cluster_upscale_factor = QLineEdit("2")
-        self.cluster_upscale_factor.setToolTip("Skeleton upscale factor (2 for 20x, 1 for 40x)")
+        self.cluster_upscale_factor.setToolTip("2 for 20x, 1 for 40x")
         param_layout.addRow("Upscale factor:", self.cluster_upscale_factor)
         self.cluster_sholl_step = QLineEdit("0")
-        self.cluster_sholl_step.setToolTip("Sholl step size in um (0 = continuous / pixel-level)")
+        self.cluster_sholl_step.setToolTip("0 = continuous / pixel-level")
         param_layout.addRow("Sholl step size (um):", self.cluster_sholl_step)
         self.cluster_largest_only = QCheckBox("Only analyze largest mask per cell")
         self.cluster_largest_only.setChecked(True)
@@ -2624,7 +2610,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         layout.addWidget(param_group)
 
         # --- SLURM Settings ---
-        slurm_group = QGroupBox("SLURM Job Settings")
+        slurm_group = QGroupBox("SLURM Job Settings (per image)")
         slurm_layout = QFormLayout()
         self.cluster_partition = QLineEdit("general")
         slurm_layout.addRow("Partition:", self.cluster_partition)
@@ -2638,29 +2624,28 @@ class MicrogliaAnalysisGUI(QMainWindow):
         slurm_layout.addRow("Job name:", self.cluster_job_name)
         self.cluster_module_load = QLineEdit("")
         self.cluster_module_load.setPlaceholderText("e.g. module load java/11")
-        self.cluster_module_load.setToolTip("Optional module load command(s) before running Fiji")
         slurm_layout.addRow("Module load:", self.cluster_module_load)
         slurm_group.setLayout(slurm_layout)
         layout.addWidget(slurm_group)
 
         # --- Generate Button ---
-        self.cluster_generate_btn = QPushButton("Generate Cluster Scripts")
-        self.cluster_generate_btn.setStyleSheet(
+        gen_btn = QPushButton("Generate Scripts")
+        gen_btn.setStyleSheet(
             "font-size: 13pt; font-weight: bold; padding: 10px; "
             "background-color: #4CAF50; color: white; border-radius: 5px;"
         )
-        self.cluster_generate_btn.clicked.connect(self.export_imagej_cluster_scripts)
-        layout.addWidget(self.cluster_generate_btn)
-
-        # --- Output info ---
-        self.cluster_output_label = QLabel("")
-        self.cluster_output_label.setWordWrap(True)
-        self.cluster_output_label.setStyleSheet("padding: 8px; color: palette(dark);")
-        layout.addWidget(self.cluster_output_label)
+        gen_btn.clicked.connect(lambda: self._do_export_imagej_cluster(dlg))
+        layout.addWidget(gen_btn)
 
         layout.addStretch()
         scroll.setWidget(container)
-        return scroll
+        dlg_layout.addWidget(scroll)
+        dlg.exec_()
+
+    def _do_export_imagej_cluster(self, dlg):
+        """Called from the dialog Generate button."""
+        self.export_imagej_cluster_scripts()
+        dlg.accept()
 
     def export_imagej_cluster_scripts(self):
         """Export cluster scripts for running ImageJ analyses on HPC."""
@@ -2750,19 +2735,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log(f"  - CLUSTER_README.txt      (instructions)")
 
         analyses_str = ", ".join(a.title() for a in analyses)
-        self.cluster_output_label.setText(
-            f"Scripts saved to:\n{save_dir}\n\n"
-            f"Analyses: {analyses_str}\n"
-            f"Pixel size: {pixel_size} um/px\n"
-            f"Upscale factor: {upscale_factor}x\n\n"
-            f"Upload to your cluster along with:\n"
-            f"  - Your Fiji.app installation\n"
-            f"  - The masks/ folder from your MMPS output\n"
-            f"  - The somas/ folder (needed for Sholl)\n\n"
-            f"Then run:  bash submit_imagej.sh /path/to/mmps_output\n\n"
-            f"This submits one SLURM task per image (all at once),\n"
-            f"then a merge job that combines per-image CSVs."
-        )
 
         QMessageBox.information(self, "Cluster Scripts Generated",
             f"Scripts saved to:\n{save_dir}\n\n"
