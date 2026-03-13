@@ -10627,10 +10627,6 @@ if __name__ == '__main__':
         self.last_qa_decisions.append({'flat_data': flat_data, 'was_approved': True})
         self._qa_approved_count += 1
 
-        # Export mask immediately upon approval (2D only; 3D already exported)
-        if not self.mode_3d:
-            self._export_approved_mask(flat_data)
-
         # Mark in deferred checklist
         if self.mode_3d:
             cl_key = f"{current_img}_{current_soma_id}_vol{current_size}"
@@ -10640,6 +10636,11 @@ if __name__ == '__main__':
 
         # Auto-approve ALL smaller masks from the SAME soma in the SAME image
         # Uses soma index for O(masks_per_soma) instead of O(all_masks)
+        # Collect masks needing export — actual I/O is deferred below
+        pending_exports = []
+        if not self.mode_3d:
+            pending_exports.append(flat_data)
+
         auto_approved = []
         soma_key = (current_img, current_soma_id)
         for idx in self._qa_soma_mask_index.get(soma_key, []):
@@ -10653,7 +10654,7 @@ if __name__ == '__main__':
                 self.last_qa_decisions.append({'flat_data': other_flat, 'was_approved': True})
                 self._qa_approved_count += 1
                 if not self.mode_3d:
-                    self._export_approved_mask(other_flat)
+                    pending_exports.append(other_flat)
                 # Mark in deferred checklist
                 if self.mode_3d:
                     auto_key = f"{current_img}_{current_soma_id}_vol{other_size}"
@@ -10664,16 +10665,28 @@ if __name__ == '__main__':
         if auto_approved:
             self.log(f"   Auto-approved {len(auto_approved)} smaller masks for {current_soma_id}")
 
-        # Auto-save every 50 QA decisions (flush checklist + session)
-        if len(self.last_qa_decisions) % 50 == 0:
-            self._flush_qa_checklist()
-            self._auto_save()
-
-        # Move to next unreviewed mask
+        # Show next mask FIRST so UI feels instant
         self._advance_to_next_unreviewed()
 
-        # Evict old somas outside the sliding window to free memory
+        # Defer all disk I/O (TIFF exports, eviction, auto-save) so UI stays responsive
+        should_autosave = len(self.last_qa_decisions) % 50 == 0
+        QTimer.singleShot(0, lambda: self._deferred_approve_io(
+            pending_exports, should_autosave))
+
+    def _deferred_approve_io(self, pending_exports, should_autosave):
+        """Run disk I/O deferred from approve_current_mask via QTimer.
+
+        This keeps the UI responsive — the next mask is already displayed
+        before any TIFF writes, eviction, or auto-save happen.
+        """
+        for flat_data in pending_exports:
+            self._export_approved_mask(flat_data)
+
         self._evict_old_qa_masks()
+
+        if should_autosave:
+            self._flush_qa_checklist()
+            self._auto_save()
 
     def _export_approved_mask(self, flat_data):
         """Export a single approved mask to TIFF file"""
@@ -10870,12 +10883,11 @@ if __name__ == '__main__':
         if not was_already_rejected:
             self._qa_user_rejected_count += 1
 
-        if self.mode_3d:
+        if not self.mode_3d:
+            self.log(f"Rejected: {mask_data.get('soma_id', '')} ({mask_data.get('area_um2', 0)} um^2)")
+        else:
             vol = mask_data.get('volume_um3', 0)
             self.log(f"Rejected: {mask_data.get('soma_id', '')} ({vol} um^3)")
-            self._delete_rejected_3d_mask(flat_data['image_name'], mask_data)
-        else:
-            self.log(f"Rejected: {mask_data.get('soma_id', '')} ({mask_data.get('area_um2', 0)} um^2)")
 
         # Mark in deferred checklist
         if self.mode_3d:
@@ -10884,10 +10896,20 @@ if __name__ == '__main__':
             key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{mask_data.get('area_um2', 0)}"
         self._qa_checklist_dirty[key] = 1
 
-        # Use _advance_to_next_unreviewed to skip over auto-rejected duplicates
+        # Show next mask FIRST so UI feels instant
         self._advance_to_next_unreviewed()
 
-        # Evict old somas outside the sliding window to free memory
+        # Defer disk I/O (3D mask deletion, eviction) so UI stays responsive
+        delete_3d = self.mode_3d
+        reject_img = flat_data['image_name']
+        reject_mask_data = mask_data
+        QTimer.singleShot(0, lambda: self._deferred_reject_io(
+            delete_3d, reject_img, reject_mask_data))
+
+    def _deferred_reject_io(self, delete_3d, img_name, mask_data):
+        """Run disk I/O deferred from reject_current_mask via QTimer."""
+        if delete_3d:
+            self._delete_rejected_3d_mask(img_name, mask_data)
         self._evict_old_qa_masks()
 
     def next_mask(self):
