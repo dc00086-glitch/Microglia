@@ -7414,6 +7414,109 @@ if __name__ == '__main__':
         except Exception as e:
             self.log(f"ERROR in 3D preview: {e}")
 
+    def _preview_intensity_threshold(self, intensity_percent, img_name=None):
+        """Show a popup previewing which pixels fall below the intensity threshold.
+
+        Pixels below threshold are shown in red on top of the grayscale image,
+        so the user can see exactly what gets excluded from masks.
+        """
+        # Determine which image to preview
+        if img_name is None:
+            img_name = self.current_image_name
+        if not img_name or img_name not in self.images:
+            QMessageBox.warning(self, "Warning", "No image selected to preview.")
+            return
+
+        img_data = self.images[img_name]
+
+        # Get the processed image (what masks are actually grown on)
+        processed = img_data.get('processed')
+        if processed is None:
+            processed = self._ensure_processed_loaded(img_name)
+        if processed is None:
+            # Fall back to preview or raw
+            processed = img_data.get('preview')
+        if processed is None:
+            QMessageBox.warning(self, "Warning",
+                                "No processed image available.\nProcess images first, or use Preview.")
+            return
+
+        # For 3D, use the max-intensity projection or current slice
+        if processed.ndim == 3:
+            mid = processed.shape[0] // 2
+            processed = processed[mid]
+
+        # Compute threshold
+        img_max = processed.max()
+        if img_max == 0:
+            QMessageBox.warning(self, "Warning", "Image is entirely black.")
+            return
+        threshold = img_max * (intensity_percent / 100.0)
+
+        # Build RGB visualization: grayscale image with sub-threshold pixels in red
+        norm = processed.astype(np.float64)
+        norm = norm / img_max * 255.0
+        gray8 = np.clip(norm, 0, 255).astype(np.uint8)
+
+        # Create RGB from grayscale
+        rgb = np.stack([gray8, gray8, gray8], axis=-1)
+
+        # Mark sub-threshold pixels red
+        below = processed < threshold
+        rgb[below, 0] = 255   # R
+        rgb[below, 1] = 40    # G (slight tint for visibility)
+        rgb[below, 2] = 40    # B
+
+        # Count statistics
+        total_px = processed.size
+        excluded_px = int(below.sum())
+        excluded_pct = excluded_px / total_px * 100.0
+
+        # Create popup dialog
+        preview_dlg = QDialog(self)
+        preview_dlg.setWindowTitle(
+            f"Intensity Threshold Preview — {intensity_percent}%")
+        preview_dlg.setModal(False)  # Non-modal so user can adjust slider
+
+        dlg_layout = QVBoxLayout()
+
+        # Info label
+        info = QLabel(
+            f"<b>Threshold: {intensity_percent}% of max</b> "
+            f"(value {threshold:.1f} / {img_max:.1f})<br>"
+            f"<span style='color:red'>Red pixels</span> = excluded from masks "
+            f"({excluded_pct:.1f}% of image, {excluded_px:,} pixels)")
+        info.setWordWrap(True)
+        dlg_layout.addWidget(info)
+
+        # Image display
+        h, w = gray8.shape
+        rgb_contiguous = np.ascontiguousarray(rgb)
+        qimg = QImage(rgb_contiguous.data, w, h, 3 * w, QImage.Format_RGB888)
+        qimg = qimg.copy()  # detach from numpy memory
+        pixmap = QPixmap.fromImage(qimg)
+
+        img_label = QLabel()
+        # Scale to fit reasonably on screen
+        max_dim = 800
+        if max(w, h) > max_dim:
+            pixmap = pixmap.scaled(max_dim, max_dim, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        img_label.setPixmap(pixmap)
+        img_label.setAlignment(Qt.AlignCenter)
+
+        scroll = QScrollArea()
+        scroll.setWidget(img_label)
+        scroll.setWidgetResizable(True)
+        dlg_layout.addWidget(scroll)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(preview_dlg.close)
+        dlg_layout.addWidget(close_btn)
+
+        preview_dlg.setLayout(dlg_layout)
+        preview_dlg.resize(min(w + 40, 850), min(h + 120, 700))
+        preview_dlg.show()
+
     def process_selected_images(self):
         if not self.output_dir:
             QMessageBox.warning(self, "Warning", "Select output folder first")
@@ -9057,6 +9160,14 @@ if __name__ == '__main__':
         slider_layout.addWidget(min_intensity_label)
         layout.addLayout(slider_layout)
 
+        # Preview threshold button
+        preview_thresh_btn = QPushButton("Preview Threshold on Current Image")
+        preview_thresh_btn.setToolTip(
+            "Opens a window showing which pixels would be excluded (red) at the current threshold")
+        preview_thresh_btn.clicked.connect(
+            lambda: self._preview_intensity_threshold(min_intensity_slider.value()))
+        layout.addWidget(preview_thresh_btn)
+
         layout.addSpacing(10)
 
         # --- Cell Boundary Segmentation ---
@@ -9451,6 +9562,14 @@ if __name__ == '__main__':
         hint = QLabel("0% = no floor (grow freely)   |   Higher = only bright pixels")
         hint.setStyleSheet("color: palette(dark); font-size: 10px;")
         layout.addWidget(hint)
+
+        # Preview threshold button
+        preview_thresh_btn_qa = QPushButton("Preview Threshold on This Image")
+        preview_thresh_btn_qa.setToolTip(
+            "Opens a window showing which pixels would be excluded (red) at the current threshold")
+        preview_thresh_btn_qa.clicked.connect(
+            lambda: self._preview_intensity_threshold(min_intensity_slider.value(), img_name))
+        layout.addWidget(preview_thresh_btn_qa)
 
         layout.addSpacing(5)
 
@@ -10146,6 +10265,15 @@ if __name__ == '__main__':
         min_intensity_slider.valueChanged.connect(lambda v: min_int_label.setText(f"{v}%"))
         slider_layout.addWidget(min_int_label)
         layout.addLayout(slider_layout)
+
+        # Preview threshold button
+        preview_thresh_btn_3d = QPushButton("Preview Threshold on Current Image")
+        preview_thresh_btn_3d.setToolTip(
+            "Opens a window showing which pixels would be excluded (red) at the current threshold")
+        preview_thresh_btn_3d.clicked.connect(
+            lambda: self._preview_intensity_threshold(min_intensity_slider.value()))
+        layout.addWidget(preview_thresh_btn_3d)
+
         layout.addSpacing(10)
 
         # Segmentation method
