@@ -1868,6 +1868,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_max_area = 800
         self.mask_step_size = 100
         self.mask_segmentation_method = 'none'  # 'none', 'competitive', 'watershed'
+        self.use_circular_constraint = False
+        self.circular_buffer_um2 = 200  # extra area (µm²) beyond target for circular boundary
         self.use_imagej = False
         # Colocalization mode - show images in color
         self.colocalization_mode = False
@@ -4455,6 +4457,8 @@ TROUBLESHOOTING:
             'mask_max_area': self.mask_max_area,
             'mask_step_size': self.mask_step_size,
             'mask_segmentation_method': self.mask_segmentation_method,
+            'use_circular_constraint': self.use_circular_constraint,
+            'circular_buffer_um2': self.circular_buffer_um2,
             'coloc_channel_1': self.coloc_channel_1,
             'coloc_channel_2': self.coloc_channel_2,
             'grayscale_channel': self.grayscale_channel,
@@ -4652,6 +4656,8 @@ TROUBLESHOOTING:
             'segmentation_method': seg_method,
             'use_min_intensity': self.use_min_intensity,
             'min_intensity_percent': self.min_intensity_percent,
+            'use_circular_constraint': self.use_circular_constraint,
+            'circular_buffer_um2': self.circular_buffer_um2,
         }
 
         script = self._build_cluster_script(settings, image_data, path)
@@ -4754,7 +4760,8 @@ def polygon_to_mask(polygon_points, shape):
 
 
 def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
-                              pixel_size_um, img_name, use_min_intensity, min_intensity_percent):
+                              pixel_size_um, img_name, use_min_intensity, min_intensity_percent,
+                              use_circular_constraint=False, circular_buffer_um2=200):
     """Create masks for ALL somas using competitive priority region growing.
 
     All somas grow simultaneously from a single shared priority queue.
@@ -4775,6 +4782,15 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
             intensity_floor = img_max * (min_intensity_percent / 100.0)
 
     roi = processed_img.astype(np.float64)
+
+    # Circular constraint
+    max_radius_px_sq = None
+    if use_circular_constraint:
+        constraint_area_um2 = sorted_areas[0] + circular_buffer_um2
+        constraint_area_px = constraint_area_um2 / (pixel_size_um ** 2)
+        max_radius_px = np.sqrt(constraint_area_px / np.pi)
+        max_radius_px_sq = max_radius_px ** 2
+
     owner_map = np.full((h, w), -1, dtype=np.int32)
     visited = np.zeros((h, w), dtype=bool)
     heap = []
@@ -4782,12 +4798,14 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
     n_somas = len(soma_outlines_data)
     growth_orders = [[] for _ in range(n_somas)]
     soma_seed_counts = [0] * n_somas
+    soma_centroids = []
 
     for si, soma_data in enumerate(soma_outlines_data):
         centroid = soma_data['centroid']
         cy, cx = int(centroid[0]), int(centroid[1])
         cy = max(0, min(h - 1, cy))
         cx = max(0, min(w - 1, cx))
+        soma_centroids.append((cy, cx))
         soma_outline = soma_data.get('outline')
 
         seeded = False
@@ -4804,6 +4822,10 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
                     nr, nc = sr + dr, sc + dc
                     if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
                         if roi[nr, nc] >= intensity_floor:
+                            if max_radius_px_sq is not None:
+                                dy, dx = nr - cy, nc - cx
+                                if (dy * dy + dx * dx) > max_radius_px_sq:
+                                    continue
                             visited[nr, nc] = True
                             owner_map[nr, nc] = si
                             heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
@@ -4819,6 +4841,10 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
                     nr, nc = cy + dr, cx + dc
                     if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
                         if roi[nr, nc] >= intensity_floor:
+                            if max_radius_px_sq is not None:
+                                dy, dx = nr - cy, nc - cx
+                                if (dy * dy + dx * dx) > max_radius_px_sq:
+                                    continue
                             visited[nr, nc] = True
                             owner_map[nr, nc] = si
                             heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
@@ -4834,10 +4860,15 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
                 break
             continue
         growth_orders[si].append((r, c))
+        sc_cy, sc_cx = soma_centroids[si]
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nr, nc = r + dr, c + dc
             if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
                 if roi[nr, nc] >= intensity_floor:
+                    if max_radius_px_sq is not None:
+                        dy, dx = nr - sc_cy, nc - sc_cx
+                        if (dy * dy + dx * dx) > max_radius_px_sq:
+                            continue
                     visited[nr, nc] = True
                     owner_map[nr, nc] = si
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
@@ -4895,7 +4926,8 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
 def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_id,
                           processed_img, img_name, soma_area_um2,
                           soma_outline_mask=None, territory_map=None,
-                          use_min_intensity=False, min_intensity_percent=0):
+                          use_min_intensity=False, min_intensity_percent=0,
+                          use_circular_constraint=False, circular_buffer_um2=200):
     """Create nested cell masks using priority region growing from the soma outline."""
     import heapq
 
@@ -4919,6 +4951,14 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
 
     cy_roi = max(0, min(h - 1, cy_roi))
     cx_roi = max(0, min(w - 1, cx_roi))
+
+    # Circular constraint
+    max_radius_px_sq = None
+    if use_circular_constraint:
+        constraint_area_um2 = sorted_areas[0] + circular_buffer_um2
+        constraint_area_px = constraint_area_um2 / (pixel_size_um ** 2)
+        max_radius_px = np.sqrt(constraint_area_px / np.pi)
+        max_radius_px_sq = max_radius_px ** 2
 
     intensity_floor = 0.0
     if use_min_intensity and min_intensity_percent > 0:
@@ -4946,6 +4986,13 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
             return True
         return territory_roi[r, c] == my_label or territory_roi[r, c] <= 0
 
+    def _in_circle(r, c):
+        if max_radius_px_sq is None:
+            return True
+        dy = r - cy_roi
+        dx = c - cx_roi
+        return (dy * dy + dx * dx) <= max_radius_px_sq
+
     visited = np.zeros((h, w), dtype=bool)
     growth_order = []
     heap = []
@@ -4963,7 +5010,7 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = sr + dr, sc + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
+                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -4974,7 +5021,7 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nr, nc = cy_roi + dr, cx_roi + dc
             if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
+                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
                     visited[nr, nc] = True
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -4984,7 +5031,7 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nr, nc = r + dr, c + dc
             if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
+                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
                     visited[nr, nc] = True
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -5084,6 +5131,8 @@ def process_image(img_name, img_info, input_dir, output_dir, settings):
     seg_method = settings['segmentation_method']
     use_min_intensity = settings['use_min_intensity']
     min_intensity_percent = settings['min_intensity_percent']
+    use_circular_constraint = settings.get('use_circular_constraint', False)
+    circular_buffer_um2 = settings.get('circular_buffer_um2', 200)
 
     # Load processed image
     processed_path = os.path.join(input_dir, img_info['processed_filename'])
@@ -5122,7 +5171,9 @@ def process_image(img_name, img_info, input_dir, output_dir, settings):
         print(f"  Using competitive growth for {{len(soma_outlines)}} cells")
         masks = create_competitive_masks(
             processed_img, soma_outlines, area_list, pixel_size, img_name,
-            use_min_intensity, min_intensity_percent
+            use_min_intensity, min_intensity_percent,
+            use_circular_constraint=use_circular_constraint,
+            circular_buffer_um2=circular_buffer_um2,
         )
     else:
         territory_map = None
@@ -5142,6 +5193,8 @@ def process_image(img_name, img_info, input_dir, output_dir, settings):
                 territory_map=territory_map,
                 use_min_intensity=use_min_intensity,
                 min_intensity_percent=min_intensity_percent,
+                use_circular_constraint=use_circular_constraint,
+                circular_buffer_um2=circular_buffer_um2,
             )
             masks.extend(m)
 
@@ -5622,6 +5675,8 @@ if __name__ == '__main__':
             self.mask_max_area = session.get('mask_max_area', 800)
             self.mask_step_size = session.get('mask_step_size', 100)
             self.mask_segmentation_method = session.get('mask_segmentation_method', 'none')
+            self.use_circular_constraint = session.get('use_circular_constraint', False)
+            self.circular_buffer_um2 = session.get('circular_buffer_um2', 200)
             self.coloc_channel_1 = session.get('coloc_channel_1', 0)
             self.coloc_channel_2 = session.get('coloc_channel_2', 1)
             self.grayscale_channel = session.get('grayscale_channel', 0)
@@ -9048,6 +9103,39 @@ if __name__ == '__main__':
 
         layout.addSpacing(10)
 
+        # --- Circular Growth Constraint ---
+        circ_group = QLabel("<b>Circular Growth Constraint</b>")
+        layout.addWidget(circ_group)
+
+        circular_check = QCheckBox("Limit growth to circular boundary around soma")
+        circular_check.setChecked(self.use_circular_constraint)
+        circular_check.setToolTip(
+            "Constrains mask growth to a circle centered on the soma centroid.\n"
+            "The circle's area = target mask area + buffer.\n"
+            "This promotes even radial development and discourages\n"
+            "one long branch from dominating the mask.")
+        layout.addWidget(circular_check)
+
+        buffer_layout = QHBoxLayout()
+        buffer_layout.addWidget(QLabel("  Buffer:"))
+        buffer_spin = QSpinBox()
+        buffer_spin.setRange(0, 2000)
+        buffer_spin.setSingleStep(50)
+        buffer_spin.setValue(self.circular_buffer_um2)
+        buffer_spin.setSuffix(" um2")
+        buffer_spin.setToolTip("Extra area beyond target mask size for the circular boundary")
+        buffer_layout.addWidget(buffer_spin)
+        layout.addLayout(buffer_layout)
+
+        circ_help = QLabel(
+            "Radius = sqrt((target_area + buffer) / pi). "
+            "Larger buffer = more room for branches; smaller = more compact masks.")
+        circ_help.setWordWrap(True)
+        circ_help.setStyleSheet("color: palette(dark); font-size: 10px;")
+        layout.addWidget(circ_help)
+
+        layout.addSpacing(10)
+
         # Help text
         help_text = QLabel(
             "💡 Tip:\n"
@@ -9091,6 +9179,8 @@ if __name__ == '__main__':
         self.mask_max_area = max_area_spin.value()
         self.mask_step_size = step_spin.value()
         self.mask_segmentation_method = seg_combo.currentData()
+        self.use_circular_constraint = circular_check.isChecked()
+        self.circular_buffer_um2 = buffer_spin.value()
 
         # Now proceed with mask generation
         try:
@@ -9245,6 +9335,8 @@ if __name__ == '__main__':
                 self.log(f"✓ Used minimum intensity: {self.min_intensity_percent}%")
             if seg_method != 'none':
                 self.log(f"✓ Cell boundary segmentation: {seg_labels.get(seg_method, seg_method)}")
+            if self.use_circular_constraint:
+                self.log(f"✓ Circular growth constraint: buffer {self.circular_buffer_um2} µm²")
             self.log("✓ Ready for QA")
             self.log("=" * 50)
             self._auto_save()
@@ -9362,6 +9454,26 @@ if __name__ == '__main__':
 
         layout.addSpacing(5)
 
+        # Circular constraint
+        layout.addWidget(QLabel("<b>Circular Growth Constraint</b>"))
+        regen_circular_check = QCheckBox("Limit growth to circular boundary")
+        regen_circular_check.setChecked(self.use_circular_constraint)
+        regen_circular_check.setToolTip(
+            "Promotes even radial growth instead of one long branch dominating.")
+        layout.addWidget(regen_circular_check)
+
+        regen_buffer_layout = QHBoxLayout()
+        regen_buffer_layout.addWidget(QLabel("  Buffer:"))
+        regen_buffer_spin = QSpinBox()
+        regen_buffer_spin.setRange(0, 2000)
+        regen_buffer_spin.setSingleStep(50)
+        regen_buffer_spin.setValue(self.circular_buffer_um2)
+        regen_buffer_spin.setSuffix(" um2")
+        regen_buffer_layout.addWidget(regen_buffer_spin)
+        layout.addLayout(regen_buffer_layout)
+
+        layout.addSpacing(5)
+
         # Buttons
         button_layout = QHBoxLayout()
         cancel_btn = QPushButton("Cancel")
@@ -9415,15 +9527,20 @@ if __name__ == '__main__':
         # Clear existing masks for this image
         img_data['masks'] = []
 
-        # Temporarily override intensity setting for this generation
+        # Temporarily override settings for this generation
         saved_intensity = self.min_intensity_percent
         saved_use_intensity = self.use_min_intensity
+        saved_circular = self.use_circular_constraint
+        saved_buffer = self.circular_buffer_um2
         self.min_intensity_percent = regen_intensity
         self.use_min_intensity = regen_intensity > 0
+        self.use_circular_constraint = regen_circular_check.isChecked()
+        self.circular_buffer_um2 = regen_buffer_spin.value()
 
         # Generate new masks
+        circ_info = f", circular buffer {self.circular_buffer_um2} µm²" if self.use_circular_constraint else ""
         self.log(f"Redoing masks for {img_name}: {regen_min}-{regen_max} µm², "
-                 f"step {regen_step}, intensity {regen_intensity}%")
+                 f"step {regen_step}, intensity {regen_intensity}%{circ_info}")
 
         # Ensure processed image is loaded (may have been freed to save RAM)
         processed_img = self._ensure_processed_loaded(img_name)
@@ -9445,9 +9562,11 @@ if __name__ == '__main__':
             )
             img_data['masks'].extend(masks)
 
-        # Restore global intensity settings
+        # Restore global settings
         self.min_intensity_percent = saved_intensity
         self.use_min_intensity = saved_use_intensity
+        self.use_circular_constraint = saved_circular
+        self.circular_buffer_um2 = saved_buffer
 
         # Export all regenerated masks to disk
         if self.masks_dir and os.path.isdir(self.masks_dir):
@@ -9566,6 +9685,15 @@ if __name__ == '__main__':
 
         roi = processed_img.astype(np.float64)
 
+        # Circular constraint: limit growth to a circle centered on each soma's
+        # centroid whose area = largest_target + buffer.  Promotes radial growth.
+        max_radius_px_sq = None
+        if self.use_circular_constraint:
+            constraint_area_um2 = sorted_areas[0] + self.circular_buffer_um2
+            constraint_area_px = constraint_area_um2 / (pixel_size_um ** 2)
+            max_radius_px = np.sqrt(constraint_area_px / np.pi)
+            max_radius_px_sq = max_radius_px ** 2
+
         # Shared state across all somas
         # owner_map: which soma owns each pixel (-1 = unclaimed)
         owner_map = np.full((h, w), -1, dtype=np.int32)
@@ -9576,6 +9704,7 @@ if __name__ == '__main__':
         n_somas = len(soma_outlines_data)
         growth_orders = [[] for _ in range(n_somas)]  # growth_orders[i] = [(r,c), ...]
         soma_seed_counts = [0] * n_somas
+        soma_centroids = []  # (cy, cx) per soma for circular constraint
 
         # Seed all somas into the shared heap
         for si, soma_data in enumerate(soma_outlines_data):
@@ -9583,6 +9712,7 @@ if __name__ == '__main__':
             cy, cx = int(centroid[0]), int(centroid[1])
             cy = max(0, min(h - 1, cy))
             cx = max(0, min(w - 1, cx))
+            soma_centroids.append((cy, cx))
             soma_outline = soma_data.get('outline')
 
             seeded = False
@@ -9600,6 +9730,11 @@ if __name__ == '__main__':
                         nr, nc = sr + dr, sc + dc
                         if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
                             if roi[nr, nc] >= intensity_floor:
+                                if max_radius_px_sq is not None:
+                                    dy = nr - cy
+                                    dx = nc - cx
+                                    if (dy * dy + dx * dx) > max_radius_px_sq:
+                                        continue
                                 visited[nr, nc] = True
                                 owner_map[nr, nc] = si
                                 heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
@@ -9615,6 +9750,11 @@ if __name__ == '__main__':
                         nr, nc = cy + dr, cx + dc
                         if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
                             if roi[nr, nc] >= intensity_floor:
+                                if max_radius_px_sq is not None:
+                                    dy = nr - cy
+                                    dx = nc - cx
+                                    if (dy * dy + dx * dx) > max_radius_px_sq:
+                                        continue
                                 visited[nr, nc] = True
                                 owner_map[nr, nc] = si
                                 heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
@@ -9640,10 +9780,16 @@ if __name__ == '__main__':
             growth_orders[si].append((r, c))
 
             # Push unclaimed 4-connected neighbors
+            sc_cy, sc_cx = soma_centroids[si]
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
                     if roi[nr, nc] >= intensity_floor:
+                        if max_radius_px_sq is not None:
+                            dy = nr - sc_cy
+                            dx = nc - sc_cx
+                            if (dy * dy + dx * dx) > max_radius_px_sq:
+                                continue
                         visited[nr, nc] = True
                         owner_map[nr, nc] = si
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
@@ -9742,6 +9888,17 @@ if __name__ == '__main__':
         cy_roi = max(0, min(h - 1, cy_roi))
         cx_roi = max(0, min(w - 1, cx_roi))
 
+        # Compute circular constraint radius (in pixels) if enabled
+        # The constraint limits growth to a circle centered on the soma centroid
+        # whose area = largest_target_area + buffer.  This encourages more radial
+        # (circular) growth instead of one long branch dominating.
+        max_radius_px_sq = None  # None = no constraint
+        if self.use_circular_constraint:
+            constraint_area_um2 = sorted_areas[0] + self.circular_buffer_um2
+            constraint_area_px = constraint_area_um2 / (pixel_size_um ** 2)
+            max_radius_px = np.sqrt(constraint_area_px / np.pi)
+            max_radius_px_sq = max_radius_px ** 2
+
         # Compute intensity floor from user settings
         intensity_floor = 0.0
         if self.use_min_intensity and self.min_intensity_percent > 0:
@@ -9772,6 +9929,14 @@ if __name__ == '__main__':
                 return True
             return territory_roi[r, c] == my_label or territory_roi[r, c] <= 0
 
+        def _in_circle(r, c):
+            """Check if pixel (r,c) is within the circular growth constraint."""
+            if max_radius_px_sq is None:
+                return True
+            dy = r - cy_roi
+            dx = c - cx_roi
+            return (dy * dy + dx * dx) <= max_radius_px_sq
+
         # Priority region growing: grow from soma outline, brightest neighbor first
         # Use a max-heap (negate intensity for min-heap)
         visited = np.zeros((h, w), dtype=bool)
@@ -9794,7 +9959,7 @@ if __name__ == '__main__':
                 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     nr, nc = sr + dr, sc + dc
                     if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                        if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
+                        if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
                             visited[nr, nc] = True
                             heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -9806,7 +9971,7 @@ if __name__ == '__main__':
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = cy_roi + dr, cx_roi + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
+                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -9820,7 +9985,7 @@ if __name__ == '__main__':
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc):
+                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
