@@ -2724,6 +2724,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         largest_only = self.cluster_largest_only.isChecked()
         fiji_path = self.cluster_fiji_path.text().strip()
+
+        # Warn if Fiji path looks like a directory instead of an executable
+        if fiji_path.endswith('Fiji.app') or fiji_path.endswith('Fiji.app/'):
+            reply = QMessageBox.warning(self, "Fiji Path Warning",
+                "The Fiji path appears to point to the Fiji.app directory, "
+                "not the executable.\n\n"
+                f"Current: {fiji_path}\n\n"
+                "It should typically end with:\n"
+                "  .../Fiji.app/ImageJ-linux64\n\n"
+                "Continue anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.No:
+                return
+
         partition = self.cluster_partition.text().strip() or "general"
         wall_time = self.cluster_time.text().strip() or "04:00:00"
         mem = self.cluster_mem.text().strip() or "8G"
