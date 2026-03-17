@@ -2858,7 +2858,7 @@ def openImageQuiet(path):
 
 def parseMaskInfo(maskFilename):
     """Extract image name, soma ID, and area from mask filename."""
-    m = re.match(r'^(.+?)_(soma_\\d+_\\d+)_area(\\d+)_mask\\.tif$', maskFilename)
+    m = re.match(r'^(.+?)_(soma_\\d+_\\d+(?:_\\d+)?)_area(\\d+)_mask\\.tif$', maskFilename)
     if m:
         return m.group(1), m.group(2), int(m.group(3))
     return maskFilename, 'unknown', 0
@@ -3687,7 +3687,7 @@ def discoverImages(masksDir):
     for f in os.listdir(masksDir):
         if not f.endswith('_mask.tif') or f.startswith('.'):
             continue
-        m = re.match(r'^(.+?)_(soma_\\d+_\\d+)_area(\\d+)_mask\\.tif$', f)
+        m = re.match(r'^(.+?)_(soma_\\d+_\\d+(?:_\\d+)?)_area(\\d+)_mask\\.tif$', f)
         if m:
             images.add(m.group(1))
     return sorted(images)
@@ -3816,14 +3816,19 @@ if [ ! -d "$MMPS_OUTPUT_DIR/masks" ]; then
 fi
 
 # Discover unique image names from mask filenames
-NUM_IMAGES=$(ls "$MMPS_OUTPUT_DIR/masks/"*_mask.tif 2>/dev/null \\
-    | xargs -n1 basename \\
-    | sed 's/_soma_[0-9]*_[0-9]*_area[0-9]*_mask\\.tif$//' \\
+# Pattern handles both 2D (soma_Y_X) and 3D (soma_Z_Y_X) naming
+NUM_IMAGES=$(find "$MMPS_OUTPUT_DIR/masks/" -maxdepth 1 -name '*_mask.tif' -printf '%f\\n' 2>/dev/null \\
+    | sed 's/_soma_[0-9][0-9]*_[0-9][0-9]*\\(_[0-9][0-9]*\\)\\{{0,1\\}}_area[0-9][0-9]*_mask\\.tif$//' \\
     | sort -u \\
     | wc -l)
 
 if [ "$NUM_IMAGES" -eq 0 ]; then
-    echo "ERROR: No mask files found in $MMPS_OUTPUT_DIR/masks/"
+    echo "ERROR: No mask files found matching *_mask.tif in $MMPS_OUTPUT_DIR/masks/"
+    echo ""
+    echo "Contents of masks/ directory:"
+    ls -la "$MMPS_OUTPUT_DIR/masks/" 2>/dev/null | head -20
+    echo ""
+    echo "Expected mask filename format: ImageName_soma_Y_X_area123_mask.tif"
     exit 1
 fi
 
