@@ -2657,9 +2657,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # --- SLURM Settings ---
         slurm_group = QGroupBox("SLURM Job Settings (per image)")
         slurm_layout = QFormLayout()
-        self.cluster_partition = QLineEdit("general")
+        self.cluster_partition = QLineEdit("comm_small_day")
         slurm_layout.addRow("Partition:", self.cluster_partition)
-        self.cluster_time = QLineEdit("04:00:00")
+        self.cluster_time = QLineEdit("24:00:00")
         slurm_layout.addRow("Wall time:", self.cluster_time)
         self.cluster_mem = QLineEdit("8G")
         slurm_layout.addRow("Memory:", self.cluster_mem)
@@ -2738,8 +2738,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
             if reply == QMessageBox.No:
                 return
 
-        partition = self.cluster_partition.text().strip() or "general"
-        wall_time = self.cluster_time.text().strip() or "04:00:00"
+        partition = self.cluster_partition.text().strip() or "comm_small_day"
+        wall_time = self.cluster_time.text().strip() or "24:00:00"
         mem = self.cluster_mem.text().strip() or "8G"
         cpus = self.cluster_cpus.text().strip() or "1"
         job_name = self.cluster_job_name.text().strip() or "mmps_imagej"
