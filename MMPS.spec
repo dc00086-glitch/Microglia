@@ -2,9 +2,9 @@
 
 import sys, os
 
-# Icon file — .icns for macOS, .ico for Windows
+# Icon file — .icns for macOS, .ico for Windows (optional — skipped if not found)
 if sys.platform == 'darwin':
-    ICON = 'MMPS.icns'
+    ICON = 'MMPS.icns' if os.path.exists('MMPS.icns') else None
 else:
     ICON = 'MMPS.ico' if os.path.exists('MMPS.ico') else None
 
