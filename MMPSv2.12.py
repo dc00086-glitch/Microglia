@@ -3869,7 +3869,7 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --output=mmps_imagej_%A_%a.out \\
     --error=mmps_imagej_%A_%a.err \\
     --wrap="{module_line}
-\\"$FIJI\\" --headless --run \\"$SCRIPT_DIR/{wrapper_basename}\\" \\
+\\"$FIJI\\" --headless -Xmx2g --run \\"$SCRIPT_DIR/{wrapper_basename}\\" \\
     \\"mmps_output_dir=$MMPS_OUTPUT_DIR\\"
 ")
 
