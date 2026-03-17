@@ -3868,7 +3868,7 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --error=mmps_imagej_%A_%a.err \\
     --wrap="{module_line}
 \\"$FIJI\\" --headless --run \\"$SCRIPT_DIR/{wrapper_basename}\\" \\
-    \\"mmps_output_dir=\'$MMPS_OUTPUT_DIR\',image_index=\'\$SLURM_ARRAY_TASK_ID\\'\\"
+    \\"mmps_output_dir=$MMPS_OUTPUT_DIR,image_index=\$SLURM_ARRAY_TASK_ID\\"
 ")
 
 echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
