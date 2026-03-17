@@ -2072,6 +2072,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         imagej_action = cluster_menu.addAction("Generate ImageJ Analysis Script...")
         imagej_action.setToolTip("Export Fiji scripts for Skeleton, Fractal/Hull, and Sholl analysis on a cluster")
         imagej_action.triggered.connect(self._open_imagej_cluster_dialog)
+        spread_action = cluster_menu.addAction("Generate Spread Analysis Script...")
+        spread_action.setToolTip("Export a Python script for cell spread / morphology analysis on a cluster")
+        spread_action.triggered.connect(self._open_spread_cluster_dialog)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -4053,6 +4056,564 @@ TROUBLESHOOTING:
   - To re-run the merge manually:
       python3 merge_results.py /path/to/mmps_output
 """
+
+    # ------------------------------------------------------------------
+    # Spread / Morphology Cluster Job
+    # ------------------------------------------------------------------
+
+    def _open_spread_cluster_dialog(self):
+        """Open a dialog for generating spread / morphology HPC cluster scripts."""
+        from PyQt5.QtWidgets import QDialog, QScrollArea
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Generate Spread Analysis Cluster Scripts")
+        dlg.setMinimumSize(500, 550)
+        dlg_layout = QVBoxLayout(dlg)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
+        desc = QLabel(
+            "Generate a self-contained Python script and SLURM array job to compute\n"
+            "cell spread and morphology metrics (perimeter, eccentricity, roundness,\n"
+            "polarity, etc.) from MMPS mask files on an HPC cluster.\n"
+            "One SLURM task per image, all submitted at once."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: palette(dark); padding-bottom: 8px;")
+        layout.addWidget(desc)
+
+        # --- Parameters ---
+        param_group = QGroupBox("Parameters")
+        param_layout = QFormLayout()
+        try:
+            px = str(self._get_pixel_size())
+        except Exception:
+            px = "0.316"
+        self.spread_pixel_size = QLineEdit(px)
+        param_layout.addRow("Pixel size (um/px):", self.spread_pixel_size)
+        param_group.setLayout(param_layout)
+        layout.addWidget(param_group)
+
+        # --- SLURM Settings ---
+        slurm_group = QGroupBox("SLURM Job Settings (per image)")
+        slurm_layout = QFormLayout()
+        self.spread_partition = QLineEdit("comm_small_day")
+        slurm_layout.addRow("Partition:", self.spread_partition)
+        self.spread_time = QLineEdit("01:00:00")
+        slurm_layout.addRow("Wall time:", self.spread_time)
+        self.spread_mem = QLineEdit("4G")
+        slurm_layout.addRow("Memory:", self.spread_mem)
+        self.spread_cpus = QLineEdit("1")
+        slurm_layout.addRow("CPUs per task:", self.spread_cpus)
+        self.spread_job_name = QLineEdit("mmps_spread")
+        slurm_layout.addRow("Job name:", self.spread_job_name)
+        self.spread_module_load = QLineEdit("")
+        self.spread_module_load.setPlaceholderText("e.g. module load python/3.9")
+        slurm_layout.addRow("Module load:", self.spread_module_load)
+        slurm_group.setLayout(slurm_layout)
+        layout.addWidget(slurm_group)
+
+        # --- Generate Button ---
+        gen_btn = QPushButton("Generate Scripts")
+        gen_btn.setStyleSheet(
+            "font-size: 13pt; font-weight: bold; padding: 10px; "
+            "background-color: #4CAF50; color: white; border-radius: 5px;"
+        )
+        gen_btn.clicked.connect(lambda: self._do_export_spread_cluster(dlg))
+        layout.addWidget(gen_btn)
+
+        layout.addStretch()
+        scroll.setWidget(container)
+        dlg_layout.addWidget(scroll)
+        dlg.exec_()
+
+    def _do_export_spread_cluster(self, dlg):
+        """Called from the spread dialog Generate button."""
+        try:
+            self._export_spread_cluster_impl()
+            dlg.accept()
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"ERROR generating spread cluster scripts: {e}\n{tb}")
+            QMessageBox.critical(self, "Error",
+                f"Failed to generate cluster scripts:\n{e}\n\nSee log for details.")
+
+    def _export_spread_cluster_impl(self):
+        """Generate the spread / morphology cluster scripts."""
+        try:
+            pixel_size = float(self.spread_pixel_size.text())
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Invalid pixel size.")
+            return
+
+        partition = self.spread_partition.text().strip() or "comm_small_day"
+        wall_time = self.spread_time.text().strip() or "01:00:00"
+        mem = self.spread_mem.text().strip() or "4G"
+        cpus = self.spread_cpus.text().strip() or "1"
+        job_name = self.spread_job_name.text().strip() or "mmps_spread"
+        module_load = self.spread_module_load.text().strip()
+
+        parent_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory for Spread Scripts")
+        if not parent_dir:
+            return
+        save_dir = os.path.join(parent_dir, "SpreadAnalysis")
+        os.makedirs(save_dir, exist_ok=True)
+
+        # --- Generate the spread analysis Python script ---
+        analysis_script = self._build_spread_analysis_script(pixel_size)
+        analysis_path = os.path.join(save_dir, "mmps_spread_analysis.py")
+        with open(analysis_path, 'w') as f:
+            f.write(analysis_script)
+
+        # --- Generate the SLURM job script ---
+        slurm_script = self._build_spread_slurm_script(
+            partition, wall_time, mem, cpus, job_name, module_load
+        )
+        slurm_path = os.path.join(save_dir, "submit_spread.sh")
+        with open(slurm_path, 'w') as f:
+            f.write(slurm_script)
+        os.chmod(slurm_path, 0o755)
+
+        self.log(f"Spread cluster scripts saved to: {save_dir}")
+        self.log(f"  - mmps_spread_analysis.py  (Python analysis script - runs per image)")
+        self.log(f"  - submit_spread.sh         (SLURM array job launcher)")
+
+        QMessageBox.information(self, "Spread Cluster Scripts Generated",
+            f"Scripts saved to:\n{save_dir}\n\n"
+            f"Pixel size: {pixel_size} um/px\n\n"
+            f"Upload to your cluster with your masks/ and somas/ folders,\n"
+            f"then run:\n\n"
+            f"  bash submit_spread.sh /path/to/mmps_output\n\n"
+            f"This submits a SLURM array job (one task per image)\n"
+            f"plus a merge job that combines results when done.\n\n"
+            f"Requirements: numpy, tifffile, scikit-image")
+
+    def _build_spread_analysis_script(self, pixel_size):
+        """Build the standalone Python script for cell spread / morphology analysis."""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        script = f'''#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MMPS Cell Spread / Morphology Cluster Analysis Script
+Generated by MMPS on {timestamp}
+
+Computes per-mask morphology metrics from MMPS-exported mask TIFF files:
+  - cell_spread, perimeter, mask_area, eccentricity, roundness
+  - polarity_index, principal_angle, major_axis_um, minor_axis_um
+  - soma_area (from somas/ folder if available)
+
+Usage:
+    # Process all images:
+    python mmps_spread_analysis.py /path/to/mmps_output
+
+    # Process a single image by index (for SLURM array jobs):
+    python mmps_spread_analysis.py /path/to/mmps_output --image-index 0
+
+    # SLURM array job:
+    #   export SLURM_ARRAY_TASK_ID=0
+    #   python mmps_spread_analysis.py /path/to/mmps_output
+
+Required files in mmps_output:
+    masks/  - *_mask.tif files
+    somas/  - *_soma.tif files (optional, for soma area)
+
+Output:
+    spread_results/  - per-image CSVs
+    spread_results/Spread_Analysis_Results.csv  (combined, after merge)
+
+Requirements: numpy, tifffile, scikit-image
+"""
+
+import os
+import sys
+import csv
+import re
+import argparse
+import numpy as np
+import tifffile
+from skimage import measure
+
+PIXEL_SIZE = {pixel_size}
+
+MASK_RE = re.compile(r'^(.+?)_(soma_\\d+_\\d+)_area(\\d+)_mask\\.tif$')
+
+
+def parse_mask_filename(filename):
+    """Extract image_name, soma_id, area from a mask filename."""
+    m = MASK_RE.match(filename)
+    if m:
+        return m.group(1), m.group(2), int(m.group(3))
+    return None, None, None
+
+
+def get_soma_area(somas_dir, image_name, soma_id, pixel_size):
+    """Try to find the soma outline TIFF and compute its area."""
+    if not somas_dir or not os.path.isdir(somas_dir):
+        return None
+    candidates = [
+        f"{{image_name}}_{{soma_id}}_soma.tif",
+        f"{{image_name}}_{{soma_id}}.tif",
+    ]
+    for c in candidates:
+        path = os.path.join(somas_dir, c)
+        if os.path.exists(path):
+            soma = tifffile.imread(path)
+            soma = (soma > 0).astype(np.uint8)
+            if np.any(soma):
+                return np.sum(soma) * (pixel_size ** 2)
+            return None
+    for f in os.listdir(somas_dir):
+        if soma_id in f and f.endswith(".tif"):
+            path = os.path.join(somas_dir, f)
+            soma = tifffile.imread(path)
+            soma = (soma > 0).astype(np.uint8)
+            if np.any(soma):
+                return np.sum(soma) * (pixel_size ** 2)
+            return None
+    return None
+
+
+def compute_metrics(mask_path, pixel_size, soma_area_um2=None):
+    """Load a mask TIFF and compute all morphology metrics."""
+    mask = tifffile.imread(mask_path)
+    mask = (mask > 0).astype(np.uint8)
+
+    if not np.any(mask):
+        return None
+
+    props = measure.regionprops(mask.astype(int))
+    if not props:
+        return None
+
+    p = props[0]
+    params = {{}}
+
+    # Basic shape metrics
+    params['perimeter'] = round(p.perimeter * pixel_size, 4)
+    params['mask_area'] = round(p.area * (pixel_size ** 2), 4)
+
+    major_axis = p.major_axis_length
+    minor_axis = p.minor_axis_length
+
+    if major_axis > 0:
+        axis_ratio = minor_axis / major_axis
+        params['eccentricity'] = round(np.sqrt(1 - axis_ratio ** 2), 6)
+        params['roundness'] = round(axis_ratio ** 2, 6)
+    else:
+        params['eccentricity'] = 0.0
+        params['roundness'] = 0.0
+
+    # Cell spread
+    centroid = np.array(p.centroid)
+    coords = np.array(p.coords)
+
+    top_point = coords[coords[:, 0].argmin()]
+    bottom_point = coords[coords[:, 0].argmax()]
+    left_point = coords[coords[:, 1].argmin()]
+    right_point = coords[coords[:, 1].argmax()]
+
+    extremities = np.array([top_point, bottom_point, left_point, right_point])
+    distances = np.sqrt(np.sum((extremities - centroid) ** 2, axis=1))
+    params['cell_spread'] = round(np.mean(distances) * pixel_size, 4)
+
+    # Soma area
+    if soma_area_um2 is not None:
+        params['soma_area'] = round(soma_area_um2, 4)
+    else:
+        params['soma_area'] = round(p.area * 0.1 * (pixel_size ** 2), 4)
+
+    # Polarity via PCA
+    centered = coords - centroid
+    if len(centered) >= 3:
+        cov = np.cov(centered.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        major_val = eigenvalues[-1]
+        minor_val = eigenvalues[0]
+        major_vec = eigenvectors[:, -1]
+
+        if major_val > 0:
+            params['polarity_index'] = round(1.0 - (minor_val / major_val), 4)
+        else:
+            params['polarity_index'] = 0
+
+        angle_rad = np.arctan2(major_vec[0], major_vec[1])
+        params['principal_angle'] = round(np.degrees(angle_rad) % 180, 2)
+        params['major_axis_um'] = round(2 * np.sqrt(major_val) * pixel_size, 4)
+        params['minor_axis_um'] = round(2 * np.sqrt(max(minor_val, 0)) * pixel_size, 4)
+    else:
+        params['polarity_index'] = 0
+        params['principal_angle'] = 0
+        params['major_axis_um'] = 0
+        params['minor_axis_um'] = 0
+
+    return params
+
+
+def get_unique_images(masks_dir):
+    """Get sorted list of unique image names from mask filenames."""
+    images = set()
+    for f in os.listdir(masks_dir):
+        img_name, _, _ = parse_mask_filename(f)
+        if img_name:
+            images.add(img_name)
+    return sorted(images)
+
+
+def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir):
+    """Process all masks for a single image and write a per-image CSV."""
+    all_files = sorted(os.listdir(masks_dir))
+    mask_files = []
+    for f in all_files:
+        img, soma_id, area = parse_mask_filename(f)
+        if img == image_name:
+            mask_files.append((f, soma_id, area))
+
+    if not mask_files:
+        print(f"  No masks found for image: {{image_name}}")
+        return 0
+
+    results = []
+    for filename, soma_id, area in mask_files:
+        mask_path = os.path.join(masks_dir, filename)
+        soma_area = get_soma_area(somas_dir, image_name, soma_id, pixel_size)
+
+        try:
+            metrics = compute_metrics(mask_path, pixel_size, soma_area)
+        except Exception as e:
+            print(f"  ERROR: {{filename}}: {{e}}")
+            continue
+
+        if metrics is None:
+            print(f"  SKIP (empty mask): {{filename}}")
+            continue
+
+        treatment = image_name.split('_')[0] if image_name else ''
+        row = {{
+            'treatment': treatment,
+            'image_name': image_name,
+            'soma_id': soma_id,
+            'area_um2': area,
+        }}
+        row.update(metrics)
+        results.append(row)
+
+    if not results:
+        return 0
+
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, f"Spread_Results_{{image_name}}.csv")
+
+    fieldnames = [
+        'treatment', 'image_name', 'soma_id', 'area_um2',
+        'mask_area', 'perimeter', 'roundness', 'eccentricity',
+        'cell_spread', 'soma_area',
+        'polarity_index', 'principal_angle',
+        'major_axis_um', 'minor_axis_um',
+    ]
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"  Wrote {{len(results)}} rows to {{csv_path}}")
+    return len(results)
+
+
+def merge_results(output_dir):
+    """Merge all per-image Spread CSVs into a single combined file."""
+    csv_files = sorted(f for f in os.listdir(output_dir)
+                       if f.startswith("Spread_Results_") and f.endswith(".csv"))
+    if not csv_files:
+        print("No per-image spread CSVs found to merge.")
+        return
+
+    all_rows = []
+    for csv_file in csv_files:
+        path = os.path.join(output_dir, csv_file)
+        with open(path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                all_rows.append(row)
+
+    combined_path = os.path.join(output_dir, "Spread_Analysis_Results.csv")
+    if all_rows:
+        fieldnames = list(all_rows[0].keys())
+        with open(combined_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(all_rows)
+        print(f"Merged {{len(all_rows)}} rows from {{len(csv_files)}} files into {{combined_path}}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MMPS Cell Spread / Morphology Analysis")
+    parser.add_argument("mmps_output_dir", help="Path to MMPS output directory (contains masks/ and somas/)")
+    parser.add_argument("--image-index", type=int, default=None,
+                        help="Process only this image index (for SLURM array jobs)")
+    parser.add_argument("--merge-only", action="store_true",
+                        help="Only merge existing per-image CSVs")
+    parser.add_argument("--pixel-size", type=float, default=PIXEL_SIZE,
+                        help=f"Pixel size in um/px (default: {{PIXEL_SIZE}})")
+    args = parser.parse_args()
+
+    mmps_dir = os.path.abspath(args.mmps_output_dir)
+    masks_dir = os.path.join(mmps_dir, "masks")
+    somas_dir = os.path.join(mmps_dir, "somas")
+    output_dir = os.path.join(mmps_dir, "spread_results")
+    pixel_size = args.pixel_size
+
+    if not os.path.isdir(somas_dir):
+        somas_dir = None
+
+    if args.merge_only:
+        merge_results(output_dir)
+        return
+
+    if not os.path.isdir(masks_dir):
+        print(f"ERROR: masks/ directory not found in {{mmps_dir}}")
+        sys.exit(1)
+
+    unique_images = get_unique_images(masks_dir)
+    if not unique_images:
+        print("ERROR: No mask files found matching expected pattern.")
+        sys.exit(1)
+
+    # Determine which image(s) to process
+    image_index = args.image_index
+    if image_index is None:
+        # Check for SLURM array task ID
+        slurm_idx = os.environ.get("SLURM_ARRAY_TASK_ID")
+        if slurm_idx is not None:
+            image_index = int(slurm_idx)
+
+    if image_index is not None:
+        if image_index < 0 or image_index >= len(unique_images):
+            print(f"ERROR: image-index {{image_index}} out of range (0-{{len(unique_images)-1}})")
+            sys.exit(1)
+        images_to_process = [unique_images[image_index]]
+        print(f"Processing image {{image_index}}/{{len(unique_images)-1}}: {{images_to_process[0]}}")
+    else:
+        images_to_process = unique_images
+        print(f"Processing all {{len(unique_images)}} images...")
+
+    total = 0
+    for img_name in images_to_process:
+        print(f"\\nImage: {{img_name}}")
+        n = process_image(img_name, masks_dir, somas_dir, pixel_size, output_dir)
+        total += n
+
+    print(f"\\nDone. Total masks processed: {{total}}")
+
+    # If processing all images, also merge
+    if image_index is None:
+        merge_results(output_dir)
+
+
+if __name__ == "__main__":
+    main()
+'''
+        return script
+
+    def _build_spread_slurm_script(self, partition, wall_time, mem, cpus, job_name, module_load):
+        """Build the SLURM array job submission script for spread analysis."""
+        module_line = f"\n{module_load}" if module_load else ""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        script = f'''#!/bin/bash
+# =============================================================================
+# MMPS Cell Spread / Morphology - SLURM Array Job Launcher
+# Generated by MMPS on {timestamp}
+#
+# This script discovers how many images you have, then submits:
+#   1. A SLURM array job (one task per image, all submitted together)
+#   2. A merge job that combines per-image CSVs after all tasks finish
+#
+# Usage:
+#   bash submit_spread.sh /path/to/mmps_output
+#
+# Requirements: numpy, tifffile, scikit-image
+# =============================================================================
+
+set -e
+
+if [ $# -lt 1 ]; then
+    echo "Usage: bash submit_spread.sh /path/to/mmps_output"
+    exit 1
+fi
+
+MMPS_OUTPUT_DIR="$(cd "$1" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Verify masks directory exists
+if [ ! -d "$MMPS_OUTPUT_DIR/masks" ]; then
+    echo "ERROR: No masks/ directory found in $MMPS_OUTPUT_DIR"
+    exit 1
+fi
+
+# Discover unique image names from mask filenames
+# Pattern handles both 2D (soma_Y_X) and 3D (soma_Z_Y_X) naming
+NUM_IMAGES=$(find "$MMPS_OUTPUT_DIR/masks/" -maxdepth 1 -name '*_mask.tif' -printf '%f\\n' 2>/dev/null \\
+    | sed 's/_soma_[0-9][0-9]*_[0-9][0-9]*\\(_[0-9][0-9]*\\)\\{{0,1\\}}_area[0-9][0-9]*_mask\\.tif$//' \\
+    | sort -u \\
+    | wc -l)
+
+if [ "$NUM_IMAGES" -eq 0 ]; then
+    echo "ERROR: No mask files found matching *_mask.tif in $MMPS_OUTPUT_DIR/masks/"
+    echo ""
+    echo "Contents of masks/ directory:"
+    ls -la "$MMPS_OUTPUT_DIR/masks/" 2>/dev/null | head -20
+    echo ""
+    echo "Expected mask filename format: ImageName_soma_Y_X_area123_mask.tif"
+    exit 1
+fi
+
+MAX_INDEX=$((NUM_IMAGES - 1))
+
+echo "======================================"
+echo "MMPS Cell Spread / Morphology Analysis"
+echo "Output dir: $MMPS_OUTPUT_DIR"
+echo "Images found: $NUM_IMAGES"
+echo "======================================"
+
+# --- Submit the array job (one task per image) ---
+ARRAY_JOB_ID=$(sbatch --parsable \\
+    --job-name={job_name} \\
+    --partition={partition} \\
+    --time={wall_time} \\
+    --mem={mem} \\
+    --cpus-per-task={cpus} \\
+    --array=0-${{MAX_INDEX}} \\
+    --output=mmps_spread_%A_%a.out \\
+    --error=mmps_spread_%A_%a.err \\
+    --wrap="{module_line}
+python3 \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\"
+")
+
+echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
+
+# --- Submit the merge job (runs after all array tasks complete) ---
+MERGE_JOB_ID=$(sbatch --parsable \\
+    --job-name={job_name}_merge \\
+    --partition={partition} \\
+    --time=00:10:00 \\
+    --mem=2G \\
+    --cpus-per-task=1 \\
+    --dependency=afterok:$ARRAY_JOB_ID \\
+    --output=mmps_spread_merge_%j.out \\
+    --error=mmps_spread_merge_%j.err \\
+    --wrap="python3 \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\" --merge-only"
+)
+
+echo "Submitted merge job:  $MERGE_JOB_ID (runs after array completes)"
+echo ""
+echo "Monitor with:  squeue -u \\$USER"
+echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
+'''
+        return script
 
     def update_timer_display(self):
         """Update the timer display during processing"""
