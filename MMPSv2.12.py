@@ -1007,6 +1007,7 @@ class MorphologyCalculationThread(QThread):
     def run(self):
         import sys
         import os
+        import time
 
         # Suppress Java warnings during processing to speed up
         old_stderr = sys.stderr
@@ -1015,14 +1016,33 @@ class MorphologyCalculationThread(QThread):
         try:
             all_results = []
             total = len(self.approved_masks)
+            batch_start = time.time()
+            calc_times = []
+
+            # Cache: reuse MorphologyCalculator per (image, pixel_size) to avoid re-init
+            calculator_cache = {}
 
             for i, flat_data in enumerate(self.approved_masks):
                 mask_data = flat_data['mask_data']
                 img_name = flat_data['image_name']
 
+                # ETA calculation
+                elapsed_total = time.time() - batch_start
+                if i > 0:
+                    avg_per_mask = elapsed_total / i
+                    remaining = avg_per_mask * (total - i)
+                    if remaining >= 60:
+                        eta_str = f"~{remaining / 60:.1f}min left"
+                    else:
+                        eta_str = f"~{remaining:.0f}s left"
+                    speed_str = f"{i / elapsed_total:.1f}/s"
+                else:
+                    eta_str = "estimating..."
+                    speed_str = ""
+
                 self.progress.emit(
                     int((i + 1) / total * 100),
-                    f"Processing {mask_data['soma_id']} ({i + 1}/{total})"
+                    f"Processing {mask_data['soma_id']} ({i + 1}/{total}) [{speed_str} {eta_str}]"
                 )
 
                 # Find soma centroid and area from original image data
@@ -1056,19 +1076,16 @@ class MorphologyCalculationThread(QThread):
                     )
                     continue
 
-                # Time tracking for diagnostics
-                import time
                 start = time.time()
 
                 img_pixel_size = self.pixel_size_map.get(img_name, self.pixel_size)
-                calculator = MorphologyCalculator(processed_img, img_pixel_size, use_imagej=self.use_imagej)
+                cache_key = (id(processed_img), img_pixel_size)
+                if cache_key not in calculator_cache:
+                    calculator_cache[cache_key] = MorphologyCalculator(processed_img, img_pixel_size, use_imagej=self.use_imagej)
+                calculator = calculator_cache[cache_key]
                 params = calculator.calculate_all_parameters(mask_data['mask'], soma_centroid, soma_area_um2)
 
-                elapsed = time.time() - start
-                # Temporarily restore stderr to print timing
-                sys.stderr = old_stderr
-                print(f"  ✓ {mask_data['soma_id']}: {elapsed:.1f}s")
-                sys.stderr = open(os.devnull, 'w')
+                calc_times.append(time.time() - start)
 
                 params['image_name'] = os.path.splitext(img_name)[0]
                 params['soma_id'] = mask_data['soma_id']
@@ -1076,6 +1093,14 @@ class MorphologyCalculationThread(QThread):
                 params['area_um2'] = mask_data['area_um2']
 
                 all_results.append(params)
+
+                # Free mask memory after calculation to avoid holding all 22k masks in RAM
+                mask_data['mask'] = None
+
+            total_time = time.time() - batch_start
+            sys.stderr = old_stderr
+            print(f"  Calculated {len(all_results)} masks in {total_time:.1f}s ({len(all_results)/max(total_time,0.001):.1f} masks/s)")
+            sys.stderr = open(os.devnull, 'w')
 
             self.finished.emit(all_results)
 
@@ -11377,22 +11402,16 @@ if __name__ == '__main__':
 
             self.log(f"all_masks_flat has {len(self.all_masks_flat)} entries")
 
-            # Reload any evicted mask arrays and processed images from disk before analysis
-            reload_count = 0
-            processed_reload_count = 0
+            # Only reload processed images on main thread (fast, one per image)
+            # Mask reloads are deferred to the worker thread to avoid freezing the UI
             reloaded_images = set()
+            processed_reload_count = 0
             for flat in self.all_masks_flat:
-                if flat['mask_data'].get('approved') and flat['mask_data'].get('mask') is None:
-                    if self._reload_mask_from_disk(flat['mask_data'], flat['image_name']):
-                        reload_count += 1
-                # Ensure processed image is loaded for each image with approved masks
                 if flat['mask_data'].get('approved') and flat['image_name'] not in reloaded_images:
                     reloaded_images.add(flat['image_name'])
                     if self._ensure_processed_loaded(flat['image_name']) is not None:
                         if self.images[flat['image_name']].get('processed') is not None:
                             processed_reload_count += 1
-            if reload_count > 0:
-                self.log(f"   Reloaded {reload_count} evicted masks from disk for analysis")
             if processed_reload_count > 0:
                 self.log(f"   Reloaded {processed_reload_count} processed images from disk for analysis")
 
@@ -11472,24 +11491,29 @@ if __name__ == '__main__':
             self.log("=" * 50)
             self.log("🎨 Calculating colocalization metrics...")
             coloc_count = 0
+            # Build O(1) lookup: (image_base, soma_id) -> flat_data
+            mask_lookup = {}
+            for flat_data in self.all_masks_flat:
+                if flat_data['mask_data'].get('approved'):
+                    key = (os.path.splitext(flat_data['image_name'])[0],
+                           flat_data['mask_data'].get('soma_id'))
+                    mask_lookup[key] = flat_data
+
             for i, result in enumerate(all_results):
                 img_name = result.get('image_name', '')
-                # Find the matching mask data
-                for flat_data in self.all_masks_flat:
-                    if (flat_data['mask_data'].get('approved') and
-                        flat_data['mask_data'].get('soma_id') == result.get('soma_id') and
-                        os.path.splitext(flat_data['image_name'])[0] == img_name):
-                        # Reload from disk if evicted
-                        if flat_data['mask_data'].get('mask') is None:
-                            self._reload_mask_from_disk(flat_data['mask_data'], flat_data['image_name'])
-                        mask = flat_data['mask_data'].get('mask')
-                        full_img_name = flat_data['image_name']
-                        if mask is not None:
-                            coloc_results = self.calculate_colocalization(mask, full_img_name)
-                            result.update(coloc_results)
-                            if coloc_results.get('coloc_status') == 'ok':
-                                coloc_count += 1
-                        break
+                key = (img_name, result.get('soma_id'))
+                flat_data = mask_lookup.get(key)
+                if flat_data:
+                    # Reload from disk if evicted
+                    if flat_data['mask_data'].get('mask') is None:
+                        self._reload_mask_from_disk(flat_data['mask_data'], flat_data['image_name'])
+                    mask = flat_data['mask_data'].get('mask')
+                    full_img_name = flat_data['image_name']
+                    if mask is not None:
+                        coloc_results = self.calculate_colocalization(mask, full_img_name)
+                        result.update(coloc_results)
+                        if coloc_results.get('coloc_status') == 'ok':
+                            coloc_count += 1
             self.log(f"✓ Colocalization calculated for {coloc_count}/{len(all_results)} cells")
 
         # Collect metadata for images
@@ -11717,17 +11741,19 @@ if __name__ == '__main__':
 
         import csv
 
+        # Build O(1) lookup: image_basename -> img_data
+        img_by_base = {}
+        for full_name, img_data in self.images.items():
+            img_by_base[os.path.splitext(full_name)[0]] = img_data
+
         # Add animal_id and treatment to each result
         for result in results:
             img_name_base = result['image_name']
-            # Find the matching image data
-            for full_name, img_data in self.images.items():
-                if os.path.splitext(full_name)[0] == img_name_base:
-                    result['animal_id'] = img_data.get('animal_id', '')
-                    result['treatment'] = img_data.get('treatment', '')
-                    break
+            img_data = img_by_base.get(img_name_base)
+            if img_data:
+                result['animal_id'] = img_data.get('animal_id', '')
+                result['treatment'] = img_data.get('treatment', '')
             else:
-                # If not found, set empty values
                 result['animal_id'] = ''
                 result['treatment'] = ''
 
@@ -11775,13 +11801,11 @@ if __name__ == '__main__':
                 soma_id = result['soma_id']
                 soma_idx = result.get('soma_idx', 0)
 
-                # Get soma position
+                # Get soma position using O(1) lookup
                 soma_x, soma_y = 0, 0
-                for full_name, img_data in self.images.items():
-                    if os.path.splitext(full_name)[0] == img_name:
-                        if soma_idx < len(img_data['somas']):
-                            soma_x, soma_y = img_data['somas'][soma_idx]
-                        break
+                img_data = img_by_base.get(img_name)
+                if img_data and soma_idx < len(img_data['somas']):
+                    soma_x, soma_y = img_data['somas'][soma_idx]
 
                 mask_filename = f"{img_name}_{soma_id}_mask.tif"
                 soma_filename = f"{img_name}_{soma_id}_soma.tif"
