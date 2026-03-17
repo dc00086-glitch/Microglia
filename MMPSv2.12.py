@@ -2731,10 +2731,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         job_name = self.cluster_job_name.text().strip() or "mmps_imagej"
         module_load = self.cluster_module_load.text().strip()
 
-        # Ask where to save
-        save_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory for Cluster Scripts")
-        if not save_dir:
+        # Ask where to save — scripts go into an "ImageJ plugin" subfolder
+        parent_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory for Cluster Scripts")
+        if not parent_dir:
             return
+        save_dir = os.path.join(parent_dir, "ImageJ plugin")
+        os.makedirs(save_dir, exist_ok=True)
 
         analyses = []
         if do_skeleton:
@@ -4670,14 +4672,13 @@ TROUBLESHOOTING:
                 img_entry['pixel_size'] = per_img_px
             image_data[img_name] = img_entry
 
-        # Ask where to save
-        default_name = "cluster_mask_generation.py"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Cluster Script", default_name,
-            "Python Files (*.py);;All Files (*)"
-        )
-        if not path:
+        # Ask where to save — script goes into a "MaskGeneration" subfolder
+        parent_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory for Cluster Script")
+        if not parent_dir:
             return
+        save_dir = os.path.join(parent_dir, "MaskGeneration")
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, "cluster_mask_generation.py")
 
         # Build the script content
         settings = {
@@ -4695,13 +4696,13 @@ TROUBLESHOOTING:
         try:
             with open(path, 'w') as f:
                 f.write(script)
-            self.log(f"Cluster script saved to: {path}")
+            self.log(f"Cluster script saved to: {save_dir}/")
 
             n_images = len(image_data)
             n_somas = sum(len(d['somas']) for d in image_data.values())
             n_masks = n_somas * len(area_list)
             QMessageBox.information(self, "Cluster Script Exported",
-                f"Script saved to:\n{path}\n\n"
+                f"Script saved to:\n{save_dir}\n\n"
                 f"Images: {n_images}\n"
                 f"Somas: {n_somas}\n"
                 f"Masks to generate: {n_masks}\n"
