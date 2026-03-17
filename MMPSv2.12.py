@@ -3720,9 +3720,8 @@ def getMasksForImage(allMaskFiles, imageName):
 
 # Get parameters from the script invocation
 #@ String mmps_output_dir
-#@ String image_index
 
-image_index = int(image_index)
+image_index = int(os.environ.get('SLURM_ARRAY_TASK_ID', '0'))
 
 masksDir = os.path.join(mmps_output_dir, "masks")
 somasDir = os.path.join(mmps_output_dir, "somas")
@@ -3868,7 +3867,7 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --error=mmps_imagej_%A_%a.err \\
     --wrap="{module_line}
 \\"$FIJI\\" --headless --run \\"$SCRIPT_DIR/{wrapper_basename}\\" \\
-    \\"mmps_output_dir=$MMPS_OUTPUT_DIR,image_index=\$SLURM_ARRAY_TASK_ID\\"
+    \\"mmps_output_dir=$MMPS_OUTPUT_DIR\\"
 ")
 
 echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
