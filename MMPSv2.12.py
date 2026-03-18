@@ -9294,7 +9294,7 @@ if __name__ == '__main__':
         for img_name, img_data in self.images.items():
             if not img_data['selected']:
                 continue
-            if img_data['status'] not in ('somas_picked', 'outlined'):
+            if len(img_data.get('somas', [])) == 0:
                 continue
             for soma_idx in range(len(img_data['somas'])):
                 self.outlining_queue.append((img_name, soma_idx))
