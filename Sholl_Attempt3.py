@@ -321,7 +321,10 @@ def analyzeOneMask(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, m
     parser.setCenter(cx, cy)
 
     # Set radii: start at soma edge, step size, extend to max possible
-    parser.setRadii(startRad, stepSize, parser.maxPossibleRadius())
+    # stepSize=0 means "continuous" (pixel-level); SNT hangs with step=0,
+    # so convert to 1 pixel in calibrated units.
+    effectiveStep = stepSize if stepSize > 0 else pixelSize
+    parser.setRadii(startRad, effectiveStep, parser.maxPossibleRadius())
     parser.setHemiShells('none')
 
     # Parse the image

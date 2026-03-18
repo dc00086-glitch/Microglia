@@ -3889,7 +3889,10 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
 
     cx, cy = centroid
     parser.setCenter(cx, cy)
-    parser.setRadii(startRad, stepSize, parser.maxPossibleRadius())
+    # stepSize=0 means "continuous" (pixel-level); SNT hangs with step=0,
+    # so convert to 1 pixel in calibrated units.
+    effectiveStep = stepSize if stepSize > 0 else pixelSize
+    parser.setRadii(startRad, effectiveStep, parser.maxPossibleRadius())
     parser.setHemiShells('none')
     parser.parse()
 
