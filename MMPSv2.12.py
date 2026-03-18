@@ -5447,15 +5447,30 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             except Exception:
                 pass
 
-    def _build_session_dict(self):
+    def _make_relative(self, abs_path, session_dir):
+        """Convert an absolute path to a relative path from session_dir, if possible."""
+        if not abs_path or not session_dir:
+            return abs_path
+        try:
+            return os.path.relpath(abs_path, session_dir)
+        except ValueError:
+            # On Windows, relpath fails across drives (e.g. C: vs D:)
+            return abs_path
+
+    def _build_session_dict(self, session_file_path=None):
         """Build a serializable session dictionary from current state."""
         # Determine the last completed workflow step
         last_step = self._determine_last_completed_step()
 
+        # Compute relative paths from the session file location
+        session_dir = os.path.dirname(os.path.abspath(session_file_path)) if session_file_path else None
+
         session = {
-            'version': 2,
+            'version': 3,
             'output_dir': self.output_dir,
             'masks_dir': self.masks_dir,
+            'output_dir_rel': self._make_relative(self.output_dir, session_dir) if session_dir else None,
+            'masks_dir_rel': self._make_relative(self.masks_dir, session_dir) if session_dir else None,
             'colocalization_mode': self.colocalization_mode,
             'pixel_size': self.pixel_size_input.text(),
             'rolling_ball_radius': self.default_rolling_ball_radius,
@@ -5502,10 +5517,19 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                     if os.path.exists(ch_candidate):
                         extra_channel_paths[str(ch_idx)] = ch_candidate
 
+            # Compute relative paths for portability across machines
+            extra_channel_paths_rel = {}
+            if session_dir:
+                for ch_str, ch_path in extra_channel_paths.items():
+                    extra_channel_paths_rel[ch_str] = self._make_relative(ch_path, session_dir)
+
             img_session = {
                 'raw_path': img_data['raw_path'],
+                'raw_path_rel': self._make_relative(img_data['raw_path'], session_dir) if session_dir else None,
                 'processed_path': processed_path,
+                'processed_path_rel': self._make_relative(processed_path, session_dir) if session_dir and processed_path else None,
                 'extra_channel_paths': extra_channel_paths,
+                'extra_channel_paths_rel': extra_channel_paths_rel if session_dir else {},
                 'status': img_data['status'],
                 'selected': img_data['selected'],
                 'animal_id': img_data.get('animal_id', ''),
@@ -5569,7 +5593,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             path += ext
 
         try:
-            session = self._build_session_dict()
+            session = self._build_session_dict(session_file_path=path)
             with open(path, 'w') as f:
                 json.dump(session, f, separators=(',', ':'))
 
@@ -6615,7 +6639,7 @@ if __name__ == '__main__':
             return
         try:
             path = os.path.join(self.output_dir, "autosave.mmps_session")
-            session = self._build_session_dict()
+            session = self._build_session_dict(session_file_path=path)
             with open(path, 'w') as f:
                 json.dump(session, f, separators=(',', ':'))
         except Exception:
@@ -6651,6 +6675,48 @@ if __name__ == '__main__':
                 QMessageBox.warning(self, "Warning", "Incompatible session file version.")
                 return
 
+            # Resolve paths: try absolute first, then relative to session file
+            session_dir = os.path.dirname(os.path.abspath(path))
+
+            def _resolve_path(abs_path, rel_path):
+                """Try absolute path first, then resolve relative path from session dir."""
+                if abs_path and os.path.exists(abs_path):
+                    return abs_path
+                if rel_path:
+                    resolved = os.path.normpath(os.path.join(session_dir, rel_path))
+                    if os.path.exists(resolved):
+                        return resolved
+                return abs_path  # return original even if not found
+
+            def _resolve_dir(abs_path, rel_path):
+                """Like _resolve_path but for directories."""
+                if abs_path and os.path.isdir(abs_path):
+                    return abs_path
+                if rel_path:
+                    resolved = os.path.normpath(os.path.join(session_dir, rel_path))
+                    if os.path.isdir(resolved):
+                        return resolved
+                return abs_path
+
+            # Resolve top-level directories
+            resolved_output_dir = _resolve_dir(
+                session.get('output_dir'), session.get('output_dir_rel'))
+            resolved_masks_dir = _resolve_dir(
+                session.get('masks_dir'), session.get('masks_dir_rel'))
+
+            # Resolve per-image paths
+            for img_name, img_session in session['images'].items():
+                img_session['raw_path'] = _resolve_path(
+                    img_session.get('raw_path'), img_session.get('raw_path_rel'))
+                img_session['processed_path'] = _resolve_path(
+                    img_session.get('processed_path'), img_session.get('processed_path_rel'))
+                # Resolve extra channel paths
+                extra_rel = img_session.get('extra_channel_paths_rel', {})
+                resolved_extra = {}
+                for ch_str, ch_path in img_session.get('extra_channel_paths', {}).items():
+                    resolved_extra[ch_str] = _resolve_path(ch_path, extra_rel.get(ch_str))
+                img_session['extra_channel_paths'] = resolved_extra
+
             # Verify image files still exist (check both raw and processed)
             missing = []
             for img_name, img_session in session['images'].items():
@@ -6659,10 +6725,50 @@ if __name__ == '__main__':
                 if not raw_exists and not proc_exists:
                     missing.append(img_name)
 
+            # If many files are missing, offer to remap the base directory
+            if missing and len(missing) > len(session['images']) * 0.5:
+                reply = QMessageBox.question(
+                    self, "Files Not Found",
+                    f"{len(missing)} of {len(session['images'])} image(s) not found.\n\n"
+                    "This session may have been created on a different computer.\n"
+                    "Would you like to select the folder containing your images?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    remap_dir = QFileDialog.getExistingDirectory(
+                        self, "Select Folder Containing Images")
+                    if remap_dir:
+                        # Try to find each missing file by name in the remap directory
+                        remap_found = 0
+                        for img_name in list(missing):
+                            # Search recursively for the file
+                            candidates = glob.glob(os.path.join(remap_dir, '**', img_name), recursive=True)
+                            if candidates:
+                                session['images'][img_name]['raw_path'] = candidates[0]
+                                missing.remove(img_name)
+                                remap_found += 1
+                        # Also remap output/masks dirs if they're under the same tree
+                        if resolved_output_dir and not os.path.isdir(resolved_output_dir):
+                            # Try to find "Output" folder near images
+                            out_candidates = glob.glob(os.path.join(remap_dir, '**', 'Output'), recursive=True)
+                            if out_candidates:
+                                resolved_output_dir = out_candidates[0]
+                                masks_candidate = os.path.join(out_candidates[0], 'masks')
+                                if os.path.isdir(masks_candidate):
+                                    resolved_masks_dir = masks_candidate
+                                # Re-resolve processed paths
+                                for img_name, img_session in session['images'].items():
+                                    if img_session.get('processed_path') and not os.path.exists(img_session['processed_path']):
+                                        name_stem = os.path.splitext(img_name)[0]
+                                        candidate = os.path.join(resolved_output_dir, f"{name_stem}_processed.tif")
+                                        if os.path.exists(candidate):
+                                            img_session['processed_path'] = candidate
+                        self.log(f"Remapped {remap_found} image path(s) from selected folder")
+
             if missing:
                 reply = QMessageBox.question(
                     self, "Missing Files",
-                    f"{len(missing)} image(s) not found at original paths:\n\n" +
+                    f"{len(missing)} image(s) not found:\n\n" +
                     "\n".join(missing[:5]) +
                     ("\n..." if len(missing) > 5 else "") +
                     "\n\nContinue loading available images?",
@@ -6672,8 +6778,8 @@ if __name__ == '__main__':
                     return
 
             # Restore settings
-            self.output_dir = session.get('output_dir')
-            self.masks_dir = session.get('masks_dir')
+            self.output_dir = resolved_output_dir
+            self.masks_dir = resolved_masks_dir
             self.colocalization_mode = session.get('colocalization_mode', False)
             self.coloc_action.setChecked(self.colocalization_mode)
             self.use_min_intensity = session.get('use_min_intensity', True)
@@ -8242,6 +8348,13 @@ if __name__ == '__main__':
 
     def _array_to_pixmap(self, arr, skip_rescale=False):
         arr_disp = arr.astype(float)
+
+        # Ensure 2D — convert 3D+ arrays to grayscale
+        if arr_disp.ndim > 2:
+            arr_disp = arr_disp.squeeze()
+        if arr_disp.ndim > 2:
+            # Still 3D after squeeze: take first channel or convert
+            arr_disp = arr_disp[:, :, 0] if arr_disp.ndim == 3 else arr_disp.reshape(arr_disp.shape[-2], arr_disp.shape[-1])
 
         # Only rescale if not already adjusted
         if not skip_rescale:
@@ -11828,55 +11941,67 @@ if __name__ == '__main__':
         img_name = flat_data['image_name']
         img_data = self.images.get(img_name, {})
 
+        # Keep current_image_name in sync when QA switches images
+        self.current_image_name = img_name
+
         if self.mode_3d:
             self._show_current_mask_3d(flat_data, mask_data, img_name, img_data)
             return
 
-        # Reload processed image from disk if it was freed to save RAM
-        processed_img = self._ensure_processed_loaded(img_name)
-        if processed_img is None:
-            self.log(f"Cannot display mask - processed image not found for {img_name}")
-            return
-
-        # Reload mask from disk if it was evicted from memory
-        if mask_data.get('mask') is None:
-            if not self._reload_mask_from_disk(mask_data, img_name):
-                self.log(f"Cannot display mask - file not found on disk")
+        try:
+            # Reload processed image from disk if it was freed to save RAM
+            processed_img = self._ensure_processed_loaded(img_name)
+            if processed_img is None:
+                self.log(f"Cannot display mask - processed image not found for {img_name}")
                 return
 
-        # Display in color or grayscale based on toggle
-        # Ensure color_image is loaded for color toggle
-        if 'color_image' not in img_data and 'raw_path' in img_data:
-            try:
-                raw_img = load_tiff_image(img_data['raw_path'])
-                if raw_img is not None and raw_img.ndim == 3:
-                    img_data['color_image'] = raw_img.copy()
-                    img_data['num_channels'] = raw_img.shape[2]
-            except Exception:
-                pass
-        if self.show_color_view and 'color_image' in img_data:
-            proc_color = self._build_processed_color_image(img_data)
-            if proc_color is not None:
-                adjusted = self._apply_display_adjustments_color(proc_color)
-            else:
-                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
-            pixmap = self._array_to_pixmap_color(adjusted)
-        else:
-            adjusted = self._apply_display_adjustments(processed_img)
-            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
-        # Show the clicked soma center as a centroid marker
-        soma_centroid = []
-        soma_idx = mask_data.get('soma_idx')
-        if soma_idx is not None and soma_idx < len(img_data.get('somas', [])):
-            soma_centroid = [img_data['somas'][soma_idx]]
-        self.mask_label.set_image(pixmap, centroids=soma_centroid, mask_overlay=mask_data['mask'])
+            # Reload mask from disk if it was evicted from memory
+            if mask_data.get('mask') is None:
+                if not self._reload_mask_from_disk(mask_data, img_name):
+                    self.log(f"Cannot display mask - file not found on disk")
+                    return
 
-        # Auto-zoom to mask center
-        mask_coords = np.argwhere(mask_data['mask'] > 0)
-        if len(mask_coords) > 0:
-            center_row = float(np.mean(mask_coords[:, 0]))
-            center_col = float(np.mean(mask_coords[:, 1]))
-            self.mask_label.zoom_to_point(center_row, center_col, zoom_level=3.0)
+            # Ensure processed image is 2D for grayscale display
+            if processed_img.ndim > 2:
+                processed_img = ensure_grayscale(processed_img)
+
+            # Display in color or grayscale based on toggle
+            # Ensure color_image is loaded for color toggle
+            if 'color_image' not in img_data and 'raw_path' in img_data:
+                try:
+                    raw_img = load_tiff_image(img_data['raw_path'])
+                    if raw_img is not None and raw_img.ndim == 3:
+                        img_data['color_image'] = raw_img.copy()
+                        img_data['num_channels'] = raw_img.shape[2]
+                except Exception:
+                    pass
+            if self.show_color_view and 'color_image' in img_data:
+                proc_color = self._build_processed_color_image(img_data)
+                if proc_color is not None:
+                    adjusted = self._apply_display_adjustments_color(proc_color)
+                else:
+                    adjusted = self._apply_display_adjustments_color(img_data['color_image'])
+                pixmap = self._array_to_pixmap_color(adjusted)
+            else:
+                adjusted = self._apply_display_adjustments(processed_img)
+                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+            # Show the clicked soma center as a centroid marker
+            soma_centroid = []
+            soma_idx = mask_data.get('soma_idx')
+            if soma_idx is not None and soma_idx < len(img_data.get('somas', [])):
+                soma_centroid = [img_data['somas'][soma_idx]]
+            self.mask_label.set_image(pixmap, centroids=soma_centroid, mask_overlay=mask_data['mask'])
+
+            # Auto-zoom to mask center
+            mask_coords = np.argwhere(mask_data['mask'] > 0)
+            if len(mask_coords) > 0:
+                center_row = float(np.mean(mask_coords[:, 0]))
+                center_col = float(np.mean(mask_coords[:, 1]))
+                self.mask_label.zoom_to_point(center_row, center_col, zoom_level=3.0)
+        except Exception as e:
+            self.log(f"ERROR displaying mask: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
         status = mask_data.get('approved')
         status_text = "Approved" if status is True else "Rejected" if status is False else "Not reviewed"
