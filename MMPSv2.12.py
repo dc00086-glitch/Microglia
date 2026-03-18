@@ -3815,12 +3815,30 @@ def getSomaRadius(somaPath, centroid, pixelSize):
 
 
 def findSomaFile(somasDir, maskFilename):
-    """Find the soma file corresponding to a mask file."""
+    """Find the soma file corresponding to a mask file.
+    Tries exact match first, then falls back to glob-based search."""
     base = re.sub(r'_area\\d+_mask\\.tif$', '', maskFilename)
     somaFilename = base + '_soma.tif'
     somaPath = os.path.join(somasDir, somaFilename)
     if os.path.exists(somaPath):
         return somaPath
+    # Fallback: search for any soma file with the same soma ID
+    info = parseMaskInfo(maskFilename)
+    imgName = info[0]
+    somaId = info[1]
+    if somaId != 'unknown':
+        for f in os.listdir(somasDir):
+            if f.endswith('_soma.tif') and somaId in f:
+                return os.path.join(somasDir, f)
+    # Last resort: list available soma files for debugging
+    try:
+        available = [f for f in os.listdir(somasDir) if f.endswith('_soma.tif')]
+        if available:
+            print("  Available soma files: " + str(available[:5]))
+        else:
+            print("  WARNING: somas/ directory is EMPTY - no soma files found")
+    except Exception:
+        pass
     return None
 
 
@@ -4016,6 +4034,10 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all"):
         f.close()
         print("Sholl results saved: " + combinedPath)
 
+    if skipped > 0 and processed == 0:
+        print("WARNING: ALL " + str(skipped) + " masks were skipped!")
+        print("  Check that soma files exist and match mask naming convention.")
+        print("  Expected: <ImageName>_<soma_Y_X>_soma.tif in the somas/ folder")
     print("Sholl analysis done: " + str(processed) + " processed, " + str(skipped) + " skipped in " + formatTime(time.time() - batchStart))
     return allResults
 
@@ -4105,9 +4127,18 @@ if "fractal" in ANALYSES:
 
 if "sholl" in ANALYSES:
     if not os.path.isdir(somasDir):
-        print("WARNING: No 'somas' folder found - skipping Sholl analysis")
+        print("ERROR: No 'somas' folder found at: " + somasDir)
+        print("  Sholl analysis REQUIRES soma mask files.")
+        print("  Make sure you uploaded the somas/ folder from your MMPS output.")
+        print("  SKIPPING Sholl analysis.")
     else:
-        runShollBatch(masksDir, somasDir, mmps_output_dir, maskFiles, imageName)
+        somaFiles = [f for f in os.listdir(somasDir) if f.endswith('_soma.tif')]
+        print("Found " + str(len(somaFiles)) + " soma files in: " + somasDir)
+        if len(somaFiles) == 0:
+            print("ERROR: somas/ folder exists but is EMPTY - no *_soma.tif files found.")
+            print("  SKIPPING Sholl analysis.")
+        else:
+            runShollBatch(masksDir, somasDir, mmps_output_dir, maskFiles, imageName)
     print("")
 
 print("=" * 60)
@@ -4308,9 +4339,54 @@ def main():
         total_rows += merge_csvs(sholl_dir, "Sholl_Results_*.csv", "Sholl_All_Results.csv")
 '''
         script += '''
+    # --- Combine all analysis types into one CSV keyed by cell name ---
+    combined = {}  # cell_name -> merged row dict
+    merge_files = []
+    skel_path = os.path.join(mmps_output, "skeleton_results", "Skeleton_Analysis_Results.csv")
+    frac_path = os.path.join(mmps_output, "fractal_results", "Fractal_Analysis_Results.csv")
+    sholl_path = os.path.join(mmps_output, "sholl_results", "Sholl_All_Results.csv")
+    for csv_path, prefix in [(skel_path, ""), (frac_path, ""), (sholl_path, "")]:
+        if not os.path.isfile(csv_path):
+            continue
+        merge_files.append(csv_path)
+        with open(csv_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Build a cell key from Image Name + Soma ID (or Cell Name)
+                img = row.get('Image Name', row.get('image_name', ''))
+                soma = row.get('Soma ID', row.get('soma_id', ''))
+                cell_key = f"{img}_{soma}" if img and soma else row.get('Cell Name', row.get('cell_name', str(len(combined))))
+                if cell_key not in combined:
+                    combined[cell_key] = {}
+                # Merge columns, skip duplicates already present
+                for k, v in row.items():
+                    if k not in combined[cell_key] or not combined[cell_key][k]:
+                        combined[cell_key][k] = v
+
+    if combined:
+        # Collect all column headers preserving order
+        all_cols = []
+        for row in combined.values():
+            for k in row.keys():
+                if k not in all_cols:
+                    all_cols.append(k)
+        combined_path = os.path.join(mmps_output, "ImageJ_Combined_Results.csv")
+        with open(combined_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=all_cols, extrasaction='ignore')
+            writer.writeheader()
+            for row in combined.values():
+                writer.writerows([row])
+        print(f"\\nCOMBINED all results -> {combined_path} ({len(combined)} cells)")
+    elif merge_files:
+        print("\\nWARNING: Could not combine results - no matching cell data found")
+    else:
+        print("\\nWARNING: No merged result files found to combine")
+
     print("")
     print("=" * 60)
     print(f"MERGE COMPLETE: {total_rows} total rows")
+    if combined:
+        print(f"Combined CSV: {os.path.join(mmps_output, 'ImageJ_Combined_Results.csv')}")
     print("=" * 60)
 
 
