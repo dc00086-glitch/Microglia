@@ -9024,7 +9024,13 @@ if __name__ == '__main__':
             elif 'color_image' in img_data:
                 gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
             else:
-                gray_img = img_data['processed']
+                # No processed or color image available — load raw from disk
+                try:
+                    raw_img = load_tiff_image(img_data['raw_path'])
+                    gray_img = ensure_grayscale(raw_img)
+                except Exception:
+                    self.log(f"ERROR: Could not load image for display")
+                    return
             adjusted = self._apply_display_adjustments(gray_img)
             pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
 
@@ -9138,7 +9144,13 @@ if __name__ == '__main__':
             elif 'color_image' in img_data:
                 gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
             else:
-                gray_img = img_data['processed']
+                # No processed or color image available — load raw from disk
+                try:
+                    raw_img = load_tiff_image(img_data['raw_path'])
+                    gray_img = ensure_grayscale(raw_img)
+                except Exception:
+                    self.log(f"ERROR: Could not load image for display")
+                    return
             adjusted = self._apply_display_adjustments(gray_img)
             pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
 
@@ -9175,7 +9187,13 @@ if __name__ == '__main__':
             elif 'color_image' in img_data:
                 gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
             else:
-                gray_img = img_data['processed']
+                # No processed or color image available — load raw from disk
+                try:
+                    raw_img = load_tiff_image(img_data['raw_path'])
+                    gray_img = ensure_grayscale(raw_img)
+                except Exception:
+                    self.log(f"ERROR: Could not load image for display")
+                    return
             adjusted = self._apply_display_adjustments(gray_img)
             pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
 
