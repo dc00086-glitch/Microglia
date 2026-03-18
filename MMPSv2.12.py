@@ -26,6 +26,8 @@ import glob
 import json
 import csv
 import math
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 # --- 3D Z-stack functions (imported from 3DMicroglia.py) ---
 try:
@@ -111,6 +113,244 @@ def extract_channel(img, channel_idx):
     elif img.ndim == 2:
         return img
     return ensure_grayscale(img)
+
+
+# ============================================================================
+# STANDALONE FUNCTIONS FOR MULTIPROCESSING
+# (must be module-level to be picklable by ProcessPoolExecutor)
+# ============================================================================
+
+def _grow_masks_for_soma(args):
+    """Standalone region-growing mask generation for a single soma.
+
+    Extracted from _create_annulus_masks so it can run in a subprocess.
+    Returns a list of mask dicts (with 'mask' as None — only growth_order
+    and metadata are returned to keep IPC lightweight).
+    """
+    import heapq
+
+    (centroid, area_list_um2, pixel_size_um, soma_idx, soma_id,
+     processed_img_shape, roi_data, roi_bounds,
+     soma_area_um2, soma_outline_roi,
+     territory_roi_data, my_territory_label,
+     use_circular_constraint, circular_buffer_um2,
+     use_min_intensity, min_intensity_percent, img_name) = args
+
+    y_min, y_max, x_min, x_max = roi_bounds
+    roi = roi_data  # already float64
+    h, w = roi.shape
+    cy, cx = int(centroid[0]), int(centroid[1])
+    cy_roi, cx_roi = cy - y_min, cx - x_min
+    cy_roi = max(0, min(h - 1, cy_roi))
+    cx_roi = max(0, min(w - 1, cx_roi))
+
+    sorted_areas = sorted(area_list_um2, reverse=True)
+    largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
+
+    # Circular constraint
+    max_radius_px_sq = None
+    if use_circular_constraint:
+        constraint_area_um2 = sorted_areas[0] + circular_buffer_um2
+        constraint_area_px = constraint_area_um2 / (pixel_size_um ** 2)
+        max_radius_px = np.sqrt(constraint_area_px / np.pi)
+        max_radius_px_sq = max_radius_px ** 2
+
+    # Intensity floor
+    intensity_floor = 0.0
+    if use_min_intensity and min_intensity_percent > 0:
+        roi_max = roi.max()
+        if roi_max > 0:
+            intensity_floor = roi_max * (min_intensity_percent / 100.0)
+
+    # Territory constraint
+    territory_roi = territory_roi_data
+    my_label = my_territory_label
+
+    def _in_territory(r, c):
+        if territory_roi is None:
+            return True
+        return territory_roi[r, c] == my_label or territory_roi[r, c] <= 0
+
+    def _in_circle(r, c):
+        if max_radius_px_sq is None:
+            return True
+        dy = r - cy_roi
+        dx = c - cx_roi
+        return (dy * dy + dx * dx) <= max_radius_px_sq
+
+    visited = np.zeros((h, w), dtype=bool)
+    growth_order = []
+    heap = []
+
+    soma_seed_count = 0
+    if soma_outline_roi is not None:
+        soma_ys, soma_xs = np.where(soma_outline_roi > 0)
+        for sr, sc in zip(soma_ys, soma_xs):
+            if not visited[sr, sc]:
+                visited[sr, sc] = True
+                growth_order.append((sr, sc))
+                soma_seed_count += 1
+        for sr, sc in zip(soma_ys, soma_xs):
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = sr + dr, sc + dc
+                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                        visited[nr, nc] = True
+                        heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+
+    if soma_seed_count == 0:
+        visited[cy_roi, cx_roi] = True
+        growth_order.append((cy_roi, cx_roi))
+        soma_seed_count = 1
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = cy_roi + dr, cx_roi + dc
+            if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                    visited[nr, nc] = True
+                    heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+
+    while heap and len(growth_order) < largest_target_px:
+        neg_intensity, r, c = heapq.heappop(heap)
+        growth_order.append((r, c))
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                    visited[nr, nc] = True
+                    heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+
+    # Build masks for each target area
+    soma_area_px = soma_seed_count
+    masks = []
+    mask_pixel_counts = []
+    for target_area_um2 in sorted_areas:
+        target_px = int(target_area_um2 / (pixel_size_um ** 2))
+        n_pixels = min(target_px, len(growth_order))
+        n_pixels = max(n_pixels, soma_area_px)
+        n_pixels = min(n_pixels, len(growth_order))
+        mask_pixel_counts.append(n_pixels)
+
+        mask_roi = np.zeros((h, w), dtype=np.uint8)
+        for r, c in growth_order[:n_pixels]:
+            mask_roi[r, c] = 1
+
+        full_mask = np.zeros(processed_img_shape, dtype=np.uint8)
+        full_mask[y_min:y_max, x_min:x_max] = mask_roi
+
+        masks.append({
+            'image_name': img_name,
+            'soma_idx': soma_idx,
+            'soma_id': soma_id,
+            'area_um2': target_area_um2,
+            'mask': full_mask,
+            'approved': None,
+            'soma_area_um2': soma_area_um2
+        })
+
+    # Auto-reject duplicates
+    pixel_count_groups = {}
+    for i, n_px in enumerate(mask_pixel_counts):
+        pixel_count_groups.setdefault(n_px, []).append(i)
+    for n_px, indices in pixel_count_groups.items():
+        if len(indices) > 1:
+            for idx in indices[:-1]:
+                masks[idx]['approved'] = False
+                masks[idx]['duplicate'] = True
+
+    return masks
+
+
+def _compute_morphology_single(args):
+    """Standalone morphology computation for a single mask.
+
+    Runs in a subprocess via ProcessPoolExecutor.
+    """
+    mask_path, pixel_size, soma_area_um2 = args
+
+    mask = safe_tiff_read(mask_path)
+    mask = (mask > 0).astype(np.uint8)
+
+    if not np.any(mask):
+        return None
+
+    props = measure.regionprops(mask.astype(int))
+    if not props:
+        return None
+
+    p = props[0]
+    params = {}
+
+    params['perimeter'] = p.perimeter * pixel_size
+    params['mask_area'] = p.area * (pixel_size ** 2)
+
+    major_axis = p.major_axis_length
+    minor_axis = p.minor_axis_length
+
+    if major_axis > 0:
+        axis_ratio = minor_axis / major_axis
+        params['eccentricity'] = np.sqrt(1 - axis_ratio ** 2)
+        params['roundness'] = axis_ratio ** 2
+    else:
+        params['eccentricity'] = 0
+        params['roundness'] = 0
+
+    centroid = np.array(p.centroid)
+    coords = np.array(p.coords)
+
+    top_point = coords[coords[:, 0].argmin()]
+    bottom_point = coords[coords[:, 0].argmax()]
+    left_point = coords[coords[:, 1].argmin()]
+    right_point = coords[coords[:, 1].argmax()]
+
+    extremities = np.array([top_point, bottom_point, left_point, right_point])
+    distances = np.sqrt(np.sum((extremities - centroid) ** 2, axis=1))
+    params['avg_centroid_distance'] = np.mean(distances) * pixel_size
+
+    if soma_area_um2 is not None:
+        params['soma_area'] = soma_area_um2
+    else:
+        params['soma_area'] = p.area * 0.1 * (pixel_size ** 2)
+
+    # Polarity via PCA
+    centered = coords - centroid
+    if len(centered) >= 3:
+        cov = np.cov(centered.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        major_val = eigenvalues[-1]
+        minor_val = eigenvalues[0]
+        major_vec = eigenvectors[:, -1]
+
+        if major_val > 0:
+            params['polarity_index'] = round(1.0 - (minor_val / major_val), 4)
+        else:
+            params['polarity_index'] = 0
+
+        angle_rad = np.arctan2(major_vec[0], major_vec[1])
+        params['principal_angle'] = round(np.degrees(angle_rad) % 180, 2)
+        params['major_axis_um'] = round(2 * np.sqrt(major_val) * pixel_size, 4)
+        params['minor_axis_um'] = round(2 * np.sqrt(max(minor_val, 0)) * pixel_size, 4)
+    else:
+        params['polarity_index'] = 0
+        params['principal_angle'] = 0
+        params['major_axis_um'] = 0
+        params['minor_axis_um'] = 0
+
+    return params
+
+
+def _export_mask_to_disk(args):
+    """Write a single mask TIFF to disk. For use with ThreadPoolExecutor."""
+    mask_path, mask_8bit, pixel_size = args
+    try:
+        tifffile.imwrite(
+            mask_path,
+            mask_8bit,
+            resolution=(1.0 / pixel_size, 1.0 / pixel_size),
+            metadata={'unit': 'um'}
+        )
+        return True
+    except Exception:
+        return False
 
 
 # ============================================================================
@@ -989,7 +1229,11 @@ class BatchProcessingThread(QThread):
 
 
 class MorphologyCalculationThread(QThread):
-    """Thread for calculating morphology parameters in the background"""
+    """Thread for calculating morphology parameters in the background.
+
+    Uses ProcessPoolExecutor to parallelize across CPU cores when masks
+    are on disk (the common case for 22k+ masks).
+    """
     progress = pyqtSignal(int, str)  # progress percentage, status message
     finished = pyqtSignal(list)  # list of results
     error_occurred = pyqtSignal(str)
@@ -1009,46 +1253,110 @@ class MorphologyCalculationThread(QThread):
         import os
         import time
 
-        # Suppress Java warnings during processing to speed up
         old_stderr = sys.stderr
         sys.stderr = open(os.devnull, 'w')
 
         try:
-            all_results = []
             total = len(self.approved_masks)
             batch_start = time.time()
-            calc_times = []
+            n_workers = max(1, multiprocessing.cpu_count() - 1)
 
-            # Cache: reuse MorphologyCalculator per (image, pixel_size) to avoid re-init
-            calculator_cache = {}
+            # Build task list: separate disk-based masks (parallelizable)
+            # from in-memory masks (serial)
+            parallel_tasks = []  # (index, mask_path, pixel_size, soma_area_um2)
+            serial_indices = []  # indices needing serial processing
+            task_metadata = {}   # index -> (img_name, soma_id, soma_idx, area_um2)
 
             for i, flat_data in enumerate(self.approved_masks):
                 mask_data = flat_data['mask_data']
                 img_name = flat_data['image_name']
+                img_pixel_size = self.pixel_size_map.get(img_name, self.pixel_size)
+                soma_area_um2 = mask_data.get('soma_area_um2', None)
 
-                # ETA calculation
-                elapsed_total = time.time() - batch_start
-                if i > 0:
-                    avg_per_mask = elapsed_total / i
-                    remaining = avg_per_mask * (total - i)
-                    if remaining >= 60:
-                        eta_str = f"~{remaining / 60:.1f}min left"
-                    else:
-                        eta_str = f"~{remaining:.0f}s left"
-                    speed_str = f"{i / elapsed_total:.1f}/s"
-                else:
-                    eta_str = "estimating..."
-                    speed_str = ""
-
-                self.progress.emit(
-                    int((i + 1) / total * 100),
-                    f"Processing {mask_data['soma_id']} ({i + 1}/{total}) [{speed_str} {eta_str}]"
+                task_metadata[i] = (
+                    os.path.splitext(img_name)[0],
+                    mask_data['soma_id'],
+                    mask_data['soma_idx'],
+                    mask_data['area_um2']
                 )
 
-                # Find soma centroid and area from original image data
+                # Check if mask is on disk
+                if self.masks_dir:
+                    img_basename = os.path.splitext(img_name)[0]
+                    soma_id = mask_data['soma_id']
+                    area_um2 = mask_data.get('area_um2', 0)
+                    mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+                    mask_path = os.path.join(self.masks_dir, mask_filename)
+                    if os.path.exists(mask_path):
+                        parallel_tasks.append((i, mask_path, img_pixel_size, soma_area_um2))
+                        continue
+
+                # Mask in memory or not on disk — process serially
+                serial_indices.append(i)
+
+            all_results = [None] * total
+            completed = 0
+
+            # Process disk-based masks in parallel
+            if parallel_tasks and n_workers > 1:
+                self.progress.emit(0, f"Parallel morphology: {len(parallel_tasks)} masks, {n_workers} workers")
+
+                pool_args = [(path, ps, sa) for _, path, ps, sa in parallel_tasks]
+
+                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                    future_to_idx = {}
+                    # Submit in batches to allow progress reporting
+                    batch_size = max(50, n_workers * 4)
+                    for batch_start_i in range(0, len(parallel_tasks), batch_size):
+                        batch_end = min(batch_start_i + batch_size, len(parallel_tasks))
+                        for j in range(batch_start_i, batch_end):
+                            idx, path, ps, sa = parallel_tasks[j]
+                            future = executor.submit(_compute_morphology_single, (path, ps, sa))
+                            future_to_idx[future] = idx
+
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        try:
+                            params = future.result()
+                        except Exception:
+                            params = None
+
+                        if params is not None:
+                            meta = task_metadata[idx]
+                            params['image_name'] = meta[0]
+                            params['soma_id'] = meta[1]
+                            params['soma_idx'] = meta[2]
+                            params['area_um2'] = meta[3]
+                            all_results[idx] = params
+
+                        completed += 1
+                        if completed % 50 == 0 or completed == len(parallel_tasks):
+                            elapsed = time.time() - batch_start
+                            speed = completed / max(elapsed, 0.001)
+                            remaining = (total - completed) / max(speed, 0.001)
+                            if remaining >= 60:
+                                eta_str = f"~{remaining / 60:.1f}min left"
+                            else:
+                                eta_str = f"~{remaining:.0f}s left"
+                            self.progress.emit(
+                                int(completed / total * 100),
+                                f"Parallel: {completed}/{total} [{speed:.1f}/s {eta_str}]"
+                            )
+
+                        # Free mask from memory after processing
+                        self.approved_masks[idx]['mask_data']['mask'] = None
+            else:
+                # Fallback: add all parallel tasks to serial
+                serial_indices.extend([idx for idx, _, _, _ in parallel_tasks])
+
+            # Process remaining masks serially (in-memory)
+            calculator_cache = {}
+            for i in serial_indices:
+                flat_data = self.approved_masks[i]
+                mask_data = flat_data['mask_data']
+                img_name = flat_data['image_name']
                 img_data = self.images[img_name]
 
-                # Get processed image, reloading from disk if needed
                 processed_img = img_data.get('processed')
                 if processed_img is None and self.output_dir:
                     name_stem = os.path.splitext(img_name)[0]
@@ -1056,10 +1364,10 @@ class MorphologyCalculationThread(QThread):
                     if os.path.exists(processed_path):
                         processed_img = safe_tiff_read(processed_path)
                         img_data['processed'] = processed_img
+
                 soma_centroid = img_data['somas'][mask_data['soma_idx']]
                 soma_area_um2 = mask_data.get('soma_area_um2', None)
 
-                # Reload mask from disk if lazy-loaded (mask=None)
                 if mask_data.get('mask') is None and self.masks_dir:
                     img_basename = os.path.splitext(img_name)[0]
                     soma_id = mask_data['soma_id']
@@ -1070,13 +1378,8 @@ class MorphologyCalculationThread(QThread):
                         mask_arr = safe_tiff_read(mask_path)
                         mask_data['mask'] = (mask_arr > 0).astype(np.uint8)
                 if mask_data.get('mask') is None:
-                    self.progress.emit(
-                        int((i + 1) / total * 100),
-                        f"Skipping {mask_data['soma_id']} (mask not found on disk)"
-                    )
+                    completed += 1
                     continue
-
-                start = time.time()
 
                 img_pixel_size = self.pixel_size_map.get(img_name, self.pixel_size)
                 cache_key = (id(processed_img), img_pixel_size)
@@ -1085,17 +1388,30 @@ class MorphologyCalculationThread(QThread):
                 calculator = calculator_cache[cache_key]
                 params = calculator.calculate_all_parameters(mask_data['mask'], soma_centroid, soma_area_um2)
 
-                calc_times.append(time.time() - start)
-
-                params['image_name'] = os.path.splitext(img_name)[0]
-                params['soma_id'] = mask_data['soma_id']
-                params['soma_idx'] = mask_data['soma_idx']
-                params['area_um2'] = mask_data['area_um2']
-
-                all_results.append(params)
-
-                # Free mask memory after calculation to avoid holding all 22k masks in RAM
+                meta = task_metadata[i]
+                params['image_name'] = meta[0]
+                params['soma_id'] = meta[1]
+                params['soma_idx'] = meta[2]
+                params['area_um2'] = meta[3]
+                all_results[i] = params
                 mask_data['mask'] = None
+
+                completed += 1
+                if completed % 50 == 0:
+                    elapsed = time.time() - batch_start
+                    speed = completed / max(elapsed, 0.001)
+                    remaining = (total - completed) / max(speed, 0.001)
+                    if remaining >= 60:
+                        eta_str = f"~{remaining / 60:.1f}min left"
+                    else:
+                        eta_str = f"~{remaining:.0f}s left"
+                    self.progress.emit(
+                        int(completed / total * 100),
+                        f"Processing ({completed}/{total}) [{speed:.1f}/s {eta_str}]"
+                    )
+
+            # Filter out None entries (skipped masks)
+            all_results = [r for r in all_results if r is not None]
 
             total_time = time.time() - batch_start
             sys.stderr = old_stderr
@@ -1107,7 +1423,6 @@ class MorphologyCalculationThread(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
         finally:
-            # Always restore stderr
             if sys.stderr != old_stderr:
                 sys.stderr.close()
                 sys.stderr = old_stderr
@@ -2505,9 +2820,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.regen_masks_btn.setToolTip("Regenerate masks for this image with different settings")
         zoom_layout.addWidget(self.regen_masks_btn)
 
-        # Clear All Masks + Undo QA — next to Redo, only visible during QA
+        # Clear All Masks + Undo QA + Approve All — next to Redo, only visible during QA
         zoom_layout.addWidget(self.clear_masks_btn)
         zoom_layout.addWidget(self.undo_qa_btn)
+        zoom_layout.addWidget(self.approve_all_btn)
 
         self.zoom_level_label = QLabel("1.0x")
         self.zoom_level_label.setFixedWidth(50)
@@ -2571,6 +2887,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.reject_mask_btn.clicked.connect(self.reject_current_mask)
         self.reject_mask_btn.setEnabled(False)
         self.reject_mask_btn.setVisible(False)
+
+        # Approve All button — skip manual QA for large datasets
+        self.approve_all_btn = QPushButton("Approve All Remaining")
+        self.approve_all_btn.clicked.connect(self._approve_all_remaining)
+        self.approve_all_btn.setEnabled(False)
+        self.approve_all_btn.setVisible(False)
+        self.approve_all_btn.setStyleSheet("QPushButton { border: 2px solid #4CAF50; font-weight: bold; }")
+        self.approve_all_btn.setToolTip(
+            "Approve all remaining unreviewed masks at once.\n"
+            "Useful for large datasets (22k+ images) where manual QA is impractical.")
 
         # Mask QA progress bar
         self.mask_qa_progress_bar = QProgressBar()
@@ -2822,7 +3148,7 @@ It performs batch Skeleton, Fractal/Hull, and/or Sholl analyses
 on MMPS-exported mask files.
 
 Usage (called by the SLURM job script):
-    ImageJ-linux64 --headless --run mmps_imagej_cluster.py \\
+    ImageJ-linux64 --headless --mem=2048m --run mmps_imagej_cluster.py \\
         "mmps_output_dir=/path/to/mmps_output"
 
 The mmps_output_dir should contain:
@@ -3869,7 +4195,7 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --output=mmps_imagej_%A_%a.out \\
     --error=mmps_imagej_%A_%a.err \\
     --wrap="{module_line}
-\\"$FIJI\\" --headless -Xmx2g --run \\"$SCRIPT_DIR/{wrapper_basename}\\" \\
+\\"$FIJI\\" --headless --mem=2048m --run \\"$SCRIPT_DIR/{wrapper_basename}\\" \\
     \\"mmps_output_dir=$MMPS_OUTPUT_DIR\\"
 ")
 
@@ -9964,7 +10290,7 @@ if __name__ == '__main__':
                     current_count += len(img_data['soma_outlines'])
                     self.progress_bar.setValue(int((current_count / total_outlines) * 100))
                 else:
-                    # Independent or watershed: per-soma growth
+                    # Independent or watershed: per-soma growth — PARALLEL
                     territory_map = None
                     if seg_method == 'watershed':
                         self.log(f"  Computing watershed territories for {len(img_data['soma_outlines'])} cells")
@@ -9974,6 +10300,16 @@ if __name__ == '__main__':
                             img_data['processed'], img_data['soma_outlines'], img_pixel_size
                         )
 
+                    processed_img = img_data['processed']
+                    n_somas = len(img_data['soma_outlines'])
+                    n_workers = min(n_somas, max(1, multiprocessing.cpu_count() - 1))
+
+                    self.log(f"  Generating masks for {n_somas} somas using {n_workers} workers")
+                    self.progress_status_label.setText(f"Parallel mask gen: {img_name} ({n_somas} somas, {n_workers} workers)")
+                    QApplication.processEvents()
+
+                    # Prepare arguments for parallel execution
+                    task_args = []
                     for soma_data in img_data['soma_outlines']:
                         centroid = soma_data['centroid']
                         soma_idx = soma_data['soma_idx']
@@ -9981,25 +10317,78 @@ if __name__ == '__main__':
                         soma_area_um2 = soma_data.get('soma_area_um2', 0)
                         soma_outline = soma_data.get('outline')
 
-                        self.progress_status_label.setText(f"Generating masks: {current_count + 1}/{total_outlines}")
-                        QApplication.processEvents()
+                        cy, cx = int(centroid[0]), int(centroid[1])
+                        sorted_areas = sorted(area_list, reverse=True)
+                        largest_target_px = int(sorted_areas[0] / (img_pixel_size ** 2))
+                        min_roi_radius = int(np.sqrt(largest_target_px / np.pi) * 3)
+                        roi_size = max(200, min_roi_radius)
 
-                        masks = self._create_annulus_masks(
+                        y_min = max(0, cy - roi_size)
+                        y_max = min(processed_img.shape[0], cy + roi_size)
+                        x_min = max(0, cx - roi_size)
+                        x_max = min(processed_img.shape[1], cx + roi_size)
+
+                        roi = processed_img[y_min:y_max, x_min:x_max].astype(np.float64)
+
+                        # Extract soma outline ROI
+                        soma_outline_roi = None
+                        if soma_outline is not None:
+                            soma_outline_roi = soma_outline[y_min:y_max, x_min:x_max]
+
+                        # Extract territory ROI
+                        territory_roi_data = None
+                        my_territory_label = 0
+                        if territory_map is not None:
+                            territory_roi_data = territory_map[y_min:y_max, x_min:x_max]
+                            cy_roi = max(0, min(roi.shape[0] - 1, cy - y_min))
+                            cx_roi = max(0, min(roi.shape[1] - 1, cx - x_min))
+                            my_territory_label = territory_roi_data[cy_roi, cx_roi]
+                            if my_territory_label <= 0:
+                                for dr in range(-3, 4):
+                                    for dc in range(-3, 4):
+                                        nr, nc = cy_roi + dr, cx_roi + dc
+                                        if 0 <= nr < roi.shape[0] and 0 <= nc < roi.shape[1] and territory_roi_data[nr, nc] > 0:
+                                            my_territory_label = territory_roi_data[nr, nc]
+                                            break
+                                    if my_territory_label > 0:
+                                        break
+
+                        task_args.append((
                             centroid, area_list, img_pixel_size, soma_idx, soma_id,
-                            img_data['processed'], img_name, soma_area_um2,
-                            soma_outline_mask=soma_outline,
-                            territory_map=territory_map
-                        )
-                        img_data['masks'].extend(masks)
+                            processed_img.shape, roi, (y_min, y_max, x_min, x_max),
+                            soma_area_um2, soma_outline_roi,
+                            territory_roi_data, my_territory_label,
+                            self.use_circular_constraint, self.circular_buffer_um2,
+                            self.use_min_intensity, self.min_intensity_percent, img_name
+                        ))
 
-                        # Mark each generated mask in the checklist
-                        if img_cl_path and os.path.exists(img_cl_path):
-                            for m in masks:
-                                m_key = f"{img_name}_{soma_id}_area{m['area_um2']}"
-                                self._update_checklist_row(img_cl_path, 0, m_key, 1, 1)
+                    # Run in parallel using ProcessPoolExecutor
+                    if n_workers > 1 and n_somas > 2:
+                        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                            futures = {executor.submit(_grow_masks_for_soma, a): i for i, a in enumerate(task_args)}
+                            for future in as_completed(futures):
+                                masks = future.result()
+                                img_data['masks'].extend(masks)
+                                current_count += 1
+                                self.progress_bar.setValue(int((current_count / total_outlines) * 100))
+                                if current_count % 10 == 0:
+                                    self.progress_status_label.setText(
+                                        f"Parallel mask gen: {current_count}/{total_outlines}")
+                                    QApplication.processEvents()
+                    else:
+                        for a in task_args:
+                            masks = _grow_masks_for_soma(a)
+                            img_data['masks'].extend(masks)
+                            current_count += 1
+                            self.progress_bar.setValue(int((current_count / total_outlines) * 100))
+                            self.progress_status_label.setText(f"Generating masks: {current_count}/{total_outlines}")
+                            QApplication.processEvents()
 
-                        current_count += 1
-                        self.progress_bar.setValue(int((current_count / total_outlines) * 100))
+                    # Mark checklists after all somas done
+                    if img_cl_path and os.path.exists(img_cl_path):
+                        for m in img_data['masks']:
+                            m_key = f"{img_name}_{m['soma_id']}_area{m['area_um2']}"
+                            self._update_checklist_row(img_cl_path, 0, m_key, 1, 1)
 
                 # Export ALL generated masks to disk immediately so they
                 # survive save/load even before QA approval
@@ -11176,6 +11565,8 @@ if __name__ == '__main__':
 
         self.approve_mask_btn.setEnabled(True)
         self.reject_mask_btn.setEnabled(True)
+        self.approve_all_btn.setEnabled(True)
+        self.approve_all_btn.setVisible(True)
         self.prev_btn.setEnabled(True)
         self.next_btn.setEnabled(True)
         self.done_btn.setEnabled(False)
@@ -11570,6 +11961,58 @@ if __name__ == '__main__':
         QTimer.singleShot(0, lambda: self._deferred_approve_io(
             pending_exports, should_autosave))
 
+    def _approve_all_remaining(self):
+        """Approve ALL remaining unreviewed masks at once.
+
+        For large datasets (22k+ images) where manual QA of every mask
+        is impractical. Marks all unreviewed masks as approved and
+        completes QA immediately.
+        """
+        if not self.mask_qa_active or not self.all_masks_flat:
+            return
+
+        remaining = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is None)
+        if remaining == 0:
+            QMessageBox.information(self, "Info", "All masks have already been reviewed.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Approve All Remaining",
+            f"This will approve {remaining} unreviewed masks.\n\n"
+            "Are you sure? This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.log(f"Approving all {remaining} remaining masks...")
+        approved_count = 0
+
+        for flat_data in self.all_masks_flat:
+            mask_data = flat_data['mask_data']
+            if mask_data.get('approved') is None:
+                mask_data['approved'] = True
+                approved_count += 1
+                self._qa_approved_count += 1
+
+                # Mark in deferred checklist
+                if self.mode_3d:
+                    size_val = mask_data.get('volume_um3', 0)
+                    cl_key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_vol{size_val}"
+                else:
+                    size_val = mask_data.get('area_um2', 0)
+                    cl_key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{size_val}"
+                self._qa_checklist_dirty[cl_key] = 1
+
+        self.log(f"Approved {approved_count} masks in bulk")
+
+        # Flush and save
+        self._flush_qa_checklist()
+        self._auto_save()
+
+        # Mark QA complete
+        self._check_qa_complete()
+
     def _deferred_approve_io(self, pending_exports, should_autosave):
         """Run disk I/O deferred from approve_current_mask via QTimer.
 
@@ -11652,6 +12095,7 @@ if __name__ == '__main__':
 
         Called after mask generation so that ALL masks exist on disk before QA.
         This ensures masks survive a save/load cycle even if QA is incomplete.
+        Uses ThreadPoolExecutor for parallel I/O to speed up writing many masks.
         """
         if not self.masks_dir:
             return
@@ -11660,7 +12104,8 @@ if __name__ == '__main__':
 
         pixel_size = self._get_pixel_size(img_name)
 
-        exported = 0
+        # Prepare all write tasks
+        write_tasks = []
         for mask_data in masks:
             mask = mask_data.get('mask')
             if mask is None or not np.any(mask):
@@ -11683,16 +12128,22 @@ if __name__ == '__main__':
             if np.count_nonzero(mask_8bit) == 0:
                 continue
 
-            try:
-                tifffile.imwrite(
-                    mask_path,
-                    mask_8bit,
-                    resolution=(1.0 / pixel_size, 1.0 / pixel_size),
-                    metadata={'unit': 'um'}
-                )
-                exported += 1
-            except Exception:
-                pass  # Don't interrupt generation for export failures
+            write_tasks.append((mask_path, mask_8bit, pixel_size))
+
+        if not write_tasks:
+            return
+
+        # Write in parallel using threads (I/O bound)
+        n_writers = min(len(write_tasks), 8)
+        exported = 0
+        if n_writers > 1:
+            with ThreadPoolExecutor(max_workers=n_writers) as executor:
+                results = executor.map(_export_mask_to_disk, write_tasks)
+                exported = sum(1 for r in results if r)
+        else:
+            for task in write_tasks:
+                if _export_mask_to_disk(task):
+                    exported += 1
 
         if exported > 0:
             self.log(f"   💾 Saved {exported} masks to disk for {img_name}")
@@ -11864,6 +12315,8 @@ if __name__ == '__main__':
             self.mask_qa_active = False
             self.approve_mask_btn.setEnabled(False)
             self.reject_mask_btn.setEnabled(False)
+            self.approve_all_btn.setEnabled(False)
+            self.approve_all_btn.setVisible(False)
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
             self.regen_masks_btn.setVisible(False)
