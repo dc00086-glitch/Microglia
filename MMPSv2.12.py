@@ -3167,7 +3167,7 @@ It performs batch Skeleton, Fractal/Hull, and/or Sholl analyses
 on MMPS-exported mask files.
 
 Usage (called by the SLURM job script):
-    ImageJ-linux64 --headless --mem=2048m --run mmps_imagej_cluster.py \\
+    ImageJ-linux64 --ij2 --headless --console --mem=2048m --run mmps_imagej_cluster.py \\
         "mmps_output_dir=/path/to/mmps_output"
 
 The mmps_output_dir should contain:
@@ -4246,7 +4246,7 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --output=mmps_imagej_%A_%a.out \\
     --error=mmps_imagej_%A_%a.err \\
     --wrap="{module_line}
-\\"$FIJI\\" --headless --mem=2048m --run \\"$SCRIPT_DIR/{wrapper_basename}\\" \\
+\\"$FIJI\\" --ij2 --headless --console --mem=2048m --run \\"$SCRIPT_DIR/{wrapper_basename}\\" \\
     \\"mmps_output_dir=$MMPS_OUTPUT_DIR\\"
 ")
 
