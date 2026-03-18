@@ -3167,10 +3167,10 @@ It performs batch Skeleton, Fractal/Hull, and/or Sholl analyses
 on MMPS-exported mask files.
 
 Usage (called by the SLURM job script):
-    ImageJ-linux64 --ij2 --headless --console --mem=2048m --run mmps_imagej_cluster.py \\
-        "mmps_output_dir=/path/to/mmps_output"
+    export MMPS_OUTPUT_DIR=/path/to/mmps_output
+    ImageJ-linux64 --ij2 --headless --console --mem=2048m --run mmps_imagej_cluster.py
 
-The mmps_output_dir should contain:
+The MMPS_OUTPUT_DIR should contain:
     masks/   - *_mask.tif files
     somas/   - *_soma.tif files (for Sholl)
 """
@@ -4089,8 +4089,11 @@ def getMasksForImage(allMaskFiles, imageName):
 # MAIN
 # ============================================================================
 
-# Get parameters from the script invocation
-#@ String mmps_output_dir
+# Get parameters from environment variables (set by SLURM --wrap)
+mmps_output_dir = os.environ.get('MMPS_OUTPUT_DIR', '')
+if not mmps_output_dir:
+    print("ERROR: MMPS_OUTPUT_DIR environment variable not set.")
+    sys.exit(1)
 
 image_index = int(os.environ.get('SLURM_ARRAY_TASK_ID', '0'))
 
@@ -4192,7 +4195,7 @@ if [ $# -lt 1 ]; then
     exit 1
 fi
 
-MMPS_OUTPUT_DIR="$(cd "$1" && pwd)"
+export MMPS_OUTPUT_DIR="$(cd "$1" && pwd)"
 FIJI="{fiji_path}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -4246,8 +4249,7 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --output=mmps_imagej_%A_%a.out \\
     --error=mmps_imagej_%A_%a.err \\
     --wrap="{module_line}
-\\"$FIJI\\" --ij2 --headless --console --mem=2048m --run \\"$SCRIPT_DIR/{wrapper_basename}\\" \\
-    \\"mmps_output_dir=$MMPS_OUTPUT_DIR\\"
+\\"$FIJI\\" --ij2 --headless --console --mem=2048m --run \\"$SCRIPT_DIR/{wrapper_basename}\\"
 ")
 
 echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
