@@ -6861,6 +6861,13 @@ if __name__ == '__main__':
                             self.masks_dir = os.path.join(new_output, "masks")
                         resolved_output_dir = new_output
                         resolved_masks_dir = self.masks_dir
+                        # Re-resolve processed_path for every image so lazy-load
+                        # picks up the new output folder instead of stale paths.
+                        for img_name, img_session in session['images'].items():
+                            name_stem = os.path.splitext(img_name)[0]
+                            candidate = os.path.join(new_output, f"{name_stem}_processed.tif")
+                            if os.path.exists(candidate):
+                                img_session['processed_path'] = candidate
                 else:
                     # User declined — clear the invalid paths so we don't
                     # error out later trying to write to them.
@@ -9592,13 +9599,18 @@ if __name__ == '__main__':
 
         # Lazy-load processed image from disk if missing
         if img_data.get('processed') is None:
-            processed_path = img_data.get('processed_path') or (
-                os.path.join(self.output_dir, f"{os.path.splitext(img_name)[0]}_processed.tif")
-                if self.output_dir else None
-            )
+            processed_path = img_data.get('processed_path')
+            # If stored path is stale (e.g. session from another computer), fall back
+            # to constructing the path from the current output_dir.
+            if not processed_path or not os.path.exists(processed_path):
+                if self.output_dir:
+                    processed_path = os.path.join(self.output_dir, f"{os.path.splitext(img_name)[0]}_processed.tif")
+                else:
+                    processed_path = None
             if processed_path and os.path.exists(processed_path):
                 try:
                     img_data['processed'] = safe_tiff_read(processed_path)
+                    img_data['processed_path'] = processed_path  # update stale path
                 except Exception:
                     pass
 
@@ -9699,13 +9711,18 @@ if __name__ == '__main__':
 
         # Lazy-load processed image from disk if missing
         if img_data.get('processed') is None:
-            processed_path = img_data.get('processed_path') or (
-                os.path.join(self.output_dir, f"{os.path.splitext(img_name)[0]}_processed.tif")
-                if self.output_dir else None
-            )
+            processed_path = img_data.get('processed_path')
+            # If stored path is stale (e.g. session from another computer), fall back
+            # to constructing the path from the current output_dir.
+            if not processed_path or not os.path.exists(processed_path):
+                if self.output_dir:
+                    processed_path = os.path.join(self.output_dir, f"{os.path.splitext(img_name)[0]}_processed.tif")
+                else:
+                    processed_path = None
             if processed_path and os.path.exists(processed_path):
                 try:
                     img_data['processed'] = safe_tiff_read(processed_path)
+                    img_data['processed_path'] = processed_path  # update stale path
                 except Exception:
                     pass
 
