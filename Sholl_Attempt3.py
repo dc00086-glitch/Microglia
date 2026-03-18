@@ -211,21 +211,15 @@ def getSomaCentroid(somaPath):
     if somaImp is None:
         return None
     ip = somaImp.getProcessor()
-    w = ip.getWidth()
-    h = ip.getHeight()
-    sumX = 0.0
-    sumY = 0.0
-    count = 0
-    for y in range(h):
-        for x in range(w):
-            if ip.getPixel(x, y) > 0:
-                sumX += x
-                sumY += y
-                count += 1
+    # Binarize: anything >= 1 becomes 255 (native Java, instant)
+    ip.threshold(1)
+    stats = ip.getStatistics()
     somaImp.close()
-    if count == 0:
+    if stats.mean == 0:
         return None
-    return (int(round(sumX / count)), int(round(sumY / count)))
+    # xCenterOfMass/yCenterOfMass are intensity-weighted; on a binary
+    # image (0/255) this equals the geometric centroid of foreground pixels.
+    return (int(round(stats.xCenterOfMass)), int(round(stats.yCenterOfMass)))
 
 
 def getSomaRadius(somaPath, centroid, pixelSize):
@@ -233,17 +227,11 @@ def getSomaRadius(somaPath, centroid, pixelSize):
     Used as the start radius for Sholl analysis (begin at soma edge)."""
     somaImp = openImageQuiet(somaPath)
     if somaImp is None or centroid is None:
-        return 0.0
+        return 0.0, 0.0
     ip = somaImp.getProcessor()
-    cx, cy = centroid
-    # Count foreground pixels to estimate area, then radius = sqrt(area/pi)
-    count = 0
-    w = ip.getWidth()
-    h = ip.getHeight()
-    for y in range(h):
-        for x in range(w):
-            if ip.getPixel(x, y) > 0:
-                count += 1
+    # Use native Java histogram to count foreground pixels (any value > 0)
+    hist = ip.getHistogram()
+    count = sum(hist[1:])  # all non-zero bins
     somaImp.close()
     import math
     areaUm2 = count * (pixelSize ** 2)

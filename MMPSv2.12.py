@@ -3797,21 +3797,15 @@ def getSomaCentroid(somaPath):
     if somaImp is None:
         return None
     ip = somaImp.getProcessor()
-    w = ip.getWidth()
-    h = ip.getHeight()
-    sumX = 0.0
-    sumY = 0.0
-    count = 0
-    for y in range(h):
-        for x in range(w):
-            if ip.getPixel(x, y) > 0:
-                sumX += x
-                sumY += y
-                count += 1
+    # Binarize: anything >= 1 becomes 255 (native Java, instant)
+    ip.threshold(1)
+    stats = ip.getStatistics()
     somaImp.close()
-    if count == 0:
+    if stats.mean == 0:
         return None
-    return (int(round(sumX / count)), int(round(sumY / count)))
+    # xCenterOfMass/yCenterOfMass are intensity-weighted; on a binary
+    # image (0/255) this equals the geometric centroid of foreground pixels.
+    return (int(round(stats.xCenterOfMass)), int(round(stats.yCenterOfMass)))
 
 
 def getSomaRadius(somaPath, centroid, pixelSize):
@@ -3820,13 +3814,9 @@ def getSomaRadius(somaPath, centroid, pixelSize):
     if somaImp is None or centroid is None:
         return 0.0, 0.0
     ip = somaImp.getProcessor()
-    count = 0
-    w = ip.getWidth()
-    h = ip.getHeight()
-    for y in range(h):
-        for x in range(w):
-            if ip.getPixel(x, y) > 0:
-                count += 1
+    # Use native Java histogram to count foreground pixels (any value > 0)
+    hist = ip.getHistogram()
+    count = sum(hist[1:])  # all non-zero bins
     somaImp.close()
     areaUm2 = count * (pixelSize ** 2)
     radiusUm = math.sqrt(areaUm2 / math.pi) if count > 0 else 0.0
@@ -4010,22 +4000,28 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all"):
             skipped += 1
             continue
 
+        print("  Finding soma centroid...")
         centroid = getSomaCentroid(somaPath)
         if centroid is None:
             print("  WARNING: Could not calculate centroid - skipping")
             skipped += 1
             continue
+        print("  Centroid: " + str(centroid))
 
         somaResult = getSomaRadius(somaPath, centroid, PIXEL_SIZE)
         somaRadiusUm = somaResult[0]
         somaAreaUm2 = somaResult[1]
         startRad = somaRadiusUm
+        print("  Start radius: " + str(round(startRad, 2)) + " um, area: " + str(round(somaAreaUm2, 1)) + " um2")
 
         try:
+            print("  Running Sholl parser...")
+            t0 = time.time()
             metrics = analyzeOneSholl(
                 maskPath, centroid, startRad, SHOLL_STEP, PIXEL_SIZE,
                 shollDir, maskFile, somaAreaUm2
             )
+            dt = time.time() - t0
             if metrics is not None:
                 metrics['Image Name'] = imgName
                 metrics['Soma ID'] = somaId
@@ -4035,11 +4031,13 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all"):
                 metrics['Start Radius (um)'] = startRad
                 allResults.append(metrics)
                 processed += 1
+                print("  Done (" + str(round(dt, 1)) + "s)")
             else:
                 skipped += 1
+                print("  Skipped - no results (" + str(round(dt, 1)) + "s)")
         except Exception as e:
             skipped += 1
-            print("  ERROR: " + str(e))
+            print("  ERROR (" + str(round(time.time() - t0, 1)) + "s): " + str(e))
 
     if allResults:
         combinedPath = os.path.join(shollDir, "Sholl_Results_" + imageName + ".csv")
