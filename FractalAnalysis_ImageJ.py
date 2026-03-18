@@ -153,15 +153,13 @@ def runFractalAnalysis(maskPath, pixelSize):
     w = imp.getWidth()
     h = imp.getHeight()
 
-    # Grab all pixels at once (native Java array) instead of per-pixel calls
-    pixels = ip.getPixels()
+    # Build boolean pixel array
     foreground = []
     totalFG = 0
     for y in range(h):
         row = []
-        offset = y * w
         for x in range(w):
-            val = (pixels[offset + x] & 0xff) > 0
+            val = ip.getPixel(x, y) > 0
             row.append(val)
             if val:
                 totalFG += 1
@@ -328,14 +326,12 @@ def runConvexHullAnalysis(maskPath, pixelSize):
     w = imp.getWidth()
     h = imp.getHeight()
 
-    # Grab all pixels at once (native Java array) instead of per-pixel calls
-    pixels = ip.getPixels()
+    # Count foreground pixels and collect boundary pixels for fallback
     totalFG = 0
     boundary = []
     for y in range(h):
-        offset = y * w
         for x in range(w):
-            if (pixels[offset + x] & 0xff) > 0:
+            if ip.getPixel(x, y) > 0:
                 totalFG += 1
                 # Check if boundary pixel (has at least one bg neighbor)
                 isBoundary = False
@@ -344,7 +340,7 @@ def runConvexHullAnalysis(maskPath, pixelSize):
                     if ny < 0 or ny >= h or nx < 0 or nx >= w:
                         isBoundary = True
                         break
-                    if (pixels[ny * w + nx] & 0xff) == 0:
+                    if ip.getPixel(nx, ny) == 0:
                         isBoundary = True
                         break
                 if isBoundary:

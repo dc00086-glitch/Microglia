@@ -3279,9 +3279,13 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
     mask.setCalibration(cal)
 
     maskProcessor = mask.getProcessor()
-    # Use native Java histogram to count foreground pixels (any value > 0)
-    maskHist = maskProcessor.getHistogram()
-    maskPixelCount = sum(maskHist[1:])
+    maskWidth = mask.getWidth()
+    maskHeight = mask.getHeight()
+    maskPixelCount = 0
+    for y in range(maskHeight):
+        for x in range(maskWidth):
+            if maskProcessor.getPixel(x, y) > 0:
+                maskPixelCount += 1
     maskArea = maskPixelCount * (pixelSize * pixelSize)
 
     IJ.setThreshold(mask, 1, 255)
@@ -3365,9 +3369,13 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
         totalSkeletonLength = numSlabVoxels * effectivePx
 
     skelProcessor = skel.getProcessor()
-    # Use native Java histogram to count foreground pixels (any value > 0)
-    skelHist = skelProcessor.getHistogram()
-    skelPixelCount = sum(skelHist[1:])
+    skelWidth = skel.getWidth()
+    skelHeight = skel.getHeight()
+    skelPixelCount = 0
+    for y in range(skelHeight):
+        for x in range(skelWidth):
+            if skelProcessor.getPixel(x, y) > 0:
+                skelPixelCount += 1
     effectivePx = pixelSize / float(scaleFactor) if scaleFactor > 1 else pixelSize
     skeletonArea = skelPixelCount * (effectivePx * effectivePx)
 
@@ -3466,15 +3474,12 @@ def runFractalAnalysis(maskPath, pixelSize):
     w = imp.getWidth()
     h = imp.getHeight()
 
-    # Grab all pixels at once (native Java array) instead of per-pixel calls
-    pixels = ip.getPixels()
     foreground = []
     totalFG = 0
     for y in range(h):
         row = []
-        offset = y * w
         for x in range(w):
-            val = (pixels[offset + x] & 0xff) > 0
+            val = ip.getPixel(x, y) > 0
             row.append(val)
             if val:
                 totalFG += 1
@@ -3600,14 +3605,11 @@ def runConvexHullAnalysis(maskPath, pixelSize):
     w = imp.getWidth()
     h = imp.getHeight()
 
-    # Grab all pixels at once (native Java array) instead of per-pixel calls
-    pixels = ip.getPixels()
     totalFG = 0
     boundary = []
     for y in range(h):
-        offset = y * w
         for x in range(w):
-            if (pixels[offset + x] & 0xff) > 0:
+            if ip.getPixel(x, y) > 0:
                 totalFG += 1
                 isBoundary = False
                 for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
@@ -3615,7 +3617,7 @@ def runConvexHullAnalysis(maskPath, pixelSize):
                     if ny < 0 or ny >= h or nx < 0 or nx >= w:
                         isBoundary = True
                         break
-                    if (pixels[ny * w + nx] & 0xff) == 0:
+                    if ip.getPixel(nx, ny) == 0:
                         isBoundary = True
                         break
                 if isBoundary:

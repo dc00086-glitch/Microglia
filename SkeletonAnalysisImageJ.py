@@ -124,9 +124,12 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
     maskWidth = mask.getWidth()
     maskHeight = mask.getHeight()
 
-    # Use native Java histogram to count foreground pixels (any value > 0)
-    maskHist = maskProcessor.getHistogram()
-    maskPixelCount = sum(maskHist[1:])
+    maskPixelCount = 0
+    for y in range(maskHeight):
+        for x in range(maskWidth):
+            if maskProcessor.getPixel(x, y) > 0:
+                maskPixelCount += 1
+
     maskArea = maskPixelCount * (pixelSize * pixelSize)
 
     # Measure shape properties on original mask
@@ -248,9 +251,11 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
     skelWidth = skel.getWidth()
     skelHeight = skel.getHeight()
 
-    # Use native Java histogram to count foreground pixels (any value > 0)
-    skelHist = skelProcessor.getHistogram()
-    skelPixelCount = sum(skelHist[1:])
+    skelPixelCount = 0
+    for y in range(skelHeight):
+        for x in range(skelWidth):
+            if skelProcessor.getPixel(x, y) > 0:
+                skelPixelCount += 1
 
     effectivePx = pixelSize / float(scaleFactor) if scaleFactor > 1 else pixelSize
     skeletonArea = skelPixelCount * (effectivePx * effectivePx)
