@@ -6826,7 +6826,47 @@ if __name__ == '__main__':
                 self.color_toggle_btn.setText("Show Grayscale (C)")
                 self.channel_select_btn.setVisible(True)
 
-            # Ensure output dirs exist
+            # Ensure output dirs exist — if the saved path is unreachable
+            # (e.g. session created on a different computer), ask the user
+            # to pick a new output folder instead of failing with PermissionError.
+            def _dir_is_usable(d):
+                """Check if a directory exists or can be created."""
+                if not d:
+                    return False
+                if os.path.isdir(d):
+                    return True
+                try:
+                    os.makedirs(d, exist_ok=True)
+                    return True
+                except OSError:
+                    return False
+
+            if self.output_dir and not _dir_is_usable(self.output_dir):
+                reply = QMessageBox.question(
+                    self, "Output Folder Not Found",
+                    f"The saved output folder is not accessible:\n"
+                    f"{self.output_dir}\n\n"
+                    "This session may have been created on a different computer.\n"
+                    "Would you like to select a new output folder?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    new_output = QFileDialog.getExistingDirectory(
+                        self, "Select Output Folder")
+                    if new_output:
+                        self.output_dir = new_output
+                        if is_3d:
+                            self.masks_dir = os.path.join(new_output, "masks_3d")
+                        else:
+                            self.masks_dir = os.path.join(new_output, "masks")
+                        resolved_output_dir = new_output
+                        resolved_masks_dir = self.masks_dir
+                else:
+                    # User declined — clear the invalid paths so we don't
+                    # error out later trying to write to them.
+                    self.output_dir = None
+                    self.masks_dir = None
+
             if self.output_dir:
                 os.makedirs(self.output_dir, exist_ok=True)
             if self.masks_dir:
