@@ -2899,6 +2899,24 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.reject_mask_btn.setEnabled(False)
         self.reject_mask_btn.setVisible(False)
 
+        # QA Autozoom level setting
+        from PyQt5.QtWidgets import QDoubleSpinBox
+        qa_zoom_layout = QHBoxLayout()
+        qa_zoom_label = QLabel("QA Autozoom:")
+        qa_zoom_label.setToolTip("Zoom level used when auto-centering on masks and somas during QA")
+        self.qa_autozoom_spin = QDoubleSpinBox()
+        self.qa_autozoom_spin.setRange(1.0, 10.0)
+        self.qa_autozoom_spin.setSingleStep(0.5)
+        self.qa_autozoom_spin.setValue(3.0)
+        self.qa_autozoom_spin.setDecimals(1)
+        self.qa_autozoom_spin.setSuffix("x")
+        self.qa_autozoom_spin.setToolTip("Set the auto-zoom level for mask/soma QA (default 3.0x)")
+        self.qa_autozoom_spin.setFixedWidth(80)
+        qa_zoom_layout.addWidget(qa_zoom_label)
+        qa_zoom_layout.addWidget(self.qa_autozoom_spin)
+        qa_zoom_layout.addStretch()
+        layout.addLayout(qa_zoom_layout)
+
         # Mask QA progress bar
         self.mask_qa_progress_bar = QProgressBar()
         self.mask_qa_progress_bar.setVisible(False)
@@ -9639,7 +9657,7 @@ if __name__ == '__main__':
 
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
-        self.processed_label.zoom_to_point(soma[0], soma[1], zoom_level=3.0)
+        self.processed_label.zoom_to_point(soma[0], soma[1], zoom_level=self.qa_autozoom_spin.value())
         self.tabs.setCurrentIndex(2)
 
         self.nav_status_label.setText(
@@ -9743,7 +9761,7 @@ if __name__ == '__main__':
         soma_id = img_data['soma_ids'][soma_idx]
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
-        self.processed_label.zoom_to_point(soma[0], soma[1], zoom_level=3.0)
+        self.processed_label.zoom_to_point(soma[0], soma[1], zoom_level=self.qa_autozoom_spin.value())
         self.tabs.setCurrentIndex(2)
         self.nav_status_label.setText(
             f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
@@ -12136,7 +12154,7 @@ if __name__ == '__main__':
             if len(mask_coords) > 0:
                 center_row = float(np.mean(mask_coords[:, 0]))
                 center_col = float(np.mean(mask_coords[:, 1]))
-                self.mask_label.zoom_to_point(center_row, center_col, zoom_level=3.0)
+                self.mask_label.zoom_to_point(center_row, center_col, zoom_level=self.qa_autozoom_spin.value())
         except Exception as e:
             self.log(f"ERROR displaying mask: {str(e)}")
             import traceback
@@ -12213,7 +12231,7 @@ if __name__ == '__main__':
             if len(mask_coords) > 0:
                 center_row = float(np.mean(mask_coords[:, 0]))
                 center_col = float(np.mean(mask_coords[:, 1]))
-                self.mask_label.zoom_to_point(center_row, center_col, zoom_level=3.0)
+                self.mask_label.zoom_to_point(center_row, center_col, zoom_level=self.qa_autozoom_spin.value())
 
         status = mask_data.get('approved')
         status_text = "Approved" if status is True else "Rejected" if status is False else "Not reviewed"
