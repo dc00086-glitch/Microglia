@@ -2679,6 +2679,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.undo_qa_btn.setToolTip("Reset all mask approvals and restart QA")
         self.undo_qa_btn.setStyleSheet("border: 2px solid #FF9800;")
         self.undo_qa_btn.setVisible(False)
+
+        # Approve All button — created here but placed in right panel zoom bar
+        self.approve_all_btn = QPushButton("Approve All Remaining")
+        self.approve_all_btn.clicked.connect(self._approve_all_remaining)
+        self.approve_all_btn.setEnabled(False)
+        self.approve_all_btn.setVisible(False)
+        self.approve_all_btn.setStyleSheet("QPushButton { border: 2px solid #4CAF50; font-weight: bold; }")
+        self.approve_all_btn.setToolTip(
+            "Approve all remaining unreviewed masks at once.\n"
+            "Useful for large datasets (22k+ images) where manual QA is impractical.")
+
         self.batch_calculate_btn = QPushButton("Calculate Simple Characteristics")
         self.batch_calculate_btn.clicked.connect(self.batch_calculate_morphology)
         self.batch_calculate_btn.setEnabled(False)
@@ -2887,16 +2898,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.reject_mask_btn.clicked.connect(self.reject_current_mask)
         self.reject_mask_btn.setEnabled(False)
         self.reject_mask_btn.setVisible(False)
-
-        # Approve All button — skip manual QA for large datasets
-        self.approve_all_btn = QPushButton("Approve All Remaining")
-        self.approve_all_btn.clicked.connect(self._approve_all_remaining)
-        self.approve_all_btn.setEnabled(False)
-        self.approve_all_btn.setVisible(False)
-        self.approve_all_btn.setStyleSheet("QPushButton { border: 2px solid #4CAF50; font-weight: bold; }")
-        self.approve_all_btn.setToolTip(
-            "Approve all remaining unreviewed masks at once.\n"
-            "Useful for large datasets (22k+ images) where manual QA is impractical.")
 
         # Mask QA progress bar
         self.mask_qa_progress_bar = QProgressBar()
