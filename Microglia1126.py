@@ -1504,6 +1504,26 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("Press 'Z' or Backspace to undo last point | 'Escape' to restart | 'Enter' to finish")
         self.log("=" * 50)
 
+    def _get_outline_image(self, img_data):
+        """Get image for outlining, with lazy-load fallback."""
+        if img_data.get('processed') is not None:
+            return img_data['processed']
+        # Try loading raw image as fallback
+        raw_path = img_data.get('raw_path')
+        if raw_path and os.path.exists(raw_path):
+            try:
+                raw_img = load_tiff_image(raw_path)
+                if raw_img is not None:
+                    if raw_img.ndim == 2:
+                        img_data['processed'] = raw_img.copy()
+                        return img_data['processed']
+                    elif raw_img.ndim == 3:
+                        img_data['processed'] = raw_img[:, :, 0].copy()
+                        return img_data['processed']
+            except Exception:
+                pass
+        return None
+
     def _load_soma_for_outlining(self, queue_idx):
         if queue_idx >= len(self.outlining_queue):
             self._finish_outlining()
@@ -1513,7 +1533,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         img_data = self.images[img_name]
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
-        pixmap = self._array_to_pixmap(img_data['processed'])
+        outline_img = self._get_outline_image(img_data)
+        if outline_img is None:
+            self.log(f"⚠ No image data for {img_name} — skipping")
+            self._load_soma_for_outlining(queue_idx + 1)
+            return
+        pixmap = self._array_to_pixmap(outline_img)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
         self.tabs.setCurrentIndex(2)
         self.nav_status_label.setText(
@@ -1530,7 +1555,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
             img_data = self.images[img_name]
             soma = img_data['somas'][soma_idx]
             soma_id = img_data['soma_ids'][soma_idx]
-            pixmap = self._array_to_pixmap(img_data['processed'])
+            outline_img = self._get_outline_image(img_data)
+            if outline_img is None:
+                return
+            pixmap = self._array_to_pixmap(outline_img)
             self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
             # Update status to show point count
             self.nav_status_label.setText(
@@ -1589,7 +1617,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
             return
         img_name, soma_idx = self.outlining_queue[queue_idx]
         img_data = self.images[img_name]
-        mask = self._polygon_to_mask(self.polygon_points, img_data['processed'].shape)
+        outline_img = self._get_outline_image(img_data)
+        if outline_img is None:
+            QMessageBox.warning(self, "Error", "Cannot determine image dimensions for mask.")
+            return
+        mask = self._polygon_to_mask(self.polygon_points, outline_img.shape[:2])
         soma_id = img_data['soma_ids'][soma_idx]
 
         # Calculate soma area from the outline

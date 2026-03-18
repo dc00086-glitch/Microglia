@@ -6961,6 +6961,7 @@ if __name__ == '__main__':
 
                 img_dict = {
                     'raw_path': img_session['raw_path'],
+                    'processed_path': img_session.get('processed_path'),
                     'processed': processed_data,
                     'rolling_ball_radius': img_session.get('rolling_ball_radius', 50),
                     'somas': [tuple(s) for s in img_session.get('somas', [])],
@@ -9589,6 +9590,18 @@ if __name__ == '__main__':
         self.current_image_name = img_name
         img_data = self.images[img_name]
 
+        # Lazy-load processed image from disk if missing
+        if img_data.get('processed') is None:
+            processed_path = img_data.get('processed_path') or (
+                os.path.join(self.output_dir, f"{os.path.splitext(img_name)[0]}_processed.tif")
+                if self.output_dir else None
+            )
+            if processed_path and os.path.exists(processed_path):
+                try:
+                    img_data['processed'] = safe_tiff_read(processed_path)
+                except Exception:
+                    pass
+
         # Ensure color_image is loaded for color toggle support
         if 'color_image' not in img_data and 'raw_path' in img_data:
             try:
@@ -9596,6 +9609,8 @@ if __name__ == '__main__':
                 if raw_img is not None and raw_img.ndim == 3:
                     img_data['color_image'] = raw_img.copy()
                     img_data['num_channels'] = raw_img.shape[2]
+                elif raw_img is not None and raw_img.ndim == 2 and img_data.get('processed') is None:
+                    img_data['processed'] = raw_img.copy()
             except Exception:
                 pass
 
@@ -9662,7 +9677,15 @@ if __name__ == '__main__':
                 adjusted = self._apply_display_adjustments(channel_img.astype(np.uint8))
                 return self._array_to_pixmap(adjusted, skip_rescale=True)
         # Default: use processed image with adjustments
-        adjusted = self._apply_display_adjustments(img_data['processed'])
+        proc = img_data.get('processed')
+        if proc is None:
+            # Fallback: try raw image as grayscale
+            proc = self._get_image_for_outlining(img_data)
+        if proc is None:
+            # Return a blank pixmap to avoid crash
+            blank = np.zeros((100, 100), dtype=np.uint8)
+            return self._array_to_pixmap(blank)
+        adjusted = self._apply_display_adjustments(proc)
         return self._array_to_pixmap(adjusted, skip_rescale=True)
 
     def _load_soma_for_outlining(self, queue_idx):
@@ -9674,6 +9697,18 @@ if __name__ == '__main__':
         self.current_image_name = img_name
         img_data = self.images[img_name]
 
+        # Lazy-load processed image from disk if missing
+        if img_data.get('processed') is None:
+            processed_path = img_data.get('processed_path') or (
+                os.path.join(self.output_dir, f"{os.path.splitext(img_name)[0]}_processed.tif")
+                if self.output_dir else None
+            )
+            if processed_path and os.path.exists(processed_path):
+                try:
+                    img_data['processed'] = safe_tiff_read(processed_path)
+                except Exception:
+                    pass
+
         # Ensure color_image is loaded for color toggle support
         if 'color_image' not in img_data and 'raw_path' in img_data:
             try:
@@ -9681,6 +9716,9 @@ if __name__ == '__main__':
                 if raw_img is not None and raw_img.ndim == 3:
                     img_data['color_image'] = raw_img.copy()
                     img_data['num_channels'] = raw_img.shape[2]
+                elif raw_img is not None and raw_img.ndim == 2 and img_data.get('processed') is None:
+                    # Fallback: use raw grayscale image as processed
+                    img_data['processed'] = raw_img.copy()
             except Exception:
                 pass
 
@@ -9782,7 +9820,21 @@ if __name__ == '__main__':
 
         img_name, soma_idx = self.outlining_queue[queue_idx]
         img_data = self.images[img_name]
-        mask = self._polygon_to_mask(self.polygon_points, img_data['processed'].shape)
+        # Determine image shape for mask creation
+        outline_img = self._get_image_for_outlining(img_data)
+        if outline_img is not None:
+            mask_shape = outline_img.shape[:2]
+        elif img_data.get('processed') is not None:
+            mask_shape = img_data['processed'].shape[:2]
+        else:
+            # Fallback: try loading raw image just for shape
+            try:
+                raw_img = load_tiff_image(img_data['raw_path'])
+                mask_shape = raw_img.shape[:2]
+            except Exception:
+                QMessageBox.warning(self, "Error", "Cannot determine image dimensions for mask.")
+                return
+        mask = self._polygon_to_mask(self.polygon_points, mask_shape)
         soma_id = img_data['soma_ids'][soma_idx]
 
         # Calculate soma area from the outline
@@ -9897,10 +9949,22 @@ if __name__ == '__main__':
 
     def _get_image_for_outlining(self, img_data):
         """Get the appropriate grayscale image for auto-outlining"""
-        if img_data['processed'] is not None:
+        if img_data.get('processed') is not None:
             return img_data['processed']
         elif 'color_image' in img_data:
             return extract_channel(img_data['color_image'], self.grayscale_channel)
+        # Last resort: try loading the raw image
+        raw_path = img_data.get('raw_path')
+        if raw_path and os.path.exists(raw_path):
+            try:
+                raw_img = load_tiff_image(raw_path)
+                if raw_img is not None:
+                    if raw_img.ndim == 2:
+                        return raw_img
+                    elif raw_img.ndim == 3:
+                        return raw_img[:, :, self.grayscale_channel] if raw_img.shape[2] > self.grayscale_channel else raw_img[:, :, 0]
+            except Exception:
+                pass
         return None
 
     def auto_outline_current_soma(self):
