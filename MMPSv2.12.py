@@ -3851,6 +3851,8 @@ def findSomaFile(somasDir, maskFilename):
     return None
 
 
+_sholl_debug_done = [False]  # mutable flag for first-mask debug output
+
 def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, maskName, somaAreaUm2):
     """Run Sholl analysis on one cell mask."""
     from sc.fiji.snt.analysis.sholl import Profile, ShollUtils
@@ -3859,11 +3861,24 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
     from sc.fiji.snt.analysis.sholl.math import ShollStats
     from sc.fiji.snt.analysis.sholl.parsers import ImageParser2D
 
+    debug = not _sholl_debug_done[0]  # verbose debug for first mask only
+
     cellName = os.path.splitext(maskName)[0]
 
     imp = openImageQuiet(maskPath)
     if imp is None:
+        if debug:
+            print("  [DEBUG] openImageQuiet returned None!")
         return None
+
+    if debug:
+        print("  [DEBUG] Image: " + str(imp.getWidth()) + "x" + str(imp.getHeight())
+              + " type=" + str(imp.getType()) + " bitDepth=" + str(imp.getBitDepth()))
+        ip = imp.getProcessor()
+        hist = ip.getHistogram()
+        fg_pixels = sum(hist[1:])
+        print("  [DEBUG] Foreground pixels (>0): " + str(fg_pixels) + " / " + str(imp.getWidth() * imp.getHeight()))
+        print("  [DEBUG] Min=" + str(ip.getMin()) + " Max=" + str(ip.getMax()))
 
     cal = Calibration(imp)
     cal.pixelWidth = pixelSize
@@ -3871,14 +3886,26 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
     cal.setUnit("um")
     imp.setCalibration(cal)
 
-    imp.getProcessor().setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
+    # Set threshold using IJ (not just processor) so the parser can see it
+    IJ.setThreshold(imp, 1, 255)
+
+    if debug:
+        print("  [DEBUG] Threshold set: minThreshold=" + str(imp.getProcessor().getMinThreshold())
+              + " maxThreshold=" + str(imp.getProcessor().getMaxThreshold()))
 
     parser = ImageParser2D(imp)
-    parser.setRadiiSpan(0, ImageParser2D.MEAN)
+    parser.setRadiiSpan(1, ImageParser2D.MEAN)
     parser.setPosition(1, 1, 1)
 
     cx, cy = centroid
     parser.setCenter(cx, cy)
+
+    if debug:
+        print("  [DEBUG] Center set to: (" + str(cx) + ", " + str(cy) + ")")
+        # Check if center pixel is foreground
+        pxVal = imp.getProcessor().getPixel(cx, cy)
+        print("  [DEBUG] Pixel value at center: " + str(pxVal))
+
     # stepSize=0 means "continuous" (pixel-level); SNT hangs with step=0,
     # so convert to 1 pixel in calibrated units.
     effectiveStep = stepSize if stepSize > 0 else pixelSize
@@ -3888,23 +3915,53 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
     roi = ThresholdToSelection.run(imp)
     if roi is not None:
         bounds = roi.getBounds()
+        if debug:
+            print("  [DEBUG] ROI bounds: x=" + str(bounds.x) + " y=" + str(bounds.y)
+                  + " w=" + str(bounds.width) + " h=" + str(bounds.height))
         corners = [(bounds.x, bounds.y), (bounds.x + bounds.width, bounds.y),
                     (bounds.x, bounds.y + bounds.height), (bounds.x + bounds.width, bounds.y + bounds.height)]
         endRad = max(((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5 for bx, by in corners) * pixelSize
     else:
+        if debug:
+            print("  [DEBUG] ThresholdToSelection returned None! Threshold may not be set properly.")
         endRad = parser.maxPossibleRadius()
+
+    if debug:
+        print("  [DEBUG] Radii: start=" + str(round(startRad, 3)) + " step=" + str(round(effectiveStep, 3))
+              + " end=" + str(round(endRad, 3)) + " (all in um)")
+
     parser.setRadii(startRad, effectiveStep, endRad)
     parser.setHemiShells('none')
     parser.parse()
 
+    if debug:
+        print("  [DEBUG] parser.successful() = " + str(parser.successful()))
+
     if not parser.successful():
+        if debug:
+            print("  [DEBUG] Parser FAILED. Trying to get error info...")
+            try:
+                profile = parser.getProfile()
+                if profile is not None:
+                    print("  [DEBUG] Profile exists but isEmpty=" + str(profile.isEmpty())
+                          + " size=" + str(profile.size()))
+                else:
+                    print("  [DEBUG] Profile is None")
+            except Exception as e:
+                print("  [DEBUG] Error getting profile: " + str(e))
+        _sholl_debug_done[0] = True
         imp.close()
         return None
 
     profile = parser.getProfile()
     if profile.isEmpty():
+        if debug:
+            print("  [DEBUG] Profile is empty after successful parse!")
+        _sholl_debug_done[0] = True
         imp.close()
         return None
+
+    _sholl_debug_done[0] = True
 
     profile.trimZeroCounts()
     lStats = LinearProfileStats(profile)
