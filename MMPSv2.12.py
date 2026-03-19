@@ -3931,12 +3931,6 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
             print("  [DEBUG] ThresholdToSelection returned None! Threshold may not be set properly.")
         endRad = parser.maxPossibleRadius()
 
-    # Cap end radius to prevent parser from hanging on large masks
-    MAX_END_RADIUS_UM = 200.0
-    if endRad > MAX_END_RADIUS_UM:
-        print("  Capping end radius from " + str(round(endRad, 1)) + " to " + str(MAX_END_RADIUS_UM) + " um")
-        endRad = MAX_END_RADIUS_UM
-
     numRadii = int((endRad - startRad) / effectiveStep) if effectiveStep > 0 else 0
     if debug:
         print("  [DEBUG] Radii: start=" + str(round(startRad, 3)) + " step=" + str(round(effectiveStep, 3))
