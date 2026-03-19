@@ -3937,7 +3937,30 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
 
     parser.setRadii(startRad, effectiveStep, endRad)
     parser.setHemiShells('none')
-    parser.parse()
+
+    # Run parser in a thread with timeout so one slow mask doesn't block the whole job
+    from java.lang import Thread, Runnable
+    class _ParserRunner(Runnable):
+        def __init__(self, p):
+            self.parser = p
+            self.finished = False
+        def run(self):
+            self.parser.parse()
+            self.finished = True
+
+    PARSE_TIMEOUT_SEC = 600  # 10 minutes per mask
+    runner = _ParserRunner(parser)
+    parseThread = Thread(runner)
+    parseThread.setDaemon(True)
+    parseThread.start()
+    parseThread.join(long(PARSE_TIMEOUT_SEC * 1000))
+
+    if not runner.finished:
+        print("  TIMEOUT after " + str(PARSE_TIMEOUT_SEC) + "s (end=" + str(round(endRad, 1))
+              + "um, " + str(numRadii) + " samples) - moving on")
+        imp.close()
+        _sholl_debug_count[0] += 1
+        return 'TIMEOUT'
 
     if debug:
         print("  [DEBUG] parser.successful() = " + str(parser.successful()))
@@ -4053,8 +4076,15 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all"):
     allResults = []
     processed = 0
     skipped = 0
+    timedOut = 0
     batchStart = time.time()
     total = len(maskFiles)
+
+    # Write results incrementally so completed masks survive job kills
+    combinedPath = os.path.join(shollDir, "Sholl_Results_" + imageName + ".csv")
+    csvFile = None
+    csvWriter = None
+    csvKeys = None
 
     for idx, maskFile in enumerate(maskFiles):
         maskPath = os.path.join(masksDir, maskFile)
@@ -4105,6 +4135,22 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all"):
                 allResults.append(metrics)
                 processed += 1
                 print("  Done (" + str(round(dt, 1)) + "s)")
+
+                # Write to CSV immediately (create header on first result)
+                if csvFile is None:
+                    csvKeys = list(metrics.keys())
+                    csvFile = open(combinedPath, 'wb')
+                    csvWriter = csv.writer(csvFile)
+                    csvWriter.writerow(csvKeys)
+                else:
+                    # Add any new keys from this result
+                    for k in metrics.keys():
+                        if k not in csvKeys:
+                            csvKeys.append(k)
+                csvWriter.writerow([metrics.get(k, '') for k in csvKeys])
+                csvFile.flush()
+            elif metrics == 'TIMEOUT':
+                timedOut += 1
             else:
                 skipped += 1
                 print("  Skipped - no results (" + str(round(dt, 1)) + "s)")
@@ -4112,26 +4158,19 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all"):
             skipped += 1
             print("  ERROR (" + str(round(time.time() - t0, 1)) + "s): " + str(e))
 
-    if allResults:
-        combinedPath = os.path.join(shollDir, "Sholl_Results_" + imageName + ".csv")
-        allKeys = list(allResults[0].keys())
-        for r in allResults:
-            for k in r.keys():
-                if k not in allKeys:
-                    allKeys.append(k)
-        f = open(combinedPath, 'wb')
-        writer = csv.writer(f)
-        writer.writerow(allKeys)
-        for r in allResults:
-            writer.writerow([r.get(k, '') for k in allKeys])
-        f.close()
+    if csvFile is not None:
+        csvFile.close()
         print("Sholl results saved: " + combinedPath)
 
-    if skipped > 0 and processed == 0:
+    summary = "Sholl analysis done: " + str(processed) + " processed, " + str(skipped) + " skipped"
+    if timedOut > 0:
+        summary += ", " + str(timedOut) + " timed out"
+    summary += " in " + formatTime(time.time() - batchStart)
+    if skipped > 0 and processed == 0 and timedOut == 0:
         print("WARNING: ALL " + str(skipped) + " masks were skipped!")
         print("  Check that soma files exist and match mask naming convention.")
         print("  Expected: <ImageName>_<soma_Y_X>_soma.tif in the somas/ folder")
-    print("Sholl analysis done: " + str(processed) + " processed, " + str(skipped) + " skipped in " + formatTime(time.time() - batchStart))
+    print(summary)
     return allResults
 
 
