@@ -3108,9 +3108,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if do_sholl:
             analyses.append("sholl")
 
+        # Build per-image pixel size map from session data
+        pixel_size_map = {}
+        for img_name, img_data in self.images.items():
+            per_img_px = img_data.get('pixel_size')
+            if per_img_px is not None:
+                # Use image name without extension to match mask filename prefixes
+                pixel_size_map[os.path.splitext(img_name)[0]] = per_img_px
+
         # --- Generate the headless Jython wrapper script ---
         wrapper_script = self._build_imagej_wrapper_script(
-            pixel_size, upscale_factor, sholl_step, largest_only, analyses
+            pixel_size, upscale_factor, sholl_step, largest_only, analyses, pixel_size_map
         )
         wrapper_path = os.path.join(save_dir, "mmps_imagej_cluster.py")
         with open(wrapper_path, 'w') as f:
@@ -3142,6 +3150,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log(f"  - submit_imagej.sh        (SLURM array job launcher)")
         self.log(f"  - merge_results.py        (combines per-image CSVs)")
         self.log(f"  - CLUSTER_README.txt      (instructions)")
+        if pixel_size_map:
+            self.log(f"  Per-image pixel sizes embedded for {len(pixel_size_map)} image(s):")
+            for name, px in pixel_size_map.items():
+                self.log(f"    {name}: {px} µm/px")
 
         analyses_str = ", ".join(a.title() for a in analyses)
 
@@ -3154,7 +3166,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f"This submits a SLURM array job (one task per image)\n"
             f"plus a merge job that combines results when done.")
 
-    def _build_imagej_wrapper_script(self, pixel_size, upscale_factor, sholl_step, largest_only, analyses):
+    def _build_imagej_wrapper_script(self, pixel_size, upscale_factor, sholl_step, largest_only, analyses, pixel_size_map=None):
         """Build the Jython script that runs all selected analyses headlessly."""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -3192,10 +3204,16 @@ import time
 # ============================================================================
 
 PIXEL_SIZE = {pixel_size}
+PIXEL_SIZE_MAP = {pixel_size_map or {{}}}
 UPSCALE_FACTOR = {upscale_factor}
 SHOLL_STEP = {sholl_step}
 LARGEST_ONLY = {largest_only}
 ANALYSES = {analyses}
+
+
+def getPixelSize(imageName):
+    \"\"\"Get per-image pixel size if set, otherwise fall back to global PIXEL_SIZE.\"\"\"
+    return PIXEL_SIZE_MAP.get(imageName, PIXEL_SIZE)
 
 
 # ============================================================================
@@ -3411,8 +3429,10 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
     return metrics
 
 
-def runSkeletonBatch(masksDir, outputDir, maskFiles, imageName="all"):
+def runSkeletonBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=None):
     """Run skeleton analysis on all mask files."""
+    if pixelSize is None:
+        pixelSize = PIXEL_SIZE
     print("=" * 60)
     print("SKELETON ANALYSIS - " + imageName)
     print("=" * 60)
@@ -3434,7 +3454,7 @@ def runSkeletonBatch(masksDir, outputDir, maskFiles, imageName="all"):
             eta = "estimating..."
         print("[" + str(idx + 1) + "/" + str(total) + "] " + maskFile + "  ETA: " + eta)
 
-        metrics = analyzeSkeleton(maskPath, PIXEL_SIZE, UPSCALE_FACTOR, skelDir)
+        metrics = analyzeSkeleton(maskPath, pixelSize, UPSCALE_FACTOR, skelDir)
         if metrics is not None:
             allResults.append(metrics)
 
@@ -3719,8 +3739,10 @@ def runConvexHullAnalysis(maskPath, pixelSize):
     }}
 
 
-def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all"):
+def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=None):
     """Run fractal + hull analysis on all mask files."""
+    if pixelSize is None:
+        pixelSize = PIXEL_SIZE
     print("=" * 60)
     print("FRACTAL / CONVEX HULL ANALYSIS - " + imageName)
     print("=" * 60)
@@ -3745,8 +3767,8 @@ def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all"):
         print("[" + str(idx + 1) + "/" + str(total) + "] " + maskFile + "  ETA: " + eta)
 
         try:
-            fracMetrics = runFractalAnalysis(maskPath, PIXEL_SIZE)
-            hullMetrics = runConvexHullAnalysis(maskPath, PIXEL_SIZE)
+            fracMetrics = runFractalAnalysis(maskPath, pixelSize)
+            hullMetrics = runConvexHullAnalysis(maskPath, pixelSize)
             if fracMetrics is not None:
                 row = {{
                     'cell_name': cellName,
@@ -4063,8 +4085,10 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
     return maskMetrics
 
 
-def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all"):
+def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all", pixelSize=None):
     """Run Sholl analysis on all mask files."""
+    if pixelSize is None:
+        pixelSize = PIXEL_SIZE
     print("=" * 60)
     print("SHOLL ANALYSIS - " + imageName)
     print("=" * 60)
@@ -4111,7 +4135,7 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all"):
             continue
         print("  Centroid: " + str(centroid))
 
-        somaResult = getSomaRadius(somaPath, centroid, PIXEL_SIZE)
+        somaResult = getSomaRadius(somaPath, centroid, pixelSize)
         somaRadiusUm = somaResult[0]
         somaAreaUm2 = somaResult[1]
         startRad = somaRadiusUm
@@ -4121,7 +4145,7 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all"):
             print("  Running Sholl parser...")
             t0 = time.time()
             metrics = analyzeOneSholl(
-                maskPath, centroid, startRad, SHOLL_STEP, PIXEL_SIZE,
+                maskPath, centroid, startRad, SHOLL_STEP, pixelSize,
                 shollDir, maskFile, somaAreaUm2
             )
             dt = time.time() - t0
@@ -4238,12 +4262,17 @@ if LARGEST_ONLY:
     maskFiles = filterLargestMasks(maskFiles)
     print("Largest-only filter: " + str(totalBefore) + " -> " + str(len(maskFiles)) + " masks")
 
+imgPixelSize = getPixelSize(imageName)
+
 print("=" * 60)
 print("MMPS CLUSTER ImageJ ANALYSIS")
 print("Image " + str(image_index + 1) + "/" + str(len(allImages)) + ": " + imageName)
 print("Masks for this image: " + str(len(maskFiles)))
 print("Analyses: " + str(ANALYSES))
-print("Pixel size: " + str(PIXEL_SIZE) + " um/px")
+if imageName in PIXEL_SIZE_MAP:
+    print("Pixel size: " + str(imgPixelSize) + " um/px (per-image override)")
+else:
+    print("Pixel size: " + str(imgPixelSize) + " um/px (global)")
 print("=" * 60)
 
 if len(maskFiles) == 0:
@@ -4253,11 +4282,11 @@ if len(maskFiles) == 0:
 totalStart = time.time()
 
 if "skeleton" in ANALYSES:
-    runSkeletonBatch(masksDir, mmps_output_dir, maskFiles, imageName)
+    runSkeletonBatch(masksDir, mmps_output_dir, maskFiles, imageName, imgPixelSize)
     print("")
 
 if "fractal" in ANALYSES:
-    runFractalBatch(masksDir, mmps_output_dir, maskFiles, imageName)
+    runFractalBatch(masksDir, mmps_output_dir, maskFiles, imageName, imgPixelSize)
     print("")
 
 if "sholl" in ANALYSES:
@@ -4273,7 +4302,7 @@ if "sholl" in ANALYSES:
             print("ERROR: somas/ folder exists but is EMPTY - no *_soma.tif files found.")
             print("  SKIPPING Sholl analysis.")
         else:
-            runShollBatch(masksDir, somasDir, mmps_output_dir, maskFiles, imageName)
+            runShollBatch(masksDir, somasDir, mmps_output_dir, maskFiles, imageName, imgPixelSize)
     print("")
 
 print("=" * 60)
@@ -4730,8 +4759,15 @@ TROUBLESHOOTING:
         save_dir = os.path.join(parent_dir, "SpreadAnalysis")
         os.makedirs(save_dir, exist_ok=True)
 
+        # Build per-image pixel size map from session data
+        pixel_size_map = {}
+        for img_name, img_data in self.images.items():
+            per_img_px = img_data.get('pixel_size')
+            if per_img_px is not None:
+                pixel_size_map[os.path.splitext(img_name)[0]] = per_img_px
+
         # --- Generate the spread analysis Python script ---
-        analysis_script = self._build_spread_analysis_script(pixel_size)
+        analysis_script = self._build_spread_analysis_script(pixel_size, pixel_size_map)
         analysis_path = os.path.join(save_dir, "mmps_spread_analysis.py")
         with open(analysis_path, 'w') as f:
             f.write(analysis_script)
@@ -4748,6 +4784,10 @@ TROUBLESHOOTING:
         self.log(f"Spread cluster scripts saved to: {save_dir}")
         self.log(f"  - mmps_spread_analysis.py  (Python analysis script - runs per image)")
         self.log(f"  - submit_spread.sh         (SLURM array job launcher)")
+        if pixel_size_map:
+            self.log(f"  Per-image pixel sizes embedded for {len(pixel_size_map)} image(s):")
+            for name, px in pixel_size_map.items():
+                self.log(f"    {name}: {px} µm/px")
 
         QMessageBox.information(self, "Spread Cluster Scripts Generated",
             f"Scripts saved to:\n{save_dir}\n\n"
@@ -4759,7 +4799,7 @@ TROUBLESHOOTING:
             f"plus a merge job that combines results when done.\n\n"
             f"Requirements: numpy, tifffile, scikit-image")
 
-    def _build_spread_analysis_script(self, pixel_size):
+    def _build_spread_analysis_script(self, pixel_size, pixel_size_map=None):
         """Build the standalone Python script for cell spread / morphology analysis."""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         script = f'''#!/usr/bin/env python3
@@ -4805,6 +4845,13 @@ import tifffile
 from skimage import measure
 
 PIXEL_SIZE = {pixel_size}
+PIXEL_SIZE_MAP = {pixel_size_map or {{}}}
+
+
+def get_pixel_size(image_name):
+    \"\"\"Get per-image pixel size if set, otherwise fall back to global PIXEL_SIZE.\"\"\"
+    return PIXEL_SIZE_MAP.get(image_name, PIXEL_SIZE)
+
 
 MASK_RE = re.compile(r'^(.+?)_(soma_\\d+_\\d+)_area(\\d+)_mask\\.tif$')
 
@@ -5069,8 +5116,12 @@ def main():
 
     total = 0
     for img_name in images_to_process:
-        print(f"\\nImage: {{img_name}}")
-        n = process_image(img_name, masks_dir, somas_dir, pixel_size, output_dir)
+        img_pixel_size = get_pixel_size(img_name)
+        if img_name in PIXEL_SIZE_MAP:
+            print(f"\\nImage: {{img_name}}  (pixel size: {{img_pixel_size}} um/px, per-image override)")
+        else:
+            print(f"\\nImage: {{img_name}}  (pixel size: {{img_pixel_size}} um/px)")
+        n = process_image(img_name, masks_dir, somas_dir, img_pixel_size, output_dir)
         total += n
 
     print(f"\\nDone. Total masks processed: {{total}}")
