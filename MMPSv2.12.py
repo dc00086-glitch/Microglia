@@ -5867,32 +5867,46 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         title.setFont(title_font)
         layout.addWidget(title)
 
-        # --- Pixel Size ---
-        px_group = QGroupBox("Pixel Size")
-        px_layout = QFormLayout()
-        try:
-            global_px = str(self._get_pixel_size())
-        except Exception:
-            global_px = "0.316"
-        cluster_pixel_size = QLineEdit(global_px)
-        px_layout.addRow("Global pixel size (µm/px):", cluster_pixel_size)
+        # --- Pixel Size (read-only summary) ---
+        px_group = QGroupBox("Pixel Calibration")
+        px_layout = QVBoxLayout()
 
-        # Show per-image overrides summary
         per_image_overrides = {name: data.get('pixel_size')
                                for name, data in self.images.items()
                                if data.get('pixel_size') is not None}
+
+        try:
+            global_px = self._get_pixel_size()
+        except Exception:
+            global_px = 0.316
+
+        # Build summary of what each image will use
+        summary_lines = []
+        for img_name in sorted(self.images.keys()):
+            img_px = self._get_pixel_size(img_name)
+            display_name = os.path.splitext(img_name)[0]
+            if img_name in per_image_overrides:
+                summary_lines.append(f"  {display_name}: {img_px} µm/px (per-image)")
+            else:
+                summary_lines.append(f"  {display_name}: {img_px} µm/px")
+
+        global_label = QLabel(f"Global: {global_px} µm/px")
+        global_label.setStyleSheet("font-weight: bold;")
+        px_layout.addWidget(global_label)
+
         if per_image_overrides:
-            override_lines = [f"  {os.path.splitext(n)[0]}: {v} µm/px"
-                              for n, v in per_image_overrides.items()]
-            override_label = QLabel(
-                f"Per-image overrides ({len(per_image_overrides)}):\n" + "\n".join(override_lines))
-            override_label.setStyleSheet("color: palette(dark); font-size: 10px;")
-            override_label.setWordWrap(True)
-            px_layout.addRow(override_label)
+            info_label = QLabel(
+                f"{len(per_image_overrides)} image(s) have per-image overrides.\n"
+                + "\n".join(summary_lines))
         else:
-            no_override_label = QLabel("No per-image overrides set. All images use the global pixel size.")
-            no_override_label.setStyleSheet("color: palette(dark); font-size: 10px;")
-            px_layout.addRow(no_override_label)
+            info_label = QLabel("All images use the global pixel size.\n" + "\n".join(summary_lines))
+        info_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+        info_label.setWordWrap(True)
+        px_layout.addWidget(info_label)
+
+        hint_label = QLabel("Change via Advanced > Set Per-Image Pixel Size or the main pixel size field.")
+        hint_label.setStyleSheet("color: palette(dark); font-style: italic; font-size: 10px;")
+        px_layout.addWidget(hint_label)
 
         px_group.setLayout(px_layout)
         layout.addWidget(px_group)
@@ -6052,11 +6066,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             return
 
         # --- Read settings from dialog ---
-        try:
-            pixel_size = float(cluster_pixel_size.text())
-        except ValueError:
-            QMessageBox.warning(self, "Warning", "Invalid pixel size.")
-            return
+        pixel_size = self._get_pixel_size()
 
         use_min_intensity = min_intensity_check.isChecked()
         min_intensity_percent = min_intensity_slider.value()
