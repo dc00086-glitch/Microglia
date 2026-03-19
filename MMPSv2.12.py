@@ -3931,13 +3931,42 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
             print("  [DEBUG] ThresholdToSelection returned None! Threshold may not be set properly.")
         endRad = parser.maxPossibleRadius()
 
+    # Cap end radius to prevent parser from hanging on large masks
+    MAX_END_RADIUS_UM = 200.0
+    if endRad > MAX_END_RADIUS_UM:
+        print("  Capping end radius from " + str(round(endRad, 1)) + " to " + str(MAX_END_RADIUS_UM) + " um")
+        endRad = MAX_END_RADIUS_UM
+
+    numRadii = int((endRad - startRad) / effectiveStep) if effectiveStep > 0 else 0
     if debug:
         print("  [DEBUG] Radii: start=" + str(round(startRad, 3)) + " step=" + str(round(effectiveStep, 3))
-              + " end=" + str(round(endRad, 3)) + " (all in um)")
+              + " end=" + str(round(endRad, 3)) + " (" + str(numRadii) + " samples)")
 
     parser.setRadii(startRad, effectiveStep, endRad)
     parser.setHemiShells('none')
-    parser.parse()
+
+    # Run parser in a thread with timeout to prevent hanging
+    from java.lang import Thread, Runnable
+    class _ParserRunner(Runnable):
+        def __init__(self, p):
+            self.parser = p
+            self.finished = False
+        def run(self):
+            self.parser.parse()
+            self.finished = True
+
+    PARSE_TIMEOUT_SEC = 120
+    runner = _ParserRunner(parser)
+    parseThread = Thread(runner)
+    parseThread.setDaemon(True)
+    parseThread.start()
+    parseThread.join(long(PARSE_TIMEOUT_SEC * 1000))
+
+    if not runner.finished:
+        print("  TIMEOUT: parser exceeded " + str(PARSE_TIMEOUT_SEC) + "s - skipping")
+        imp.close()
+        _sholl_debug_count[0] += 1
+        return None
 
     if debug:
         print("  [DEBUG] parser.successful() = " + str(parser.successful()))
