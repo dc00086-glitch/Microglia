@@ -3908,8 +3908,6 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
         effectiveStep = stepSize
     else:
         effectiveStep = max(pixelSize, 1.0)
-    nRadii = int((endRadUm - startRad) / effectiveStep) + 1
-    print("    Sholl: radii " + str(round(startRad, 2)) + "-" + str(round(endRadUm, 2)) + " um, step=" + str(round(effectiveStep, 2)) + " um, n=" + str(nRadii))
     parser.setRadii(startRad, effectiveStep, endRadUm)
     parser.setHemiShells('none')
     parser.parse()
