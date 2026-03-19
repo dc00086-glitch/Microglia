@@ -4268,13 +4268,33 @@ FIJI="{fiji_path}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Set up Java 21 (required for SNT/Sholl analysis)
+# Fiji's native launcher ignores JAVA_HOME and --java-home, so we must
+# replace its bundled Java directory with a symlink to JDK 21.
+FIJI_DIR="$(dirname "$FIJI")"
+FIJI_JAVA_LINUX="$FIJI_DIR/java/linux64"
+
 if [ -d "$SCRATCH/jdk-21" ]; then
     export JAVA_HOME="$SCRATCH/jdk-21"
     export PATH="$JAVA_HOME/bin:$PATH"
-    echo "Using Java: $(java -version 2>&1 | head -1)"
+
+    if [ -d "$FIJI_JAVA_LINUX" ]; then
+        # Find the bundled JDK directory (e.g. jdk1.8.0_172)
+        BUNDLED_JDK=$(ls -d "$FIJI_JAVA_LINUX"/jdk* 2>/dev/null | head -1)
+        if [ -n "$BUNDLED_JDK" ] && [ ! -L "$BUNDLED_JDK" ]; then
+            # Back up bundled Java 8 and symlink to JDK 21
+            echo "Replacing Fiji bundled Java with JDK 21..."
+            mv "$BUNDLED_JDK" "${{BUNDLED_JDK}}.java8bak"
+            ln -s "$SCRATCH/jdk-21" "$BUNDLED_JDK"
+            echo "  $BUNDLED_JDK -> $SCRATCH/jdk-21"
+        elif [ -L "$BUNDLED_JDK" ]; then
+            echo "Fiji Java already symlinked: $(readlink "$BUNDLED_JDK")"
+        fi
+    fi
+    echo "Java version: $(java -version 2>&1 | head -1)"
 else
-    echo "WARNING: $SCRATCH/jdk-21 not found. SNT/Sholl analysis requires Java 21+."
+    echo "ERROR: $SCRATCH/jdk-21 not found. SNT/Sholl analysis requires Java 21+."
     echo "Install with: cd \\$SCRATCH && wget https://download.java.net/openjdk/jdk21/ri/openjdk-21+35_linux-x64_bin.tar.gz && tar -xzf openjdk-21+35_linux-x64_bin.tar.gz"
+    exit 1
 fi
 
 # Verify Fiji exists
@@ -4326,9 +4346,9 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --array=0-${{MAX_INDEX}} \\
     --output=mmps_imagej_%A_%a.out \\
     --error=mmps_imagej_%A_%a.err \\
-    --export=MMPS_OUTPUT_DIR,JAVA_HOME,PATH \\
-    --wrap="export JAVA_HOME=$SCRATCH/jdk-21 && export PATH=$SCRATCH/jdk-21/bin:$PATH{module_line}
-\\"$FIJI\\" --java-home \\"$SCRATCH/jdk-21\\" --ij2 --headless --console --mem=2048m --run \\"$SCRIPT_DIR/{wrapper_basename}\\"
+    --export=MMPS_OUTPUT_DIR \\
+    --wrap="{module_line}
+\\"$FIJI\\" --ij2 --headless --console --mem=2048m --run \\"$SCRIPT_DIR/{wrapper_basename}\\"
 ")
 
 echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
