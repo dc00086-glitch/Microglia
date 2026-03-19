@@ -3871,18 +3871,46 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
     cal.setUnit("um")
     imp.setCalibration(cal)
 
-    imp.getProcessor().setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
+    ip = imp.getProcessor()
+    ip.setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
+
+    # Compute actual max radius from mask bounding box instead of
+    # parser.maxPossibleRadius() which uses image corners and causes
+    # the parser to iterate over thousands of empty-background radii.
+    cx, cy = centroid
+    from ij.plugin.filter import ThresholdToSelection
+    roi = ThresholdToSelection.run(imp)
+    if roi is None:
+        imp.close()
+        return None
+    bounds = roi.getBounds()
+    # Max distance from centroid to any corner of the foreground bounding box
+    corners = [
+        (bounds.x, bounds.y),
+        (bounds.x + bounds.width, bounds.y),
+        (bounds.x, bounds.y + bounds.height),
+        (bounds.x + bounds.width, bounds.y + bounds.height),
+    ]
+    maxDistPx = max(((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5 for bx, by in corners)
+    endRadUm = maxDistPx * pixelSize
+    if endRadUm <= 0:
+        imp.close()
+        return None
 
     parser = ImageParser2D(imp)
     parser.setRadiiSpan(0, ImageParser2D.MEAN)
     parser.setPosition(1, 1, 1)
 
-    cx, cy = centroid
     parser.setCenter(cx, cy)
-    # stepSize=0 means "continuous" (pixel-level); SNT hangs with step=0,
-    # so convert to 1 pixel in calibrated units.
-    effectiveStep = stepSize if stepSize > 0 else pixelSize
-    parser.setRadii(startRad, effectiveStep, parser.maxPossibleRadius())
+    # stepSize=0 means "continuous" (pixel-level); SNT can hang with very
+    # small steps over long radii, so enforce a minimum of 1 um.
+    if stepSize > 0:
+        effectiveStep = stepSize
+    else:
+        effectiveStep = max(pixelSize, 1.0)
+    nRadii = int((endRadUm - startRad) / effectiveStep) + 1
+    print("    Sholl: radii " + str(round(startRad, 2)) + "-" + str(round(endRadUm, 2)) + " um, step=" + str(round(effectiveStep, 2)) + " um, n=" + str(nRadii))
+    parser.setRadii(startRad, effectiveStep, endRadUm)
     parser.setHemiShells('none')
     parser.parse()
 
