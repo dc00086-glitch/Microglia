@@ -4265,36 +4265,56 @@ fi
 
 export MMPS_OUTPUT_DIR="$(cd "$1" && pwd)"
 FIJI="{fiji_path}"
+FIJI_DIR="$(dirname "$FIJI")"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Set up Java 21 (required for SNT/Sholl analysis)
-# Fiji's native launcher ignores JAVA_HOME and --java-home, so we must
-# replace its bundled Java directory with a symlink to JDK 21.
-FIJI_DIR="$(dirname "$FIJI")"
-FIJI_JAVA_LINUX="$FIJI_DIR/java/linux64"
+# ---- Java 21 Setup (required for SNT/Sholl analysis) ----
+# Fiji's native launcher ignores JAVA_HOME/--java-home and always uses
+# its bundled Java 8. We bypass it entirely by calling java directly.
+if [ ! -d "$SCRATCH/jdk-21" ]; then
+    echo "ERROR: $SCRATCH/jdk-21 not found. SNT/Sholl analysis requires Java 21+."
+    echo "Install with:"
+    echo "  cd \\$SCRATCH"
+    echo "  wget https://download.java.net/openjdk/jdk21/ri/openjdk-21+35_linux-x64_bin.tar.gz"
+    echo "  tar -xzf openjdk-21+35_linux-x64_bin.tar.gz"
+    exit 1
+fi
+export JAVA_HOME="$SCRATCH/jdk-21"
+export PATH="$JAVA_HOME/bin:$PATH"
+echo "Java: $(java -version 2>&1 | head -1)"
 
-if [ -d "$SCRATCH/jdk-21" ]; then
-    export JAVA_HOME="$SCRATCH/jdk-21"
-    export PATH="$JAVA_HOME/bin:$PATH"
+# Build the command to launch Fiji with JDK 21 (bypassing native launcher)
+# This calls java directly with Fiji's classpath instead of ImageJ-linux64
+FIJI_CMD="$SCRATCH/jdk-21/bin/java -Xmx2048m \\
+  -Djava.awt.headless=true \\
+  -Dpython.cachedir.skip=true \\
+  -Dimagej.dir=$FIJI_DIR \\
+  -Dij.dir=$FIJI_DIR \\
+  -Dplugins.dir=$FIJI_DIR/plugins \\
+  -Dscijava.app.directory=$FIJI_DIR \\
+  -cp $FIJI_DIR/jars/*:$FIJI_DIR/jars/bio-formats/*:$FIJI_DIR/plugins/* \\
+  net.imagej.launcher.ClassLauncher -ijjarpath jars -ijjarpath plugins \\
+  -- --ij2 --headless --console"
 
+echo "Fiji dir: $FIJI_DIR"
+echo "Testing Fiji+JDK21 launch..."
+# Quick sanity check - verify the ClassLauncher resolves
+if ! $SCRATCH/jdk-21/bin/java -cp "$FIJI_DIR/jars/*" -Dimagej.dir="$FIJI_DIR" net.imagej.launcher.ClassLauncher -ijjarpath jars -ijjarpath plugins -- --ij2 --headless --console -eval 'print("FIJI_OK")' 2>/dev/null | grep -q "FIJI_OK"; then
+    echo "WARNING: Direct Java launch test did not return expected output."
+    echo "Falling back to native launcher with symlink approach..."
+    # Attempt symlink as fallback
+    FIJI_JAVA_LINUX="$FIJI_DIR/java/linux64"
     if [ -d "$FIJI_JAVA_LINUX" ]; then
-        # Find the bundled JDK directory (e.g. jdk1.8.0_172)
-        BUNDLED_JDK=$(ls -d "$FIJI_JAVA_LINUX"/jdk* 2>/dev/null | head -1)
+        BUNDLED_JDK=$(ls -d "$FIJI_JAVA_LINUX"/jdk* "$FIJI_JAVA_LINUX"/zulu* 2>/dev/null | grep -v bak | head -1)
         if [ -n "$BUNDLED_JDK" ] && [ ! -L "$BUNDLED_JDK" ]; then
-            # Back up bundled Java 8 and symlink to JDK 21
-            echo "Replacing Fiji bundled Java with JDK 21..."
             mv "$BUNDLED_JDK" "${{BUNDLED_JDK}}.java8bak"
             ln -s "$SCRATCH/jdk-21" "$BUNDLED_JDK"
-            echo "  $BUNDLED_JDK -> $SCRATCH/jdk-21"
-        elif [ -L "$BUNDLED_JDK" ]; then
-            echo "Fiji Java already symlinked: $(readlink "$BUNDLED_JDK")"
+            echo "Symlinked: $BUNDLED_JDK -> $SCRATCH/jdk-21"
         fi
     fi
-    echo "Java version: $(java -version 2>&1 | head -1)"
+    FIJI_CMD="\\"$FIJI\\" --ij2 --headless --console --mem=2048m"
 else
-    echo "ERROR: $SCRATCH/jdk-21 not found. SNT/Sholl analysis requires Java 21+."
-    echo "Install with: cd \\$SCRATCH && wget https://download.java.net/openjdk/jdk21/ri/openjdk-21+35_linux-x64_bin.tar.gz && tar -xzf openjdk-21+35_linux-x64_bin.tar.gz"
-    exit 1
+    echo "Direct Java launch OK"
 fi
 
 # Verify Fiji exists
@@ -4333,8 +4353,36 @@ echo "======================================"
 echo "MMPS ImageJ Cluster Analysis"
 echo "Output dir: $MMPS_OUTPUT_DIR"
 echo "Images found: $NUM_IMAGES"
-echo "Fiji: $FIJI"
+echo "Fiji dir: $FIJI_DIR"
 echo "======================================"
+
+# Write the per-task runner script (uses JDK 21 directly)
+RUNNER_SCRIPT="$SCRIPT_DIR/run_fiji_task.sh"
+cat > "$RUNNER_SCRIPT" << 'RUNNER_EOF'
+#!/bin/bash
+export JAVA_HOME="PLACEHOLDER_JAVA_HOME"
+export PATH="$JAVA_HOME/bin:$PATH"
+FIJI_DIR="PLACEHOLDER_FIJI_DIR"
+WRAPPER="PLACEHOLDER_WRAPPER"
+
+# Launch Fiji via JDK 21 directly (bypasses native launcher's bundled Java 8)
+"$JAVA_HOME/bin/java" -Xmx2048m \\
+    -Djava.awt.headless=true \\
+    -Dpython.cachedir.skip=true \\
+    -Dimagej.dir="$FIJI_DIR" \\
+    -Dij.dir="$FIJI_DIR" \\
+    -Dplugins.dir="$FIJI_DIR/plugins" \\
+    -Dscijava.app.directory="$FIJI_DIR" \\
+    -cp "$FIJI_DIR/jars/*:$FIJI_DIR/jars/bio-formats/*:$FIJI_DIR/plugins/*" \\
+    net.imagej.launcher.ClassLauncher -ijjarpath jars -ijjarpath plugins \\
+    -- --ij2 --headless --console --run "$WRAPPER"
+RUNNER_EOF
+# Fill in actual paths
+sed -i "s|PLACEHOLDER_JAVA_HOME|$SCRATCH/jdk-21|g" "$RUNNER_SCRIPT"
+sed -i "s|PLACEHOLDER_FIJI_DIR|$FIJI_DIR|g" "$RUNNER_SCRIPT"
+sed -i "s|PLACEHOLDER_WRAPPER|$SCRIPT_DIR/{wrapper_basename}|g" "$RUNNER_SCRIPT"
+chmod +x "$RUNNER_SCRIPT"
+echo "Runner script: $RUNNER_SCRIPT"
 
 # --- Submit the array job (one task per image) ---
 ARRAY_JOB_ID=$(sbatch --parsable \\
@@ -4347,9 +4395,8 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --output=mmps_imagej_%A_%a.out \\
     --error=mmps_imagej_%A_%a.err \\
     --export=MMPS_OUTPUT_DIR \\
-    --wrap="{module_line}
-\\"$FIJI\\" --ij2 --headless --console --mem=2048m --run \\"$SCRIPT_DIR/{wrapper_basename}\\"
-")
+    "$RUNNER_SCRIPT"
+)
 
 echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
 
