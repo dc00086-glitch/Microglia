@@ -3851,7 +3851,7 @@ def findSomaFile(somasDir, maskFilename):
     return None
 
 
-_sholl_debug_done = [False]  # mutable flag for first-mask debug output
+_sholl_debug_count = [0]  # how many masks have had debug output
 
 def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, maskName, somaAreaUm2):
     """Run Sholl analysis on one cell mask."""
@@ -3861,7 +3861,7 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
     from sc.fiji.snt.analysis.sholl.math import ShollStats
     from sc.fiji.snt.analysis.sholl.parsers import ImageParser2D
 
-    debug = not _sholl_debug_done[0]  # verbose debug for first mask only
+    debug = _sholl_debug_count[0] < 5  # verbose debug for first 5 masks
 
     cellName = os.path.splitext(maskName)[0]
 
@@ -3886,15 +3886,16 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
     cal.setUnit("um")
     imp.setCalibration(cal)
 
-    # Set threshold using IJ (not just processor) so the parser can see it
-    IJ.setThreshold(imp, 1, 255)
+    # Set threshold directly on processor with NO_LUT_UPDATE for headless compatibility.
+    # IJ.setThreshold() uses RED_LUT which can interfere in headless mode.
+    imp.getProcessor().setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
 
     if debug:
         print("  [DEBUG] Threshold set: minThreshold=" + str(imp.getProcessor().getMinThreshold())
               + " maxThreshold=" + str(imp.getProcessor().getMaxThreshold()))
 
     parser = ImageParser2D(imp)
-    parser.setRadiiSpan(1, ImageParser2D.MEAN)
+    parser.setRadiiSpan(0, ImageParser2D.MEAN)
     parser.setPosition(1, 1, 1)
 
     cx, cy = centroid
@@ -3949,7 +3950,7 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
                     print("  [DEBUG] Profile is None")
             except Exception as e:
                 print("  [DEBUG] Error getting profile: " + str(e))
-        _sholl_debug_done[0] = True
+        _sholl_debug_count[0] += 1
         imp.close()
         return None
 
@@ -3957,11 +3958,11 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
     if profile.isEmpty():
         if debug:
             print("  [DEBUG] Profile is empty after successful parse!")
-        _sholl_debug_done[0] = True
+        _sholl_debug_count[0] += 1
         imp.close()
         return None
 
-    _sholl_debug_done[0] = True
+    _sholl_debug_count[0] += 1
 
     profile.trimZeroCounts()
     lStats = LinearProfileStats(profile)
