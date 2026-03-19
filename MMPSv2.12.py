@@ -3168,7 +3168,7 @@ on MMPS-exported mask files.
 
 Usage (called by the SLURM job script):
     export MMPS_OUTPUT_DIR=/path/to/mmps_output
-    ImageJ-linux64 --ij2 --headless --console --mem=2048m --run mmps_imagej_cluster.py
+    ImageJ-linux64 --java-home $SCRATCH/jdk-21 --ij2 --headless --console --mem=2048m --run mmps_imagej_cluster.py
 
 The MMPS_OUTPUT_DIR should contain:
     masks/   - *_mask.tif files
@@ -4328,7 +4328,7 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --error=mmps_imagej_%A_%a.err \\
     --export=MMPS_OUTPUT_DIR,JAVA_HOME,PATH \\
     --wrap="export JAVA_HOME=$SCRATCH/jdk-21 && export PATH=$SCRATCH/jdk-21/bin:$PATH{module_line}
-\\"$FIJI\\" --ij2 --headless --console --mem=2048m --run \\"$SCRIPT_DIR/{wrapper_basename}\\"
+\\"$FIJI\\" --java-home \\"$SCRATCH/jdk-21\\" --ij2 --headless --console --mem=2048m --run \\"$SCRIPT_DIR/{wrapper_basename}\\"
 ")
 
 echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
