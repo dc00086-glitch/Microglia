@@ -227,9 +227,9 @@ def analyzeOneMask(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, m
     parser.setRadiiSpan(0, ImageParser2D.MEAN)
     parser.setPosition(1, 1, 1)  # channel, frame, Z-slice
 
-    # Set center from our calculated soma centroid (pixel coordinates)
+    # setCenter expects calibrated (um) coordinates, not pixel coordinates
     cx, cy = centroid
-    parser.setCenter(cx, cy)
+    parser.setCenter(cx * pixelSize, cy * pixelSize)
 
     # Set radii: start at soma edge, step size, extend to max possible
     parser.setRadii(startRad, stepSize, parser.maxPossibleRadius())

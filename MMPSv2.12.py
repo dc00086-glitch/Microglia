@@ -3899,10 +3899,14 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
     parser.setPosition(1, 1, 1)
 
     cx, cy = centroid
-    parser.setCenter(cx, cy)
+    # setCenter expects calibrated (um) coordinates, not pixel coordinates
+    cx_cal = cx * pixelSize
+    cy_cal = cy * pixelSize
+    parser.setCenter(cx_cal, cy_cal)
 
     if debug:
-        print("  [DEBUG] Center set to: (" + str(cx) + ", " + str(cy) + ")")
+        print("  [DEBUG] Center pixel: (" + str(cx) + ", " + str(cy)
+              + ") -> calibrated: (" + str(round(cx_cal, 2)) + ", " + str(round(cy_cal, 2)) + ") um")
         # Check if center pixel is foreground
         pxVal = imp.getProcessor().getPixel(cx, cy)
         print("  [DEBUG] Pixel value at center: " + str(pxVal))
