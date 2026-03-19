@@ -5854,14 +5854,237 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                 "Complete soma picking and outlining before generating a cluster script.")
             return
 
-        # Gather settings
-        pixel_size = self._get_pixel_size()
+        # --- Settings dialog ---
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Cluster Mask Generation Settings")
+        dialog.setModal(True)
+        layout = QVBoxLayout()
 
-        area_list = list(range(self.mask_min_area, self.mask_max_area + 1, self.mask_step_size))
-        if area_list[-1] != self.mask_max_area:
-            area_list.append(self.mask_max_area)
+        title = QLabel("Configure Mask Generation for Cluster")
+        title_font = title.font()
+        title_font.setBold(True)
+        title_font.setPointSize(12)
+        title.setFont(title_font)
+        layout.addWidget(title)
 
-        seg_method = self.mask_segmentation_method
+        # --- Pixel Size ---
+        px_group = QGroupBox("Pixel Size")
+        px_layout = QFormLayout()
+        try:
+            global_px = str(self._get_pixel_size())
+        except Exception:
+            global_px = "0.316"
+        cluster_pixel_size = QLineEdit(global_px)
+        px_layout.addRow("Global pixel size (µm/px):", cluster_pixel_size)
+
+        # Show per-image overrides summary
+        per_image_overrides = {name: data.get('pixel_size')
+                               for name, data in self.images.items()
+                               if data.get('pixel_size') is not None}
+        if per_image_overrides:
+            override_lines = [f"  {os.path.splitext(n)[0]}: {v} µm/px"
+                              for n, v in per_image_overrides.items()]
+            override_label = QLabel(
+                f"Per-image overrides ({len(per_image_overrides)}):\n" + "\n".join(override_lines))
+            override_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+            override_label.setWordWrap(True)
+            px_layout.addRow(override_label)
+        else:
+            no_override_label = QLabel("No per-image overrides set. All images use the global pixel size.")
+            no_override_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+            px_layout.addRow(no_override_label)
+
+        px_group.setLayout(px_layout)
+        layout.addWidget(px_group)
+
+        # --- Mask Size Settings ---
+        size_group = QGroupBox("Mask Sizes (µm²)")
+        size_layout = QHBoxLayout()
+
+        size_layout.addWidget(QLabel("Min:"))
+        min_area_spin = QSpinBox()
+        min_area_spin.setRange(10, 2000)
+        min_area_spin.setSingleStep(50)
+        min_area_spin.setValue(self.mask_min_area)
+        min_area_spin.setSuffix(" µm²")
+        size_layout.addWidget(min_area_spin)
+
+        size_layout.addWidget(QLabel("Max:"))
+        max_area_spin = QSpinBox()
+        max_area_spin.setRange(200, 5000)
+        max_area_spin.setSingleStep(50)
+        max_area_spin.setValue(self.mask_max_area)
+        max_area_spin.setSuffix(" µm²")
+        size_layout.addWidget(max_area_spin)
+
+        size_layout.addWidget(QLabel("Step:"))
+        step_spin = QSpinBox()
+        step_spin.setRange(10, 500)
+        step_spin.setSingleStep(10)
+        step_spin.setValue(self.mask_step_size)
+        step_spin.setSuffix(" µm²")
+        size_layout.addWidget(step_spin)
+
+        size_group.setLayout(size_layout)
+        layout.addWidget(size_group)
+
+        # Preview of mask sizes
+        preview_label = QLabel("")
+        preview_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+        preview_label.setWordWrap(True)
+        layout.addWidget(preview_label)
+
+        def update_size_preview():
+            mn = min_area_spin.value()
+            mx = max_area_spin.value()
+            st = step_spin.value()
+            if mn > mx:
+                preview_label.setText("Warning: Min must be <= Max")
+                return
+            sizes = list(range(mn, mx + 1, st))
+            if sizes[-1] != mx:
+                sizes.append(mx)
+            preview_label.setText(f"Masks: {', '.join(str(s) for s in sizes)} µm²  ({len(sizes)} per cell)")
+
+        min_area_spin.valueChanged.connect(lambda: update_size_preview())
+        max_area_spin.valueChanged.connect(lambda: update_size_preview())
+        step_spin.valueChanged.connect(lambda: update_size_preview())
+        update_size_preview()
+
+        # --- Intensity Settings ---
+        intensity_group = QGroupBox("Intensity Filtering")
+        intensity_layout = QVBoxLayout()
+
+        min_intensity_check = QCheckBox("Use minimum intensity threshold")
+        min_intensity_check.setChecked(self.use_min_intensity)
+        intensity_layout.addWidget(min_intensity_check)
+
+        slider_layout = QHBoxLayout()
+        slider_layout.addWidget(QLabel("Min intensity:"))
+        min_intensity_slider = QSlider(Qt.Horizontal)
+        min_intensity_slider.setRange(0, 100)
+        min_intensity_slider.setValue(self.min_intensity_percent)
+        slider_layout.addWidget(min_intensity_slider)
+        min_intensity_label = QLabel(f"{self.min_intensity_percent}%")
+        min_intensity_slider.valueChanged.connect(
+            lambda v: min_intensity_label.setText(f"{v}%"))
+        slider_layout.addWidget(min_intensity_label)
+        intensity_layout.addLayout(slider_layout)
+
+        intensity_group.setLayout(intensity_layout)
+        layout.addWidget(intensity_group)
+
+        # --- Segmentation Method ---
+        seg_group = QGroupBox("Cell Boundary Segmentation")
+        seg_layout = QVBoxLayout()
+
+        seg_combo = QComboBox()
+        seg_combo.addItem("None (independent growth)", "none")
+        seg_combo.addItem("Competitive Growth (shared priority queue)", "competitive")
+        seg_combo.addItem("Watershed Territories (pre-computed basins)", "watershed")
+        for idx in range(seg_combo.count()):
+            if seg_combo.itemData(idx) == self.mask_segmentation_method:
+                seg_combo.setCurrentIndex(idx)
+                break
+        seg_layout.addWidget(seg_combo)
+
+        seg_help = QLabel("")
+        seg_help.setWordWrap(True)
+        seg_help.setStyleSheet("color: palette(dark); font-size: 10px;")
+        seg_layout.addWidget(seg_help)
+
+        def update_seg_help(index):
+            method = seg_combo.itemData(index)
+            if method == 'none':
+                seg_help.setText("Each cell grows independently. Masks may overlap.")
+            elif method == 'competitive':
+                seg_help.setText("All cells grow simultaneously. Pixels claimed by whichever cell reaches first.")
+            elif method == 'watershed':
+                seg_help.setText("Watershed basins confine each cell's growth to its territory.")
+
+        seg_combo.currentIndexChanged.connect(update_seg_help)
+        update_seg_help(seg_combo.currentIndex())
+
+        seg_group.setLayout(seg_layout)
+        layout.addWidget(seg_group)
+
+        # --- Circular Growth Constraint ---
+        circ_group = QGroupBox("Circular Growth Constraint")
+        circ_layout = QVBoxLayout()
+
+        circular_check = QCheckBox("Limit growth to circular boundary around soma")
+        circular_check.setChecked(self.use_circular_constraint)
+        circ_layout.addWidget(circular_check)
+
+        buffer_layout = QHBoxLayout()
+        buffer_layout.addWidget(QLabel("Buffer:"))
+        buffer_spin = QSpinBox()
+        buffer_spin.setRange(0, 2000)
+        buffer_spin.setSingleStep(50)
+        buffer_spin.setValue(self.circular_buffer_um2)
+        buffer_spin.setSuffix(" µm²")
+        buffer_layout.addWidget(buffer_spin)
+        circ_layout.addLayout(buffer_layout)
+
+        circ_group.setLayout(circ_layout)
+        layout.addWidget(circ_group)
+
+        layout.addSpacing(10)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_btn)
+        button_layout.addStretch()
+        ok_btn = QPushButton("Generate Cluster Script")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(dialog.accept)
+        ok_btn.setStyleSheet(
+            "QPushButton { border: 2px solid #4CAF50; font-weight: bold; padding: 8px; }")
+        button_layout.addWidget(ok_btn)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        dialog.setMinimumWidth(500)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        # --- Read settings from dialog ---
+        try:
+            pixel_size = float(cluster_pixel_size.text())
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Invalid pixel size.")
+            return
+
+        use_min_intensity = min_intensity_check.isChecked()
+        min_intensity_percent = min_intensity_slider.value()
+        mask_min_area = min_area_spin.value()
+        mask_max_area = max_area_spin.value()
+        mask_step_size = step_spin.value()
+        seg_method = seg_combo.currentData()
+        use_circular_constraint = circular_check.isChecked()
+        circular_buffer_um2 = buffer_spin.value()
+
+        if mask_min_area > mask_max_area:
+            QMessageBox.warning(self, "Warning", "Min area must be <= Max area.")
+            return
+
+        # Save settings back to instance for next time
+        self.use_min_intensity = use_min_intensity
+        self.min_intensity_percent = min_intensity_percent
+        self.mask_min_area = mask_min_area
+        self.mask_max_area = mask_max_area
+        self.mask_step_size = mask_step_size
+        self.mask_segmentation_method = seg_method
+        self.use_circular_constraint = use_circular_constraint
+        self.circular_buffer_um2 = circular_buffer_um2
+
+        # --- Build area list ---
+        area_list = list(range(mask_min_area, mask_max_area + 1, mask_step_size))
+        if area_list[-1] != mask_max_area:
+            area_list.append(mask_max_area)
 
         # Build per-image soma data
         image_data = {}
@@ -5900,10 +6123,10 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             'pixel_size_um': pixel_size,
             'area_list_um2': area_list,
             'segmentation_method': seg_method,
-            'use_min_intensity': self.use_min_intensity,
-            'min_intensity_percent': self.min_intensity_percent,
-            'use_circular_constraint': self.use_circular_constraint,
-            'circular_buffer_um2': self.circular_buffer_um2,
+            'use_min_intensity': use_min_intensity,
+            'min_intensity_percent': min_intensity_percent,
+            'use_circular_constraint': use_circular_constraint,
+            'circular_buffer_um2': circular_buffer_um2,
         }
 
         script = self._build_cluster_script(settings, image_data, path)
@@ -5912,6 +6135,14 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             with open(path, 'w') as f:
                 f.write(script)
             self.log(f"Cluster script saved to: {save_dir}/")
+            self.log(f"  Global pixel size: {pixel_size} µm/px")
+            if per_image_overrides:
+                self.log(f"  Per-image pixel sizes embedded for {len(per_image_overrides)} image(s):")
+                for name, px in per_image_overrides.items():
+                    self.log(f"    {os.path.splitext(name)[0]}: {px} µm/px")
+            self.log(f"  Segmentation: {seg_method}")
+            self.log(f"  Min intensity: {'On (' + str(min_intensity_percent) + '%)' if use_min_intensity else 'Off'}")
+            self.log(f"  Circular constraint: {'On (buffer=' + str(circular_buffer_um2) + ' µm²)' if use_circular_constraint else 'Off'}")
 
             n_images = len(image_data)
             n_somas = sum(len(d['somas']) for d in image_data.values())
@@ -5922,7 +6153,8 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                 f"Somas: {n_somas}\n"
                 f"Masks to generate: {n_masks}\n"
                 f"Mask sizes: {', '.join(str(a) for a in area_list)} µm²\n"
-                f"Segmentation: {seg_method}\n\n"
+                f"Segmentation: {seg_method}\n"
+                f"{'Per-image pixel sizes: ' + str(len(per_image_overrides)) + ' overrides' if per_image_overrides else 'Pixel size: ' + str(pixel_size) + ' µm/px'}\n\n"
                 f"Upload to your cluster along with the _processed.tif files,\n"
                 f"then run:\n"
                 f"  python {os.path.basename(path)} --input-dir /path/to/processed/tifs")
