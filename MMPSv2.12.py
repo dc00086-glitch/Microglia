@@ -11176,13 +11176,26 @@ if __name__ == '__main__':
 
                 if seg_method == 'competitive':
                     # Competitive growth: all somas grow simultaneously
-                    self.log(f"  Using competitive growth for {len(img_data['soma_outlines'])} cells")
+                    n_img_somas = len(img_data['soma_outlines'])
+                    self.log(f"  Using competitive growth for {n_img_somas} cells")
                     self.progress_status_label.setText(f"Competitive growth: {img_name}")
                     QApplication.processEvents()
 
+                    # Progress callback keeps the UI responsive during the long growth loop
+                    base_pct = int((current_count / total_outlines) * 100)
+                    img_pct_range = max(1, int((n_img_somas / total_outlines) * 100))
+
+                    def _competitive_progress(growth_pct):
+                        bar_val = base_pct + int(growth_pct / 100.0 * img_pct_range)
+                        self.progress_bar.setValue(min(bar_val, 99))
+                        self.progress_status_label.setText(
+                            f"Competitive growth: {img_name} ({growth_pct}%)")
+                        QApplication.processEvents()
+
                     masks = self._create_competitive_masks(
                         processed_img, img_data['soma_outlines'],
-                        area_list, img_pixel_size, img_name
+                        area_list, img_pixel_size, img_name,
+                        progress_callback=_competitive_progress
                     )
                     img_data['masks'].extend(masks)
 
@@ -11191,8 +11204,9 @@ if __name__ == '__main__':
                             m_key = f"{img_name}_{m['soma_id']}_area{m['area_um2']}"
                             self._update_checklist_row(img_cl_path, 0, m_key, 1, 1)
 
-                    current_count += len(img_data['soma_outlines'])
+                    current_count += n_img_somas
                     self.progress_bar.setValue(int((current_count / total_outlines) * 100))
+                    QApplication.processEvents()
                 else:
                     # Independent or watershed: per-soma growth — PARALLEL
                     territory_map = None
@@ -11275,10 +11289,9 @@ if __name__ == '__main__':
                                 img_data['masks'].extend(masks)
                                 current_count += 1
                                 self.progress_bar.setValue(int((current_count / total_outlines) * 100))
-                                if current_count % 10 == 0:
-                                    self.progress_status_label.setText(
-                                        f"Parallel mask gen: {current_count}/{total_outlines}")
-                                    QApplication.processEvents()
+                                self.progress_status_label.setText(
+                                    f"Parallel mask gen: {current_count}/{total_outlines}")
+                                QApplication.processEvents()
                     else:
                         for a in task_args:
                             masks = _grow_masks_for_soma(a)
@@ -11676,7 +11689,7 @@ if __name__ == '__main__':
         return territory
 
     def _create_competitive_masks(self, processed_img, soma_outlines_data, area_list_um2,
-                                   pixel_size_um, img_name):
+                                   pixel_size_um, img_name, progress_callback=None):
         """Create masks for ALL somas in an image using competitive priority region growing.
 
         All somas grow simultaneously from a single shared priority queue.
@@ -11778,6 +11791,10 @@ if __name__ == '__main__':
         # Competitive growth: all somas grow simultaneously
         # Stop each soma when it reaches its largest target
         soma_done = [False] * n_somas
+        total_target_px = largest_target_px * n_somas
+        total_grown = sum(len(go) for go in growth_orders)
+        progress_interval = max(1000, total_target_px // 50)  # ~50 updates
+        pixels_since_update = 0
         while heap:
             neg_intensity, r, c, si = heapq.heappop(heap)
 
@@ -11794,6 +11811,12 @@ if __name__ == '__main__':
                 continue
 
             growth_orders[si].append((r, c))
+            pixels_since_update += 1
+            if progress_callback and pixels_since_update >= progress_interval:
+                total_grown += pixels_since_update
+                pixels_since_update = 0
+                pct = min(99, int(total_grown / total_target_px * 100))
+                progress_callback(pct)
 
             # Push unclaimed 4-connected neighbors
             sc_cy, sc_cx = soma_centroids[si]
