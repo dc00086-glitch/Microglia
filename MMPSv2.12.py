@@ -12623,16 +12623,38 @@ if __name__ == '__main__':
         if img_data.get('processed') is not None:
             return img_data['processed']
 
-        # Try to reload from the _processed.tif file on disk
+        # Try to reload from disk — check stored path first, then output_dir
         name_stem = os.path.splitext(img_name)[0]
+        candidates = []
+        stored_path = img_data.get('processed_path')
+        if stored_path:
+            candidates.append(stored_path)
         if self.output_dir:
-            processed_path = os.path.join(self.output_dir, f"{name_stem}_processed.tif")
-            if os.path.exists(processed_path):
+            candidates.append(os.path.join(self.output_dir, f"{name_stem}_processed.tif"))
+
+        for path in candidates:
+            if path and os.path.exists(path):
                 try:
-                    img_data['processed'] = safe_tiff_read(processed_path)
+                    img_data['processed'] = safe_tiff_read(path)
+                    img_data['processed_path'] = path
+                    self.log(f"   Reloaded processed image for {img_name}")
                     return img_data['processed']
                 except Exception as e:
-                    self.log(f"   ⚠️ Could not reload processed image {name_stem}: {e}")
+                    self.log(f"   ⚠️ Could not reload processed image {name_stem} from {path}: {e}")
+
+        # Last resort: load from raw if it's a single-channel image
+        raw_path = img_data.get('raw_path')
+        if raw_path and os.path.exists(raw_path):
+            try:
+                raw_img = load_tiff_image(raw_path)
+                if raw_img is not None and raw_img.ndim == 2:
+                    img_data['processed'] = raw_img.copy()
+                    self.log(f"   Loaded processed image from raw for {img_name}")
+                    return img_data['processed']
+            except Exception:
+                pass
+
+        self.log(f"   ⚠️ No processed image found on disk for {img_name}")
         return None
 
     def _show_current_mask(self):
