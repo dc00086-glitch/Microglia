@@ -2092,6 +2092,88 @@ class ChannelSelectDialog(QDialog):
         }
 
 
+class CSVMergeDialog(QDialog):
+    """Dialog to select which ImageJ CSV files to merge (Sholl, Skeleton, Fractal, Combined)."""
+    def __init__(self, parent=None, initial_dir=None):
+        super().__init__(parent)
+        self.setWindowTitle("Merge ImageJ CSV Results")
+        self.setModal(True)
+        self.setMinimumWidth(600)
+        self._initial_dir = initial_dir or os.path.expanduser("~")
+        self._file_paths = {}  # csv_type -> file_path
+
+        layout = QVBoxLayout(self)
+
+        instructions = QLabel(
+            "Select which ImageJ result CSVs to merge.\n"
+            "Check a type and browse for its CSV file."
+        )
+        layout.addWidget(instructions)
+
+        # One row per CSV type: checkbox + path display + browse button
+        self._checks = {}
+        self._path_labels = {}
+        csv_types = [
+            ('sholl', 'Sholl Results'),
+            ('skeleton', 'Skeleton Results'),
+            ('fractal', 'Fractal / Convex Hull Results'),
+            ('combined', 'Pre-Combined Results'),
+        ]
+        for csv_type, display_name in csv_types:
+            group = QGroupBox(display_name)
+            row_layout = QHBoxLayout(group)
+
+            check = QCheckBox("Include")
+            check.setChecked(False)
+            self._checks[csv_type] = check
+            row_layout.addWidget(check)
+
+            path_label = QLabel("No file selected")
+            path_label.setStyleSheet("color: gray; font-style: italic;")
+            path_label.setMinimumWidth(300)
+            self._path_labels[csv_type] = path_label
+            row_layout.addWidget(path_label, 1)
+
+            browse_btn = QPushButton("Browse...")
+            browse_btn.clicked.connect(lambda checked, t=csv_type: self._browse(t))
+            row_layout.addWidget(browse_btn)
+
+            layout.addWidget(group)
+
+        # OK / Cancel
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("Merge")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def _browse(self, csv_type):
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Select {csv_type.title()} CSV",
+            self._initial_dir,
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if path:
+            self._file_paths[csv_type] = path
+            self._path_labels[csv_type].setText(os.path.basename(path))
+            self._path_labels[csv_type].setStyleSheet("color: black; font-style: normal;")
+            self._checks[csv_type].setChecked(True)
+            # Update browse directory for convenience
+            self._initial_dir = os.path.dirname(path)
+
+    def get_selected_files(self):
+        """Return dict of {csv_type: file_path} for checked types that have a file."""
+        result = {}
+        for csv_type, check in self._checks.items():
+            if check.isChecked() and csv_type in self._file_paths:
+                result[csv_type] = self._file_paths[csv_type]
+        return result
+
+
 class GrayscaleChannelDialog(QDialog):
     """Dialog to select channel for outlining AND channels for colocalization"""
     def __init__(self, parent=None, channel_names=None, color_image=None,
@@ -4533,8 +4615,9 @@ def main():
         total_rows += merge_csvs(sholl_dir, "Sholl_Results_*.csv", "Sholl_All_Results.csv")
 '''
         script += '''
-    # --- Combine all analysis types into one CSV keyed by cell name ---
-    combined = {}  # cell_name -> merged row dict
+    # --- Combine all analysis types into one CSV keyed by cell name + area ---
+    import re as _re
+    combined = {}  # cell_key_area -> merged row dict
     merge_files = []
     skel_path = os.path.join(mmps_output, "skeleton_results", "Skeleton_Analysis_Results.csv")
     frac_path = os.path.join(mmps_output, "fractal_results", "Fractal_Analysis_Results.csv")
@@ -4549,7 +4632,21 @@ def main():
                 # Build a cell key from Image Name + Soma ID (or Cell Name)
                 img = row.get('Image Name', row.get('image_name', ''))
                 soma = row.get('Soma ID', row.get('soma_id', ''))
-                cell_key = f"{img}_{soma}" if img and soma else row.get('Cell Name', row.get('cell_name', str(len(combined))))
+                cell_base = f"{img}_{soma}" if img and soma else row.get('Cell Name', row.get('cell_name', ''))
+                if not cell_base:
+                    cell_base = f"row_{len(combined)}"
+                # Extract area for area-aware keying
+                area = row.get('Mask Area (um2)', row.get('mask_area_um2', ''))
+                if area:
+                    try:
+                        area = str(int(float(area)))
+                    except (ValueError, TypeError):
+                        area = ''
+                if not area:
+                    m = _re.search(r'_area(\\d+)', cell_base)
+                    if m:
+                        area = m.group(1)
+                cell_key = f"{cell_base}_area{area}" if area else cell_base
                 if cell_key not in combined:
                     combined[cell_key] = {}
                 # Merge columns, skip duplicates already present
@@ -7836,48 +7933,61 @@ if __name__ == '__main__':
                         else:
                             row_data[prefix + k] = v
 
-                    data[cell_name] = {'data': row_data, 'area': area}
+                    # Normalize Sholl cell_name: strip full mask filename down
+                    # to match skeleton/fractal format (imgname_somaid)
+                    if csv_type == 'sholl':
+                        # Sholl uses 'Mask Name' which is the full filename
+                        # e.g. "img_soma_1_0_area400_mask.tif" -> "img_soma_1_0"
+                        import re as _re2
+                        norm = _re2.sub(r'_area\d+_mask\.tif$', '', cell_name)
+                        if norm == cell_name:
+                            norm = _re2.sub(r'_mask\.tif$', '', cell_name)
+                        cell_name = norm
+
+                    # Use area-aware key so multiple areas per cell aren't overwritten
+                    if area is not None:
+                        dict_key = f"{cell_name}_area{area}"
+                    else:
+                        dict_key = cell_name
+                    data[dict_key] = {'data': row_data, 'area': area}
         except Exception as e:
             self.log(f"  ERROR reading {os.path.basename(file_path)}: {e}")
         return data
 
     def import_imagej_results(self):
         """Import ImageJ result CSVs and merge with morphology results.
-        Shows a single multi-file dialog for the user to select all CSVs."""
+        Shows a dialog letting the user pick which CSV types to include."""
         import csv
         import re as _re
 
         # Determine initial directory for file dialog
         initial_dir = self.output_dir if self.output_dir else os.path.expanduser("~")
 
-        # Single multi-file dialog — user selects all CSVs at once
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select all ImageJ Result CSVs to Import",
-            initial_dir,
-            "CSV Files (*.csv);;All Files (*)"
-        )
-        if not file_paths:
+        # Show the CSV merge dialog
+        dlg = CSVMergeDialog(self, initial_dir=initial_dir)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        selected_files = dlg.get_selected_files()
+        if not selected_files:
+            QMessageBox.information(self, "No Files", "No CSV files were selected.")
             return
 
         # Set output_dir from the first selected file's directory
         if not self.output_dir:
-            self.output_dir = os.path.dirname(file_paths[0])
+            first_path = next(iter(selected_files.values()))
+            self.output_dir = os.path.dirname(first_path)
 
         self.log("=" * 50)
         self.log("Importing ImageJ results...")
 
-        # Detect and load each selected CSV
-        sholl_data = {}   # {cell_name: {'data': {...}, 'area': int|None}}
+        # Load each selected CSV by its declared type
+        sholl_data = {}   # {cell_key: {'data': {...}, 'area': int|None}}
         skeleton_data = {}
         fractal_data = {}
 
-        for fp in file_paths:
-            csv_type = self._detect_imagej_csv_type(fp)
-            if csv_type is None:
-                self.log(f"  WARNING: Could not detect type for {os.path.basename(fp)} - skipping")
-                continue
-
-            self.log(f"  Detected {csv_type}: {os.path.basename(fp)}")
+        for csv_type, fp in selected_files.items():
+            self.log(f"  Loading {csv_type}: {os.path.basename(fp)}")
             loaded = self._load_imagej_csv(fp, csv_type)
 
             if csv_type == 'combined':
