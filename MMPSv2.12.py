@@ -7848,14 +7848,24 @@ if __name__ == '__main__':
         # Check for Skeleton
         skel_markers = {'num_branches', 'num_junctions', 'skeleton_area_um2',
                         'num_end_points', 'avg_branch_length_um'}
-        if len(skel_markers & headers_lower) >= 2:
-            return 'skeleton'
+        has_skel = len(skel_markers & headers_lower) >= 2
 
         # Check for Fractal (includes hull columns from same script)
         fractal_markers = {'fractal_dimension', 'fractal_lacunarity_mean',
                            'fractal_r_squared', 'fractal_foreground_pixels'}
         hull_markers = {'hull_area_um2', 'hull_circularity', 'hull_density'}
-        if len(fractal_markers & headers_lower) >= 1 or len(hull_markers & headers_lower) >= 2:
+        has_fractal = len(fractal_markers & headers_lower) >= 1 or len(hull_markers & headers_lower) >= 2
+
+        # Check for unprefixed combined (cluster ImageJ_Combined_Results.csv):
+        # has skeleton + fractal/hull or skeleton + sholl columns in same file
+        has_sholl_cols = len(sholl_markers & headers_lower) >= 2
+        if has_skel and (has_fractal or has_sholl_cols):
+            return 'combined'
+
+        if has_skel:
+            return 'skeleton'
+
+        if has_fractal:
             return 'fractal'
 
         # Filename fallback
@@ -7911,7 +7921,7 @@ if __name__ == '__main__':
                             if m:
                                 area = int(m.group(1))
                     else:
-                        area_str = row.get('mask_area_um2', '')
+                        area_str = row.get('mask_area_um2', '') or row.get('Mask Area (um2)', '')
                         if area_str:
                             try:
                                 area = int(float(area_str))
@@ -7922,13 +7932,31 @@ if __name__ == '__main__':
                     prefix_map = {'sholl': 'sholl_', 'skeleton': 'skel_', 'fractal': 'fractal_'}
                     prefix = prefix_map.get(csv_type, '')
 
+                    # Known skeleton data columns (from cluster wrapper script)
+                    _skel_cols = {'num_branches', 'num_junctions', 'num_end_points',
+                                  'num_junction_voxels', 'num_slab_voxels', 'num_triple_points',
+                                  'num_quadruple_points', 'max_branch_length_um',
+                                  'avg_branch_length_um', 'longest_shortest_path_um',
+                                  'total_skeleton_length_um', 'skeleton_area_um2',
+                                  'branching_density', 'mask_perimeter_um', 'mask_circularity',
+                                  'mask_aspect_ratio', 'mask_roundness', 'mask_solidity'}
+
                     row_data = {}
                     for k, v in row.items():
                         if k.strip().lower() in id_columns:
                             continue
                         if csv_type == 'combined':
-                            # Already prefixed from CombinedAnalysis script
-                            row_data[k] = v
+                            # Check if columns are already prefixed
+                            if k.startswith('skel_') or k.startswith('sholl_') or k.startswith('fractal_') or k.startswith('hull_'):
+                                row_data[k] = v
+                            # Otherwise add the correct prefix based on column name
+                            elif k in _skel_cols:
+                                row_data['skel_' + k] = v
+                            elif k.startswith('fractal_') or k.startswith('hull_'):
+                                row_data[k] = v
+                            else:
+                                # Remaining data columns are Sholl
+                                row_data['sholl_' + k] = v
                         elif k.startswith(prefix) or k.startswith('hull_'):
                             # Already has correct prefix
                             row_data[k] = v
@@ -7958,22 +7986,66 @@ if __name__ == '__main__':
 
     def import_imagej_results(self):
         """Import ImageJ result CSVs and merge with morphology results.
-        Shows a dialog letting the user pick which CSV types to include."""
+        Auto-detects ImageJ CSVs in the output directory when possible,
+        otherwise shows a dialog letting the user pick files."""
         import csv
         import re as _re
 
         # Determine initial directory for file dialog
         initial_dir = self.output_dir if self.output_dir else os.path.expanduser("~")
 
-        # Show the CSV merge dialog
-        dlg = CSVMergeDialog(self, initial_dir=initial_dir)
-        if dlg.exec_() != QDialog.Accepted:
-            return
+        # --- Auto-find: look for ImageJ CSVs in output directory ---
+        auto_found = {}
+        if self.output_dir and os.path.isdir(self.output_dir):
+            # Check for cluster combined CSV first
+            combined_path = os.path.join(self.output_dir, "ImageJ_Combined_Results.csv")
+            if os.path.isfile(combined_path):
+                auto_found['combined'] = combined_path
+            else:
+                # Check individual result subdirectories
+                skel_path = os.path.join(self.output_dir, "skeleton_results", "Skeleton_Analysis_Results.csv")
+                frac_path = os.path.join(self.output_dir, "fractal_results", "Fractal_Analysis_Results.csv")
+                sholl_path = os.path.join(self.output_dir, "sholl_results", "Sholl_All_Results.csv")
+                if os.path.isfile(skel_path):
+                    auto_found['skeleton'] = skel_path
+                if os.path.isfile(frac_path):
+                    auto_found['fractal'] = frac_path
+                if os.path.isfile(sholl_path):
+                    auto_found['sholl'] = sholl_path
 
-        selected_files = dlg.get_selected_files()
-        if not selected_files:
-            QMessageBox.information(self, "No Files", "No CSV files were selected.")
-            return
+        if auto_found:
+            # Check if morphology results exist too
+            morph_path = os.path.join(self.output_dir, "combined_morphology_results.csv")
+            has_morph = os.path.isfile(morph_path)
+
+            found_types = ", ".join(t.title() for t in auto_found.keys())
+            msg = f"Found ImageJ results in output directory:\n\n"
+            for csv_type, path in auto_found.items():
+                msg += f"  {csv_type.title()}: {os.path.basename(path)}\n"
+            if has_morph:
+                msg += f"\nMorphology results also found — will merge both.\n"
+            msg += f"\nUse these files?"
+
+            reply = QMessageBox.question(self, "ImageJ Results Found",
+                                         msg, QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            if reply == QMessageBox.Cancel:
+                return
+            elif reply == QMessageBox.Yes:
+                selected_files = auto_found
+            else:
+                # User said No — fall through to manual dialog
+                auto_found = {}
+
+        if not auto_found:
+            # Show the CSV merge dialog for manual selection
+            dlg = CSVMergeDialog(self, initial_dir=initial_dir)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+
+            selected_files = dlg.get_selected_files()
+            if not selected_files:
+                QMessageBox.information(self, "No Files", "No CSV files were selected.")
+                return
 
         # Set output_dir from the first selected file's directory
         if not self.output_dir:
