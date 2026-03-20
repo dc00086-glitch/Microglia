@@ -11151,6 +11151,12 @@ if __name__ == '__main__':
 
                 self.log(f"Generating masks for {img_name}...")
 
+                # Ensure processed image is in memory (may have been freed to save RAM)
+                processed_img = self._ensure_processed_loaded(img_name)
+                if processed_img is None:
+                    self.log(f"  ⚠️ Skipping {img_name}: cannot load processed image")
+                    continue
+
                 # Use per-image pixel size if set
                 img_pixel_size = self._get_pixel_size(img_name)
                 if img_pixel_size != pixel_size:
@@ -11175,7 +11181,7 @@ if __name__ == '__main__':
                     QApplication.processEvents()
 
                     masks = self._create_competitive_masks(
-                        img_data['processed'], img_data['soma_outlines'],
+                        processed_img, img_data['soma_outlines'],
                         area_list, img_pixel_size, img_name
                     )
                     img_data['masks'].extend(masks)
@@ -11195,10 +11201,10 @@ if __name__ == '__main__':
                         self.progress_status_label.setText(f"Watershed: {img_name}")
                         QApplication.processEvents()
                         territory_map = self._build_watershed_territory_map(
-                            img_data['processed'], img_data['soma_outlines'], img_pixel_size
+                            processed_img, img_data['soma_outlines'], img_pixel_size
                         )
 
-                    processed_img = img_data['processed']
+                    # processed_img already loaded above
                     n_somas = len(img_data['soma_outlines'])
                     n_workers = min(n_somas, max(1, multiprocessing.cpu_count() - 1))
 
