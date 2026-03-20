@@ -8224,9 +8224,6 @@ if __name__ == '__main__':
             self.log(f"  Matched Fractal data: {matched_fractal}/{len(morphology_rows)} cells")
             self.log(f"  Merged results saved to: {merged_path}")
 
-            # --- Average by animal_id and area_um2 ---
-            self._save_averaged_results(morphology_rows, ordered_keys)
-
         self.log("=" * 50)
 
         summary = "ImageJ Results Import Complete\n\n"
@@ -8238,72 +8235,11 @@ if __name__ == '__main__':
             summary += f"Fractal/Hull: {len(fractal_data)} cells\n"
         if morphology_rows:
             summary += f"\nMerged with {len(morphology_rows)} morphology results\n"
-            summary += f"Output: combined_all_results.csv\n"
-            summary += f"Averaged: averaged_by_animal_area.csv"
+            summary += f"Output: combined_all_results.csv"
         else:
             summary += "\nSaved as: imagej_combined_results.csv"
 
         QMessageBox.information(self, "Import Complete", summary)
-
-    def _save_averaged_results(self, rows, all_columns):
-        """Average all numeric data columns grouped by animal_id and area_um2.
-        Saves result as averaged_by_animal_area.csv in the output directory."""
-        import csv
-        from collections import defaultdict
-
-        # Columns to exclude from averaging (metadata / ID columns)
-        skip_cols = {
-            'image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx',
-            'cell_name', 'mask_file', 'skeleton_file', 'pixel_size_um',
-            'upscale_factor', 'soma.id', 'mask.name',
-        }
-
-        # Group rows by (animal_id, area_um2)
-        groups = defaultdict(list)
-        for row in rows:
-            animal = row.get('animal_id', 'unknown')
-            area = row.get('area_um2', '')
-            groups[(animal, area)].append(row)
-
-        # Identify numeric data columns (everything not in skip_cols)
-        data_cols = [c for c in all_columns if c.lower() not in skip_cols]
-
-        # Build averaged rows
-        avg_rows = []
-        for (animal, area), group_rows in sorted(groups.items()):
-            avg_row = {
-                'animal_id': animal,
-                'area_um2': area,
-                'treatment': group_rows[0].get('treatment', ''),
-                'n_cells': len(group_rows),
-            }
-            for col in data_cols:
-                values = []
-                for r in group_rows:
-                    val = r.get(col, '')
-                    if val == '' or val is None:
-                        continue
-                    try:
-                        values.append(float(val))
-                    except (ValueError, TypeError):
-                        pass
-                if values:
-                    avg_row[col] = sum(values) / len(values)
-                else:
-                    avg_row[col] = ''
-
-            avg_rows.append(avg_row)
-
-        # Write averaged CSV
-        out_cols = ['animal_id', 'treatment', 'area_um2', 'n_cells'] + data_cols
-        avg_path = os.path.join(self.output_dir, "averaged_by_animal_area.csv")
-        with open(avg_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=out_cols, extrasaction='ignore')
-            writer.writeheader()
-            writer.writerows(avg_rows)
-
-        self.log(f"  Averaged results: {len(avg_rows)} groups from {len(rows)} cells")
-        self.log(f"  Saved to: {avg_path}")
 
     def show_legend(self):
         """Display a popup dialog with the workflow status legend"""
