@@ -4518,7 +4518,8 @@ MERGE_JOB_ID=$(sbatch --parsable \\
     --dependency=afterok:$ARRAY_JOB_ID \\
     --output=mmps_imagej_merge_%j.out \\
     --error=mmps_imagej_merge_%j.err \\
-    --wrap="python3 \\"$SCRIPT_DIR/merge_results.py\\" \\"$MMPS_OUTPUT_DIR\\""
+    --wrap="{module_line}
+python3 \\"$SCRIPT_DIR/merge_results.py\\" \\"$MMPS_OUTPUT_DIR\\""
 )
 
 echo "Submitted merge job:  $MERGE_JOB_ID (runs after array completes)"
@@ -5320,7 +5321,8 @@ MERGE_JOB_ID=$(sbatch --parsable \\
     --dependency=afterok:$ARRAY_JOB_ID \\
     --output=mmps_spread_merge_%j.out \\
     --error=mmps_spread_merge_%j.err \\
-    --wrap="python3 \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\" --merge-only"
+    --wrap="{module_line}
+python3 \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\" --merge-only"
 )
 
 echo "Submitted merge job:  $MERGE_JOB_ID (runs after array completes)"
