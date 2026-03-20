@@ -3286,7 +3286,7 @@ import time
 # ============================================================================
 
 PIXEL_SIZE = {pixel_size}
-PIXEL_SIZE_MAP = {pixel_size_map or {{}}}
+PIXEL_SIZE_MAP = {repr(pixel_size_map or {})}
 UPSCALE_FACTOR = {upscale_factor}
 SHOLL_STEP = {sholl_step}
 LARGEST_ONLY = {largest_only}
@@ -4943,7 +4943,7 @@ import tifffile
 from skimage import measure
 
 PIXEL_SIZE = {pixel_size}
-PIXEL_SIZE_MAP = {pixel_size_map or {{}}}
+PIXEL_SIZE_MAP = {repr(pixel_size_map or {})}
 
 
 def get_pixel_size(image_name):
