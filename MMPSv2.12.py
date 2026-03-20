@@ -4620,10 +4620,16 @@ def main():
     import re as _re
     combined = {}  # cell_key_area -> merged row dict
     merge_files = []
+    # ID columns that should NOT be prefixed
+    _id_cols = {'cell_name', 'image_name', 'soma_id', 'mask_file', 'mask_area_um2',
+                'pixel_size_um', 'upscale_factor', 'skeleton_file',
+                'Cell Name', 'Image Name', 'Soma ID', 'Mask Name',
+                'Mask Area (um2)', 'Soma Area (um2)',
+                'Centroid X (px)', 'Centroid Y (px)', 'Start Radius (um)'}
     skel_path = os.path.join(mmps_output, "skeleton_results", "Skeleton_Analysis_Results.csv")
     frac_path = os.path.join(mmps_output, "fractal_results", "Fractal_Analysis_Results.csv")
     sholl_path = os.path.join(mmps_output, "sholl_results", "Sholl_All_Results.csv")
-    for csv_path, prefix in [(skel_path, ""), (frac_path, ""), (sholl_path, "")]:
+    for csv_path, prefix in [(skel_path, "skel_"), (frac_path, ""), (sholl_path, "sholl_")]:
         if not os.path.isfile(csv_path):
             continue
         merge_files.append(csv_path)
@@ -4650,10 +4656,15 @@ def main():
                 cell_key = f"{cell_base}_area{area}" if area else cell_base
                 if cell_key not in combined:
                     combined[cell_key] = {}
-                # Merge columns, skip duplicates already present
+                # Merge columns with prefix, skip duplicates already present
                 for k, v in row.items():
-                    if k not in combined[cell_key] or not combined[cell_key][k]:
-                        combined[cell_key][k] = v
+                    # Apply prefix to data columns (skip ID columns and already-prefixed cols)
+                    if prefix and k not in _id_cols and not k.startswith(prefix) and not k.startswith('hull_'):
+                        out_k = prefix + k
+                    else:
+                        out_k = k
+                    if out_k not in combined[cell_key] or not combined[cell_key][out_k]:
+                        combined[cell_key][out_k] = v
 
     if combined:
         # Collect all column headers preserving order
