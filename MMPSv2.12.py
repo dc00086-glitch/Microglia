@@ -10962,6 +10962,23 @@ if __name__ == '__main__':
     def _polygon_to_mask(self, polygon, shape):
         if len(polygon) < 3:
             return np.zeros(shape, dtype=np.uint8)
+
+    def _ensure_outline_masks(self, img_name, img_shape):
+        """Reconstruct outline masks from polygon_points if they are None.
+
+        After a session load, outline masks are set to None to save memory.
+        This method lazily rebuilds them from the stored polygon_points
+        before mask generation so that the soma outline properly seeds
+        the region-growing algorithm.
+        """
+        img_data = self.images.get(img_name)
+        if img_data is None:
+            return
+        for outline in img_data.get('soma_outlines', []):
+            if outline.get('outline') is None and outline.get('polygon_points'):
+                pts = outline['polygon_points']
+                if len(pts) >= 3:
+                    outline['outline'] = self._polygon_to_mask(pts, img_shape)
         poly_array = np.array([[p[1], p[0]] for p in polygon])
         h, w = shape[:2]
         yy, xx = np.mgrid[:h, :w]
@@ -11297,6 +11314,10 @@ if __name__ == '__main__':
                 if processed_img is None:
                     self.log(f"  ⚠️ Skipping {img_name}: cannot load processed image")
                     continue
+
+                # Reconstruct outline masks from polygon_points if needed
+                # (after session load, outline masks are None)
+                self._ensure_outline_masks(img_name, processed_img.shape[:2])
 
                 # Use per-image pixel size if set
                 img_pixel_size = self._get_pixel_size(img_name)
@@ -11717,6 +11738,9 @@ if __name__ == '__main__':
         if processed_img is None:
             QMessageBox.warning(self, "Error", f"Cannot reload processed image for {img_name}")
             return
+
+        # Reconstruct outline masks from polygon_points if needed
+        self._ensure_outline_masks(img_name, processed_img.shape[:2])
 
         for soma_data in img_data['soma_outlines']:
             centroid = soma_data['centroid']
