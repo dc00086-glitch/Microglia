@@ -13198,7 +13198,7 @@ if __name__ == '__main__':
 
         pixel_size = self._get_pixel_size(img_name)
 
-        # Prepare all write tasks
+        # Prepare all write tasks (skip auto-rejected duplicates)
         write_tasks = []
         for mask_data in masks:
             mask = mask_data.get('mask')
@@ -13209,6 +13209,15 @@ if __name__ == '__main__':
             area_um2 = mask_data.get('area_um2', 0)
             mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
             mask_path = os.path.join(self.masks_dir, mask_filename)
+
+            # Don't write auto-rejected duplicates to disk — delete if stale
+            if mask_data.get('duplicate', False):
+                if os.path.exists(mask_path):
+                    try:
+                        os.remove(mask_path)
+                    except Exception:
+                        pass
+                continue
 
             # Always write the current in-memory mask to disk — stale masks
             # from a previous run with different settings must be overwritten.
@@ -13351,6 +13360,9 @@ if __name__ == '__main__':
         """Run disk I/O deferred from reject_current_mask via QTimer."""
         if delete_3d:
             self._delete_rejected_3d_mask(img_name, mask_data)
+        else:
+            # Delete rejected 2D mask TIFF from disk immediately
+            self._delete_rejected_mask_tiff(img_name, mask_data)
         self._evict_old_qa_masks()
 
     def next_mask(self):
