@@ -7691,6 +7691,11 @@ if __name__ == '__main__':
                             mask_pattern = re.compile(
                                 re.escape(img_basename) + r'_(soma_\d+_\d+)_area(\d+)_mask\.tif$'
                             )
+                        # Group masks by soma_id to detect duplicates (same soma,
+                        # different target areas that produced identical pixel masks).
+                        # For each soma, keep only the largest-area mask per unique
+                        # file-size on disk (a rough proxy for pixel count).
+                        soma_masks_pending = {}  # soma_id -> [(size_val, mf, soma_idx)]
                         for mf in all_mask_files:
                             m = mask_pattern.match(mf)
                             if not m:
@@ -7698,21 +7703,39 @@ if __name__ == '__main__':
                             soma_id = m.group(1)
                             size_val = int(m.group(2))
                             soma_idx = soma_ids_list.index(soma_id) if soma_id in soma_ids_list else 0
-                            approval = True if orig_status in ('qa_complete', 'analyzed') else None
-                            mask_entry = {
-                                'image_name': img_name,
-                                'soma_idx': soma_idx,
-                                'soma_id': soma_id,
-                                'mask': None,
-                                'approved': approval,
-                                'duplicate': False,
-                            }
-                            if is_3d:
-                                mask_entry['volume_um3'] = size_val
-                            else:
-                                mask_entry['area_um2'] = size_val
-                            mask_entry['soma_area_um2'] = outline_lookup.get(soma_id, 0)
-                            self.images[img_name]['masks'].append(mask_entry)
+                            soma_masks_pending.setdefault(soma_id, []).append(
+                                (size_val, mf, soma_idx))
+
+                        approval = True if orig_status in ('qa_complete', 'analyzed') else None
+                        for soma_id, entries in soma_masks_pending.items():
+                            # Sort largest area first for consistency with QA ordering
+                            entries.sort(key=lambda e: e[0], reverse=True)
+                            # Detect duplicates: masks with the same file size on disk
+                            # are likely pixel-identical (same growth_order prefix)
+                            seen_file_sizes = {}
+                            for size_val, mf, soma_idx in entries:
+                                mf_path = os.path.join(self.masks_dir, mf)
+                                try:
+                                    fsize = os.path.getsize(mf_path)
+                                except OSError:
+                                    fsize = -1
+                                is_dup = fsize in seen_file_sizes and fsize > 0
+                                if not is_dup:
+                                    seen_file_sizes[fsize] = size_val
+                                mask_entry = {
+                                    'image_name': img_name,
+                                    'soma_idx': soma_idx,
+                                    'soma_id': soma_id,
+                                    'mask': None,
+                                    'approved': False if is_dup else approval,
+                                    'duplicate': is_dup,
+                                }
+                                if is_3d:
+                                    mask_entry['volume_um3'] = size_val
+                                else:
+                                    mask_entry['area_um2'] = size_val
+                                mask_entry['soma_area_um2'] = outline_lookup.get(soma_id, 0)
+                                self.images[img_name]['masks'].append(mask_entry)
 
                     if len(self.images[img_name]['masks']) == 0:
                         print(f"Warning: No masks found for {img_name}")
@@ -13502,23 +13525,35 @@ if __name__ == '__main__':
             # No ImageJ required for simple characteristics
             # Complex analysis (Sholl, Skeleton) will be done separately in ImageJ
 
-            self.log(f"all_masks_flat has {len(self.all_masks_flat)} entries")
+            # Count mask states for diagnostics
+            n_approved = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is True)
+            n_rejected = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is False)
+            n_unreviewed = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is None)
+            n_duplicates = sum(1 for f in self.all_masks_flat if f['mask_data'].get('duplicate'))
+            self.log(f"Mask inventory: {len(self.all_masks_flat)} total | "
+                     f"{n_approved} approved | {n_rejected} rejected | "
+                     f"{n_unreviewed} unreviewed | {n_duplicates} duplicates")
+
+            # Filter to only approved, non-duplicate masks
+            approved_masks = [flat for flat in self.all_masks_flat
+                              if flat['mask_data'].get('approved') is True
+                              and not flat['mask_data'].get('duplicate', False)]
+            total = len(approved_masks)
+
+            self.log(f"Running morphology on {total} approved (non-duplicate) masks")
 
             # Only reload processed images on main thread (fast, one per image)
             # Mask reloads are deferred to the worker thread to avoid freezing the UI
             reloaded_images = set()
             processed_reload_count = 0
-            for flat in self.all_masks_flat:
-                if flat['mask_data'].get('approved') and flat['image_name'] not in reloaded_images:
+            for flat in approved_masks:
+                if flat['image_name'] not in reloaded_images:
                     reloaded_images.add(flat['image_name'])
                     if self._ensure_processed_loaded(flat['image_name']) is not None:
                         if self.images[flat['image_name']].get('processed') is not None:
                             processed_reload_count += 1
             if processed_reload_count > 0:
                 self.log(f"   Reloaded {processed_reload_count} processed images from disk for analysis")
-
-            approved_masks = [flat for flat in self.all_masks_flat if flat['mask_data']['approved']]
-            total = len(approved_masks)
 
             if total == 0:
                 self.log(f"DEBUG: all_masks_flat count = {len(self.all_masks_flat)}")
