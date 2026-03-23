@@ -1343,57 +1343,8 @@ class MorphologyCalculationThread(QThread):
             all_results = [None] * total
             completed = 0
 
-            # Process disk-based masks in parallel
-            if parallel_tasks and n_workers > 1:
-                self.progress.emit(0, f"Parallel morphology: {len(parallel_tasks)} masks, {n_workers} workers")
-
-                pool_args = [(path, ps, sa) for _, path, ps, sa in parallel_tasks]
-
-                with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                    future_to_idx = {}
-                    # Submit in batches to allow progress reporting
-                    batch_size = max(50, n_workers * 4)
-                    for batch_start_i in range(0, len(parallel_tasks), batch_size):
-                        batch_end = min(batch_start_i + batch_size, len(parallel_tasks))
-                        for j in range(batch_start_i, batch_end):
-                            idx, path, ps, sa = parallel_tasks[j]
-                            future = executor.submit(_compute_morphology_single, (path, ps, sa))
-                            future_to_idx[future] = idx
-
-                    for future in as_completed(future_to_idx):
-                        idx = future_to_idx[future]
-                        try:
-                            params = future.result()
-                        except Exception:
-                            params = None
-
-                        if params is not None:
-                            meta = task_metadata[idx]
-                            params['image_name'] = meta[0]
-                            params['soma_id'] = meta[1]
-                            params['soma_idx'] = meta[2]
-                            params['area_um2'] = meta[3]
-                            all_results[idx] = params
-
-                        completed += 1
-                        if completed % 50 == 0 or completed == len(parallel_tasks):
-                            elapsed = time.time() - batch_start
-                            speed = completed / max(elapsed, 0.001)
-                            remaining = (total - completed) / max(speed, 0.001)
-                            if remaining >= 60:
-                                eta_str = f"~{remaining / 60:.1f}min left"
-                            else:
-                                eta_str = f"~{remaining:.0f}s left"
-                            self.progress.emit(
-                                int(completed / total * 100),
-                                f"Parallel: {completed}/{total} [{speed:.1f}/s {eta_str}]"
-                            )
-
-                        # Free mask from memory after processing
-                        self.approved_masks[idx]['mask_data']['mask'] = None
-            else:
-                # Fallback: add all parallel tasks to serial
-                serial_indices.extend([idx for idx, _, _, _ in parallel_tasks])
+            # Process all disk-based masks serially
+            serial_indices.extend([idx for idx, _, _, _ in parallel_tasks])
 
             # Process remaining masks serially (in-memory)
             calculator_cache = {}
@@ -11384,8 +11335,8 @@ if __name__ == '__main__':
                     n_somas = len(img_data['soma_outlines'])
                     n_workers = min(n_somas, max(1, multiprocessing.cpu_count() - 1))
 
-                    self.log(f"  Generating masks for {n_somas} somas using {n_workers} workers")
-                    self.progress_status_label.setText(f"Parallel mask gen: {img_name} ({n_somas} somas, {n_workers} workers)")
+                    self.log(f"  Generating masks for {n_somas} somas")
+                    self.progress_status_label.setText(f"Generating masks: {img_name} ({n_somas} somas)")
                     QApplication.processEvents()
 
                     # Prepare arguments for parallel execution
@@ -11442,26 +11393,14 @@ if __name__ == '__main__':
                             self.use_min_intensity, self.min_intensity_percent, img_name
                         ))
 
-                    # Run in parallel using ProcessPoolExecutor
-                    if n_workers > 1 and n_somas > 2:
-                        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                            futures = {executor.submit(_grow_masks_for_soma, a): i for i, a in enumerate(task_args)}
-                            for future in as_completed(futures):
-                                masks = future.result()
-                                img_data['masks'].extend(masks)
-                                current_count += 1
-                                self.progress_bar.setValue(int((current_count / total_outlines) * 100))
-                                self.progress_status_label.setText(
-                                    f"Parallel mask gen: {current_count}/{total_outlines}")
-                                QApplication.processEvents()
-                    else:
-                        for a in task_args:
-                            masks = _grow_masks_for_soma(a)
-                            img_data['masks'].extend(masks)
-                            current_count += 1
-                            self.progress_bar.setValue(int((current_count / total_outlines) * 100))
-                            self.progress_status_label.setText(f"Generating masks: {current_count}/{total_outlines}")
-                            QApplication.processEvents()
+                    # Run serially (desktops are not set up for parallel work)
+                    for a in task_args:
+                        masks = _grow_masks_for_soma(a)
+                        img_data['masks'].extend(masks)
+                        current_count += 1
+                        self.progress_bar.setValue(int((current_count / total_outlines) * 100))
+                        self.progress_status_label.setText(f"Generating masks: {current_count}/{total_outlines}")
+                        QApplication.processEvents()
 
                     # Mark checklists after all somas done
                     if img_cl_path and os.path.exists(img_cl_path):
