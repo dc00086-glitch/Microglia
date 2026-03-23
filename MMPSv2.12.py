@@ -120,6 +120,49 @@ def extract_channel(img, channel_idx):
 # (must be module-level to be picklable by ProcessPoolExecutor)
 # ============================================================================
 
+def _enforce_mask_subset_invariant(masks):
+    """Ensure smaller masks are strict subsets of larger masks for the same soma.
+
+    After region-growing, the growth_order prefix approach should guarantee
+    this, but rounding and edge cases can occasionally violate it.
+    Walks from the largest mask to the smallest and intersects each smaller
+    mask with its next-larger sibling so that every pixel in the small mask
+    is also present in the large mask.
+
+    Modifies the mask arrays **in place** and returns the number of pixels
+    that were removed to enforce the invariant.
+    """
+    if len(masks) < 2:
+        return 0
+
+    # Sort masks by descending actual pixel count (largest first)
+    indexed = [(i, np.count_nonzero(m['mask'])) for i, m in enumerate(masks)
+               if m.get('mask') is not None and not m.get('duplicate', False)]
+    indexed.sort(key=lambda t: t[1], reverse=True)
+
+    total_removed = 0
+    for pos in range(1, len(indexed)):
+        larger_idx = indexed[pos - 1][0]
+        smaller_idx = indexed[pos][0]
+        larger_mask = masks[larger_idx]['mask']
+        smaller_mask = masks[smaller_idx]['mask']
+        if larger_mask is None or smaller_mask is None:
+            continue
+
+        # Pixels in smaller but NOT in larger => violation
+        violation = (smaller_mask > 0) & (larger_mask == 0)
+        n_bad = int(np.count_nonzero(violation))
+        if n_bad > 0:
+            smaller_mask[violation] = 0
+            masks[smaller_idx]['mask'] = smaller_mask
+            total_removed += n_bad
+            print(f"    ⚠️ Subset fix: removed {n_bad} px from "
+                  f"{masks[smaller_idx].get('area_um2', '?')} µm² mask "
+                  f"(not in {masks[larger_idx].get('area_um2', '?')} µm² mask)")
+
+    return total_removed
+
+
 def _grow_masks_for_soma(args):
     """Standalone region-growing mask generation for a single soma.
 
@@ -256,6 +299,9 @@ def _grow_masks_for_soma(args):
             for idx in indices[:-1]:
                 masks[idx]['approved'] = False
                 masks[idx]['duplicate'] = True
+
+    # Enforce subset invariant: every smaller mask ⊆ every larger mask
+    _enforce_mask_subset_invariant(masks)
 
     return masks
 
@@ -1569,6 +1615,8 @@ class InteractiveImageLabel(QLabel):
         # Centroid dragging
         self.dragging_centroid = False
         self.dragging_centroid_idx = None
+        # Pixel intensity picker
+        self.pixel_picker_mode = False
 
     def set_image(self, qpix, centroids=None, mask_overlay=None, polygon_pts=None):
         self.pix_source = qpix
@@ -1803,6 +1851,12 @@ class InteractiveImageLabel(QLabel):
                 if self.parent_widget and hasattr(self.parent_widget, '_show_measurement'):
                     self.parent_widget._show_measurement()
             self._update_display()
+            return
+
+        # Pixel intensity picker mode
+        if self.pixel_picker_mode and event.button() == Qt.LeftButton:
+            if self.parent_widget and hasattr(self.parent_widget, '_show_pixel_intensity'):
+                self.parent_widget._show_pixel_intensity(coords)
             return
 
         if self.soma_mode and self.parent_widget:
@@ -2310,6 +2364,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.z_key_held = False
         # Measurement tool state
         self.measure_mode = False
+        # Pixel intensity picker state
+        self.pixel_picker_mode = False
         self.measure_point1 = None  # (row, col) image coords
         self.measure_point2 = None
         # --- 3D Z-stack mode state ---
@@ -2498,6 +2554,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.shortcut_help.activated.connect(self.show_shortcut_help)
         self.shortcut_measure = QShortcut(QKeySequence('M'), self)
         self.shortcut_measure.activated.connect(self.toggle_measure_mode)
+        self.shortcut_pixel_picker = QShortcut(QKeySequence('I'), self)
+        self.shortcut_pixel_picker.activated.connect(self.toggle_pixel_picker_mode)
         self.shortcut_undo_qa = QShortcut(QKeySequence('B'), self)
         self.shortcut_undo_qa.activated.connect(self.undo_last_qa)
 
@@ -2868,6 +2926,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.measure_btn.setToolTip("Click two points to measure distance in microns")
         self.measure_btn.setCheckable(True)
         display_btn_layout.addWidget(self.measure_btn)
+
+        # Pixel intensity picker button
+        self.pixel_picker_btn = QPushButton("Pick Intensity (I)")
+        self.pixel_picker_btn.clicked.connect(self.toggle_pixel_picker_mode)
+        self.pixel_picker_btn.setToolTip("Click a pixel to see its intensity in each channel")
+        self.pixel_picker_btn.setCheckable(True)
+        display_btn_layout.addWidget(self.pixel_picker_btn)
 
         # Help button
         help_btn = QPushButton("?")
@@ -5532,6 +5597,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             ("Z + Left-click", "Zoom in"),
             ("Z + Right-click", "Zoom out"),
             ("M", "Toggle measure tool"),
+            ("I", "Toggle pixel intensity picker"),
         ]
         for key, desc in always:
             html += f"<tr><td><code>{key}</code></td><td>{desc}</td></tr>"
@@ -5611,6 +5677,74 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             self.log("Measure tool ON - click two points to measure distance")
         else:
             self.log("Measure tool OFF")
+
+    def toggle_pixel_picker_mode(self):
+        """Toggle pixel intensity picker on/off"""
+        self.pixel_picker_mode = not getattr(self, 'pixel_picker_mode', False)
+        self.pixel_picker_btn.setChecked(self.pixel_picker_mode)
+
+        for label in [self.original_label, self.preview_label, self.processed_label, self.mask_label]:
+            label.pixel_picker_mode = self.pixel_picker_mode
+
+        if self.pixel_picker_mode:
+            self.log("Pixel picker ON - click any pixel to see channel intensities")
+        else:
+            self.log("Pixel picker OFF")
+
+    def _show_pixel_intensity(self, coords):
+        """Show pixel intensity for each channel at the clicked coordinates."""
+        row, col = int(coords[0]), int(coords[1])
+        img_name = self.current_image_name
+        if not img_name:
+            return
+
+        img_data = self.images.get(img_name)
+        if img_data is None:
+            return
+
+        parts = [f"Pixel ({row}, {col})"]
+
+        # Show raw / color image channel values
+        color_img = img_data.get('color_image')
+        if color_img is None and img_data.get('raw_path'):
+            try:
+                raw = load_tiff_image(img_data['raw_path'])
+                if raw is not None and raw.ndim == 3:
+                    img_data['color_image'] = raw.copy()
+                    img_data['num_channels'] = raw.shape[2]
+                    color_img = raw
+            except Exception:
+                pass
+
+        if color_img is not None and color_img.ndim == 3:
+            h, w, nc = color_img.shape
+            if 0 <= row < h and 0 <= col < w:
+                for ch in range(nc):
+                    name = self.channel_names.get(ch, f'Ch{ch + 1}')
+                    if not name:
+                        name = f'Ch{ch + 1}'
+                    val = int(color_img[row, col, ch])
+                    parts.append(f"{name}={val}")
+        elif color_img is not None and color_img.ndim == 2:
+            h, w = color_img.shape
+            if 0 <= row < h and 0 <= col < w:
+                val = int(color_img[row, col])
+                parts.append(f"Gray={val}")
+
+        # Also show processed image value if available
+        processed = img_data.get('processed')
+        if processed is not None:
+            if processed.ndim == 2:
+                ph, pw = processed.shape
+                if 0 <= row < ph and 0 <= col < pw:
+                    parts.append(f"Processed={int(processed[row, col])}")
+            elif processed.ndim == 3 and processed.shape[0] > 1:
+                # 3D stack - show current Z slice
+                z = getattr(self, 'current_z_slice', 0)
+                if 0 <= z < processed.shape[0] and 0 <= row < processed.shape[1] and 0 <= col < processed.shape[2]:
+                    parts.append(f"Processed(z={z})={int(processed[z, row, col])}")
+
+        self.log(" | ".join(parts))
 
     def _get_measure_text(self):
         """Get formatted measurement text for display overlay"""
@@ -6507,6 +6641,10 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
                     print(f"    Auto-rejected {{all_masks[soma_masks_start + idx]['area_um2']}} um2 "
                           f"(duplicate of {{all_masks[soma_masks_start + keep_idx]['area_um2']}} um2, both {{n_px}} px)")
 
+        # Enforce subset invariant for this soma's masks
+        soma_masks_slice = all_masks[soma_masks_start:]
+        _enforce_mask_subset_invariant(soma_masks_slice)
+
     return all_masks
 
 
@@ -6663,6 +6801,9 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
                 masks[idx]['duplicate'] = True
                 print(f"    Auto-rejected {{masks[idx]['area_um2']}} um2 "
                       f"(duplicate of {{masks[keep_idx]['area_um2']}} um2, both {{n_px}} px)")
+
+    # Enforce subset invariant
+    _enforce_mask_subset_invariant(masks)
 
     return masks
 
@@ -11886,6 +12027,9 @@ if __name__ == '__main__':
                         print(f"    ⚠️ Auto-rejected {all_masks[soma_masks_start + idx]['area_um2']} µm² "
                               f"(duplicate of {all_masks[soma_masks_start + keep_idx]['area_um2']} µm², both {n_px} px)")
 
+            # Enforce subset invariant for this soma's masks
+            _enforce_mask_subset_invariant(all_masks[soma_masks_start:])
+
         return all_masks
 
     def _create_annulus_masks(self, centroid, area_list_um2, pixel_size_um, soma_idx, soma_id, processed_img, img_name,
@@ -12081,6 +12225,9 @@ if __name__ == '__main__':
                     masks[idx]['duplicate'] = True
                     print(f"    ⚠️ Auto-rejected {masks[idx]['area_um2']} µm² "
                           f"(duplicate of {masks[keep_idx]['area_um2']} µm², both {n_px} px)")
+
+        # Enforce subset invariant
+        _enforce_mask_subset_invariant(masks)
 
         return masks
 
@@ -13077,9 +13224,8 @@ if __name__ == '__main__':
             mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
             mask_path = os.path.join(self.masks_dir, mask_filename)
 
-            # Skip if already on disk (e.g. from a previous run)
-            if os.path.exists(mask_path):
-                continue
+            # Always write the current in-memory mask to disk — stale masks
+            # from a previous run with different settings must be overwritten.
 
             if mask.dtype == bool:
                 mask_8bit = mask.astype(np.uint8) * 255
