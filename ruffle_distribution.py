@@ -446,22 +446,26 @@ def run_session(args):
     is_3d = session.get("mode_3d", False)
     mode = "3d" if is_3d else "2d"
 
-    # Pixel size: CLI > session global > prompt user
-    global_vxy = None
-    if args.vxy is not None:
-        global_vxy = args.vxy
-    else:
-        ps_str = session.get("pixel_size", "")
-        try:
-            global_vxy = float(ps_str)
-        except (ValueError, TypeError):
-            pass
-    if global_vxy is None:
-        try:
-            global_vxy = float(input("Enter XY pixel size in µm (e.g. 0.22): "))
-        except (ValueError, EOFError):
-            print("ERROR: A pixel size is required. Use --vxy or set it in the session.", file=sys.stderr)
-            sys.exit(1)
+    # --- Pixel sizes: CLI > session per-image > session global > prompt ---
+    # Build per-image pixel size lookup from session
+    image_pixel_sizes = {}  # image_name (stem or full) -> float
+    for img_name, img_data in session.get("images", {}).items():
+        ps = img_data.get("pixel_size")
+        if ps is not None:
+            try:
+                val = float(ps)
+                image_pixel_sizes[img_name] = val
+                image_pixel_sizes[os.path.splitext(img_name)[0]] = val
+            except (ValueError, TypeError):
+                pass
+
+    # Session-level global pixel size
+    session_vxy = None
+    ps_str = session.get("pixel_size", "")
+    try:
+        session_vxy = float(ps_str)
+    except (ValueError, TypeError):
+        pass
 
     global_vz = 1.0
     if args.vz is not None:
@@ -531,17 +535,56 @@ def run_session(args):
         print(f"No .tif files found in {masks_dir}")
         sys.exit(1)
 
-    # Show sample parsed mask filenames
-    sample_shown = 0
+    # --- Collect unique image names and prompt for pixel sizes ---
+    unique_images = []
+    seen = set()
     for f_ in mask_files:
-        n_, s_, _ = parse_mask_filename(f_, mode)
-        if n_ is not None and sample_shown < 3:
-            print(f"  Parsed: {f_!r} -> image={n_!r}  soma_id={s_!r}")
-            sample_shown += 1
+        n_, _, _ = parse_mask_filename(f_, mode)
+        if n_ is not None and n_ not in seen:
+            unique_images.append(n_)
+            seen.add(n_)
+
     unparsed = sum(1 for f_ in mask_files if parse_mask_filename(f_, mode)[0] is None)
     if unparsed:
         print(f"  ({unparsed} mask files did not match the {mode.upper()} filename pattern)")
-    print()
+
+    # For each image, resolve pixel size: CLI --vxy > session per-image > session global > ask
+    final_pixel_sizes = {}  # image_name -> float
+    if args.vxy is not None:
+        # CLI override applies to all
+        for img in unique_images:
+            final_pixel_sizes[img] = args.vxy
+        print(f"Using --vxy={args.vxy} µm for all {len(unique_images)} images\n")
+    else:
+        need_input = []
+        for img in unique_images:
+            ps = image_pixel_sizes.get(img, session_vxy)
+            if ps is not None:
+                final_pixel_sizes[img] = ps
+            else:
+                need_input.append(img)
+
+        if final_pixel_sizes:
+            vals = set(final_pixel_sizes.values())
+            if len(vals) == 1:
+                print(f"Pixel size from session: {vals.pop()} µm for {len(final_pixel_sizes)} image(s)")
+            else:
+                print(f"Per-image pixel sizes from session for {len(final_pixel_sizes)} image(s)")
+
+        if need_input:
+            print(f"\nPixel size needed for {len(need_input)} image(s):")
+            for img in need_input:
+                while True:
+                    try:
+                        val = float(input(f"  {img} — XY pixel size in µm: "))
+                        final_pixel_sizes[img] = val
+                        break
+                    except ValueError:
+                        print("    Please enter a number (e.g. 0.22)")
+                    except EOFError:
+                        print("ERROR: Pixel size is required.", file=sys.stderr)
+                        sys.exit(1)
+        print()
 
     # --- Cache processed images (one per image_name) ---
     processed_cache = {}  # image_name (stem) -> ndarray
@@ -564,7 +607,9 @@ def run_session(args):
                 skipped += 1
                 continue
 
-        vxy = global_vxy
+        vxy = final_pixel_sizes.get(image_name)
+        if vxy is None:
+            continue  # shouldn't happen — we prompted above
         vz = global_vz
 
         soma_path = find_soma_mask(somas_dir, image_name, soma_id)
