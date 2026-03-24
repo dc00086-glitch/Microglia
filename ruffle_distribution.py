@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""
+Ruffle Distribution Analysis
+=============================
+Standalone script to quantify the spatial distribution of membrane ruffles
+(processes) relative to the soma in 3D microglia segmentation masks.
+
+Ruffles = cell_mask minus soma_mask (i.e. the processes extending from the soma).
+
+Outputs per-cell metrics:
+  - ruffle_polarity_index   : PCA-based (0 = evenly distributed, 1 = all on one side)
+  - ruffle_principal_azimuth: azimuthal angle of the dominant ruffle direction (0-360°)
+  - ruffle_principal_elevation: elevation angle of the dominant ruffle direction (0-180°)
+  - ruffle_centroid_offset_um: distance between soma centroid and ruffle centroid
+  - ruffle_centroid_angle_azimuth: azimuth from soma center to ruffle center of mass
+  - ruffle_centroid_angle_elevation: elevation from soma center to ruffle center of mass
+  - ruffle_dispersion       : mean distance of ruffle voxels from soma centroid,
+                              normalized by soma equivalent radius (low = clustered, high = spread)
+  - ruffle_major_axis_um    : extent along the dominant PCA axis
+  - ruffle_mid_axis_um      : extent along the second PCA axis
+  - ruffle_minor_axis_um    : extent along the third PCA axis
+
+Usage:
+  # Single pair of masks
+  python ruffle_distribution.py --cell-mask cell_mask3d.tif --soma-mask soma_mask3d.tif \
+      --vxy 0.22 --vz 1.0
+
+  # Batch mode: folder of MMPS-exported masks + somas
+  python ruffle_distribution.py --masks-dir output/masks --somas-dir output/somas \
+      --vxy 0.22 --vz 1.0 -o ruffle_distribution_results.csv
+
+  # 2D mode (single-slice masks)
+  python ruffle_distribution.py --cell-mask cell_mask.tif --soma-mask soma.tif \
+      --vxy 0.22 --mode 2d
+"""
+
+import argparse
+import csv
+import os
+import re
+import sys
+
+import numpy as np
+import tifffile
+
+
+# ---------------------------------------------------------------------------
+# Core analysis
+# ---------------------------------------------------------------------------
+
+def compute_ruffle_distribution(cell_mask, soma_mask, vxy, vz=1.0, mode="3d"):
+    """Compute ruffle spatial distribution metrics.
+
+    Parameters
+    ----------
+    cell_mask : ndarray
+        Binary cell mask (2D or 3D).
+    soma_mask : ndarray
+        Binary soma mask, same shape as cell_mask.
+    vxy : float
+        Pixel size in XY (µm/pixel).
+    vz : float
+        Voxel depth in Z (µm/slice). Ignored for 2D.
+    mode : str
+        '2d' or '3d'.
+
+    Returns
+    -------
+    dict  with metric name → value, or None if no ruffle voxels.
+    """
+    cell_bin = (cell_mask > 0).astype(np.uint8)
+    soma_bin = (soma_mask > 0).astype(np.uint8)
+
+    # Ruffle = cell minus soma
+    ruffle_bin = cell_bin & (~soma_bin.astype(bool)).astype(np.uint8)
+    ruffle_coords = np.argwhere(ruffle_bin > 0)  # (N, ndim)
+
+    if len(ruffle_coords) < 3:
+        return None
+
+    soma_coords = np.argwhere(soma_bin > 0)
+    if len(soma_coords) == 0:
+        return None
+
+    is_3d = (mode == "3d") and (cell_mask.ndim == 3)
+
+    # Scale coordinates to physical units
+    if is_3d:
+        scale = np.array([vz, vxy, vxy])  # (Z, Y, X)
+    else:
+        scale = np.array([vxy, vxy])  # (row, col)
+        # Flatten to 2D if needed
+        if ruffle_coords.shape[1] == 3:
+            ruffle_coords = ruffle_coords[:, 1:]
+        if soma_coords.shape[1] == 3:
+            soma_coords = soma_coords[:, 1:]
+
+    ruffle_phys = ruffle_coords * scale
+    soma_phys = soma_coords * scale
+
+    soma_centroid = soma_phys.mean(axis=0)
+    ruffle_centroid = ruffle_phys.mean(axis=0)
+
+    # --- PCA on ruffle coordinates (centered on soma centroid) ---
+    centered = ruffle_phys - soma_centroid
+    cov = np.cov(centered.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    # eigh returns ascending order
+    eigenvalues = eigenvalues[::-1]
+    eigenvectors = eigenvectors[:, ::-1]
+
+    major_val = eigenvalues[0]
+    minor_val = eigenvalues[-1]
+    major_vec = eigenvectors[:, 0]
+
+    metrics = {}
+
+    # Polarity index
+    if major_val > 0:
+        metrics["ruffle_polarity_index"] = round(1.0 - (minor_val / major_val), 4)
+    else:
+        metrics["ruffle_polarity_index"] = 0.0
+
+    # Principal direction angles
+    if is_3d:
+        # Azimuth (XY plane, 0-360°) and elevation (from Z axis, 0-180°)
+        dz, dy, dx = major_vec
+        azimuth = np.degrees(np.arctan2(dy, dx)) % 360
+        elevation = np.degrees(np.arccos(np.clip(dz / (np.linalg.norm(major_vec) + 1e-12), -1, 1)))
+        metrics["ruffle_principal_azimuth"] = round(azimuth, 2)
+        metrics["ruffle_principal_elevation"] = round(elevation, 2)
+    else:
+        angle = np.degrees(np.arctan2(major_vec[0], major_vec[1])) % 180
+        metrics["ruffle_principal_angle"] = round(angle, 2)
+
+    # Axis extents
+    metrics["ruffle_major_axis_um"] = round(2 * np.sqrt(max(eigenvalues[0], 0)), 4)
+    if is_3d:
+        metrics["ruffle_mid_axis_um"] = round(2 * np.sqrt(max(eigenvalues[1], 0)), 4)
+    metrics["ruffle_minor_axis_um"] = round(2 * np.sqrt(max(eigenvalues[-1], 0)), 4)
+
+    # --- Centroid offset ---
+    offset_vec = ruffle_centroid - soma_centroid
+    offset_dist = np.linalg.norm(offset_vec)
+    metrics["ruffle_centroid_offset_um"] = round(offset_dist, 4)
+
+    # Direction from soma center to ruffle center
+    if is_3d:
+        dz, dy, dx = offset_vec
+        c_az = np.degrees(np.arctan2(dy, dx)) % 360
+        c_el = np.degrees(np.arccos(np.clip(dz / (offset_dist + 1e-12), -1, 1)))
+        metrics["ruffle_centroid_angle_azimuth"] = round(c_az, 2)
+        metrics["ruffle_centroid_angle_elevation"] = round(c_el, 2)
+    else:
+        c_ang = np.degrees(np.arctan2(offset_vec[0], offset_vec[1])) % 180
+        metrics["ruffle_centroid_angle"] = round(c_ang, 2)
+
+    # --- Dispersion (normalized by soma equivalent radius) ---
+    distances = np.linalg.norm(ruffle_phys - soma_centroid, axis=1)
+    mean_dist = distances.mean()
+    # Soma equivalent radius
+    soma_volume = len(soma_coords) * np.prod(scale)
+    if is_3d:
+        soma_eq_radius = (3 * soma_volume / (4 * np.pi)) ** (1 / 3)
+    else:
+        soma_eq_radius = np.sqrt(soma_volume / np.pi)
+    if soma_eq_radius > 0:
+        metrics["ruffle_dispersion"] = round(mean_dist / soma_eq_radius, 4)
+    else:
+        metrics["ruffle_dispersion"] = 0.0
+
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Mask filename parsing (compatible with MMPS export conventions)
+# ---------------------------------------------------------------------------
+
+MASK_RE_3D = re.compile(r'^(.+?)_(soma_\d+_\d+_\d+)_vol(\d+)_mask3d\.tif$')
+MASK_RE_2D = re.compile(r'^(.+?)_(soma_\d+_\d+)_area(\d+)_mask\.tif$')
+
+
+def parse_mask_filename(filename, mode="3d"):
+    pat = MASK_RE_3D if mode == "3d" else MASK_RE_2D
+    m = pat.match(filename)
+    if m:
+        return m.group(1), m.group(2), int(m.group(3))
+    return None, None, None
+
+
+def find_soma_mask(somas_dir, image_name, soma_id):
+    """Locate the matching soma mask file."""
+    candidates = [
+        f"{image_name}_{soma_id}_soma.tif",
+        f"{image_name}_{soma_id}.tif",
+    ]
+    for c in candidates:
+        path = os.path.join(somas_dir, c)
+        if os.path.exists(path):
+            return path
+    # Fallback: search for soma_id substring
+    if os.path.isdir(somas_dir):
+        for f in os.listdir(somas_dir):
+            if soma_id in f and f.endswith(".tif"):
+                return os.path.join(somas_dir, f)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Single-pair mode
+# ---------------------------------------------------------------------------
+
+def run_single(args):
+    print(f"Loading cell mask: {args.cell_mask}")
+    cell = tifffile.imread(args.cell_mask)
+    print(f"Loading soma mask: {args.soma_mask}")
+    soma = tifffile.imread(args.soma_mask)
+
+    if cell.shape != soma.shape:
+        # If 3D cell but 2D soma, broadcast soma across Z
+        if cell.ndim == 3 and soma.ndim == 2:
+            print("  Broadcasting 2D soma mask across Z slices.")
+            soma = np.broadcast_to(soma[np.newaxis], cell.shape).copy()
+        else:
+            print(f"ERROR: Shape mismatch: cell {cell.shape} vs soma {soma.shape}", file=sys.stderr)
+            sys.exit(1)
+
+    mode = args.mode
+    if mode == "auto":
+        mode = "3d" if cell.ndim == 3 else "2d"
+
+    metrics = compute_ruffle_distribution(cell, soma, args.vxy, args.vz, mode=mode)
+    if metrics is None:
+        print("No ruffle voxels found (cell minus soma is empty).")
+        return
+
+    print("\n--- Ruffle Distribution Metrics ---")
+    for k, v in metrics.items():
+        print(f"  {k:40s} = {v}")
+
+    if args.output:
+        with open(args.output, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(metrics.keys()))
+            writer.writeheader()
+            writer.writerow(metrics)
+        print(f"\nResults saved to {args.output}")
+
+
+# ---------------------------------------------------------------------------
+# Batch mode
+# ---------------------------------------------------------------------------
+
+def run_batch(args):
+    masks_dir = args.masks_dir
+    somas_dir = args.somas_dir
+    mode = args.mode
+
+    mask_files = sorted(f for f in os.listdir(masks_dir) if f.endswith(".tif"))
+    if not mask_files:
+        print(f"No .tif files found in {masks_dir}")
+        sys.exit(1)
+
+    # Detect mode from filenames if auto
+    if mode == "auto":
+        if any(MASK_RE_3D.match(f) for f in mask_files):
+            mode = "3d"
+        else:
+            mode = "2d"
+
+    print(f"Mode: {mode.upper()}")
+    print(f"Masks dir : {masks_dir}")
+    print(f"Somas dir : {somas_dir}")
+    print(f"Pixel size: vxy={args.vxy} µm, vz={args.vz} µm")
+    print()
+
+    all_results = []
+    for fname in mask_files:
+        image_name, soma_id, _ = parse_mask_filename(fname, mode)
+        if image_name is None:
+            continue
+
+        soma_path = find_soma_mask(somas_dir, image_name, soma_id)
+        if soma_path is None:
+            print(f"  SKIP {fname}: no matching soma mask found")
+            continue
+
+        cell = tifffile.imread(os.path.join(masks_dir, fname))
+        soma = tifffile.imread(soma_path)
+
+        if cell.shape != soma.shape:
+            if cell.ndim == 3 and soma.ndim == 2:
+                soma = np.broadcast_to(soma[np.newaxis], cell.shape).copy()
+            else:
+                print(f"  SKIP {fname}: shape mismatch cell {cell.shape} vs soma {soma.shape}")
+                continue
+
+        metrics = compute_ruffle_distribution(cell, soma, args.vxy, args.vz, mode=mode)
+        if metrics is None:
+            print(f"  SKIP {fname}: no ruffle voxels")
+            continue
+
+        row = {"image_name": image_name, "soma_id": soma_id}
+        row.update(metrics)
+        all_results.append(row)
+        print(f"  OK   {fname}  polarity={metrics['ruffle_polarity_index']:.3f}  "
+              f"offset={metrics['ruffle_centroid_offset_um']:.2f} µm  "
+              f"dispersion={metrics['ruffle_dispersion']:.2f}")
+
+    if not all_results:
+        print("\nNo cells processed.")
+        return
+
+    # Write CSV
+    out_path = args.output or os.path.join(os.path.dirname(masks_dir), "ruffle_distribution_results.csv")
+    fieldnames = list(all_results[0].keys())
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_results)
+
+    print(f"\n{len(all_results)} cells processed. Results saved to {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Quantify ruffle (process) spatial distribution relative to the soma.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--vxy", type=float, required=True, help="XY pixel size in µm")
+    parser.add_argument("--vz", type=float, default=1.0, help="Z voxel depth in µm (default: 1.0)")
+    parser.add_argument("--mode", choices=["2d", "3d", "auto"], default="auto",
+                        help="Analysis mode (default: auto-detect)")
+    parser.add_argument("-o", "--output", type=str, default=None, help="Output CSV path")
+
+    # Single-pair mode
+    parser.add_argument("--cell-mask", type=str, help="Path to a single cell mask TIFF")
+    parser.add_argument("--soma-mask", type=str, help="Path to the matching soma mask TIFF")
+
+    # Batch mode
+    parser.add_argument("--masks-dir", type=str, help="Folder of MMPS-exported cell masks")
+    parser.add_argument("--somas-dir", type=str, help="Folder of MMPS-exported soma masks")
+
+    args = parser.parse_args()
+
+    if args.cell_mask and args.soma_mask:
+        run_single(args)
+    elif args.masks_dir and args.somas_dir:
+        run_batch(args)
+    else:
+        parser.error("Provide either --cell-mask + --soma-mask, or --masks-dir + --somas-dir")
+
+
+if __name__ == "__main__":
+    main()
