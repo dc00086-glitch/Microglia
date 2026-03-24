@@ -520,7 +520,7 @@ def run_session(args):
     print(f"Output   : {output_dir}")
     print(f"Masks    : {masks_dir}")
     print(f"Somas    : {somas_dir}")
-    print(f"Pixel XY : {global_vxy} µm,  Z: {global_vz} µm")
+    print(f"Pixel XY : {session_vxy} µm (session default),  Z: {global_vz} µm")
     if approved_masks:
         print(f"Approved : {len(approved_masks)} mask entries")
         sample = list(approved_masks)[:3]
