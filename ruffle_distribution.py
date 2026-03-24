@@ -3,9 +3,14 @@
 Ruffle Distribution Analysis
 =============================
 Standalone script to quantify the spatial distribution of membrane ruffles
-(processes) relative to the soma in 3D microglia segmentation masks.
+relative to the soma in microglia.
 
-Ruffles = cell_mask minus soma_mask (i.e. the processes extending from the soma).
+Workflow per cell:
+  1. Overlay soma mask on the processed (grayscale) image
+  2. Crop to the cell-mask bounding box
+  3. Otsu-threshold to separate bright ruffles from dimmer processes
+  4. Keep only pixels above the threshold (upper intensity peak)
+  5. Compute spatial stats on those ruffle pixels relative to the soma
 
 Outputs per-cell metrics:
   - ruffle_polarity_index   : PCA-based (0 = evenly distributed, 1 = all on one side)
@@ -46,21 +51,35 @@ import sys
 
 import numpy as np
 import tifffile
+from skimage.filters import threshold_otsu
 
 
 # ---------------------------------------------------------------------------
 # Core analysis
 # ---------------------------------------------------------------------------
 
-def compute_ruffle_distribution(cell_mask, soma_mask, vxy, vz=1.0, mode="3d"):
+def compute_ruffle_distribution(processed_img, soma_mask, cell_mask, vxy,
+                                vz=1.0, mode="3d"):
     """Compute ruffle spatial distribution metrics.
+
+    Workflow
+    --------
+    1. Overlay soma on the processed (grayscale) image.
+    2. Crop to the cell-mask bounding box.
+    3. Otsu-threshold the cropped region to separate bright ruffles from
+       dimmer processes.
+    4. Keep only pixels above the Otsu threshold (the upper intensity peak).
+    5. Compute spatial statistics on those ruffle pixels relative to the soma
+       centroid.
 
     Parameters
     ----------
-    cell_mask : ndarray
-        Binary cell mask (2D or 3D).
+    processed_img : ndarray
+        Grayscale processed image (2D or 3D).
     soma_mask : ndarray
-        Binary soma mask, same shape as cell_mask.
+        Binary soma mask, same shape as processed_img.
+    cell_mask : ndarray
+        Binary cell mask, same shape as processed_img.
     vxy : float
         Pixel size in XY (µm/pixel).
     vz : float
@@ -70,30 +89,54 @@ def compute_ruffle_distribution(cell_mask, soma_mask, vxy, vz=1.0, mode="3d"):
 
     Returns
     -------
-    dict  with metric name → value, or None if no ruffle voxels.
+    dict  with metric name -> value, or None if no ruffle voxels.
     """
-    cell_bin = (cell_mask > 0).astype(np.uint8)
-    soma_bin = (soma_mask > 0).astype(np.uint8)
+    cell_bin = cell_mask > 0
+    soma_bin = soma_mask > 0
 
-    # Ruffle = cell minus soma
-    ruffle_bin = cell_bin & (~soma_bin.astype(bool)).astype(np.uint8)
-    ruffle_coords = np.argwhere(ruffle_bin > 0)  # (N, ndim)
+    soma_coords = np.argwhere(soma_bin)
+    if len(soma_coords) == 0:
+        return None
+
+    # Crop to cell-mask bounding box for Otsu
+    cell_coords = np.argwhere(cell_bin)
+    if len(cell_coords) < 3:
+        return None
+    mins = cell_coords.min(axis=0)
+    maxs = cell_coords.max(axis=0) + 1
+    if cell_bin.ndim == 2:
+        crop_slice = (slice(mins[0], maxs[0]), slice(mins[1], maxs[1]))
+    else:
+        crop_slice = (slice(mins[0], maxs[0]), slice(mins[1], maxs[1]),
+                      slice(mins[2], maxs[2]))
+
+    cropped_img = processed_img[crop_slice]
+    cropped_cell = cell_bin[crop_slice]
+
+    # Otsu on cell-masked intensities
+    cell_intensities = cropped_img[cropped_cell]
+    if len(cell_intensities) < 3:
+        return None
+
+    try:
+        otsu_thresh = threshold_otsu(cell_intensities)
+    except ValueError:
+        return None
+
+    # Bright ruffle pixels: above Otsu AND inside cell AND outside soma
+    ruffle_bin = (processed_img > otsu_thresh) & cell_bin & (~soma_bin)
+    ruffle_coords = np.argwhere(ruffle_bin)
 
     if len(ruffle_coords) < 3:
         return None
 
-    soma_coords = np.argwhere(soma_bin > 0)
-    if len(soma_coords) == 0:
-        return None
-
-    is_3d = (mode == "3d") and (cell_mask.ndim == 3)
+    is_3d = (mode == "3d") and (processed_img.ndim == 3)
 
     # Scale coordinates to physical units
     if is_3d:
         scale = np.array([vz, vxy, vxy])  # (Z, Y, X)
     else:
         scale = np.array([vxy, vxy])  # (row, col)
-        # Flatten to 2D if needed
         if ruffle_coords.shape[1] == 3:
             ruffle_coords = ruffle_coords[:, 1:]
         if soma_coords.shape[1] == 3:
@@ -109,7 +152,6 @@ def compute_ruffle_distribution(cell_mask, soma_mask, vxy, vz=1.0, mode="3d"):
     centered = ruffle_phys - soma_centroid
     cov = np.cov(centered.T)
     eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    # eigh returns ascending order
     eigenvalues = eigenvalues[::-1]
     eigenvectors = eigenvectors[:, ::-1]
 
@@ -119,6 +161,12 @@ def compute_ruffle_distribution(cell_mask, soma_mask, vxy, vz=1.0, mode="3d"):
 
     metrics = {}
 
+    # Number of ruffle pixels and their mean intensity
+    ruffle_intensities = processed_img[ruffle_bin]
+    metrics["otsu_threshold"] = round(float(otsu_thresh), 4)
+    metrics["ruffle_pixel_count"] = int(len(ruffle_coords))
+    metrics["ruffle_mean_intensity"] = round(float(ruffle_intensities.mean()), 4)
+
     # Polarity index
     if major_val > 0:
         metrics["ruffle_polarity_index"] = round(1.0 - (minor_val / major_val), 4)
@@ -127,7 +175,6 @@ def compute_ruffle_distribution(cell_mask, soma_mask, vxy, vz=1.0, mode="3d"):
 
     # Principal direction angles
     if is_3d:
-        # Azimuth (XY plane, 0-360°) and elevation (from Z axis, 0-180°)
         dz, dy, dx = major_vec
         azimuth = np.degrees(np.arctan2(dy, dx)) % 360
         elevation = np.degrees(np.arccos(np.clip(dz / (np.linalg.norm(major_vec) + 1e-12), -1, 1)))
@@ -162,7 +209,6 @@ def compute_ruffle_distribution(cell_mask, soma_mask, vxy, vz=1.0, mode="3d"):
     # --- Dispersion (normalized by soma equivalent radius) ---
     distances = np.linalg.norm(ruffle_phys - soma_centroid, axis=1)
     mean_dist = distances.mean()
-    # Soma equivalent radius
     soma_volume = len(soma_coords) * np.prod(scale)
     if is_3d:
         soma_eq_radius = (3 * soma_volume / (4 * np.pi)) ** (1 / 3)
@@ -219,9 +265,10 @@ def run_single(args):
     cell = tifffile.imread(args.cell_mask)
     print(f"Loading soma mask: {args.soma_mask}")
     soma = tifffile.imread(args.soma_mask)
+    print(f"Loading processed image: {args.processed_image}")
+    processed_img = tifffile.imread(args.processed_image)
 
     if cell.shape != soma.shape:
-        # If 3D cell but 2D soma, broadcast soma across Z
         if cell.ndim == 3 and soma.ndim == 2:
             print("  Broadcasting 2D soma mask across Z slices.")
             soma = np.broadcast_to(soma[np.newaxis], cell.shape).copy()
@@ -234,9 +281,9 @@ def run_single(args):
         mode = "3d" if cell.ndim == 3 else "2d"
 
     vz = args.vz if args.vz is not None else 1.0
-    metrics = compute_ruffle_distribution(cell, soma, args.vxy, vz, mode=mode)
+    metrics = compute_ruffle_distribution(processed_img, soma, cell, args.vxy, vz, mode=mode)
     if metrics is None:
-        print("No ruffle voxels found (cell minus soma is empty).")
+        print("No ruffle voxels found after Otsu filtering.")
         return
 
     print("\n--- Ruffle Distribution Metrics ---")
@@ -300,9 +347,20 @@ def run_batch(args):
                 print(f"  SKIP {fname}: shape mismatch cell {cell.shape} vs soma {soma.shape}")
                 continue
 
-        metrics = compute_ruffle_distribution(cell, soma, args.vxy, vz, mode=mode)
+        # Load processed image for this image_name
+        proc_path = None
+        if args.processed_dir:
+            proc_path = os.path.join(args.processed_dir, f"{image_name}_processed.tif")
+            if not os.path.isfile(proc_path):
+                proc_path = None
+        if proc_path is None:
+            print(f"  SKIP {fname}: no processed image found for {image_name}")
+            continue
+        processed_img = tifffile.imread(proc_path)
+
+        metrics = compute_ruffle_distribution(processed_img, soma, cell, args.vxy, vz, mode=mode)
         if metrics is None:
-            print(f"  SKIP {fname}: no ruffle voxels")
+            print(f"  SKIP {fname}: no ruffle voxels after Otsu filtering")
             continue
 
         if mode == "3d":
@@ -388,40 +446,32 @@ def run_session(args):
     is_3d = session.get("mode_3d", False)
     mode = "3d" if is_3d else "2d"
 
-    # Global pixel size (fallback)
+    # Pixel size: CLI > session global > prompt user
     global_vxy = None
-    ps_str = session.get("pixel_size", "")
-    try:
-        global_vxy = float(ps_str)
-    except (ValueError, TypeError):
-        pass
-
-    global_vz = 1.0
-    vz_str = session.get("voxel_size_z", "")
-    try:
-        global_vz = float(vz_str)
-    except (ValueError, TypeError):
-        pass
-
-    # CLI overrides if provided
     if args.vxy is not None:
         global_vxy = args.vxy
+    else:
+        ps_str = session.get("pixel_size", "")
+        try:
+            global_vxy = float(ps_str)
+        except (ValueError, TypeError):
+            pass
+    if global_vxy is None:
+        try:
+            global_vxy = float(input("Enter XY pixel size in µm (e.g. 0.22): "))
+        except (ValueError, EOFError):
+            print("ERROR: A pixel size is required. Use --vxy or set it in the session.", file=sys.stderr)
+            sys.exit(1)
+
+    global_vz = 1.0
     if args.vz is not None:
         global_vz = args.vz
-
-    # --- Build per-image pixel size lookup ---
-    # Session keys include file extension (e.g. "image.tif") but mask
-    # filename parsing yields stems (e.g. "image"). Store both forms.
-    image_pixel_sizes = {}
-    for img_name, img_data in session.get("images", {}).items():
-        ps = img_data.get("pixel_size")
-        if ps is not None:
-            try:
-                val = float(ps)
-                image_pixel_sizes[img_name] = val
-                image_pixel_sizes[os.path.splitext(img_name)[0]] = val
-            except (ValueError, TypeError):
-                pass
+    else:
+        vz_str = session.get("voxel_size_z", "")
+        try:
+            global_vz = float(vz_str)
+        except (ValueError, TypeError):
+            pass
 
     # --- Collect approved masks ---
     # Store with both the full session key and the stem so lookups from
@@ -461,16 +511,14 @@ def run_session(args):
                             morph_lookup[(stem, msid)] = morph_lookup[(mimg, msid)]
             print(f"Morphology CSV loaded: {len(morph_lookup)} entries from {morph_csv}")
 
-    print(f"Session : {session_path}")
-    print(f"Mode    : {mode.upper()}")
-    print(f"Masks   : {masks_dir}")
-    print(f"Somas   : {somas_dir}")
-    print(f"Default : vxy={global_vxy} µm, vz={global_vz} µm")
-    if image_pixel_sizes:
-        print(f"Per-image pixel sizes found for {len(image_pixel_sizes)} image(s)")
+    print(f"Session  : {session_path}")
+    print(f"Mode     : {mode.upper()}")
+    print(f"Output   : {output_dir}")
+    print(f"Masks    : {masks_dir}")
+    print(f"Somas    : {somas_dir}")
+    print(f"Pixel XY : {global_vxy} µm,  Z: {global_vz} µm")
     if approved_masks:
-        print(f"Approved masks: {len(approved_masks)}")
-        # Show a sample to help diagnose matching issues
+        print(f"Approved : {len(approved_masks)} mask entries")
         sample = list(approved_masks)[:3]
         for img, sid in sample:
             print(f"  e.g. image={img!r}  soma_id={sid!r}")
@@ -495,6 +543,9 @@ def run_session(args):
         print(f"  ({unparsed} mask files did not match the {mode.upper()} filename pattern)")
     print()
 
+    # --- Cache processed images (one per image_name) ---
+    processed_cache = {}  # image_name (stem) -> ndarray
+
     all_results = []
     skipped = 0
     mismatch_shown = 0
@@ -513,12 +564,7 @@ def run_session(args):
                 skipped += 1
                 continue
 
-        # Per-image pixel size or global fallback
-        vxy = image_pixel_sizes.get(image_name, global_vxy)
-        if vxy is None:
-            print(f"  SKIP {fname}: no pixel size found (set --vxy or check session)")
-            continue
-
+        vxy = global_vxy
         vz = global_vz
 
         soma_path = find_soma_mask(somas_dir, image_name, soma_id)
@@ -526,19 +572,37 @@ def run_session(args):
             print(f"  SKIP {fname}: no matching soma mask found")
             continue
 
+        # Load processed image (cached per image_name)
+        if image_name not in processed_cache:
+            proc_path = os.path.join(output_dir, f"{image_name}_processed.tif")
+            if not os.path.isfile(proc_path):
+                print(f"  SKIP {fname}: processed image not found at {proc_path}")
+                continue
+            processed_cache[image_name] = tifffile.imread(proc_path)
+
+        processed_img = processed_cache[image_name]
+
         cell = tifffile.imread(os.path.join(masks_dir, fname))
         soma = tifffile.imread(soma_path)
 
+        # Ensure shapes match
         if cell.shape != soma.shape:
             if cell.ndim == 3 and soma.ndim == 2:
                 soma = np.broadcast_to(soma[np.newaxis], cell.shape).copy()
             else:
                 print(f"  SKIP {fname}: shape mismatch cell {cell.shape} vs soma {soma.shape}")
                 continue
+        if processed_img.shape != cell.shape:
+            if processed_img.ndim > cell.ndim:
+                # Processed might be multi-channel; take first channel
+                processed_img = processed_img[..., 0] if processed_img.shape[-1] <= 4 else processed_img[0]
+            if processed_img.ndim == 3 and cell.ndim == 2:
+                # Max-project 3D processed to 2D
+                processed_img = processed_img.max(axis=0)
 
-        metrics = compute_ruffle_distribution(cell, soma, vxy, vz, mode=mode)
+        metrics = compute_ruffle_distribution(processed_img, soma, cell, vxy, vz, mode=mode)
         if metrics is None:
-            print(f"  SKIP {fname}: no ruffle voxels")
+            print(f"  SKIP {fname}: no ruffle voxels after Otsu filtering")
             continue
 
         # Compute mask area in µm²
@@ -564,9 +628,10 @@ def run_session(args):
         }
         row.update(metrics)
         all_results.append(row)
-        print(f"  OK   {fname}  (vxy={vxy})  polarity={metrics['ruffle_polarity_index']:.3f}  "
-              f"offset={metrics['ruffle_centroid_offset_um']:.2f} µm  "
-              f"dispersion={metrics['ruffle_dispersion']:.2f}")
+        print(f"  OK   {fname}  otsu={metrics['otsu_threshold']:.1f}  "
+              f"ruffles={metrics['ruffle_pixel_count']}  "
+              f"polarity={metrics['ruffle_polarity_index']:.3f}  "
+              f"offset={metrics['ruffle_centroid_offset_um']:.2f} µm")
 
     if skipped:
         print(f"\n  ({skipped} unapproved masks skipped)")
@@ -609,10 +674,12 @@ def main():
     # Single-pair mode
     parser.add_argument("--cell-mask", type=str, help="Path to a single cell mask TIFF")
     parser.add_argument("--soma-mask", type=str, help="Path to the matching soma mask TIFF")
+    parser.add_argument("--processed-image", type=str, help="Path to the processed grayscale TIFF (for single mode)")
 
     # Batch mode
     parser.add_argument("--masks-dir", type=str, help="Folder of MMPS-exported cell masks")
     parser.add_argument("--somas-dir", type=str, help="Folder of MMPS-exported soma masks")
+    parser.add_argument("--processed-dir", type=str, help="Folder of processed images (for batch mode)")
 
     args = parser.parse_args()
 
@@ -621,6 +688,8 @@ def main():
     elif args.cell_mask and args.soma_mask:
         if args.vxy is None:
             parser.error("--vxy is required when using --cell-mask / --soma-mask")
+        if not args.processed_image:
+            parser.error("--processed-image is required when using --cell-mask / --soma-mask")
         run_single(args)
     elif args.masks_dir and args.somas_dir:
         if args.vxy is None:
