@@ -281,7 +281,7 @@ def run_batch(args):
 
     all_results = []
     for fname in mask_files:
-        image_name, soma_id, _ = parse_mask_filename(fname, mode)
+        image_name, soma_id, area_px = parse_mask_filename(fname, mode)
         if image_name is None:
             continue
 
@@ -305,7 +305,12 @@ def run_batch(args):
             print(f"  SKIP {fname}: no ruffle voxels")
             continue
 
-        row = {"image_name": image_name, "soma_id": soma_id}
+        if mode == "3d":
+            area_um2 = area_px * (args.vxy ** 2) * vz
+        else:
+            area_um2 = area_px * (args.vxy ** 2)
+
+        row = {"image_name": image_name, "soma_id": soma_id, "area_um2": area_um2}
         row.update(metrics)
         all_results.append(row)
         print(f"  OK   {fname}  polarity={metrics['ruffle_polarity_index']:.3f}  "
@@ -467,7 +472,7 @@ def run_session(args):
     all_results = []
     skipped = 0
     for fname in mask_files:
-        image_name, soma_id, _ = parse_mask_filename(fname, mode)
+        image_name, soma_id, area_px = parse_mask_filename(fname, mode)
         if image_name is None:
             continue
 
@@ -504,6 +509,12 @@ def run_session(args):
             print(f"  SKIP {fname}: no ruffle voxels")
             continue
 
+        # Compute mask area in µm²
+        if mode == "3d":
+            area_um2 = area_px * (vxy ** 2) * vz
+        else:
+            area_um2 = area_px * (vxy ** 2)
+
         # Get animal_id and treatment from session if available
         images_dict = session.get("images", {})
         img_session = images_dict.get(image_name) or images_dict.get(image_name + ".tif") or images_dict.get(image_name + ".tiff")
@@ -514,6 +525,7 @@ def run_session(args):
             "animal_id": img_session.get("animal_id", "") if img_session else "",
             "treatment": img_session.get("treatment", "") if img_session else "",
             "pixel_size_xy": vxy,
+            "area_um2": area_um2,
         }
         row.update(metrics)
         all_results.append(row)
