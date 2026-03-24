@@ -571,22 +571,32 @@ def main():
         run_batch(args)
     else:
         # No arguments given — open a file dialog to pick a session file
-        try:
-            from PyQt5.QtWidgets import QApplication, QFileDialog
-            app = QApplication.instance() or QApplication(sys.argv)
-            path, _ = QFileDialog.getOpenFileName(
-                None,
-                "Select MMPS Session File",
-                "",
-                "Session Files (*.mmps_session *.mmps3d_session);;JSON Files (*.json);;All Files (*)",
-            )
-            if not path:
-                print("No file selected. Exiting.")
-                sys.exit(0)
-            args.session = path
+        args.session = _pick_session_file()
+        if args.session:
             run_session(args)
-        except ImportError:
+        else:
             parser.error("Provide --session, or --cell-mask + --soma-mask, or --masks-dir + --somas-dir")
+
+
+def _pick_session_file():
+    """Open a Qt file dialog and return the chosen path, or None."""
+    try:
+        from PyQt5.QtWidgets import QApplication, QFileDialog
+    except ImportError:
+        return None
+    try:
+        app = QApplication.instance() or QApplication(sys.argv)
+        path, _ = QFileDialog.getOpenFileName(
+            None,
+            "Select MMPS Session File",
+            "",
+            "Session Files (*.mmps_session *.mmps3d_session);;JSON Files (*.json);;All Files (*)",
+        )
+        if path:
+            return path
+    except Exception as e:
+        print(f"Could not open file dialog: {e}", file=sys.stderr)
+    return None
 
 
 if __name__ == "__main__":
