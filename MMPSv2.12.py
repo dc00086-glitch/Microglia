@@ -3353,6 +3353,37 @@ def getCellName(maskFilename):
     return name
 
 
+def loadMaskMetadata(masksDir):
+    \"\"\"Load mask_metadata.csv from the masks directory.
+    Returns a dict keyed by (image_name, soma_id) -> row dict.\"\"\"
+    meta_path = os.path.join(masksDir, "mask_metadata.csv")
+    lookup = {{}}
+    if not os.path.isfile(meta_path):
+        return lookup
+    try:
+        with open(meta_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                key = (row.get('image_name', ''), row.get('soma_id', ''))
+                lookup[key] = row
+        print("Loaded mask_metadata.csv: " + str(len(lookup)) + " entries")
+    except Exception as e:
+        print("WARNING: Could not load mask_metadata.csv: " + str(e))
+    return lookup
+
+
+def getMetaIds(metadata, imgName, somaId):
+    \"\"\"Get standard identifier fields from metadata lookup.
+    Returns (animal_id, treatment, soma_idx).\"\"\"
+    row = metadata.get((imgName, somaId), {{}})
+    animal_id = row.get('animal_id', '')
+    treatment = row.get('treatment', '')
+    soma_idx = row.get('soma_idx', '')
+    if not treatment and imgName:
+        treatment = imgName.split('_')[0]
+    return animal_id, treatment, soma_idx
+
+
 def filterLargestMasks(maskFiles):
     """Keep only the largest area mask per cell."""
     best = {{}}
@@ -3495,7 +3526,14 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
     effectivePx = pixelSize / float(scaleFactor) if scaleFactor > 1 else pixelSize
     skeletonArea = skelPixelCount * (effectivePx * effectivePx)
 
+    imgName, somaId, areaUm2 = parseMaskInfo(os.path.basename(maskPath))
+
     metrics = {{
+        'image_name': imgName,
+        'animal_id': '',
+        'treatment': '',
+        'soma_id': somaId,
+        'soma_idx': '',
         'mask_file': os.path.basename(maskPath),
         'cell_name': cellName,
         'skeleton_file': os.path.basename(skelPath),
@@ -3527,10 +3565,12 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
     return metrics
 
 
-def runSkeletonBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=None):
+def runSkeletonBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=None, metadata=None):
     """Run skeleton analysis on all mask files."""
     if pixelSize is None:
         pixelSize = PIXEL_SIZE
+    if metadata is None:
+        metadata = {{}}
     print("=" * 60)
     print("SKELETON ANALYSIS - " + imageName)
     print("=" * 60)
@@ -3554,10 +3594,17 @@ def runSkeletonBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=
 
         metrics = analyzeSkeleton(maskPath, pixelSize, UPSCALE_FACTOR, skelDir)
         if metrics is not None:
+            # Populate standard identifiers from metadata
+            imgN, somaI, _ = parseMaskInfo(maskFile)
+            aid, treat, sidx = getMetaIds(metadata, imgN, somaI)
+            metrics['animal_id'] = aid
+            metrics['treatment'] = treat
+            metrics['soma_idx'] = sidx
             allResults.append(metrics)
 
     if allResults:
         outputPath = os.path.join(skelDir, "Skeleton_Results_" + imageName + ".csv")
+        stdCols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx']
         idCols = ['cell_name', 'mask_file', 'skeleton_file', 'pixel_size_um', 'upscale_factor']
         maskCols = ['mask_area_um2', 'mask_perimeter_um', 'mask_circularity',
                     'mask_aspect_ratio', 'mask_roundness', 'mask_solidity']
@@ -3566,7 +3613,7 @@ def runSkeletonBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=
                     'num_quadruple_points', 'max_branch_length_um',
                     'avg_branch_length_um', 'longest_shortest_path_um',
                     'total_skeleton_length_um', 'skeleton_area_um2', 'branching_density']
-        columns = idCols + maskCols + skelCols
+        columns = stdCols + idCols + maskCols + skelCols
         f = open(outputPath, 'wb')
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
@@ -3837,10 +3884,12 @@ def runConvexHullAnalysis(maskPath, pixelSize):
     }}
 
 
-def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=None):
+def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=None, metadata=None):
     """Run fractal + hull analysis on all mask files."""
     if pixelSize is None:
         pixelSize = PIXEL_SIZE
+    if metadata is None:
+        metadata = {{}}
     print("=" * 60)
     print("FRACTAL / CONVEX HULL ANALYSIS - " + imageName)
     print("=" * 60)
@@ -3857,6 +3906,7 @@ def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=N
         maskPath = os.path.join(masksDir, maskFile)
         imgName, somaId, areaUm2 = parseMaskInfo(maskFile)
         cellName = getCellName(maskFile)
+        aid, treat, sidx = getMetaIds(metadata, imgName, somaId)
         elapsed = time.time() - batchStart
         if idx > 0:
             eta = formatTime(elapsed / idx * (total - idx))
@@ -3869,9 +3919,12 @@ def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=N
             hullMetrics = runConvexHullAnalysis(maskPath, pixelSize)
             if fracMetrics is not None:
                 row = {{
-                    'cell_name': cellName,
                     'image_name': imgName,
+                    'animal_id': aid,
+                    'treatment': treat,
                     'soma_id': somaId,
+                    'soma_idx': sidx,
+                    'cell_name': cellName,
                     'mask_area_um2': areaUm2,
                     'mask_file': maskFile,
                 }}
@@ -3887,7 +3940,8 @@ def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=N
 
     if allResults:
         outputPath = os.path.join(resultsDir, "Fractal_Results_" + imageName + ".csv")
-        idCols = ['cell_name', 'image_name', 'soma_id', 'mask_area_um2', 'mask_file']
+        stdCols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx']
+        idCols = ['cell_name', 'mask_area_um2', 'mask_file']
         fracCols = ['fractal_dimension', 'fractal_r_squared',
                     'fractal_lacunarity_mean', 'fractal_lacunarity_small',
                     'fractal_lacunarity_large', 'fractal_num_scales',
@@ -3895,7 +3949,7 @@ def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=N
         hullCols = ['hull_area_px', 'hull_area_um2', 'hull_perimeter_px', 'hull_perimeter_um',
                     'hull_circularity', 'hull_density', 'hull_max_span_px', 'hull_max_span_um',
                     'hull_span_ratio']
-        columns = idCols + fracCols + hullCols
+        columns = stdCols + idCols + fracCols + hullCols
         f = open(outputPath, 'wb')
         writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
         writer.writeheader()
@@ -4119,52 +4173,52 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
     cal = Calibration(imp)
 
     maskMetrics = {{
-        'Mask Name': maskName,
-        'Soma Area (um2)': somaAreaUm2,
-        'Primary Branches': lStats.getPrimaryBranches(False),
-        'Intersecting Radii': lStats.getIntersectingRadii(False),
-        'Sum of Intersections': lStats.getSum(False),
-        'Mean of Intersections': lStats.getMean(False),
-        'Median of Intersections': lStats.getMedian(False),
-        'Skewness (sampled)': lStats.getSkewness(False),
-        'Kurtosis (sampled)': lStats.getKurtosis(False),
-        'Maximum Number of Intersections': lStats.getMax(False),
-        'Max Intersection Radius': lStats.getXvalues()[lStats.getIndexOfInters(False, float(lStats.getMax(False)))],
-        'Ramification Index (sampled)': lStats.getRamificationIndex(False),
-        'Centroid Radius': lStats.getCentroid(False).rawX(cal),
-        'Centroid Value': lStats.getCentroid(False).rawY(cal),
-        'Enclosing Radius': lStats.getEnclosingRadius(False),
-        'Regression Coefficient (semi-log)': nStatsSemiLog.getSlope(),
-        'Regression Coefficient (Log-log)': nStatsLogLog.getSlope(),
-        'Regression Intercept (semi-log)': nStatsSemiLog.getIntercept(),
-        'Regression Intercept (Log-log)': nStatsLogLog.getIntercept(),
+        'mask_name': maskName,
+        'soma_area_um2': somaAreaUm2,
+        'primary_branches': lStats.getPrimaryBranches(False),
+        'intersecting_radii': lStats.getIntersectingRadii(False),
+        'sum_of_intersections': lStats.getSum(False),
+        'mean_of_intersections': lStats.getMean(False),
+        'median_of_intersections': lStats.getMedian(False),
+        'skewness_sampled': lStats.getSkewness(False),
+        'kurtosis_sampled': lStats.getKurtosis(False),
+        'max_intersections': lStats.getMax(False),
+        'max_intersection_radius': lStats.getXvalues()[lStats.getIndexOfInters(False, float(lStats.getMax(False)))],
+        'ramification_index_sampled': lStats.getRamificationIndex(False),
+        'centroid_radius': lStats.getCentroid(False).rawX(cal),
+        'centroid_value': lStats.getCentroid(False).rawY(cal),
+        'enclosing_radius': lStats.getEnclosingRadius(False),
+        'regression_coeff_semi_log': nStatsSemiLog.getSlope(),
+        'regression_coeff_log_log': nStatsLogLog.getSlope(),
+        'regression_intercept_semi_log': nStatsSemiLog.getIntercept(),
+        'regression_intercept_log_log': nStatsLogLog.getIntercept(),
     }}
 
     # P10-P90
     nStatsSemiLog.restrictRegToPercentile(10, 90)
     nStatsLogLog.restrictRegToPercentile(10, 90)
-    maskMetrics['Regression Coefficient (semi-log)[P10-P90]'] = nStatsSemiLog.getSlope()
-    maskMetrics['Regression Coefficient (Log-log)[P10-P90]'] = nStatsLogLog.getSlope()
-    maskMetrics['Regression Intercept (Semi-log)[P10-P90]'] = nStatsSemiLog.getIntercept()
-    maskMetrics['Regression Intercept (Log-log)[P10-P90]'] = nStatsLogLog.getIntercept()
+    maskMetrics['regression_coeff_semi_log_p10_p90'] = nStatsSemiLog.getSlope()
+    maskMetrics['regression_coeff_log_log_p10_p90'] = nStatsLogLog.getSlope()
+    maskMetrics['regression_intercept_semi_log_p10_p90'] = nStatsSemiLog.getIntercept()
+    maskMetrics['regression_intercept_log_log_p10_p90'] = nStatsLogLog.getIntercept()
 
     # Polynomial fit
     bestDegree = lStats.findBestFit(1, 30, 0.7, 0.05)
     if bestDegree != -1:
         lStats.fitPolynomial(bestDegree)
         try:
-            maskMetrics['Kurtosis (fit)'] = lStats.getKurtosis(True)
+            maskMetrics['kurtosis_fit'] = lStats.getKurtosis(True)
         except:
-            maskMetrics['Kurtosis (fit)'] = 'NaN'
+            maskMetrics['kurtosis_fit'] = 'NaN'
         try:
-            maskMetrics['Ramification Index (fit)'] = lStats.getRamificationIndex(True)
+            maskMetrics['ramification_index_fit'] = lStats.getRamificationIndex(True)
         except:
-            maskMetrics['Ramification Index (fit)'] = 'NaN'
+            maskMetrics['ramification_index_fit'] = 'NaN'
         try:
-            maskMetrics['Mean Value'] = lStats.getMean(True)
+            maskMetrics['mean_value'] = lStats.getMean(True)
         except:
-            maskMetrics['Mean Value'] = 'NaN'
-        maskMetrics['Polynomial Degree'] = bestDegree
+            maskMetrics['mean_value'] = 'NaN'
+        maskMetrics['polynomial_degree'] = bestDegree
 
         critVals = []
         critRadii = []
@@ -4176,17 +4230,19 @@ def analyzeOneSholl(maskPath, centroid, startRad, stepSize, pixelSize, saveLoc, 
                     critRadii.append(curr.rawX(cal))
         except:
             pass
-        maskMetrics['Critical Value'] = sum(critVals) / len(critVals) if critVals else 'NaN'
-        maskMetrics['Critical Radius'] = sum(critRadii) / len(critRadii) if critRadii else 'NaN'
+        maskMetrics['critical_value'] = sum(critVals) / len(critVals) if critVals else 'NaN'
+        maskMetrics['critical_radius'] = sum(critRadii) / len(critRadii) if critRadii else 'NaN'
 
     imp.close()
     return maskMetrics
 
 
-def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all", pixelSize=None):
+def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all", pixelSize=None, metadata=None):
     """Run Sholl analysis on all mask files."""
     if pixelSize is None:
         pixelSize = PIXEL_SIZE
+    if metadata is None:
+        metadata = {{}}
     print("=" * 60)
     print("SHOLL ANALYSIS - " + imageName)
     print("=" * 60)
@@ -4248,12 +4304,16 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all", pix
             )
             dt = time.time() - t0
             if metrics is not None:
-                metrics['Image Name'] = imgName
-                metrics['Soma ID'] = somaId
-                metrics['Mask Area (um2)'] = areaUm2
-                metrics['Centroid X (px)'] = centroid[0]
-                metrics['Centroid Y (px)'] = centroid[1]
-                metrics['Start Radius (um)'] = startRad
+                aid, treat, sidx = getMetaIds(metadata, imgName, somaId)
+                metrics['image_name'] = imgName
+                metrics['animal_id'] = aid
+                metrics['treatment'] = treat
+                metrics['soma_id'] = somaId
+                metrics['soma_idx'] = sidx
+                metrics['mask_area_um2'] = areaUm2
+                metrics['centroid_x_px'] = centroid[0]
+                metrics['centroid_y_px'] = centroid[1]
+                metrics['start_radius_um'] = startRad
                 allResults.append(metrics)
                 processed += 1
                 print("  Done (" + str(round(dt, 1)) + "s)")
@@ -4377,14 +4437,17 @@ if len(maskFiles) == 0:
     print("No masks for this image, nothing to do.")
     sys.exit(0)
 
+# Load metadata for standard identifiers (animal_id, treatment, soma_idx)
+metadata = loadMaskMetadata(masksDir)
+
 totalStart = time.time()
 
 if "skeleton" in ANALYSES:
-    runSkeletonBatch(masksDir, mmps_output_dir, maskFiles, imageName, imgPixelSize)
+    runSkeletonBatch(masksDir, mmps_output_dir, maskFiles, imageName, imgPixelSize, metadata)
     print("")
 
 if "fractal" in ANALYSES:
-    runFractalBatch(masksDir, mmps_output_dir, maskFiles, imageName, imgPixelSize)
+    runFractalBatch(masksDir, mmps_output_dir, maskFiles, imageName, imgPixelSize, metadata)
     print("")
 
 if "sholl" in ANALYSES:
@@ -4400,7 +4463,7 @@ if "sholl" in ANALYSES:
             print("ERROR: somas/ folder exists but is EMPTY - no *_soma.tif files found.")
             print("  SKIPPING Sholl analysis.")
         else:
-            runShollBatch(masksDir, somasDir, mmps_output_dir, maskFiles, imageName, imgPixelSize)
+            runShollBatch(masksDir, somasDir, mmps_output_dir, maskFiles, imageName, imgPixelSize, metadata)
     print("")
 
 print("=" * 60)
@@ -4632,38 +4695,28 @@ def main():
         total_rows += merge_csvs(sholl_dir, "Sholl_Results_*.csv", "Sholl_All_Results.csv")
 '''
         script += '''
-    # --- Combine all analysis types into one CSV keyed by cell name + area ---
-    import re as _re
-    combined = {}  # cell_key_area -> merged row dict
+    # --- Combine all analysis types into one CSV keyed by image_name + soma_id + mask_area_um2 ---
+    combined = {}  # cell_key -> merged row dict
     merge_files = []
     skel_path = os.path.join(mmps_output, "skeleton_results", "Skeleton_Analysis_Results.csv")
     frac_path = os.path.join(mmps_output, "fractal_results", "Fractal_Analysis_Results.csv")
     sholl_path = os.path.join(mmps_output, "sholl_results", "Sholl_All_Results.csv")
-    for csv_path, prefix in [(skel_path, ""), (frac_path, ""), (sholl_path, "")]:
+    for csv_path in [skel_path, frac_path, sholl_path]:
         if not os.path.isfile(csv_path):
             continue
         merge_files.append(csv_path)
         with open(csv_path, 'r') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                # Build a cell key from Image Name + Soma ID (or Cell Name)
-                img = row.get('Image Name', row.get('image_name', ''))
-                soma = row.get('Soma ID', row.get('soma_id', ''))
-                cell_base = f"{img}_{soma}" if img and soma else row.get('Cell Name', row.get('cell_name', ''))
-                if not cell_base:
-                    cell_base = f"row_{len(combined)}"
-                # Extract area for area-aware keying
-                area = row.get('Mask Area (um2)', row.get('mask_area_um2', ''))
+                img = row.get('image_name', '')
+                soma = row.get('soma_id', '')
+                area = row.get('mask_area_um2', '')
                 if area:
                     try:
                         area = str(int(float(area)))
                     except (ValueError, TypeError):
                         area = ''
-                if not area:
-                    m = _re.search(r'_area(\\d+)', cell_base)
-                    if m:
-                        area = m.group(1)
-                cell_key = f"{cell_base}_area{area}" if area else cell_base
+                cell_key = f"{img}_{soma}_area{area}" if img and soma else row.get('cell_name', f"row_{len(combined)}")
                 if cell_key not in combined:
                     combined[cell_key] = {}
                 # Merge columns, skip duplicates already present
@@ -4672,8 +4725,9 @@ def main():
                         combined[cell_key][k] = v
 
     if combined:
-        # Collect all column headers preserving order
-        all_cols = []
+        # Ensure standard ID columns come first
+        std_cols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx']
+        all_cols = list(std_cols)
         for row in combined.values():
             for k in row.keys():
                 if k not in all_cols:
@@ -4733,8 +4787,10 @@ SETUP:
   2. Upload your Fiji.app installation to the cluster
      (or use an existing installation)
   3. Upload your MMPS output folder containing:
-     - masks/  (the mask TIFF files)
+     - masks/  (the mask TIFF files + mask_metadata.csv)
      - somas/  (the soma TIFF files, needed for Sholl analysis)
+     Note: mask_metadata.csv (in masks/) provides animal_id, treatment,
+     and soma_idx for consistent CSV identifiers across all analyses.
   4. Make sure the Fiji path in submit_imagej.sh is correct
      Current setting: {fiji_path}
 
@@ -4978,6 +5034,37 @@ def parse_mask_filename(filename):
     return None, None, None
 
 
+def load_mask_metadata(masks_dir):
+    \"\"\"Load mask_metadata.csv for standard identifiers.
+    Returns dict keyed by (image_name, soma_id) -> row dict.\"\"\"
+    meta_path = os.path.join(masks_dir, "mask_metadata.csv")
+    lookup = {{}}
+    if not os.path.isfile(meta_path):
+        return lookup
+    try:
+        with open(meta_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                key = (row.get('image_name', ''), row.get('soma_id', ''))
+                lookup[key] = row
+        print(f"Loaded mask_metadata.csv: {{len(lookup)}} entries")
+    except Exception as e:
+        print(f"WARNING: Could not load mask_metadata.csv: {{e}}")
+    return lookup
+
+
+def get_meta_ids(metadata, image_name, soma_id):
+    \"\"\"Get standard identifier fields from metadata lookup.
+    Returns (animal_id, treatment, soma_idx).\"\"\"
+    row = metadata.get((image_name, soma_id), {{}})
+    animal_id = row.get('animal_id', '')
+    treatment = row.get('treatment', '')
+    soma_idx = row.get('soma_idx', '')
+    if not treatment and image_name:
+        treatment = image_name.split('_')[0]
+    return animal_id, treatment, soma_idx
+
+
 def get_soma_area(somas_dir, image_name, soma_id, pixel_size):
     """Try to find the soma outline TIFF and compute its area."""
     if not somas_dir or not os.path.isdir(somas_dir):
@@ -5091,8 +5178,10 @@ def get_unique_images(masks_dir):
     return sorted(images)
 
 
-def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir):
+def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir, metadata=None):
     """Process all masks for a single image and write a per-image CSV."""
+    if metadata is None:
+        metadata = {{}}
     all_files = sorted(os.listdir(masks_dir))
     mask_files = []
     for f in all_files:
@@ -5108,6 +5197,7 @@ def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir):
     for filename, soma_id, area in mask_files:
         mask_path = os.path.join(masks_dir, filename)
         soma_area = get_soma_area(somas_dir, image_name, soma_id, pixel_size)
+        aid, treat, sidx = get_meta_ids(metadata, image_name, soma_id)
 
         try:
             metrics = compute_metrics(mask_path, pixel_size, soma_area)
@@ -5119,12 +5209,13 @@ def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir):
             print(f"  SKIP (empty mask): {{filename}}")
             continue
 
-        treatment = image_name.split('_')[0] if image_name else ''
         row = {{
-            'treatment': treatment,
             'image_name': image_name,
+            'animal_id': aid,
+            'treatment': treat,
             'soma_id': soma_id,
-            'area_um2': area,
+            'soma_idx': sidx,
+            'mask_area_um2': area,
         }}
         row.update(metrics)
         results.append(row)
@@ -5136,7 +5227,8 @@ def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir):
     csv_path = os.path.join(output_dir, f"Spread_Results_{{image_name}}.csv")
 
     fieldnames = [
-        'treatment', 'image_name', 'soma_id', 'area_um2',
+        'image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx',
+        'mask_area_um2',
         'mask_area', 'perimeter', 'roundness', 'eccentricity',
         'cell_spread', 'soma_area',
         'polarity_index', 'principal_angle',
@@ -5228,6 +5320,9 @@ def main():
         images_to_process = unique_images
         print(f"Processing all {{len(unique_images)}} images...")
 
+    # Load metadata for standard identifiers
+    metadata = load_mask_metadata(masks_dir)
+
     total = 0
     for img_name in images_to_process:
         img_pixel_size = get_pixel_size(img_name)
@@ -5235,7 +5330,7 @@ def main():
             print(f"\\nImage: {{img_name}}  (pixel size: {{img_pixel_size}} um/px, per-image override)")
         else:
             print(f"\\nImage: {{img_name}}  (pixel size: {{img_pixel_size}} um/px)")
-        n = process_image(img_name, masks_dir, somas_dir, img_pixel_size, output_dir)
+        n = process_image(img_name, masks_dir, somas_dir, img_pixel_size, output_dir, metadata)
         total += n
 
     print(f"\\nDone. Total masks processed: {{total}}")
