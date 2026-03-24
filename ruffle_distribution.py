@@ -19,6 +19,7 @@ Outputs per-cell metrics:
   - ruffle_centroid_offset_um: distance between soma centroid and ruffle centroid
   - ruffle_centroid_angle_azimuth: azimuth from soma center to ruffle center of mass
   - ruffle_centroid_angle_elevation: elevation from soma center to ruffle center of mass
+  - ruffle_count            : number of distinct (connected-component) ruffle objects
   - ruffle_dispersion       : mean distance of ruffle voxels from soma centroid,
                               normalized by soma equivalent radius (low = clustered, high = spread)
   - ruffle_major_axis_um    : extent along the dominant PCA axis
@@ -51,6 +52,7 @@ import sys
 
 import numpy as np
 import tifffile
+from scipy.ndimage import label as ndimage_label
 from skimage.filters import threshold_otsu
 
 
@@ -165,6 +167,8 @@ def compute_ruffle_distribution(processed_img, soma_mask, cell_mask, vxy,
     ruffle_intensities = processed_img[ruffle_bin]
     metrics["otsu_threshold"] = round(float(otsu_thresh), 4)
     metrics["ruffle_pixel_count"] = int(len(ruffle_coords))
+    _, ruffle_n = ndimage_label(ruffle_bin)
+    metrics["ruffle_count"] = int(ruffle_n)
     metrics["ruffle_mean_intensity"] = round(float(ruffle_intensities.mean()), 4)
 
     # Polarity index
