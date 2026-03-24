@@ -21,6 +21,9 @@ Outputs per-cell metrics:
   - ruffle_minor_axis_um    : extent along the third PCA axis
 
 Usage:
+  # Easiest: load from an MMPS session file (reads pixel sizes, paths, etc.)
+  python ruffle_distribution.py --session my_project.mmps3d_session
+
   # Single pair of masks
   python ruffle_distribution.py --cell-mask cell_mask3d.tif --soma-mask soma_mask3d.tif \
       --vxy 0.22 --vz 1.0
@@ -36,6 +39,7 @@ Usage:
 
 import argparse
 import csv
+import json
 import os
 import re
 import sys
@@ -229,7 +233,8 @@ def run_single(args):
     if mode == "auto":
         mode = "3d" if cell.ndim == 3 else "2d"
 
-    metrics = compute_ruffle_distribution(cell, soma, args.vxy, args.vz, mode=mode)
+    vz = args.vz if args.vz is not None else 1.0
+    metrics = compute_ruffle_distribution(cell, soma, args.vxy, vz, mode=mode)
     if metrics is None:
         print("No ruffle voxels found (cell minus soma is empty).")
         return
@@ -267,10 +272,11 @@ def run_batch(args):
         else:
             mode = "2d"
 
+    vz = args.vz if args.vz is not None else 1.0
     print(f"Mode: {mode.upper()}")
     print(f"Masks dir : {masks_dir}")
     print(f"Somas dir : {somas_dir}")
-    print(f"Pixel size: vxy={args.vxy} µm, vz={args.vz} µm")
+    print(f"Pixel size: vxy={args.vxy} µm, vz={vz} µm")
     print()
 
     all_results = []
@@ -294,7 +300,7 @@ def run_batch(args):
                 print(f"  SKIP {fname}: shape mismatch cell {cell.shape} vs soma {soma.shape}")
                 continue
 
-        metrics = compute_ruffle_distribution(cell, soma, args.vxy, args.vz, mode=mode)
+        metrics = compute_ruffle_distribution(cell, soma, args.vxy, vz, mode=mode)
         if metrics is None:
             print(f"  SKIP {fname}: no ruffle voxels")
             continue
@@ -322,6 +328,208 @@ def run_batch(args):
 
 
 # ---------------------------------------------------------------------------
+# Session file mode
+# ---------------------------------------------------------------------------
+
+def resolve_session_path(session_dir, absolute_path, relative_path):
+    """Resolve a path from session JSON, trying relative first for portability."""
+    if relative_path:
+        resolved = os.path.normpath(os.path.join(session_dir, relative_path))
+        if os.path.exists(resolved):
+            return resolved
+    if absolute_path and os.path.exists(absolute_path):
+        return absolute_path
+    return None
+
+
+def run_session(args):
+    """Load an MMPS session file and batch-process all approved masks."""
+    session_path = args.session
+    if not os.path.isfile(session_path):
+        print(f"ERROR: Session file not found: {session_path}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(session_path, "r") as f:
+        session = json.load(f)
+
+    session_dir = os.path.dirname(os.path.abspath(session_path))
+
+    # --- Resolve masks and somas directories ---
+    masks_dir = resolve_session_path(
+        session_dir,
+        session.get("masks_dir"),
+        session.get("masks_dir_rel"),
+    )
+    if not masks_dir or not os.path.isdir(masks_dir):
+        # Fallback: look for masks/ inside output_dir
+        output_dir = resolve_session_path(
+            session_dir,
+            session.get("output_dir"),
+            session.get("output_dir_rel"),
+        )
+        if output_dir:
+            masks_dir = os.path.join(output_dir, "masks")
+
+    if not masks_dir or not os.path.isdir(masks_dir):
+        print("ERROR: Could not locate masks directory from session file.", file=sys.stderr)
+        sys.exit(1)
+
+    somas_dir = os.path.join(os.path.dirname(masks_dir), "somas")
+    if not os.path.isdir(somas_dir):
+        print(f"ERROR: Somas directory not found at {somas_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # --- Read pixel sizes ---
+    is_3d = session.get("mode_3d", False)
+    mode = "3d" if is_3d else "2d"
+
+    # Global pixel size (fallback)
+    global_vxy = None
+    ps_str = session.get("pixel_size", "")
+    try:
+        global_vxy = float(ps_str)
+    except (ValueError, TypeError):
+        pass
+
+    global_vz = 1.0
+    vz_str = session.get("voxel_size_z", "")
+    try:
+        global_vz = float(vz_str)
+    except (ValueError, TypeError):
+        pass
+
+    # CLI overrides if provided
+    if args.vxy is not None:
+        global_vxy = args.vxy
+    if args.vz is not None:
+        global_vz = args.vz
+
+    # --- Build per-image pixel size lookup ---
+    # Images can have individual pixel sizes stored in the session
+    image_pixel_sizes = {}
+    for img_name, img_data in session.get("images", {}).items():
+        ps = img_data.get("pixel_size")
+        if ps is not None:
+            try:
+                image_pixel_sizes[img_name] = float(ps)
+            except (ValueError, TypeError):
+                pass
+
+    # --- Collect approved masks ---
+    approved_masks = set()
+    for img_name, img_data in session.get("images", {}).items():
+        for mqa in img_data.get("mask_qa_state", []):
+            if mqa.get("approved") is True:
+                soma_id = mqa.get("soma_id", "")
+                approved_masks.add((img_name, soma_id))
+
+    print(f"Session : {session_path}")
+    print(f"Mode    : {mode.upper()}")
+    print(f"Masks   : {masks_dir}")
+    print(f"Somas   : {somas_dir}")
+    print(f"Default : vxy={global_vxy} µm, vz={global_vz} µm")
+    if image_pixel_sizes:
+        print(f"Per-image pixel sizes found for {len(image_pixel_sizes)} image(s)")
+    if approved_masks:
+        print(f"Approved masks: {len(approved_masks)}")
+    else:
+        print("No approval filter found — processing all masks")
+    print()
+
+    mask_files = sorted(f for f in os.listdir(masks_dir) if f.endswith(".tif"))
+    if not mask_files:
+        print(f"No .tif files found in {masks_dir}")
+        sys.exit(1)
+
+    all_results = []
+    skipped = 0
+    for fname in mask_files:
+        image_name, soma_id, _ = parse_mask_filename(fname, mode)
+        if image_name is None:
+            continue
+
+        # If we have approval info, only process approved masks
+        if approved_masks and (image_name, soma_id) not in approved_masks:
+            skipped += 1
+            continue
+
+        # Per-image pixel size or global fallback
+        # The image name in the session may include extension; try both
+        vxy = image_pixel_sizes.get(image_name)
+        if vxy is None:
+            # Try with common extensions
+            for ext in [".tif", ".tiff", ".TIF", ".TIFF"]:
+                vxy = image_pixel_sizes.get(image_name + ext)
+                if vxy is not None:
+                    break
+        if vxy is None:
+            vxy = global_vxy
+        if vxy is None:
+            print(f"  SKIP {fname}: no pixel size found (set --vxy or check session)")
+            continue
+
+        vz = global_vz
+
+        soma_path = find_soma_mask(somas_dir, image_name, soma_id)
+        if soma_path is None:
+            print(f"  SKIP {fname}: no matching soma mask found")
+            continue
+
+        cell = tifffile.imread(os.path.join(masks_dir, fname))
+        soma = tifffile.imread(soma_path)
+
+        if cell.shape != soma.shape:
+            if cell.ndim == 3 and soma.ndim == 2:
+                soma = np.broadcast_to(soma[np.newaxis], cell.shape).copy()
+            else:
+                print(f"  SKIP {fname}: shape mismatch cell {cell.shape} vs soma {soma.shape}")
+                continue
+
+        metrics = compute_ruffle_distribution(cell, soma, vxy, vz, mode=mode)
+        if metrics is None:
+            print(f"  SKIP {fname}: no ruffle voxels")
+            continue
+
+        # Get animal_id and treatment from session if available
+        img_data = session.get("images", {})
+        img_session = None
+        for key in [image_name, image_name + ".tif", image_name + ".tiff"]:
+            if key in img_data:
+                img_session = img_data[key]
+                break
+
+        row = {
+            "image_name": image_name,
+            "soma_id": soma_id,
+            "animal_id": img_session.get("animal_id", "") if img_session else "",
+            "treatment": img_session.get("treatment", "") if img_session else "",
+            "pixel_size_xy": vxy,
+        }
+        row.update(metrics)
+        all_results.append(row)
+        print(f"  OK   {fname}  (vxy={vxy})  polarity={metrics['ruffle_polarity_index']:.3f}  "
+              f"offset={metrics['ruffle_centroid_offset_um']:.2f} µm  "
+              f"dispersion={metrics['ruffle_dispersion']:.2f}")
+
+    if skipped:
+        print(f"\n  ({skipped} unapproved masks skipped)")
+
+    if not all_results:
+        print("\nNo cells processed.")
+        return
+
+    # Write CSV
+    out_path = args.output or os.path.join(os.path.dirname(masks_dir), "ruffle_distribution_results.csv")
+    fieldnames = list(all_results[0].keys())
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_results)
+
+    print(f"\n{len(all_results)} cells processed. Results saved to {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -331,11 +539,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--vxy", type=float, required=True, help="XY pixel size in µm")
-    parser.add_argument("--vz", type=float, default=1.0, help="Z voxel depth in µm (default: 1.0)")
+    parser.add_argument("--vxy", type=float, default=None, help="XY pixel size in µm (read from session if omitted)")
+    parser.add_argument("--vz", type=float, default=None, help="Z voxel depth in µm (read from session if omitted)")
     parser.add_argument("--mode", choices=["2d", "3d", "auto"], default="auto",
                         help="Analysis mode (default: auto-detect)")
     parser.add_argument("-o", "--output", type=str, default=None, help="Output CSV path")
+
+    # Session mode
+    parser.add_argument("--session", type=str,
+                        help="Path to .mmps_session or .mmps3d_session file (easiest — reads all settings)")
 
     # Single-pair mode
     parser.add_argument("--cell-mask", type=str, help="Path to a single cell mask TIFF")
@@ -347,12 +559,18 @@ def main():
 
     args = parser.parse_args()
 
-    if args.cell_mask and args.soma_mask:
+    if args.session:
+        run_session(args)
+    elif args.cell_mask and args.soma_mask:
+        if args.vxy is None:
+            parser.error("--vxy is required when using --cell-mask / --soma-mask")
         run_single(args)
     elif args.masks_dir and args.somas_dir:
+        if args.vxy is None:
+            parser.error("--vxy is required when using --masks-dir / --somas-dir")
         run_batch(args)
     else:
-        parser.error("Provide either --cell-mask + --soma-mask, or --masks-dir + --somas-dir")
+        parser.error("Provide --session, or --cell-mask + --soma-mask, or --masks-dir + --somas-dir")
 
 
 if __name__ == "__main__":
