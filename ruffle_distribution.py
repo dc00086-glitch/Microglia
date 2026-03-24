@@ -570,7 +570,23 @@ def main():
             parser.error("--vxy is required when using --masks-dir / --somas-dir")
         run_batch(args)
     else:
-        parser.error("Provide --session, or --cell-mask + --soma-mask, or --masks-dir + --somas-dir")
+        # No arguments given — open a file dialog to pick a session file
+        try:
+            from PyQt5.QtWidgets import QApplication, QFileDialog
+            app = QApplication.instance() or QApplication(sys.argv)
+            path, _ = QFileDialog.getOpenFileName(
+                None,
+                "Select MMPS Session File",
+                "",
+                "Session Files (*.mmps_session *.mmps3d_session);;JSON Files (*.json);;All Files (*)",
+            )
+            if not path:
+                print("No file selected. Exiting.")
+                sys.exit(0)
+            args.session = path
+            run_session(args)
+        except ImportError:
+            parser.error("Provide --session, or --cell-mask + --soma-mask, or --masks-dir + --somas-dir")
 
 
 if __name__ == "__main__":
