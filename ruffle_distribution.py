@@ -363,10 +363,7 @@ def run_batch(args):
             print(f"  SKIP {fname}: no ruffle voxels after Otsu filtering")
             continue
 
-        if mode == "3d":
-            area_um2 = area_px * (args.vxy ** 2) * vz
-        else:
-            area_um2 = area_px * (args.vxy ** 2)
+        area_um2 = area_px  # target mask size already in µm² (increments of 50)
 
         row = {"image_name": image_name, "soma_id": soma_id, "area_um2": area_um2}
         row.update(metrics)
@@ -650,11 +647,7 @@ def run_session(args):
             print(f"  SKIP {fname}: no ruffle voxels after Otsu filtering")
             continue
 
-        # Compute mask area in µm²
-        if mode == "3d":
-            area_um2 = area_px * (vxy ** 2) * vz
-        else:
-            area_um2 = area_px * (vxy ** 2)
+        area_um2 = area_px  # target mask size already in µm² (increments of 50)
 
         # Get animal_id and treatment from session, fallback to morphology CSV
         images_dict = session.get("images", {})
