@@ -435,6 +435,27 @@ def run_session(args):
                 approved_masks.add((img_name, soma_id))
                 approved_masks.add((stem, soma_id))
 
+    # --- Build animal_id / treatment lookup from combined_morphology_results ---
+    morph_lookup = {}  # (image_name, soma_id) -> {"animal_id": ..., "treatment": ...}
+    if output_dir:
+        morph_csv = os.path.join(output_dir, "combined_morphology_results.csv")
+        if os.path.isfile(morph_csv):
+            with open(morph_csv, newline="") as f:
+                reader = csv.DictReader(f)
+                for mrow in reader:
+                    mimg = mrow.get("image_name", "")
+                    msid = mrow.get("soma_id", "")
+                    if mimg and msid:
+                        morph_lookup[(mimg, msid)] = {
+                            "animal_id": mrow.get("animal_id", ""),
+                            "treatment": mrow.get("treatment", ""),
+                        }
+                        # Also store without extension
+                        stem = os.path.splitext(mimg)[0]
+                        if stem != mimg:
+                            morph_lookup[(stem, msid)] = morph_lookup[(mimg, msid)]
+            print(f"Morphology CSV loaded: {len(morph_lookup)} entries from {morph_csv}")
+
     print(f"Session : {session_path}")
     print(f"Mode    : {mode.upper()}")
     print(f"Masks   : {masks_dir}")
@@ -515,15 +536,18 @@ def run_session(args):
         else:
             area_um2 = area_px * (vxy ** 2)
 
-        # Get animal_id and treatment from session if available
+        # Get animal_id and treatment from session, fallback to morphology CSV
         images_dict = session.get("images", {})
         img_session = images_dict.get(image_name) or images_dict.get(image_name + ".tif") or images_dict.get(image_name + ".tiff")
+
+        animal_id = (img_session.get("animal_id", "") if img_session else "") or morph_lookup.get((image_name, soma_id), {}).get("animal_id", "")
+        treatment = (img_session.get("treatment", "") if img_session else "") or morph_lookup.get((image_name, soma_id), {}).get("treatment", "")
 
         row = {
             "image_name": image_name,
             "soma_id": soma_id,
-            "animal_id": img_session.get("animal_id", "") if img_session else "",
-            "treatment": img_session.get("treatment", "") if img_session else "",
+            "animal_id": animal_id,
+            "treatment": treatment,
             "pixel_size_xy": vxy,
             "area_um2": area_um2,
         }
