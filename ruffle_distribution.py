@@ -360,6 +360,11 @@ def run_session(args):
     session_dir = os.path.dirname(os.path.abspath(session_path))
 
     # --- Resolve masks and somas directories ---
+    output_dir = resolve_session_path(
+        session_dir,
+        session.get("output_dir"),
+        session.get("output_dir_rel"),
+    )
     masks_dir = resolve_session_path(
         session_dir,
         session.get("masks_dir"),
@@ -367,11 +372,6 @@ def run_session(args):
     )
     if not masks_dir or not os.path.isdir(masks_dir):
         # Fallback: look for masks/ inside output_dir
-        output_dir = resolve_session_path(
-            session_dir,
-            session.get("output_dir"),
-            session.get("output_dir_rel"),
-        )
         if output_dir:
             masks_dir = os.path.join(output_dir, "masks")
 
