@@ -439,6 +439,10 @@ def run_session(args):
         print(f"Per-image pixel sizes found for {len(image_pixel_sizes)} image(s)")
     if approved_masks:
         print(f"Approved masks: {len(approved_masks)}")
+        # Show a sample to help diagnose matching issues
+        sample = list(approved_masks)[:3]
+        for img, sid in sample:
+            print(f"  e.g. image={img!r}  soma_id={sid!r}")
     else:
         print("No approval filter found — processing all masks")
     print()
@@ -447,6 +451,18 @@ def run_session(args):
     if not mask_files:
         print(f"No .tif files found in {masks_dir}")
         sys.exit(1)
+
+    # Show sample parsed mask filenames
+    sample_shown = 0
+    for f_ in mask_files:
+        n_, s_, _ = parse_mask_filename(f_, mode)
+        if n_ is not None and sample_shown < 3:
+            print(f"  Parsed: {f_!r} -> image={n_!r}  soma_id={s_!r}")
+            sample_shown += 1
+    unparsed = sum(1 for f_ in mask_files if parse_mask_filename(f_, mode)[0] is None)
+    if unparsed:
+        print(f"  ({unparsed} mask files did not match the {mode.upper()} filename pattern)")
+    print()
 
     all_results = []
     skipped = 0
