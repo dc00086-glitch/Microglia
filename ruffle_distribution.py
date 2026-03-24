@@ -497,6 +497,7 @@ def run_session(args):
 
     all_results = []
     skipped = 0
+    mismatch_shown = 0
     for fname in mask_files:
         image_name, soma_id, area_px = parse_mask_filename(fname, mode)
         if image_name is None:
@@ -506,6 +507,9 @@ def run_session(args):
         # If the image has no QA data at all, treat all its masks as approved.
         if image_name in images_with_qa:
             if (image_name, soma_id) not in approved_masks:
+                if mismatch_shown < 3:
+                    print(f"  MISMATCH: ({image_name!r}, {soma_id!r}) not in approved_masks")
+                    mismatch_shown += 1
                 skipped += 1
                 continue
 
