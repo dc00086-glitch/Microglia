@@ -405,23 +405,30 @@ def run_session(args):
         global_vz = args.vz
 
     # --- Build per-image pixel size lookup ---
-    # Images can have individual pixel sizes stored in the session
+    # Session keys include file extension (e.g. "image.tif") but mask
+    # filename parsing yields stems (e.g. "image"). Store both forms.
     image_pixel_sizes = {}
     for img_name, img_data in session.get("images", {}).items():
         ps = img_data.get("pixel_size")
         if ps is not None:
             try:
-                image_pixel_sizes[img_name] = float(ps)
+                val = float(ps)
+                image_pixel_sizes[img_name] = val
+                image_pixel_sizes[os.path.splitext(img_name)[0]] = val
             except (ValueError, TypeError):
                 pass
 
     # --- Collect approved masks ---
+    # Store with both the full session key and the stem so lookups from
+    # parsed mask filenames (which lack extensions) can match.
     approved_masks = set()
     for img_name, img_data in session.get("images", {}).items():
+        stem = os.path.splitext(img_name)[0]
         for mqa in img_data.get("mask_qa_state", []):
             if mqa.get("approved") is True:
                 soma_id = mqa.get("soma_id", "")
                 approved_masks.add((img_name, soma_id))
+                approved_masks.add((stem, soma_id))
 
     print(f"Session : {session_path}")
     print(f"Mode    : {mode.upper()}")
@@ -454,16 +461,7 @@ def run_session(args):
             continue
 
         # Per-image pixel size or global fallback
-        # The image name in the session may include extension; try both
-        vxy = image_pixel_sizes.get(image_name)
-        if vxy is None:
-            # Try with common extensions
-            for ext in [".tif", ".tiff", ".TIF", ".TIFF"]:
-                vxy = image_pixel_sizes.get(image_name + ext)
-                if vxy is not None:
-                    break
-        if vxy is None:
-            vxy = global_vxy
+        vxy = image_pixel_sizes.get(image_name, global_vxy)
         if vxy is None:
             print(f"  SKIP {fname}: no pixel size found (set --vxy or check session)")
             continue
@@ -491,12 +489,8 @@ def run_session(args):
             continue
 
         # Get animal_id and treatment from session if available
-        img_data = session.get("images", {})
-        img_session = None
-        for key in [image_name, image_name + ".tif", image_name + ".tiff"]:
-            if key in img_data:
-                img_session = img_data[key]
-                break
+        images_dict = session.get("images", {})
+        img_session = images_dict.get(image_name) or images_dict.get(image_name + ".tif") or images_dict.get(image_name + ".tiff")
 
         row = {
             "image_name": image_name,
