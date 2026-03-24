@@ -427,9 +427,14 @@ def run_session(args):
     # Store with both the full session key and the stem so lookups from
     # parsed mask filenames (which lack extensions) can match.
     approved_masks = set()
+    images_with_qa = set()   # images that have QA data at all
     for img_name, img_data in session.get("images", {}).items():
         stem = os.path.splitext(img_name)[0]
-        for mqa in img_data.get("mask_qa_state", []):
+        qa_list = img_data.get("mask_qa_state", [])
+        if qa_list:
+            images_with_qa.add(img_name)
+            images_with_qa.add(stem)
+        for mqa in qa_list:
             if mqa.get("approved") is True:
                 soma_id = mqa.get("soma_id", "")
                 approved_masks.add((img_name, soma_id))
@@ -497,10 +502,12 @@ def run_session(args):
         if image_name is None:
             continue
 
-        # If we have approval info, only process approved masks
-        if approved_masks and (image_name, soma_id) not in approved_masks:
-            skipped += 1
-            continue
+        # If this image has QA data, only process approved masks.
+        # If the image has no QA data at all, treat all its masks as approved.
+        if image_name in images_with_qa:
+            if (image_name, soma_id) not in approved_masks:
+                skipped += 1
+                continue
 
         # Per-image pixel size or global fallback
         vxy = image_pixel_sizes.get(image_name, global_vxy)
