@@ -6,11 +6,10 @@ Standalone script to quantify the spatial distribution of membrane ruffles
 relative to the soma in microglia.
 
 Workflow per cell:
-  1. Overlay soma mask on the processed (grayscale) image
-  2. Crop to the cell-mask bounding box
-  3. Otsu-threshold to separate bright ruffles from dimmer processes
-  4. Keep only pixels above the threshold (upper intensity peak)
-  5. Compute spatial stats on those ruffle pixels relative to the soma
+  1. Extract intensities within the soma mask
+  2. Otsu-threshold the soma region to separate bright ruffles from dimmer background
+  3. Keep only pixels above the threshold within the soma outline
+  4. Compute spatial stats on those ruffle pixels relative to the soma centroid
 
 Outputs per-cell metrics:
   - ruffle_polarity_index   : PCA-based (0 = evenly distributed, 1 = all on one side)
@@ -66,12 +65,11 @@ def compute_ruffle_distribution(processed_img, soma_mask, cell_mask, vxy,
 
     Workflow
     --------
-    1. Overlay soma on the processed (grayscale) image.
-    2. Crop to the cell-mask bounding box.
-    3. Otsu-threshold the cropped region to separate bright ruffles from
-       dimmer processes.
-    4. Keep only pixels above the Otsu threshold (the upper intensity peak).
-    5. Compute spatial statistics on those ruffle pixels relative to the soma
+    1. Extract intensities within the soma mask.
+    2. Otsu-threshold the soma region to separate bright ruffles from
+       dimmer soma background.
+    3. Keep only pixels above the Otsu threshold within the soma outline.
+    4. Compute spatial statistics on those ruffle pixels relative to the soma
        centroid.
 
     Parameters
@@ -100,33 +98,18 @@ def compute_ruffle_distribution(processed_img, soma_mask, cell_mask, vxy,
     if len(soma_coords) == 0:
         return None
 
-    # Crop to cell-mask bounding box for Otsu
-    cell_coords = np.argwhere(cell_bin)
-    if len(cell_coords) < 3:
-        return None
-    mins = cell_coords.min(axis=0)
-    maxs = cell_coords.max(axis=0) + 1
-    if cell_bin.ndim == 2:
-        crop_slice = (slice(mins[0], maxs[0]), slice(mins[1], maxs[1]))
-    else:
-        crop_slice = (slice(mins[0], maxs[0]), slice(mins[1], maxs[1]),
-                      slice(mins[2], maxs[2]))
-
-    cropped_img = processed_img[crop_slice]
-    cropped_cell = cell_bin[crop_slice]
-
-    # Otsu on cell-masked intensities
-    cell_intensities = cropped_img[cropped_cell]
-    if len(cell_intensities) < 3:
+    # Otsu on soma-masked intensities
+    soma_intensities = processed_img[soma_bin]
+    if len(soma_intensities) < 3:
         return None
 
     try:
-        otsu_thresh = threshold_otsu(cell_intensities)
+        otsu_thresh = threshold_otsu(soma_intensities)
     except ValueError:
         return None
 
-    # Bright ruffle pixels: above Otsu AND inside cell AND outside soma
-    ruffle_bin = (processed_img > otsu_thresh) & cell_bin & (~soma_bin)
+    # Bright ruffle pixels: above Otsu AND inside soma outline
+    ruffle_bin = (processed_img > otsu_thresh) & soma_bin
     ruffle_coords = np.argwhere(ruffle_bin)
 
     if len(ruffle_coords) < 3:
