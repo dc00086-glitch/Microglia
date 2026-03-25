@@ -267,6 +267,14 @@ def _compute_morphology_single(args):
     """
     mask_path, pixel_size, soma_area_um2 = args
 
+    # Support (px_x, px_y) tuple or single float
+    if isinstance(pixel_size, (list, tuple)) and len(pixel_size) == 2:
+        px_x, px_y = float(pixel_size[0]), float(pixel_size[1])
+    else:
+        px_x = px_y = float(pixel_size)
+    pixel_area = px_x * px_y
+    pixel_size_mean = math.sqrt(pixel_area)
+
     mask = safe_tiff_read(mask_path)
     mask = (mask > 0).astype(np.uint8)
 
@@ -280,8 +288,8 @@ def _compute_morphology_single(args):
     p = props[0]
     params = {}
 
-    params['perimeter'] = p.perimeter * pixel_size
-    params['mask_area'] = p.area * (pixel_size ** 2)
+    params['perimeter'] = p.perimeter * pixel_size_mean
+    params['mask_area'] = p.area * pixel_area
 
     major_axis = p.major_axis_length
     minor_axis = p.minor_axis_length
@@ -303,18 +311,21 @@ def _compute_morphology_single(args):
     right_point = coords[coords[:, 1].argmax()]
 
     extremities = np.array([top_point, bottom_point, left_point, right_point])
-    distances = np.sqrt(np.sum((extremities - centroid) ** 2, axis=1))
-    params['avg_centroid_distance'] = np.mean(distances) * pixel_size
+    diffs = extremities - centroid
+    scaled_diffs = diffs * np.array([px_y, px_x])
+    distances = np.sqrt(np.sum(scaled_diffs ** 2, axis=1))
+    params['avg_centroid_distance'] = np.mean(distances)
 
     if soma_area_um2 is not None:
         params['soma_area'] = soma_area_um2
     else:
-        params['soma_area'] = p.area * 0.1 * (pixel_size ** 2)
+        params['soma_area'] = p.area * 0.1 * pixel_area
 
-    # Polarity via PCA
+    # Polarity via PCA (in µm space)
     centered = coords - centroid
-    if len(centered) >= 3:
-        cov = np.cov(centered.T)
+    centered_um = centered * np.array([px_y, px_x])
+    if len(centered_um) >= 3:
+        cov = np.cov(centered_um.T)
         eigenvalues, eigenvectors = np.linalg.eigh(cov)
         major_val = eigenvalues[-1]
         minor_val = eigenvalues[0]
@@ -327,8 +338,8 @@ def _compute_morphology_single(args):
 
         angle_rad = np.arctan2(major_vec[0], major_vec[1])
         params['principal_angle'] = round(np.degrees(angle_rad) % 180, 2)
-        params['major_axis_um'] = round(2 * np.sqrt(major_val) * pixel_size, 4)
-        params['minor_axis_um'] = round(2 * np.sqrt(max(minor_val, 0)) * pixel_size, 4)
+        params['major_axis_um'] = round(2 * np.sqrt(major_val), 4)
+        params['minor_axis_um'] = round(2 * np.sqrt(max(minor_val, 0)), 4)
     else:
         params['polarity_index'] = 0
         params['principal_angle'] = 0
@@ -341,11 +352,15 @@ def _compute_morphology_single(args):
 def _export_mask_to_disk(args):
     """Write a single mask TIFF to disk. For use with ThreadPoolExecutor."""
     mask_path, mask_8bit, pixel_size = args
+    if isinstance(pixel_size, (list, tuple)) and len(pixel_size) == 2:
+        res_x, res_y = 1.0 / float(pixel_size[0]), 1.0 / float(pixel_size[1])
+    else:
+        res_x = res_y = 1.0 / float(pixel_size)
     try:
         tifffile.imwrite(
             mask_path,
             mask_8bit,
-            resolution=(1.0 / pixel_size, 1.0 / pixel_size),
+            resolution=(res_x, res_y),
             metadata={'unit': 'um'}
         )
         return True
@@ -1064,7 +1079,15 @@ class MorphologyCalculator:
 
     def __init__(self, image, pixel_size_um, use_imagej=False):
         self.image = image
-        self.pixel_size = pixel_size_um
+        # Support (px_x, px_y) tuple or single float
+        if isinstance(pixel_size_um, (list, tuple)) and len(pixel_size_um) == 2:
+            self.pixel_size_x = float(pixel_size_um[0])
+            self.pixel_size_y = float(pixel_size_um[1])
+        else:
+            self.pixel_size_x = float(pixel_size_um)
+            self.pixel_size_y = float(pixel_size_um)
+        self.pixel_size = math.sqrt(self.pixel_size_x * self.pixel_size_y)
+        self.pixel_area = self.pixel_size_x * self.pixel_size_y
         # Note: use_imagej parameter kept for backwards compatibility but not used
 
     def calculate_all_parameters(self, cell_mask, soma_centroid, soma_area_um2=None):
@@ -1080,18 +1103,18 @@ class MorphologyCalculator:
         props = measure.regionprops(mask.astype(int))[0] if np.any(mask) else None
         if props:
             params['perimeter'] = props.perimeter * self.pixel_size
-            params['mask_area'] = props.area * (self.pixel_size ** 2)
+            params['mask_area'] = props.area * self.pixel_area
 
             major_axis = props.major_axis_length
             minor_axis = props.minor_axis_length
-            
+
             # Range: 0 (perfect circle) to 1 (highly elongated)
             if major_axis > 0:
                 axis_ratio = minor_axis / major_axis
                 params['eccentricity'] = np.sqrt(1 - axis_ratio**2)
             else:
                 params['eccentricity'] = 0
-            
+
             # Roundness: (minor/major)^2  — 0 = elongated, 1 = circular
             if major_axis > 0:
                 params['roundness'] = axis_ratio ** 2
@@ -1107,13 +1130,16 @@ class MorphologyCalculator:
             right_point = coords[coords[:, 1].argmax()]
 
             extremities = np.array([top_point, bottom_point, left_point, right_point])
-            distances = np.sqrt(np.sum((extremities - centroid) ** 2, axis=1))
-            params['avg_centroid_distance'] = np.mean(distances) * self.pixel_size
+            # Direction-aware distance: row=Y, col=X
+            diffs = extremities - centroid
+            scaled_diffs = diffs * np.array([self.pixel_size_y, self.pixel_size_x])
+            distances = np.sqrt(np.sum(scaled_diffs ** 2, axis=1))
+            params['avg_centroid_distance'] = np.mean(distances)
 
             if soma_area_um2 is not None:
                 params['soma_area'] = soma_area_um2
             else:
-                params['soma_area'] = props.area * 0.1 * (self.pixel_size ** 2)
+                params['soma_area'] = props.area * 0.1 * self.pixel_area
 
             # Directional polarity via PCA on mask coordinates
             params.update(self._calculate_polarity(coords, centroid))
@@ -1132,18 +1158,20 @@ class MorphologyCalculator:
             principal_angle (0-180 degrees), major_axis_um, minor_axis_um.
         """
         params = {}
-        # Center coordinates on the centroid
+        # Center coordinates on the centroid and scale to µm
         centered = coords - centroid
+        # Scale: row (axis 0) = Y direction, col (axis 1) = X direction
+        centered_um = centered * np.array([self.pixel_size_y, self.pixel_size_x])
 
-        if len(centered) < 3:
+        if len(centered_um) < 3:
             params['polarity_index'] = 0
             params['principal_angle'] = 0
             params['major_axis_um'] = 0
             params['minor_axis_um'] = 0
             return params
 
-        # Covariance matrix of (row, col) positions
-        cov = np.cov(centered.T)
+        # Covariance matrix of (row, col) positions in µm
+        cov = np.cov(centered_um.T)
 
         # Eigenvalues = variance along principal axes
         eigenvalues, eigenvectors = np.linalg.eigh(cov)
@@ -1165,9 +1193,9 @@ class MorphologyCalculator:
         angle_deg = np.degrees(angle_rad) % 180  # Map to 0-180 range
         params['principal_angle'] = round(angle_deg, 2)
 
-        # Axis extents in microns (2 * sqrt(eigenvalue) gives the std dev extent)
-        params['major_axis_um'] = round(2 * np.sqrt(major_val) * self.pixel_size, 4)
-        params['minor_axis_um'] = round(2 * np.sqrt(max(minor_val, 0)) * self.pixel_size, 4)
+        # Axis extents in microns (already in µm from scaled coordinates)
+        params['major_axis_um'] = round(2 * np.sqrt(major_val), 4)
+        params['minor_axis_um'] = round(2 * np.sqrt(max(minor_val, 0)), 4)
 
         return params
 
@@ -2185,6 +2213,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.output_dir = None
         self.masks_dir = None
         self.pixel_size = 0.316
+        self.pixel_size_x = 0.316
+        self.pixel_size_y = 0.316
         self.default_rolling_ball_radius = 50
         self.all_masks_flat = []
         self.mask_qa_idx = 0
@@ -2451,9 +2481,39 @@ class MicrogliaAnalysisGUI(QMainWindow):
         param_group = QGroupBox("2. Parameters")
         param_layout = QVBoxLayout()
         form_layout = QFormLayout()
-        self.pixel_size_input = QLineEdit(str(self.pixel_size))
+        # Pixel size X and Y inputs with lock toggle
+        pixel_size_widget = QWidget()
+        pixel_size_layout = QHBoxLayout()
+        pixel_size_layout.setContentsMargins(0, 0, 0, 0)
+        self.pixel_size_x_input = QLineEdit(str(self.pixel_size_x))
+        self.pixel_size_y_input = QLineEdit(str(self.pixel_size_y))
+        self.pixel_size_x_input.setToolTip("Pixel size in X (horizontal) direction")
+        self.pixel_size_y_input.setToolTip("Pixel size in Y (vertical) direction")
+        self.pixel_size_x_input.setFixedWidth(70)
+        self.pixel_size_y_input.setFixedWidth(70)
+        self.pixel_size_lock_btn = QPushButton("🔒")
+        self.pixel_size_lock_btn.setFixedWidth(28)
+        self.pixel_size_lock_btn.setCheckable(True)
+        self.pixel_size_lock_btn.setChecked(True)
+        self.pixel_size_lock_btn.setToolTip("Lock X and Y pixel sizes together")
+        self.pixel_size_lock_btn.toggled.connect(self._on_pixel_size_lock_toggled)
+        self.pixel_size_x_input.textChanged.connect(self._on_pixel_size_x_changed)
+        pixel_size_layout.addWidget(QLabel("X:"))
+        pixel_size_layout.addWidget(self.pixel_size_x_input)
+        pixel_size_layout.addWidget(QLabel("Y:"))
+        pixel_size_layout.addWidget(self.pixel_size_y_input)
+        pixel_size_layout.addWidget(self.pixel_size_lock_btn)
+        pixel_size_layout.addStretch()
+        pixel_size_widget.setLayout(pixel_size_layout)
         self.pixel_size_label = QLabel("Pixel size (μm/px):")
-        form_layout.addRow(self.pixel_size_label, self.pixel_size_input)
+        form_layout.addRow(self.pixel_size_label, pixel_size_widget)
+        # Backward-compatible property: pixel_size_input reads X value
+        self.pixel_size_input = self.pixel_size_x_input
+        # Calibrate from scale bar button
+        self.calibrate_btn = QPushButton("Calibrate from Scale Bar...")
+        self.calibrate_btn.setToolTip("Measure a scale bar on the image to calculate μm/px")
+        self.calibrate_btn.clicked.connect(self._calibrate_from_scale_bar)
+        form_layout.addRow("", self.calibrate_btn)
         # 3D voxel Z input (hidden until 3D mode enabled)
         self.voxel_z_input = QLineEdit(str(self.voxel_size_z))
         self.voxel_z_label = QLabel("Z step size (μm/slice):")
@@ -5335,14 +5395,14 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         label = self._get_active_label()
         if not label or label.measure_pt1 is None or label.measure_pt2 is None:
             return ""
-        pixel_size = self._get_pixel_size(self.current_image_name)
+        px_x, px_y = self._get_pixel_size_xy(self.current_image_name)
 
         pt1 = label.measure_pt1
         pt2 = label.measure_pt2
-        dx = (pt2[1] - pt1[1])
-        dy = (pt2[0] - pt1[0])
+        dx = (pt2[1] - pt1[1])  # col = X direction
+        dy = (pt2[0] - pt1[0])  # row = Y direction
         dist_px = math.sqrt(dx * dx + dy * dy)
-        dist_um = dist_px * pixel_size
+        dist_um = math.sqrt((dx * px_x) ** 2 + (dy * px_y) ** 2)
         return f"{dist_um:.2f} um ({dist_px:.0f} px)"
 
     def _show_measurement(self):
@@ -5504,7 +5564,9 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             'output_dir_rel': self._make_relative(self.output_dir, session_dir) if session_dir else None,
             'masks_dir_rel': self._make_relative(self.masks_dir, session_dir) if session_dir else None,
             'colocalization_mode': self.colocalization_mode,
-            'pixel_size': self.pixel_size_input.text(),
+            'pixel_size': self.pixel_size_x_input.text(),
+            'pixel_size_x': self.pixel_size_x_input.text(),
+            'pixel_size_y': self.pixel_size_y_input.text(),
             'rolling_ball_radius': self.default_rolling_ball_radius,
             'use_min_intensity': self.use_min_intensity,
             'min_intensity_percent': self.min_intensity_percent,
@@ -5568,6 +5630,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                 'treatment': img_data.get('treatment', ''),
                 'rolling_ball_radius': img_data.get('rolling_ball_radius', 50),
                 'pixel_size': img_data.get('pixel_size'),
+                'pixel_size_xy': img_data.get('pixel_size_xy'),
                 'somas': [tuple(float(c) for c in s) for s in img_data.get('somas', [])],
                 'soma_ids': img_data.get('soma_ids', []),
                 'soma_outlines': [],
@@ -6402,10 +6465,10 @@ if __name__ == '__main__':
         self.voxel_z_label.setVisible(checked)
         self.voxel_z_input.setVisible(checked)
         if checked:
-            self.pixel_size_label.setText("XY pixel size (μm/px):")
+            self.pixel_size_label.setText("XY pixel size (µm/px):")
             self.setWindowTitle("Microglia Analysis - 3D Z-Stack Mode")
         else:
-            self.pixel_size_label.setText("Pixel size (μm/px):")
+            self.pixel_size_label.setText("Pixel size (µm/px):")
             self.setWindowTitle("Microglia Analysis - Multi-Image Batch Processing")
 
         self.log(f"{'3D Z-Stack' if checked else '2D'} mode {'enabled' if checked else 'restored'}")
@@ -6540,22 +6603,347 @@ if __name__ == '__main__':
         return best_z, best_y, best_x
 
     def _get_pixel_size(self, img_name=None):
-        """Get the pixel size for an image, falling back to the global setting.
+        """Get the effective pixel size for an image (geometric mean of X and Y).
+
+        For backward compatibility, returns a single float. Use _get_pixel_size_xy()
+        when separate X/Y values are needed.
 
         Args:
             img_name: Image name to look up. If None, returns the global pixel size.
 
         Returns:
-            float pixel size in µm/px.
+            float pixel size in µm/px (geometric mean of X and Y).
+        """
+        px_x, px_y = self._get_pixel_size_xy(img_name)
+        return math.sqrt(px_x * px_y)
+
+    def _get_pixel_size_xy(self, img_name=None):
+        """Get the (pixel_size_x, pixel_size_y) tuple for an image.
+
+        Args:
+            img_name: Image name to look up. If None, returns the global pixel sizes.
+
+        Returns:
+            tuple of (pixel_size_x, pixel_size_y) in µm/px.
         """
         if img_name and img_name in self.images:
             per_image = self.images[img_name].get('pixel_size')
             if per_image is not None:
-                return per_image
+                if isinstance(per_image, (list, tuple)) and len(per_image) == 2:
+                    return (float(per_image[0]), float(per_image[1]))
+                return (float(per_image), float(per_image))
+            per_image_xy = self.images[img_name].get('pixel_size_xy')
+            if per_image_xy is not None:
+                return (float(per_image_xy[0]), float(per_image_xy[1]))
         try:
-            return float(self.pixel_size_input.text())
+            px_x = float(self.pixel_size_x_input.text())
         except (ValueError, AttributeError):
-            return 0.316
+            px_x = 0.316
+        try:
+            px_y = float(self.pixel_size_y_input.text())
+        except (ValueError, AttributeError):
+            px_y = px_x
+        return (px_x, px_y)
+
+    def _on_pixel_size_lock_toggled(self, locked):
+        """Update lock button appearance and sync Y to X if locking."""
+        self.pixel_size_lock_btn.setText("🔒" if locked else "🔓")
+        if locked:
+            self.pixel_size_y_input.setText(self.pixel_size_x_input.text())
+
+    def _on_pixel_size_x_changed(self, text):
+        """When X pixel size changes, sync Y if locked."""
+        if self.pixel_size_lock_btn.isChecked():
+            self.pixel_size_y_input.setText(text)
+
+    def _calibrate_from_scale_bar(self):
+        """Open a dialog to calibrate pixel size by measuring a scale bar on the image."""
+        if not self.current_image_name or self.current_image_name not in self.images:
+            QMessageBox.warning(self, "Warning", "Load and select an image first.")
+            return
+
+        img_data = self.images[self.current_image_name]
+        raw_img = load_tiff_image(img_data['raw_path'])
+        if raw_img is None:
+            QMessageBox.warning(self, "Warning", "Could not load image.")
+            return
+
+        img_h, img_w = raw_img.shape[:2]
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Calibrate Pixel Size from Scale Bar")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(650)
+        dialog.setMinimumHeight(550)
+        layout = QVBoxLayout()
+
+        # Image info
+        info_label = QLabel(
+            f"Image: {self.current_image_name}\n"
+            f"Dimensions: {img_w} x {img_h} pixels"
+        )
+        info_label.setStyleSheet("font-weight: bold; padding: 4px;")
+        layout.addWidget(info_label)
+
+        instructions = QLabel(
+            "Click two points on the scale bar in the image below to measure its length in pixels.\n"
+            "Then enter the known distance in µm and click 'Calculate'."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+
+        # Image display for scale bar measurement
+        from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
+        from PyQt5.QtCore import QPoint
+
+        # Convert image to QPixmap for display
+        if raw_img.ndim == 3:
+            display_img = raw_img.copy()
+            if display_img.shape[2] == 1:
+                display_img = np.squeeze(display_img)
+                display_img = np.stack([display_img] * 3, axis=-1)
+            h, w, ch = display_img.shape
+            bytes_per_line = ch * w
+            qimg = QImage(display_img.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        else:
+            display_img = raw_img.copy()
+            h, w = display_img.shape
+            qimg = QImage(display_img.data, w, h, w, QImage.Format_Grayscale8)
+
+        base_pixmap = QPixmap.fromImage(qimg)
+
+        class ScaleBarLabel(QLabel):
+            def __init__(self, pixmap, parent_dialog):
+                super().__init__()
+                self.base_pixmap = pixmap
+                self.parent_dialog = parent_dialog
+                self.pt1 = None
+                self.pt2 = None
+                self.setMinimumSize(400, 300)
+                self.setAlignment(Qt.AlignCenter)
+                self._update()
+
+            def _get_scale(self):
+                if self.base_pixmap is None:
+                    return 1.0
+                w = self.width()
+                h = self.height()
+                return min(w / self.base_pixmap.width(), h / self.base_pixmap.height())
+
+            def _to_img_coords(self, pos):
+                scale = self._get_scale()
+                pw = int(self.base_pixmap.width() * scale)
+                ph = int(self.base_pixmap.height() * scale)
+                ox = (self.width() - pw) // 2
+                oy = (self.height() - ph) // 2
+                ix = (pos.x() - ox) / scale
+                iy = (pos.y() - oy) / scale
+                ix = max(0, min(self.base_pixmap.width() - 1, ix))
+                iy = max(0, min(self.base_pixmap.height() - 1, iy))
+                return (ix, iy)
+
+            def _to_display_coords(self, img_pt):
+                scale = self._get_scale()
+                pw = int(self.base_pixmap.width() * scale)
+                ph = int(self.base_pixmap.height() * scale)
+                ox = (self.width() - pw) // 2
+                oy = (self.height() - ph) // 2
+                return (int(img_pt[0] * scale + ox), int(img_pt[1] * scale + oy))
+
+            def mousePressEvent(self, event):
+                if event.button() == Qt.LeftButton:
+                    coords = self._to_img_coords(event.pos())
+                    if self.pt1 is None or self.pt2 is not None:
+                        self.pt1 = coords
+                        self.pt2 = None
+                    else:
+                        self.pt2 = coords
+                        # Update pixel distance display
+                        dx = self.pt2[0] - self.pt1[0]
+                        dy = self.pt2[1] - self.pt1[1]
+                        dist = math.sqrt(dx * dx + dy * dy)
+                        self.parent_dialog._px_dist_label.setText(f"{dist:.1f}")
+                        self.parent_dialog._recalculate()
+                    self._update()
+
+            def _update(self):
+                if self.base_pixmap is None:
+                    return
+                scale = self._get_scale()
+                pw = int(self.base_pixmap.width() * scale)
+                ph = int(self.base_pixmap.height() * scale)
+                scaled = self.base_pixmap.scaled(pw, ph, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                canvas = QPixmap(self.size())
+                canvas.fill(QColor(0, 0, 0))
+                painter = QPainter(canvas)
+                ox = (self.width() - pw) // 2
+                oy = (self.height() - ph) // 2
+                painter.drawPixmap(ox, oy, scaled)
+
+                if self.pt1 is not None:
+                    pen = QPen(QColor(255, 255, 0), 2, Qt.SolidLine)
+                    painter.setPen(pen)
+                    painter.setBrush(QColor(255, 255, 0, 150))
+                    dx1, dy1 = self._to_display_coords(self.pt1)
+                    painter.drawEllipse(dx1 - 4, dy1 - 4, 8, 8)
+                    if self.pt2 is not None:
+                        dx2, dy2 = self._to_display_coords(self.pt2)
+                        painter.drawLine(dx1, dy1, dx2, dy2)
+                        painter.drawEllipse(dx2 - 4, dy2 - 4, 8, 8)
+
+                painter.end()
+                self.setPixmap(canvas)
+
+            def resizeEvent(self, event):
+                super().resizeEvent(event)
+                self._update()
+
+        scale_label = ScaleBarLabel(base_pixmap, dialog)
+        layout.addWidget(scale_label, stretch=1)
+
+        # Measurement results row
+        meas_layout = QHBoxLayout()
+        meas_layout.addWidget(QLabel("Scale bar length (px):"))
+        dialog._px_dist_label = QLabel("--")
+        dialog._px_dist_label.setStyleSheet("font-weight: bold;")
+        meas_layout.addWidget(dialog._px_dist_label)
+        meas_layout.addSpacing(15)
+        meas_layout.addWidget(QLabel("Known distance (µm):"))
+        dialog._um_input = QLineEdit()
+        dialog._um_input.setFixedWidth(80)
+        dialog._um_input.setPlaceholderText("e.g. 50")
+        dialog._um_input.textChanged.connect(lambda: dialog._recalculate())
+        meas_layout.addWidget(dialog._um_input)
+        meas_layout.addStretch()
+        layout.addLayout(meas_layout)
+
+        # Calculated result
+        result_layout = QHBoxLayout()
+        result_layout.addWidget(QLabel("Calculated pixel size:"))
+        dialog._result_label = QLabel("-- µm/px")
+        dialog._result_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        result_layout.addWidget(dialog._result_label)
+
+        # Direction info
+        dialog._direction_label = QLabel("")
+        dialog._direction_label.setStyleSheet("color: gray;")
+        result_layout.addWidget(dialog._direction_label)
+        result_layout.addStretch()
+        layout.addLayout(result_layout)
+
+        def _recalculate():
+            px_text = dialog._px_dist_label.text()
+            um_text = dialog._um_input.text().strip()
+            if px_text == "--" or not um_text:
+                dialog._result_label.setText("-- µm/px")
+                dialog._direction_label.setText("")
+                return
+            try:
+                px_dist = float(px_text)
+                um_dist = float(um_text)
+                if px_dist > 0 and um_dist > 0:
+                    um_per_px = um_dist / px_dist
+                    dialog._result_label.setText(f"{um_per_px:.6f} µm/px")
+                    # Show per-axis breakdown
+                    pt1 = scale_label.pt1
+                    pt2 = scale_label.pt2
+                    if pt1 and pt2:
+                        dx = abs(pt2[0] - pt1[0])
+                        dy = abs(pt2[1] - pt1[1])
+                        if dx > dy * 3:
+                            dialog._direction_label.setText("(horizontal measurement → X pixel size)")
+                        elif dy > dx * 3:
+                            dialog._direction_label.setText("(vertical measurement → Y pixel size)")
+                        else:
+                            dialog._direction_label.setText("(diagonal measurement → isotropic pixel size)")
+                else:
+                    dialog._result_label.setText("-- µm/px")
+                    dialog._direction_label.setText("")
+            except ValueError:
+                dialog._result_label.setText("-- µm/px")
+                dialog._direction_label.setText("")
+
+        dialog._recalculate = _recalculate
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        # Apply to X button
+        apply_x_btn = QPushButton("Apply to X")
+        apply_x_btn.setToolTip("Set the calculated value as the X pixel size")
+        btn_layout.addWidget(apply_x_btn)
+
+        # Apply to Y button
+        apply_y_btn = QPushButton("Apply to Y")
+        apply_y_btn.setToolTip("Set the calculated value as the Y pixel size")
+        btn_layout.addWidget(apply_y_btn)
+
+        # Apply to both button
+        apply_both_btn = QPushButton("Apply to Both")
+        apply_both_btn.setStyleSheet("QPushButton { font-weight: bold; }")
+        apply_both_btn.setToolTip("Set the calculated value as both X and Y pixel size")
+        btn_layout.addWidget(apply_both_btn)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        def _get_calculated_value():
+            px_text = dialog._px_dist_label.text()
+            um_text = dialog._um_input.text().strip()
+            if px_text == "--" or not um_text:
+                return None
+            try:
+                px_dist = float(px_text)
+                um_dist = float(um_text)
+                if px_dist > 0 and um_dist > 0:
+                    return um_dist / px_dist
+            except ValueError:
+                pass
+            return None
+
+        def _apply_to_x():
+            val = _get_calculated_value()
+            if val is None:
+                QMessageBox.warning(dialog, "Warning", "Measure the scale bar and enter the known distance first.")
+                return
+            was_locked = self.pixel_size_lock_btn.isChecked()
+            if was_locked:
+                self.pixel_size_lock_btn.setChecked(False)
+            self.pixel_size_x_input.setText(f"{val:.6f}")
+            self.log(f"Pixel size X set to {val:.6f} µm/px from scale bar calibration")
+            dialog.accept()
+
+        def _apply_to_y():
+            val = _get_calculated_value()
+            if val is None:
+                QMessageBox.warning(dialog, "Warning", "Measure the scale bar and enter the known distance first.")
+                return
+            was_locked = self.pixel_size_lock_btn.isChecked()
+            if was_locked:
+                self.pixel_size_lock_btn.setChecked(False)
+            self.pixel_size_y_input.setText(f"{val:.6f}")
+            self.log(f"Pixel size Y set to {val:.6f} µm/px from scale bar calibration")
+            dialog.accept()
+
+        def _apply_to_both():
+            val = _get_calculated_value()
+            if val is None:
+                QMessageBox.warning(dialog, "Warning", "Measure the scale bar and enter the known distance first.")
+                return
+            self.pixel_size_lock_btn.setChecked(True)
+            self.pixel_size_x_input.setText(f"{val:.6f}")
+            self.log(f"Pixel size set to {val:.6f} µm/px from scale bar calibration")
+            dialog.accept()
+
+        apply_x_btn.clicked.connect(_apply_to_x)
+        apply_y_btn.clicked.connect(_apply_to_y)
+        apply_both_btn.clicked.connect(_apply_to_both)
+
+        layout.addLayout(btn_layout)
+        dialog.setLayout(layout)
+        dialog.exec_()
 
     def _set_per_image_pixel_size(self):
         """Show a dialog to set pixel size overrides for individual images."""
@@ -6576,20 +6964,26 @@ if __name__ == '__main__':
         layout.addWidget(info)
 
         # Global pixel size display
-        global_px = self.pixel_size_input.text()
-        global_label = QLabel(f"Global pixel size: {global_px} µm/px")
+        global_px_x = self.pixel_size_x_input.text()
+        global_px_y = self.pixel_size_y_input.text()
+        if global_px_x == global_px_y:
+            global_label = QLabel(f"Global pixel size: {global_px_x} µm/px")
+        else:
+            global_label = QLabel(f"Global pixel size: X={global_px_x}, Y={global_px_y} µm/px")
         global_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(global_label)
 
         layout.addSpacing(5)
 
-        # Table of images with pixel size inputs
+        # Table of images with pixel size inputs (X and Y columns)
         table = QTableWidget()
-        table.setColumnCount(2)
-        table.setHorizontalHeaderLabels(["Image", "Pixel Size (µm/px)"])
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["Image", "Pixel Size X (µm/px)", "Pixel Size Y (µm/px)"])
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
-        table.setColumnWidth(1, 150)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        table.setColumnWidth(1, 130)
+        table.setColumnWidth(2, 130)
 
         image_names = list(self.images.keys())
         table.setRowCount(len(image_names))
@@ -6601,14 +6995,29 @@ if __name__ == '__main__':
             name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
             table.setItem(row, 0, name_item)
 
-            # Pixel size input
+            # Get current per-image pixel size
             per_image = self.images[img_name].get('pixel_size')
-            line_edit = QLineEdit()
-            line_edit.setPlaceholderText(f"{global_px} (global)")
-            if per_image is not None:
-                line_edit.setText(str(per_image))
-            table.setCellWidget(row, 1, line_edit)
-            inputs[img_name] = line_edit
+            per_image_xy = self.images[img_name].get('pixel_size_xy')
+
+            x_edit = QLineEdit()
+            y_edit = QLineEdit()
+            x_edit.setPlaceholderText(f"{global_px_x} (global)")
+            y_edit.setPlaceholderText(f"{global_px_y} (global)")
+
+            if per_image_xy is not None:
+                x_edit.setText(str(per_image_xy[0]))
+                y_edit.setText(str(per_image_xy[1]))
+            elif per_image is not None:
+                if isinstance(per_image, (list, tuple)) and len(per_image) == 2:
+                    x_edit.setText(str(per_image[0]))
+                    y_edit.setText(str(per_image[1]))
+                else:
+                    x_edit.setText(str(per_image))
+                    y_edit.setText(str(per_image))
+
+            table.setCellWidget(row, 1, x_edit)
+            table.setCellWidget(row, 2, y_edit)
+            inputs[img_name] = (x_edit, y_edit)
 
         layout.addWidget(table)
 
@@ -6616,7 +7025,11 @@ if __name__ == '__main__':
         btn_layout = QHBoxLayout()
 
         clear_btn = QPushButton("Clear All Overrides")
-        clear_btn.clicked.connect(lambda: [inp.clear() for inp in inputs.values()])
+        def _clear_all():
+            for x_inp, y_inp in inputs.values():
+                x_inp.clear()
+                y_inp.clear()
+        clear_btn.clicked.connect(_clear_all)
         btn_layout.addWidget(clear_btn)
 
         btn_layout.addStretch()
@@ -6633,7 +7046,7 @@ if __name__ == '__main__':
 
         layout.addLayout(btn_layout)
         dialog.setLayout(layout)
-        dialog.setMinimumWidth(500)
+        dialog.setMinimumWidth(600)
         dialog.setMinimumHeight(400)
 
         if dialog.exec_() != QDialog.Accepted:
@@ -6641,27 +7054,45 @@ if __name__ == '__main__':
 
         # Apply the pixel sizes
         changed = 0
-        for img_name, line_edit in inputs.items():
-            text = line_edit.text().strip()
-            if text:
+        for img_name, (x_edit, y_edit) in inputs.items():
+            x_text = x_edit.text().strip()
+            y_text = y_edit.text().strip()
+            if x_text or y_text:
                 try:
-                    val = float(text)
-                    if val > 0:
-                        self.images[img_name]['pixel_size'] = val
+                    val_x = float(x_text) if x_text else None
+                    val_y = float(y_text) if y_text else None
+                    if val_x is not None and val_x > 0:
+                        if val_y is not None and val_y > 0:
+                            self.images[img_name]['pixel_size'] = [val_x, val_y]
+                            self.images[img_name]['pixel_size_xy'] = [val_x, val_y]
+                        else:
+                            self.images[img_name]['pixel_size'] = val_x
+                            self.images[img_name]['pixel_size_xy'] = [val_x, val_x]
+                        changed += 1
+                    elif val_y is not None and val_y > 0:
+                        self.images[img_name]['pixel_size'] = val_y
+                        self.images[img_name]['pixel_size_xy'] = [val_y, val_y]
                         changed += 1
                     else:
                         self.images[img_name]['pixel_size'] = None
+                        self.images[img_name]['pixel_size_xy'] = None
                 except ValueError:
                     self.images[img_name]['pixel_size'] = None
+                    self.images[img_name]['pixel_size_xy'] = None
             else:
                 self.images[img_name]['pixel_size'] = None
+                self.images[img_name]['pixel_size_xy'] = None
 
-        overrides = {name: data['pixel_size'] for name, data in self.images.items()
+        overrides = {name: data.get('pixel_size_xy') or data.get('pixel_size')
+                     for name, data in self.images.items()
                      if data.get('pixel_size') is not None}
         if overrides:
             self.log(f"Per-image pixel sizes set for {len(overrides)} image(s):")
             for name, px in overrides.items():
-                self.log(f"  {os.path.splitext(name)[0]}: {px} µm/px")
+                if isinstance(px, (list, tuple)):
+                    self.log(f"  {os.path.splitext(name)[0]}: X={px[0]}, Y={px[1]} µm/px")
+                else:
+                    self.log(f"  {os.path.splitext(name)[0]}: {px} µm/px")
         elif changed == 0:
             self.log("All per-image pixel size overrides cleared (using global)")
 
@@ -6827,7 +7258,12 @@ if __name__ == '__main__':
             self.grayscale_channel = session.get('grayscale_channel', 0)
 
             pixel_size = session.get('pixel_size', '0.316')
-            self.pixel_size_input.setText(str(pixel_size))
+            pixel_size_x = session.get('pixel_size_x', pixel_size)
+            pixel_size_y = session.get('pixel_size_y', pixel_size)
+            self.pixel_size_x_input.setText(str(pixel_size_x))
+            if str(pixel_size_x) != str(pixel_size_y):
+                self.pixel_size_lock_btn.setChecked(False)
+            self.pixel_size_y_input.setText(str(pixel_size_y))
             self.default_rolling_ball_radius = session.get('rolling_ball_radius', 50)
 
             # Restore 3D mode state
@@ -6843,14 +7279,14 @@ if __name__ == '__main__':
             if is_3d:
                 vz = session.get('voxel_size_z', '1.0')
                 self.voxel_z_input.setText(str(vz))
-                self.pixel_size_label.setText("XY pixel size (um/px):")
+                self.pixel_size_label.setText("XY pixel size (µm/px):")
                 self.setWindowTitle("Microglia Analysis - 3D Z-Stack Mode")
                 self.mask_min_volume = session.get('mask_min_volume', 500)
                 self.mask_max_volume = session.get('mask_max_volume', 5000)
                 self.soma_intensity_tolerance = session.get('soma_intensity_tolerance', 30)
                 self.soma_max_radius_um = session.get('soma_max_radius_um', 8.0)
             else:
-                self.pixel_size_label.setText("Pixel size (um/px):")
+                self.pixel_size_label.setText("Pixel size (µm/px):")
                 self.setWindowTitle("Microglia Analysis - Multi-Image Batch Processing")
 
             if self.colocalization_mode:
@@ -7011,6 +7447,7 @@ if __name__ == '__main__':
                     'animal_id': img_session.get('animal_id', ''),
                     'treatment': img_session.get('treatment', ''),
                     'pixel_size': img_session.get('pixel_size'),
+                    'pixel_size_xy': img_session.get('pixel_size_xy'),
                 }
                 if is_3d:
                     img_dict['raw_stack'] = None
@@ -8210,6 +8647,7 @@ if __name__ == '__main__':
                 'animal_id': '',
                 'treatment': '',
                 'pixel_size': None,
+                'pixel_size_xy': None,
             }
             if self.mode_3d:
                 img_dict['raw_stack'] = None
@@ -9887,8 +10325,8 @@ if __name__ == '__main__':
         soma_id = img_data['soma_ids'][soma_idx]
 
         # Calculate soma area from the outline
-        pixel_size = self._get_pixel_size(img_name)
-        soma_area_um2 = np.sum(mask) * (pixel_size ** 2)
+        px_x, px_y = self._get_pixel_size_xy(img_name)
+        soma_area_um2 = np.sum(mask) * (px_x * px_y)
 
         img_data['soma_outlines'].append({
             'soma_idx': soma_idx,
@@ -9900,7 +10338,7 @@ if __name__ == '__main__':
         })
 
         # Export soma outline to file
-        self._export_soma_outline(img_name, soma_id, mask, pixel_size, soma_area_um2)
+        self._export_soma_outline(img_name, soma_id, mask, (px_x, px_y), soma_area_um2)
 
         self.log(f"✓ {soma_id} approved (soma area: {soma_area_um2:.1f} µm²)")
         self.polygon_points = []
@@ -10147,8 +10585,8 @@ if __name__ == '__main__':
 
             # Create mask from points
             mask = self._polygon_to_mask(points, outline_img.shape)
-            pixel_size = self._get_pixel_size(img_name)
-            soma_area_um2 = np.sum(mask) * (pixel_size ** 2)
+            px_x, px_y = self._get_pixel_size_xy(img_name)
+            soma_area_um2 = np.sum(mask) * (px_x * px_y)
 
             # Save outline
             img_data['soma_outlines'].append({
@@ -10162,7 +10600,7 @@ if __name__ == '__main__':
             })
 
             # Export soma outline
-            self._export_soma_outline(img_name, soma_id, mask, pixel_size, soma_area_um2)
+            self._export_soma_outline(img_name, soma_id, mask, (px_x, px_y), soma_area_um2)
             success_count += 1
 
         self.log(f"✓ Auto-outlined {success_count} somas")
@@ -12447,14 +12885,14 @@ if __name__ == '__main__':
             return
 
         # Get pixel size
-        pixel_size = self._get_pixel_size(img_name)
+        px_x, px_y = self._get_pixel_size_xy(img_name)
 
         # Save as TIFF with calibration
         try:
             tifffile.imwrite(
                 mask_path,
                 mask_8bit,
-                resolution=(1.0 / pixel_size, 1.0 / pixel_size),
+                resolution=(1.0 / px_x, 1.0 / px_y),
                 metadata={'unit': 'um'}
             )
 
@@ -12475,7 +12913,7 @@ if __name__ == '__main__':
 
         img_basename = os.path.splitext(img_name)[0]
 
-        pixel_size = self._get_pixel_size(img_name)
+        pixel_size_xy = self._get_pixel_size_xy(img_name)
 
         # Prepare all write tasks
         write_tasks = []
@@ -12501,7 +12939,7 @@ if __name__ == '__main__':
             if np.count_nonzero(mask_8bit) == 0:
                 continue
 
-            write_tasks.append((mask_path, mask_8bit, pixel_size))
+            write_tasks.append((mask_path, mask_8bit, pixel_size_xy))
 
         if not write_tasks:
             return
@@ -12549,12 +12987,18 @@ if __name__ == '__main__':
             self.log(f"   ⚠️ Soma outline {soma_id} became empty after conversion")
             return
 
+        # Handle (px_x, px_y) tuple or single float
+        if isinstance(pixel_size, (list, tuple)) and len(pixel_size) == 2:
+            res_x, res_y = 1.0 / float(pixel_size[0]), 1.0 / float(pixel_size[1])
+        else:
+            res_x = res_y = 1.0 / float(pixel_size)
+
         # Save as TIFF with calibration
         try:
             tifffile.imwrite(
                 soma_path,
                 mask_8bit,
-                resolution=(1.0 / pixel_size, 1.0 / pixel_size),
+                resolution=(res_x, res_y),
                 metadata={'unit': 'um'}
             )
 
@@ -12851,14 +13295,15 @@ if __name__ == '__main__':
             # Disable the calculate button during processing
             self.batch_calculate_btn.setEnabled(False)
 
-            # Build per-image pixel size map
+            # Build per-image pixel size map (using (px_x, px_y) tuples)
             pixel_size_map = {}
             for img_name, img_data in self.images.items():
-                pixel_size_map[img_name] = self._get_pixel_size(img_name)
+                pixel_size_map[img_name] = self._get_pixel_size_xy(img_name)
 
             # Create and start worker thread (no ImageJ needed)
+            pixel_size_xy = self._get_pixel_size_xy()
             self.morph_thread = MorphologyCalculationThread(
-                approved_masks, pixel_size, use_imagej=False, images=self.images,
+                approved_masks, pixel_size_xy, use_imagej=False, images=self.images,
                 output_dir=self.output_dir, pixel_size_map=pixel_size_map,
                 masks_dir=self.masks_dir
             )
