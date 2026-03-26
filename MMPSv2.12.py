@@ -14412,7 +14412,11 @@ if __name__ == '__main__':
         # Combined results file
         combined_path = os.path.join(self.output_dir, "combined_morphology_results.csv")
 
-        keys = list(results[0].keys())
+        # Collect all keys across all results (some may have coloc fields, others not)
+        all_keys_set = set()
+        for r in results:
+            all_keys_set.update(r.keys())
+        keys = list(all_keys_set)
         # Remove these to reorder them
         for key in ['soma_id', 'image_name', 'animal_id', 'treatment', 'soma_idx', 'soma_group']:
             if key in keys:
