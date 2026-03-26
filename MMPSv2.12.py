@@ -29,6 +29,21 @@ import math
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
+
+# --- Global exception hook: prevent PyQt5 from silently swallowing crashes ---
+def _global_exception_hook(exc_type, exc_value, exc_tb):
+    import traceback
+    traceback.print_exception(exc_type, exc_value, exc_tb)
+    try:
+        from PyQt5.QtWidgets import QMessageBox
+        msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        QMessageBox.critical(None, "Unhandled Error", msg[:2000])
+    except Exception:
+        pass
+
+sys.excepthook = _global_exception_hook
+
+
 # --- 3D Z-stack functions (imported from 3DMicroglia.py) ---
 try:
     import importlib.util as _ilu
@@ -10940,6 +10955,15 @@ if __name__ == '__main__':
             self.log("⚠️ No points to clear")
 
     def finish_polygon(self):
+        try:
+            self._finish_polygon_impl()
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"ERROR in finish_polygon: {e}\n{tb}")
+            QMessageBox.critical(self, "Error", f"Failed to confirm outline:\n{e}\n\nSee log for details.")
+
+    def _finish_polygon_impl(self):
         # Reset zoom state to prevent getting stuck
         self.z_key_held = False
         self.processed_label.selected_point_idx = None
