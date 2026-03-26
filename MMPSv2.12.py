@@ -1284,7 +1284,7 @@ class MorphologyCalculationThread(QThread):
     finished = pyqtSignal(list)  # list of results
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, approved_masks, pixel_size, use_imagej, images, output_dir=None, pixel_size_map=None, masks_dir=None):
+    def __init__(self, approved_masks, pixel_size, use_imagej, images, output_dir=None, pixel_size_map=None, masks_dir=None, soma_group_map=None):
         super().__init__()
         self.approved_masks = approved_masks
         self.pixel_size = pixel_size
@@ -1293,6 +1293,7 @@ class MorphologyCalculationThread(QThread):
         self.output_dir = output_dir
         self.pixel_size_map = pixel_size_map or {}
         self.masks_dir = masks_dir
+        self.soma_group_map = soma_group_map or {}
 
     def run(self):
         import sys
@@ -1399,6 +1400,7 @@ class MorphologyCalculationThread(QThread):
                 params['area_um2'] = meta[3]
                 params['pixel_size_x_um'] = ps_x
                 params['pixel_size_y_um'] = ps_y
+                params['soma_group'] = self.soma_group_map.get((meta[0], meta[1]), '')
                 all_results[i] = params
                 mask_data['mask'] = None
 
@@ -1540,6 +1542,7 @@ class InteractiveImageLabel(QLabel):
         self.parent_widget = parent
         self.pix_source = None
         self.centroids = []
+        self.locked_centroids = []  # Pass 1 somas shown during Pass 2 (cyan)
         self.mask_overlay = None
         self.polygon_pts = []
         self.soma_mode = False
@@ -1578,9 +1581,10 @@ class InteractiveImageLabel(QLabel):
         # Pixel intensity picker
         self.pixel_picker_mode = False
 
-    def set_image(self, qpix, centroids=None, mask_overlay=None, polygon_pts=None):
+    def set_image(self, qpix, centroids=None, mask_overlay=None, polygon_pts=None, locked_centroids=None):
         self.pix_source = qpix
         self.centroids = centroids or []
+        self.locked_centroids = locked_centroids or []
         self.mask_overlay = mask_overlay
         self.polygon_pts = polygon_pts or []
         self._update_display()
@@ -1678,13 +1682,21 @@ class InteractiveImageLabel(QLabel):
         if self.mask_overlay is not None:
             self._draw_mask_overlay(painter)
 
-        # Draw soma markers (centroids)
+        # Draw locked centroids (Pass 1 somas during Pass 2) in cyan
+        if self.locked_centroids:
+            pen = QPen(QColor(0, 255, 255), 3)
+            painter.setPen(pen)
+            for centroid in self.locked_centroids:
+                x, y = self._to_display_coords(centroid)
+                if 0 <= x <= self.width() and 0 <= y <= self.height():
+                    painter.drawEllipse(int(x - 6), int(y - 6), 12, 12)
+
+        # Draw active soma markers (centroids) in red
         if self.centroids:
             pen = QPen(QColor(255, 0, 0), 3)
             painter.setPen(pen)
             for centroid in self.centroids:
                 x, y = self._to_display_coords(centroid)
-                # Only draw if visible
                 if 0 <= x <= self.width() and 0 <= y <= self.height():
                     painter.drawEllipse(int(x - 6), int(y - 6), 12, 12)
 
@@ -2399,6 +2411,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         count = len(img_data['somas'])
                         img_data['somas'].clear()
                         img_data['soma_ids'].clear()
+                        if 'soma_groups' in img_data:
+                            img_data['soma_groups'].clear()
                         self.log(f"↩ Cleared {count} soma(s) on {self.current_image_name}")
                         self._load_image_for_soma_picking()
                     else:
@@ -2520,8 +2534,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.shortcut_undo_qa.activated.connect(self.undo_last_qa)
 
     def _create_left_panel(self):
+        scroll = QScrollArea()
+        scroll.setFixedWidth(450)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         panel = QWidget()
-        panel.setFixedWidth(450)
         layout = QVBoxLayout(panel)
         file_group = QGroupBox("1. File Selection")
         file_layout = QVBoxLayout()
@@ -2855,7 +2873,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         layout.addWidget(legend_btn)
 
         layout.addStretch()
-        return panel
+        scroll.setWidget(panel)
+        return scroll
 
     def _create_right_panel(self):
         panel = QWidget()
@@ -6167,6 +6186,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                 'pixel_size': img_data.get('pixel_size'),
                 'somas': [tuple(float(c) for c in s) for s in img_data.get('somas', [])],
                 'soma_ids': img_data.get('soma_ids', []),
+                'soma_groups': img_data.get('soma_groups', []),
                 'soma_outlines': [],
             }
             # Save soma outlines with full metadata (2D only)
@@ -7941,6 +7961,7 @@ if __name__ == '__main__':
                     'rolling_ball_radius': img_session.get('rolling_ball_radius', 50),
                     'somas': [tuple(s) for s in img_session.get('somas', [])],
                     'soma_ids': img_session.get('soma_ids', []),
+                    'soma_groups': img_session.get('soma_groups', []),
                     'masks': [],
                     'status': img_session.get('status', 'loaded'),
                     'selected': img_session.get('selected', False),
@@ -9176,6 +9197,7 @@ if __name__ == '__main__':
                 'rolling_ball_radius': self.default_rolling_ball_radius,
                 'somas': [],
                 'soma_ids': [],
+                'soma_groups': [],
                 'masks': [],
                 'status': 'loaded',
                 'selected': False,
@@ -10016,18 +10038,43 @@ if __name__ == '__main__':
         if not self.soma_picking_queue:
             QMessageBox.warning(self, "Warning", "No processed images to pick somas from")
             return
-        self.batch_mode = True
-        # Resume on the last image the user was working on, if available
-        if self.current_image_name and self.current_image_name in self.soma_picking_queue:
-            pass  # keep current_image_name
+
+        # In colocalization mode, use two-pass soma picking
+        if self.colocalization_mode:
+            self._coloc_soma_pass = 1
+            QMessageBox.information(self, "Colocalization — Pass 1 of 2",
+                "PASS 1: Colocalized cells\n\n"
+                "You will see the color composite (both channels).\n"
+                "Click on cells that show signal in BOTH channels.\n\n"
+                "After finishing all images, Pass 2 will start\n"
+                "for single-channel-only cells.")
         else:
-            # Start at the first image that doesn't have somas yet
-            resume_name = None
-            for name in self.soma_picking_queue:
-                if not self.images[name]['somas']:
-                    resume_name = name
-                    break
-            self.current_image_name = resume_name or self.soma_picking_queue[0]
+            self._coloc_soma_pass = 0
+
+        self._begin_soma_picking_pass()
+
+    def _begin_soma_picking_pass(self):
+        """Start or restart soma picking for the current pass."""
+        self.batch_mode = True
+
+        if self._coloc_soma_pass == 2:
+            # Pass 2: force single-channel view
+            self._coloc_saved_color_view = self.show_color_view
+            self.show_color_view = False
+            self.color_toggle_btn.setText("Show Color (C)")
+            self.current_image_name = self.soma_picking_queue[0]
+        else:
+            # Pass 1 or non-coloc: resume where we left off
+            if self.current_image_name and self.current_image_name in self.soma_picking_queue:
+                pass
+            else:
+                resume_name = None
+                for name in self.soma_picking_queue:
+                    if not self.images[name]['somas']:
+                        resume_name = name
+                        break
+                self.current_image_name = resume_name or self.soma_picking_queue[0]
+
         self.processed_label.soma_mode = True
         self.original_label.soma_mode = False
         self.preview_label.soma_mode = False
@@ -10045,8 +10092,13 @@ if __name__ == '__main__':
             self.log("Backspace = undo last, Escape = clear all on image")
             self.log("=" * 50)
         else:
+            pass_label = ""
+            if self._coloc_soma_pass == 1:
+                pass_label = " — PASS 1: Coloc cells (both channels)"
+            elif self._coloc_soma_pass == 2:
+                pass_label = " — PASS 2: Single-channel cells (cyan = already picked)"
             self.log("=" * 50)
-            self.log("BATCH SOMA PICKING MODE")
+            self.log(f"BATCH SOMA PICKING MODE{pass_label}")
             self.log(f"Click somas on: {self.current_image_name}")
             self.log("Click 'Done with Current' when finished with this image")
             self.log("=" * 50)
@@ -10086,13 +10138,26 @@ if __name__ == '__main__':
             adjusted = self._apply_display_adjustments(gray_img)
             pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
 
-        self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+        # In Pass 2, split somas into locked (Pass 1) and active (Pass 2)
+        if getattr(self, '_coloc_soma_pass', 0) == 2:
+            groups = img_data.get('soma_groups', [])
+            locked = [s for s, g in zip(img_data['somas'], groups) if g == 'coloc']
+            active = [s for s, g in zip(img_data['somas'], groups) if g != 'coloc']
+            self.processed_label.set_image(pixmap, centroids=active, locked_centroids=locked)
+        else:
+            self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+
         self.tabs.setCurrentIndex(2)
         current_idx = self.soma_picking_queue.index(
             self.current_image_name) if self.current_image_name in self.soma_picking_queue else -1
+        pass_label = ""
+        if getattr(self, '_coloc_soma_pass', 0) == 1:
+            pass_label = " [Pass 1: Coloc]"
+        elif getattr(self, '_coloc_soma_pass', 0) == 2:
+            pass_label = " [Pass 2: Single-channel]"
         self.nav_status_label.setText(
             f"Image {current_idx + 1}/{len(self.soma_picking_queue)}: {self.current_image_name} | "
-            f"Somas: {len(img_data['somas'])}"
+            f"Somas: {len(img_data['somas'])}{pass_label}"
         )
 
     def _load_image_for_soma_picking_3d(self):
@@ -10168,6 +10233,9 @@ if __name__ == '__main__':
             img_data['somas'].append(soma_zyx)
             soma_id = f"soma_{z}_{row}_{col}"
             img_data['soma_ids'].append(soma_id)
+            group = "coloc" if getattr(self, '_coloc_soma_pass', 0) == 1 else \
+                    "single_channel" if getattr(self, '_coloc_soma_pass', 0) == 2 else ""
+            img_data['soma_groups'].append(group)
             self.log(f"Soma {len(img_data['somas'])} added at Z={z}, Y={row}, X={col} | ID: {soma_id}")
             if z != self.current_z_slice:
                 self.current_z_slice = z
@@ -10179,6 +10247,9 @@ if __name__ == '__main__':
         img_data['somas'].append(coords)
         soma_id = f"soma_{coords[0]}_{coords[1]}"
         img_data['soma_ids'].append(soma_id)
+        group = "coloc" if getattr(self, '_coloc_soma_pass', 0) == 1 else \
+                "single_channel" if getattr(self, '_coloc_soma_pass', 0) == 2 else ""
+        img_data['soma_groups'].append(group)
 
         # Show color or grayscale based on toggle, with display adjustments
         if self.show_color_view and 'color_image' in img_data:
@@ -10219,9 +10290,11 @@ if __name__ == '__main__':
             self.log("No somas to undo")
             return
 
-        # Remove the last soma and its ID
+        # Remove the last soma, its ID, and its group
         removed_soma = img_data['somas'].pop()
         removed_id = img_data['soma_ids'].pop() if img_data['soma_ids'] else None
+        if img_data.get('soma_groups'):
+            img_data['soma_groups'].pop()
 
         # Update the display with adjustments
         if self.show_color_view and 'color_image' in img_data:
@@ -10283,6 +10356,31 @@ if __name__ == '__main__':
             self._load_image_for_soma_picking()
 
     def _finish_soma_picking(self):
+        # In coloc mode Pass 1 → transition to Pass 2
+        if getattr(self, '_coloc_soma_pass', 0) == 1:
+            pass1_count = sum(
+                sum(1 for g in data.get('soma_groups', []) if g == 'coloc')
+                for data in self.images.values() if data['selected']
+            )
+            self._coloc_soma_pass = 2
+            QMessageBox.information(self, "Colocalization — Pass 2 of 2",
+                f"Pass 1 complete! {pass1_count} coloc cells marked.\n\n"
+                "PASS 2: Single-channel cells\n\n"
+                "You will now see only the primary channel.\n"
+                "Cyan circles show your Pass 1 (coloc) somas — do NOT re-click them.\n"
+                "Click on cells that show signal in only ONE channel.")
+            self._begin_soma_picking_pass()
+            return
+
+        # Restore color view if it was saved during Pass 2
+        if getattr(self, '_coloc_soma_pass', 0) == 2:
+            if hasattr(self, '_coloc_saved_color_view'):
+                self.show_color_view = self._coloc_saved_color_view
+                if self.show_color_view:
+                    self.color_toggle_btn.setText("Show Grayscale (C)")
+                del self._coloc_saved_color_view
+            self._coloc_soma_pass = 0
+
         self.batch_mode = False
         self.processed_label.soma_mode = False
         self.prev_btn.setEnabled(False)
@@ -10290,11 +10388,28 @@ if __name__ == '__main__':
         self.done_btn.setEnabled(False)
         total_somas = sum(len(data['somas']) for data in self.images.values() if data['selected'])
         self.batch_outline_btn.setEnabled(True)
-        # self.update_workflow_status()
-        self.log("=" * 50)
-        self.log(f"✓ Soma picking complete! Total somas: {total_somas}")
-        self.log("✓ Ready for outlining")
-        self.log("=" * 50)
+
+        # Log group counts if coloc mode was used
+        if self.colocalization_mode:
+            coloc_count = sum(
+                sum(1 for g in data.get('soma_groups', []) if g == 'coloc')
+                for data in self.images.values() if data['selected']
+            )
+            single_count = sum(
+                sum(1 for g in data.get('soma_groups', []) if g == 'single_channel')
+                for data in self.images.values() if data['selected']
+            )
+            self.log("=" * 50)
+            self.log(f"✓ Soma picking complete! Total: {total_somas} "
+                     f"(coloc: {coloc_count}, single-channel: {single_count})")
+            self.log("✓ Ready for outlining")
+            self.log("=" * 50)
+        else:
+            self.log("=" * 50)
+            self.log(f"✓ Soma picking complete! Total somas: {total_somas}")
+            self.log("✓ Ready for outlining")
+            self.log("=" * 50)
+
         self._auto_save()
         QMessageBox.information(
             self, "Complete",
@@ -13920,11 +14035,20 @@ if __name__ == '__main__':
             for img_name, img_data in self.images.items():
                 pixel_size_map[img_name] = self._get_pixel_size_xy(img_name)
 
+            # Build soma_group lookup: (img_basename, soma_id) -> group string
+            soma_group_map = {}
+            for img_name, img_data in self.images.items():
+                basename = os.path.splitext(img_name)[0]
+                groups = img_data.get('soma_groups', [])
+                for i, sid in enumerate(img_data.get('soma_ids', [])):
+                    group = groups[i] if i < len(groups) else ''
+                    soma_group_map[(basename, sid)] = group
+
             # Create and start worker thread (no ImageJ needed)
             self.morph_thread = MorphologyCalculationThread(
                 approved_masks, pixel_size, use_imagej=False, images=self.images,
                 output_dir=self.output_dir, pixel_size_map=pixel_size_map,
-                masks_dir=self.masks_dir
+                masks_dir=self.masks_dir, soma_group_map=soma_group_map
             )
 
             # Connect signals
@@ -14231,7 +14355,7 @@ if __name__ == '__main__':
 
         keys = list(results[0].keys())
         # Remove these to reorder them
-        for key in ['soma_id', 'image_name', 'animal_id', 'treatment', 'soma_idx']:
+        for key in ['soma_id', 'image_name', 'animal_id', 'treatment', 'soma_idx', 'soma_group']:
             if key in keys:
                 keys.remove(key)
 
@@ -14246,7 +14370,7 @@ if __name__ == '__main__':
         coloc_present = [k for k in coloc_keys if k in keys]
 
         # Put them in the desired order: identifiers, morphology, colocalization
-        ordered_keys = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx'] + sorted(morph_keys) + coloc_present
+        ordered_keys = ['image_name', 'animal_id', 'treatment', 'soma_group', 'soma_id', 'soma_idx'] + sorted(morph_keys) + coloc_present
 
         with open(combined_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=ordered_keys)
