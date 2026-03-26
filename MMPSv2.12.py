@@ -283,13 +283,24 @@ def _grow_masks_for_soma(args):
     mask_pixel_counts = []
     for target_area_um2 in sorted_areas:
         target_px = int(target_area_um2 / (pixel_size_um ** 2))
-        n_pixels = min(target_px, len(growth_order))
+
+        # Per-step circular constraint: ring grows with each target
+        if use_circular_constraint:
+            step_constraint_um2 = target_area_um2 + circular_buffer_um2
+            step_constraint_px = step_constraint_um2 / (pixel_size_um ** 2)
+            step_radius_sq = step_constraint_px / np.pi
+            step_order = [(r, c) for r, c in growth_order
+                          if (r - cy_roi) ** 2 + (c - cx_roi) ** 2 <= step_radius_sq]
+        else:
+            step_order = growth_order
+
+        n_pixels = min(target_px, len(step_order))
         n_pixels = max(n_pixels, soma_area_px)
-        n_pixels = min(n_pixels, len(growth_order))
+        n_pixels = min(n_pixels, len(step_order))
         mask_pixel_counts.append(n_pixels)
 
         mask_roi = np.zeros((h, w), dtype=np.uint8)
-        for r, c in growth_order[:n_pixels]:
+        for r, c in step_order[:n_pixels]:
             mask_roi[r, c] = 1
 
         full_mask = np.zeros(processed_img_shape, dtype=np.uint8)
@@ -6984,13 +6995,24 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
     mask_pixel_counts = []
     for target_area_um2 in sorted_areas:
         target_px = int(target_area_um2 / (pixel_size_um ** 2))
-        n_pixels = min(target_px, len(growth_order))
+
+        # Per-step circular constraint: ring grows with each target
+        if use_circular_constraint:
+            step_constraint_um2 = target_area_um2 + circular_buffer_um2
+            step_constraint_px = step_constraint_um2 / (pixel_size_um ** 2)
+            step_radius_sq = step_constraint_px / np.pi
+            step_order = [(r, c) for r, c in growth_order
+                          if (r - cy_roi) ** 2 + (c - cx_roi) ** 2 <= step_radius_sq]
+        else:
+            step_order = growth_order
+
+        n_pixels = min(target_px, len(step_order))
         n_pixels = max(n_pixels, soma_area_px)
-        n_pixels = min(n_pixels, len(growth_order))
+        n_pixels = min(n_pixels, len(step_order))
         mask_pixel_counts.append(n_pixels)
 
         mask_roi = np.zeros((h, w), dtype=np.uint8)
-        for r, c in growth_order[:n_pixels]:
+        for r, c in step_order[:n_pixels]:
             mask_roi[r, c] = 1
 
         full_mask = np.zeros(processed_img.shape, dtype=np.uint8)
@@ -12631,14 +12653,25 @@ if __name__ == '__main__':
         mask_pixel_counts = []
         for target_area_um2 in sorted_areas:
             target_px = int(target_area_um2 / (pixel_size_um ** 2))
-            n_pixels = min(target_px, len(growth_order))
+
+            # Per-step circular constraint: ring grows with each target
+            if self.use_circular_constraint:
+                step_constraint_um2 = target_area_um2 + self.circular_buffer_um2
+                step_constraint_px = step_constraint_um2 / (pixel_size_um ** 2)
+                step_radius_sq = step_constraint_px / np.pi
+                step_order = [(r, c) for r, c in growth_order
+                              if (r - cy_roi) ** 2 + (c - cx_roi) ** 2 <= step_radius_sq]
+            else:
+                step_order = growth_order
+
+            n_pixels = min(target_px, len(step_order))
             n_pixels = max(n_pixels, soma_area_px)  # always include full soma
-            n_pixels = min(n_pixels, len(growth_order))
+            n_pixels = min(n_pixels, len(step_order))
 
             mask_pixel_counts.append(n_pixels)
 
             mask_roi = np.zeros((h, w), dtype=np.uint8)
-            for r, c in growth_order[:n_pixels]:
+            for r, c in step_order[:n_pixels]:
                 mask_roi[r, c] = 1
 
             full_mask = np.zeros(processed_img.shape, dtype=np.uint8)
