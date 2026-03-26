@@ -2553,6 +2553,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         scroll.setFixedWidth(450)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFocusPolicy(Qt.NoFocus)  # Don't steal focus from child widgets
 
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -2889,6 +2890,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         layout.addStretch()
         scroll.setWidget(panel)
+        scroll.viewport().setFocusPolicy(Qt.NoFocus)
         return scroll
 
     def _create_right_panel(self):
