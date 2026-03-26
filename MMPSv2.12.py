@@ -11395,6 +11395,13 @@ if __name__ == '__main__':
     def _polygon_to_mask(self, polygon, shape):
         if len(polygon) < 3:
             return np.zeros(shape, dtype=np.uint8)
+        poly_array = np.array([[p[1], p[0]] for p in polygon])
+        h, w = shape[:2]
+        yy, xx = np.mgrid[:h, :w]
+        points = np.c_[xx.ravel(), yy.ravel()]
+        path = mplPath(poly_array)
+        mask = path.contains_points(points).reshape(h, w)
+        return mask.astype(np.uint8)
 
     def _ensure_outline_masks(self, img_name, img_shape):
         """Reconstruct outline masks from polygon_points if they are None.
@@ -11412,13 +11419,6 @@ if __name__ == '__main__':
                 pts = outline['polygon_points']
                 if len(pts) >= 3:
                     outline['outline'] = self._polygon_to_mask(pts, img_shape)
-        poly_array = np.array([[p[1], p[0]] for p in polygon])
-        h, w = shape[:2]
-        yy, xx = np.mgrid[:h, :w]
-        points = np.c_[xx.ravel(), yy.ravel()]
-        path = mplPath(poly_array)
-        mask = path.contains_points(points).reshape(h, w)
-        return mask.astype(np.uint8)
 
     def _soma_has_outline(self, img_name, soma_idx):
         """Check if a soma already has a completed outline."""
