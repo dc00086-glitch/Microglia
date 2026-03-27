@@ -14457,7 +14457,7 @@ if __name__ == '__main__':
         ordered_keys = id_keys + sorted(morph_keys) + coloc_present
 
         with open(combined_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=ordered_keys)
+            writer = csv.DictWriter(f, fieldnames=ordered_keys, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(results)
 
@@ -14526,7 +14526,7 @@ if __name__ == '__main__':
         for img_name, img_results in by_image.items():
             img_path = os.path.join(self.output_dir, f"{img_name}_morphology_results.csv")
             with open(img_path, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=ordered_keys)
+                writer = csv.DictWriter(f, fieldnames=ordered_keys, extrasaction='ignore')
                 writer.writeheader()
                 writer.writerows(img_results)
 
