@@ -3626,11 +3626,10 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
         'treatment': '',
         'soma_id': somaId,
         'soma_idx': '',
+        'area_um2': areaUm2,
         'mask_file': os.path.basename(maskPath),
         'cell_name': cellName,
         'skeleton_file': os.path.basename(skelPath),
-        'pixel_size_um': pixelSize,
-        'upscale_factor': scaleFactor,
         'mask_area_um2': maskArea,
         'mask_perimeter_um': maskPerimeter,
         'mask_circularity': maskCircularity,
@@ -3696,8 +3695,8 @@ def runSkeletonBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=
 
     if allResults:
         outputPath = os.path.join(skelDir, "Skeleton_Results_" + imageName + ".csv")
-        stdCols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx']
-        idCols = ['cell_name', 'mask_file', 'skeleton_file', 'pixel_size_um', 'upscale_factor']
+        stdCols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx', 'area_um2']
+        idCols = ['cell_name', 'mask_file', 'skeleton_file']
         maskCols = ['mask_area_um2', 'mask_perimeter_um', 'mask_circularity',
                     'mask_aspect_ratio', 'mask_roundness', 'mask_solidity']
         skelCols = ['num_branches', 'num_junctions', 'num_end_points',
@@ -4016,8 +4015,8 @@ def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=N
                     'treatment': treat,
                     'soma_id': somaId,
                     'soma_idx': sidx,
+                    'area_um2': areaUm2,
                     'cell_name': cellName,
-                    'mask_area_um2': areaUm2,
                     'mask_file': maskFile,
                 }}
                 row.update(fracMetrics)
@@ -4032,8 +4031,8 @@ def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=N
 
     if allResults:
         outputPath = os.path.join(resultsDir, "Fractal_Results_" + imageName + ".csv")
-        stdCols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx']
-        idCols = ['cell_name', 'mask_area_um2', 'mask_file']
+        stdCols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx', 'area_um2']
+        idCols = ['cell_name', 'mask_file']
         fracCols = ['fractal_dimension', 'fractal_r_squared',
                     'fractal_lacunarity_mean', 'fractal_lacunarity_small',
                     'fractal_lacunarity_large', 'fractal_num_scales',
@@ -4402,7 +4401,7 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all", pix
                 metrics['treatment'] = treat
                 metrics['soma_id'] = somaId
                 metrics['soma_idx'] = sidx
-                metrics['mask_area_um2'] = areaUm2
+                metrics['area_um2'] = areaUm2
                 metrics['centroid_x_px'] = centroid[0]
                 metrics['centroid_y_px'] = centroid[1]
                 metrics['start_radius_um'] = startRad
@@ -4802,7 +4801,7 @@ def main():
             for row in reader:
                 img = row.get('image_name', '')
                 soma = row.get('soma_id', '')
-                area = row.get('mask_area_um2', '')
+                area = row.get('area_um2', row.get('mask_area_um2', ''))
                 if area:
                     try:
                         area = str(int(float(area)))
@@ -4818,7 +4817,7 @@ def main():
 
     if combined:
         # Ensure standard ID columns come first
-        std_cols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx']
+        std_cols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx', 'area_um2']
         all_cols = list(std_cols)
         for row in combined.values():
             for k in row.keys():
@@ -5307,7 +5306,7 @@ def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir, meta
             'treatment': treat,
             'soma_id': soma_id,
             'soma_idx': sidx,
-            'mask_area_um2': area,
+            'area_um2': area,
         }}
         row.update(metrics)
         results.append(row)
@@ -5320,7 +5319,7 @@ def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir, meta
 
     fieldnames = [
         'image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx',
-        'mask_area_um2',
+        'area_um2',
         'mask_area', 'perimeter', 'roundness', 'eccentricity',
         'cell_spread', 'soma_area',
         'polarity_index', 'principal_angle',
@@ -8331,7 +8330,7 @@ if __name__ == '__main__':
         import re as _re
         data = {}
         id_columns = {'cell_name', 'image_name', 'soma_id', 'mask_file',
-                       'mask_area_um2', 'cell', 'mask name', 'image name',
+                       'area_um2', 'mask_area_um2', 'cell', 'mask name', 'image name',
                        'soma id', 'mask area (um2)', 'centroid x (px)',
                        'centroid y (px)', 'start radius (um)',
                        'pixel_size_um', 'upscale_factor', 'skeleton_file',
@@ -8363,7 +8362,7 @@ if __name__ == '__main__':
                             if m:
                                 area = int(m.group(1))
                     else:
-                        area_str = row.get('mask_area_um2', '')
+                        area_str = row.get('area_um2', row.get('mask_area_um2', ''))
                         if area_str:
                             try:
                                 area = int(float(area_str))
