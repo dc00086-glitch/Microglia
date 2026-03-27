@@ -2155,26 +2155,28 @@ class CSVMergeDialog(QDialog):
         layout = QVBoxLayout(self)
 
         instructions = QLabel(
-            "Select which ImageJ result CSVs to merge.\n"
-            "Check a type and browse for its CSV file."
+            "Select which ImageJ result CSVs to merge with your morphology results.\n"
+            "Files found in your output directory are pre-filled below."
         )
         layout.addWidget(instructions)
+
+        # Auto-detect known CSV files
+        auto_detected = self._auto_detect(initial_dir) if initial_dir else {}
 
         # One row per CSV type: checkbox + path display + browse button
         self._checks = {}
         self._path_labels = {}
         csv_types = [
+            ('combined', 'ImageJ Combined Results'),
             ('sholl', 'Sholl Results'),
             ('skeleton', 'Skeleton Results'),
             ('fractal', 'Fractal / Convex Hull Results'),
-            ('combined', 'Pre-Combined Results'),
         ]
         for csv_type, display_name in csv_types:
             group = QGroupBox(display_name)
             row_layout = QHBoxLayout(group)
 
             check = QCheckBox("Include")
-            check.setChecked(False)
             self._checks[csv_type] = check
             row_layout.addWidget(check)
 
@@ -2188,6 +2190,15 @@ class CSVMergeDialog(QDialog):
             browse_btn.clicked.connect(lambda checked, t=csv_type: self._browse(t))
             row_layout.addWidget(browse_btn)
 
+            # Pre-fill if auto-detected
+            if csv_type in auto_detected:
+                self._file_paths[csv_type] = auto_detected[csv_type]
+                path_label.setText(os.path.basename(auto_detected[csv_type]))
+                path_label.setStyleSheet("color: black; font-style: normal;")
+                check.setChecked(True)
+            else:
+                check.setChecked(False)
+
             layout.addWidget(group)
 
         # OK / Cancel
@@ -2200,6 +2211,27 @@ class CSVMergeDialog(QDialog):
         btn_layout.addWidget(ok_btn)
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
+
+    def _auto_detect(self, base_dir):
+        """Search output directory for known ImageJ CSV files."""
+        found = {}
+        if not base_dir or not os.path.isdir(base_dir):
+            return found
+        # Check for ImageJ_Combined_Results.csv first (in output root)
+        combined = os.path.join(base_dir, "ImageJ_Combined_Results.csv")
+        if os.path.isfile(combined):
+            found['combined'] = combined
+        # Check subdirectories for individual analysis results
+        skel = os.path.join(base_dir, "skeleton_results", "Skeleton_Analysis_Results.csv")
+        if os.path.isfile(skel):
+            found['skeleton'] = skel
+        frac = os.path.join(base_dir, "fractal_results", "Fractal_Analysis_Results.csv")
+        if os.path.isfile(frac):
+            found['fractal'] = frac
+        sholl = os.path.join(base_dir, "sholl_results", "Sholl_All_Results.csv")
+        if os.path.isfile(sholl):
+            found['sholl'] = sholl
+        return found
 
     def _browse(self, csv_type):
         path, _ = QFileDialog.getOpenFileName(
