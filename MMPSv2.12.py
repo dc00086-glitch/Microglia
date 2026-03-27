@@ -14774,6 +14774,20 @@ def _get_app_icon():
 
 
 def main():
+    # Required for PyInstaller on macOS — prevents duplicate processes
+    multiprocessing.freeze_support()
+
+    # Tell macOS this is a regular GUI app (prevents duplicate dock icons)
+    if sys.platform == 'darwin':
+        try:
+            from Foundation import NSBundle
+            bundle = NSBundle.mainBundle()
+            info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+            if info:
+                info['LSUIElement'] = False
+        except ImportError:
+            pass
+
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
 
