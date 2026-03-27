@@ -5570,7 +5570,22 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             return {}
 
         img_data = self.images.get(img_name)
-        if img_data is None or 'color_image' not in img_data:
+        if img_data is None:
+            return {'coloc_status': 'no_color_data'}
+
+        # Lazy-load color image from raw file if not in memory
+        if 'color_image' not in img_data or img_data['color_image'] is None:
+            raw_path = img_data.get('raw_path')
+            if raw_path and os.path.exists(raw_path):
+                try:
+                    raw_img = load_tiff_image(raw_path)
+                    if raw_img is not None and raw_img.ndim == 3:
+                        img_data['color_image'] = raw_img
+                        img_data['num_channels'] = raw_img.shape[2]
+                except Exception:
+                    pass
+
+        if 'color_image' not in img_data or img_data['color_image'] is None:
             return {'coloc_status': 'no_color_data'}
 
         color_img = img_data['color_image']
@@ -14433,7 +14448,13 @@ if __name__ == '__main__':
         coloc_present = [k for k in coloc_keys if k in keys]
 
         # Put them in the desired order: identifiers, morphology, colocalization
-        ordered_keys = ['image_name', 'animal_id', 'treatment', 'soma_group', 'soma_id', 'soma_idx'] + sorted(morph_keys) + coloc_present
+        # Only include soma_group column if any result has a non-empty group
+        has_groups = any(r.get('soma_group', '') for r in results)
+        id_keys = ['image_name', 'animal_id', 'treatment']
+        if has_groups:
+            id_keys.append('soma_group')
+        id_keys.extend(['soma_id', 'soma_idx'])
+        ordered_keys = id_keys + sorted(morph_keys) + coloc_present
 
         with open(combined_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=ordered_keys)
