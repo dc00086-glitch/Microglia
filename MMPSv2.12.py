@@ -1424,8 +1424,6 @@ class MorphologyCalculationThread(QThread):
                 params['soma_id'] = meta[1]
                 params['soma_idx'] = meta[2]
                 params['area_um2'] = meta[3]
-                params['pixel_size_x_um'] = ps_x
-                params['pixel_size_y_um'] = ps_y
                 params['soma_group'] = self.soma_group_map.get((meta[0], meta[1]), '')
                 all_results[i] = params
                 mask_data['mask'] = None
@@ -14412,7 +14410,6 @@ if __name__ == '__main__':
             writer = csv.writer(f)
             writer.writerow(['mask_filename', 'soma_filename', 'image_name', 'soma_id', 'soma_idx',
                              'soma_x', 'soma_y', 'soma_area_um2', 'cell_area_um2',
-                             'pixel_size_x_um', 'pixel_size_y_um',
                              'perimeter', 'eccentricity', 'roundness',
                              'avg_centroid_distance', 'polarity_index', 'principal_angle',
                              'major_axis_um', 'minor_axis_um', 'animal_id', 'treatment'])
@@ -14431,7 +14428,6 @@ if __name__ == '__main__':
                 mask_filename = f"{img_name}_{soma_id}_mask.tif"
                 soma_filename = f"{img_name}_{soma_id}_soma.tif"
 
-                img_px_x, img_px_y = self._get_pixel_size_xy(img_name)
                 writer.writerow([
                     mask_filename,
                     soma_filename,
@@ -14442,8 +14438,6 @@ if __name__ == '__main__':
                     f"{soma_y:.2f}",
                     result.get('soma_area', 0),
                     result.get('area_um2', 0),
-                    img_px_x,
-                    img_px_y,
                     result.get('perimeter', 0),
                     result.get('eccentricity', 0),
                     result.get('roundness', 0),

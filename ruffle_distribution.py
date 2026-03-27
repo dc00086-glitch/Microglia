@@ -648,7 +648,6 @@ def run_session(args):
             "soma_id": soma_id,
             "animal_id": animal_id,
             "treatment": treatment,
-            "pixel_size_xy": vxy,
             "area_um2": area_um2,
         }
         row.update(metrics)
