@@ -2167,6 +2167,7 @@ class CSVMergeDialog(QDialog):
         self._checks = {}
         self._path_labels = {}
         csv_types = [
+            ('simple', 'Simple Morphology Results'),
             ('combined', 'ImageJ Combined Results'),
             ('sholl', 'Sholl Results'),
             ('skeleton', 'Skeleton Results'),
@@ -2217,7 +2218,11 @@ class CSVMergeDialog(QDialog):
         found = {}
         if not base_dir or not os.path.isdir(base_dir):
             return found
-        # Check for ImageJ_Combined_Results.csv first (in output root)
+        # Check for simple morphology results
+        simple = os.path.join(base_dir, "combined_morphology_results.csv")
+        if os.path.isfile(simple):
+            found['simple'] = simple
+        # Check for ImageJ_Combined_Results.csv (in output root)
         combined = os.path.join(base_dir, "ImageJ_Combined_Results.csv")
         if os.path.isfile(combined):
             found['combined'] = combined
@@ -8470,8 +8475,14 @@ if __name__ == '__main__':
         sholl_data = {}   # {cell_key: {'data': {...}, 'area': int|None}}
         skeleton_data = {}
         fractal_data = {}
+        simple_path = None  # Track user-selected simple morphology CSV
 
         for csv_type, fp in selected_files.items():
+            if csv_type == 'simple':
+                simple_path = fp
+                self.log(f"  Simple morphology: {os.path.basename(fp)}")
+                continue
+
             self.log(f"  Loading {csv_type}: {os.path.basename(fp)}")
             loaded = self._load_imagej_csv(fp, csv_type)
 
@@ -8498,8 +8509,8 @@ if __name__ == '__main__':
 
             self.log(f"    Loaded {len(loaded)} cells")
 
-        if not sholl_data and not skeleton_data and not fractal_data:
-            QMessageBox.information(self, "No Data", "No ImageJ results could be loaded from the selected files.")
+        if not sholl_data and not skeleton_data and not fractal_data and not simple_path:
+            QMessageBox.information(self, "No Data", "No CSV files could be loaded.")
             return
 
         if sholl_data:
@@ -8509,8 +8520,8 @@ if __name__ == '__main__':
         if fractal_data:
             self.log(f"  Fractal/Hull total: {len(fractal_data)} cells")
 
-        # Read existing morphology results
-        morphology_path = os.path.join(self.output_dir, "combined_morphology_results.csv")
+        # Read simple morphology results (user-selected or auto-detected)
+        morphology_path = simple_path or os.path.join(self.output_dir, "combined_morphology_results.csv")
         morphology_rows = []
         morph_fieldnames = []
         if os.path.exists(morphology_path):
@@ -8519,7 +8530,7 @@ if __name__ == '__main__':
                     reader = csv.DictReader(f)
                     morph_fieldnames = list(reader.fieldnames)
                     morphology_rows = list(reader)
-                self.log(f"  Morphology: loaded {len(morphology_rows)} cells")
+                self.log(f"  Morphology: loaded {len(morphology_rows)} cells from {os.path.basename(morphology_path)}")
             except Exception as e:
                 self.log(f"  ERROR reading morphology results: {e}")
 
