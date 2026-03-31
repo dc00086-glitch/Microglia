@@ -8557,7 +8557,7 @@ if __name__ == '__main__':
                     writer.writerows(all_ij_data.values())
                 self.log(f"  Saved ImageJ results to: {combined_ij_path}")
         else:
-            # Merge with morphology results using area-aware matching
+            # Merge with morphology results using direct field matching
             matched_sholl = 0
             matched_skel = 0
             matched_fractal = 0
@@ -8573,6 +8573,36 @@ if __name__ == '__main__':
             for entry in fractal_data.values():
                 new_fractal_keys.update(entry['data'].keys())
 
+            # Rebuild ImageJ data into lookup dicts keyed by (image_name, soma_id, area)
+            # so we match on actual fields, not substring hacks
+            def _build_ij_lookup(ij_data):
+                """Build {(image_name, soma_id, area): data_dict} from loaded ImageJ data."""
+                import re as _re3
+                lookup = {}
+                for dict_key, entry in ij_data.items():
+                    area = entry.get('area')
+                    # Parse image_name and soma_id from dict_key format: "imagename_soma_Y_X_area123"
+                    m = _re3.match(r'^(.+?)_(soma_\d+_\d+(?:_\d+)?)(?:_area(\d+))?$', dict_key)
+                    if m:
+                        img = m.group(1)
+                        sid = m.group(2)
+                        if area is None and m.group(3):
+                            area = int(m.group(3))
+                    else:
+                        # Fallback: try without area suffix
+                        m2 = _re3.match(r'^(.+?)_(soma_\d+_\d+(?:_\d+)?)$', dict_key)
+                        if m2:
+                            img = m2.group(1)
+                            sid = m2.group(2)
+                        else:
+                            continue
+                    lookup[(img, sid, area)] = entry['data']
+                return lookup
+
+            sholl_lookup = _build_ij_lookup(sholl_data) if sholl_data else {}
+            skel_lookup = _build_ij_lookup(skeleton_data) if skeleton_data else {}
+            fractal_lookup = _build_ij_lookup(fractal_data) if fractal_data else {}
+
             for row in morphology_rows:
                 img_name = row.get('image_name', '')
                 soma_id = row.get('soma_id', '')
@@ -8582,42 +8612,20 @@ if __name__ == '__main__':
                 except (ValueError, TypeError):
                     morph_area = None
 
-                cell_key = f"{img_name}_{soma_id}" if img_name and soma_id else ''
+                key = (img_name, soma_id, morph_area)
+                key_no_area = (img_name, soma_id, None)
 
-                # Try to match each ImageJ data type with area-aware matching
-                for ij_data, counter_name in [
-                    (sholl_data, 'sholl'),
-                    (skeleton_data, 'skeleton'),
-                    (fractal_data, 'fractal'),
+                for lookup, counter_name in [
+                    (sholl_lookup, 'sholl'),
+                    (skel_lookup, 'skeleton'),
+                    (fractal_lookup, 'fractal'),
                 ]:
-                    if not ij_data or not cell_key:
+                    if not lookup:
                         continue
-
-                    # Find candidate keys that contain this cell's identifier
-                    candidates = []
-                    for ij_key, ij_entry in ij_data.items():
-                        if cell_key in ij_key:
-                            candidates.append((ij_key, ij_entry))
-
-                    if not candidates:
-                        continue
-
-                    matched = False
-                    for ij_key, ij_entry in candidates:
-                        ij_area = ij_entry.get('area')
-                        if ij_area is not None and morph_area is not None:
-                            # Area-aware: only merge if areas match
-                            if ij_area == morph_area:
-                                row.update(ij_entry['data'])
-                                matched = True
-                                break
-                        elif ij_area is None:
-                            # No area info — merge unconditionally (backwards compat)
-                            row.update(ij_entry['data'])
-                            matched = True
-                            break
-
-                    if matched:
+                    # Try exact match with area first, then without area
+                    match_data = lookup.get(key) or lookup.get(key_no_area)
+                    if match_data:
+                        row.update(match_data)
                         if counter_name == 'sholl':
                             matched_sholl += 1
                         elif counter_name == 'skeleton':
