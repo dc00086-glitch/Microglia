@@ -2449,6 +2449,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 # Restart current outline
                 self.restart_polygon()
                 return
+            elif key == Qt.Key_Delete:
+                # Delete this soma and skip to next
+                self.skip_delete_current_soma()
+                return
             elif key == Qt.Key_Return or key == Qt.Key_Enter:
                 # Alternative way to finish polygon
                 self.finish_polygon()
@@ -2857,6 +2861,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.accept_outline_btn.setStyleSheet("border: 2px solid #2196F3; font-weight: bold;")
         self.accept_outline_btn.setToolTip("Accept outline and move to next soma")
         outline_btn_layout.addWidget(self.accept_outline_btn)
+
+        self.skip_soma_btn = QPushButton("Skip (Del)")
+        self.skip_soma_btn.clicked.connect(self.skip_delete_current_soma)
+        self.skip_soma_btn.setEnabled(False)
+        self.skip_soma_btn.setStyleSheet("border: 2px solid #f44336;")
+        self.skip_soma_btn.setToolTip("Delete this soma and skip to next (Del key)")
+        outline_btn_layout.addWidget(self.skip_soma_btn)
         outline_controls_layout.addLayout(outline_btn_layout)
 
         # Redo button
@@ -10624,6 +10635,7 @@ if __name__ == '__main__':
         self.auto_outline_btn.setEnabled(True)
         self.manual_draw_btn.setEnabled(True)
         self.accept_outline_btn.setEnabled(False)
+        self.skip_soma_btn.setEnabled(True)
 
         self.log("=" * 50)
         self.log(f"📐 MANUAL OUTLINING MODE")
@@ -10816,6 +10828,7 @@ if __name__ == '__main__':
         self.auto_outline_btn.setEnabled(True)
         self.manual_draw_btn.setEnabled(True)
         self.accept_outline_btn.setEnabled(len(self.polygon_points) >= 3)
+        self.skip_soma_btn.setEnabled(True)
 
         if review_idx in self.auto_outlined_points:
             self.log(f"Reviewing {soma_id} - {len(self.polygon_points)} points")
@@ -11125,6 +11138,87 @@ if __name__ == '__main__':
             self.redo_outline_btn.setEnabled(False)
 
         self._load_soma_for_outlining(last_queue_idx)
+
+    def skip_delete_current_soma(self):
+        """Delete the current soma and skip to the next one during outlining."""
+        if not hasattr(self, 'outlining_queue') or not self.outlining_queue:
+            return
+        queue_idx = getattr(self, 'current_outline_idx', 0)
+        if queue_idx >= len(self.outlining_queue):
+            return
+
+        img_name, soma_idx = self.outlining_queue[queue_idx]
+        img_data = self.images[img_name]
+        soma_id = img_data['soma_ids'][soma_idx]
+
+        # Confirm
+        reply = QMessageBox.question(
+            self, "Delete Soma",
+            f"Delete {soma_id} from {img_name}?\n\n"
+            "This removes the soma, its outline, and exported files.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Delete exported soma TIFF if it exists
+        if hasattr(self, 'somas_dir') and self.somas_dir:
+            prefix = os.path.splitext(img_name)[0]
+            soma_file = os.path.join(self.somas_dir, f"{prefix}_{soma_id}_soma.tif")
+            if os.path.exists(soma_file):
+                os.remove(soma_file)
+                self.log(f"  Deleted: {os.path.basename(soma_file)}")
+
+        # Remove any existing outline for this soma
+        img_data['soma_outlines'] = [
+            ol for ol in img_data.get('soma_outlines', [])
+            if not (ol['soma_idx'] == soma_idx and ol['soma_id'] == soma_id)
+        ]
+
+        # Remove the soma from the image data
+        if soma_idx < len(img_data['somas']):
+            img_data['somas'].pop(soma_idx)
+        if soma_idx < len(img_data['soma_ids']):
+            img_data['soma_ids'].pop(soma_idx)
+        if soma_idx < len(img_data.get('soma_groups', [])):
+            img_data['soma_groups'].pop(soma_idx)
+
+        # Fix soma_idx references in remaining outlines (shift down indices above the removed one)
+        for ol in img_data.get('soma_outlines', []):
+            if ol['soma_idx'] > soma_idx:
+                ol['soma_idx'] -= 1
+
+        # Remove from outlining queue and fix indices
+        self.outlining_queue.pop(queue_idx)
+        for i in range(len(self.outlining_queue)):
+            q_img, q_idx = self.outlining_queue[i]
+            if q_img == img_name and q_idx > soma_idx:
+                self.outlining_queue[i] = (q_img, q_idx - 1)
+
+        self.log(f"✗ Deleted {soma_id} from {img_name}")
+        self.polygon_points = []
+
+        self._update_outline_progress()
+        self._auto_save()
+
+        # Move to next soma (queue_idx now points to what was the next entry)
+        if not self.outlining_queue:
+            self._finish_outlining()
+        elif queue_idx >= len(self.outlining_queue):
+            # Was the last one — check if all done
+            next_idx = self._find_next_unoutlined_idx(start_from=0)
+            if next_idx is None:
+                self._finish_outlining()
+            else:
+                self._load_soma_for_outlining(next_idx)
+        else:
+            next_idx = self._find_next_unoutlined_idx(start_from=queue_idx)
+            if next_idx is None:
+                next_idx = self._find_next_unoutlined_idx(start_from=0)
+            if next_idx is None:
+                self._finish_outlining()
+            else:
+                self._load_soma_for_outlining(next_idx)
 
     def _get_auto_outline_method(self):
         """Get the selected auto-outline method function"""
@@ -11493,6 +11587,7 @@ if __name__ == '__main__':
         self.auto_outline_btn.setEnabled(False)
         self.manual_draw_btn.setEnabled(False)
         self.accept_outline_btn.setEnabled(False)
+        self.skip_soma_btn.setEnabled(False)
 
         for img_name, img_data in self.images.items():
             if img_data['selected'] and img_data['soma_outlines']:
