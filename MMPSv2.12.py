@@ -11195,8 +11195,25 @@ if __name__ == '__main__':
             if q_img == img_name and q_idx > soma_idx:
                 self.outlining_queue[i] = (q_img, q_idx - 1)
 
+        # Fix auto_outlined_points keys (shift queue indices down)
+        if hasattr(self, 'auto_outlined_points'):
+            new_auto = {}
+            for k, v in self.auto_outlined_points.items():
+                if k < queue_idx:
+                    new_auto[k] = v
+                elif k > queue_idx:
+                    new_auto[k - 1] = v
+                # k == queue_idx: deleted, skip
+            self.auto_outlined_points = new_auto
+        if hasattr(self, 'failed_auto_outlines'):
+            self.failed_auto_outlines = [
+                (i - 1 if i > queue_idx else i)
+                for i in self.failed_auto_outlines if i != queue_idx
+            ]
+
         self.log(f"✗ Deleted {soma_id} from {img_name}")
         self.polygon_points = []
+        self.processed_label.polygon_pts = []
 
         self._update_outline_progress()
         self._auto_save()
