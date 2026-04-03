@@ -135,6 +135,35 @@ def extract_channel(img, channel_idx):
 # (must be module-level to be picklable by ProcessPoolExecutor)
 # ============================================================================
 
+def _smooth_mask(mask, max_gap_size=4):
+    """Fill small pixel gaps in a binary mask.
+
+    1. Morphological close with 3x3 elliptical kernel (fills 1-px border notches)
+    2. Fill internal holes <= max_gap_size pixels that don't touch the image border
+    """
+    if mask is None or np.count_nonzero(mask) == 0:
+        return mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    smoothed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    # Fill small internal holes
+    inverted = (smoothed == 0).astype(np.uint8)
+    labeled, n_features = ndimage.label(inverted)
+    for i in range(1, n_features + 1):
+        component = (labeled == i)
+        if np.count_nonzero(component) <= max_gap_size:
+            if not (component[0, :].any() or component[-1, :].any() or
+                    component[:, 0].any() or component[:, -1].any()):
+                smoothed[component] = 1
+    return smoothed
+
+
+def _smooth_masks(masks, max_gap_size=4):
+    """Apply smoothing to all non-duplicate masks in a list."""
+    for m in masks:
+        if m.get('mask') is not None and not m.get('duplicate', False):
+            m['mask'] = _smooth_mask(m['mask'], max_gap_size)
+
+
 def _enforce_mask_subset_invariant(masks):
     """Ensure smaller masks are strict subsets of larger masks for the same soma.
 
@@ -193,7 +222,7 @@ def _grow_masks_for_soma(args):
      territory_roi_data, my_territory_label,
      use_circular_constraint, circular_buffer_um2,
      use_min_intensity, min_intensity_percent, img_name,
-     local_intensity_window) = args
+     local_intensity_window, smooth_enabled, smooth_gap_size) = args
 
     y_min, y_max, x_min, x_max = roi_bounds
     roi = roi_data  # already float64
@@ -337,6 +366,10 @@ def _grow_masks_for_soma(args):
             for idx in indices[:-1]:
                 masks[idx]['approved'] = False
                 masks[idx]['duplicate'] = True
+
+    # Smooth masks to fill small gaps
+    if smooth_enabled:
+        _smooth_masks(masks, smooth_gap_size)
 
     # Enforce subset invariant: every smaller mask ⊆ every larger mask
     _enforce_mask_subset_invariant(masks)
@@ -1616,6 +1649,10 @@ class InteractiveImageLabel(QLabel):
         self.dragging_centroid_idx = None
         # Pixel intensity picker
         self.pixel_picker_mode = False
+        # Paint fill mode
+        self.paint_mode = False
+        self.paint_brush_size = 3
+        self._is_painting = False
 
     def set_image(self, qpix, centroids=None, mask_overlay=None, polygon_pts=None, locked_centroids=None):
         self.pix_source = qpix
@@ -1861,6 +1898,13 @@ class InteractiveImageLabel(QLabel):
             self._update_display()
             return
 
+        # Paint fill mode
+        if self.paint_mode and event.button() == Qt.LeftButton:
+            if self.mask_overlay is not None:
+                self._paint_at(coords)
+                self._is_painting = True
+            return
+
         # Pixel intensity picker mode
         if self.pixel_picker_mode and event.button() == Qt.LeftButton:
             if self.parent_widget and hasattr(self.parent_widget, '_show_pixel_intensity'):
@@ -1898,6 +1942,13 @@ class InteractiveImageLabel(QLabel):
 
     def mouseMoveEvent(self, event):
         """Handle mouse move for point/centroid dragging"""
+        # Paint fill dragging
+        if self.paint_mode and self._is_painting:
+            coords = self._to_image_coords(event.pos().x(), event.pos().y())
+            if coords and self.mask_overlay is not None:
+                self._paint_at(coords)
+            return
+
         # Centroid dragging
         if self.dragging_centroid and self.dragging_centroid_idx is not None and self.parent_widget:
             coords = self._to_image_coords(event.pos().x(), event.pos().y())
@@ -1921,6 +1972,10 @@ class InteractiveImageLabel(QLabel):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release to finish dragging"""
+        if self.paint_mode and self._is_painting:
+            self._is_painting = False
+            return
+
         # Centroid drag release - snap to brightest pixel within 5 µm
         if self.dragging_centroid and event.button() == Qt.LeftButton:
             self.dragging_centroid = False
@@ -1975,6 +2030,19 @@ class InteractiveImageLabel(QLabel):
         # Update parent's zoom label if available
         if self.parent_widget and hasattr(self.parent_widget, 'zoom_level_label'):
             self.parent_widget.zoom_level_label.setText(f"{self.zoom_level:.1f}x")
+
+    def _paint_at(self, coords):
+        """Fill mask pixels in a circle around coords."""
+        r, c = int(coords[0]), int(coords[1])
+        h, w = self.mask_overlay.shape
+        bs = self.paint_brush_size
+        for dr in range(-bs, bs + 1):
+            for dc in range(-bs, bs + 1):
+                if dr * dr + dc * dc <= bs * bs:
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < h and 0 <= nc < w:
+                        self.mask_overlay[nr, nc] = 1
+        self._update_display()
 
     def _draw_mask_overlay(self, painter):
         if self.mask_overlay is None:
@@ -2392,6 +2460,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.use_circular_constraint = False
         self.circular_buffer_um2 = 200  # extra area (µm²) beyond target for circular boundary
         self.local_intensity_window = 51  # local adaptive window size (0 = global)
+        self.mask_smooth_enabled = True
+        self.mask_smooth_gap_size = 4
         self.use_imagej = False
         # Colocalization mode - show images in color
         self.colocalization_mode = False
@@ -2506,6 +2576,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.approve_current_mask()
             elif key == Qt.Key_R:
                 self.reject_current_mask()
+            elif key == Qt.Key_P:
+                self.paint_fill_btn.toggle()
             elif key == Qt.Key_Left:
                 self.prev_mask()
             elif key == Qt.Key_Right:
@@ -3081,6 +3153,28 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.regen_masks_btn.setStyleSheet("border: 2px solid #FF9800; font-weight: bold; padding: 4px 10px;")
         self.regen_masks_btn.setToolTip("Regenerate masks for this image with different settings")
         zoom_layout.addWidget(self.regen_masks_btn)
+
+        # Paint Fill button — only visible during QA
+        self.paint_fill_btn = QPushButton("Paint Fill (P)")
+        self.paint_fill_btn.setCheckable(True)
+        self.paint_fill_btn.setVisible(False)
+        self.paint_fill_btn.setToolTip("Click and drag to paint mask pixels onto gaps")
+        self.paint_fill_btn.toggled.connect(self._toggle_paint_mode)
+        self.paint_fill_btn.setStyleSheet(
+            "QPushButton:checked { border: 2px solid #2196F3; background: #2196F3; color: white; font-weight: bold; padding: 4px 10px; }"
+            "QPushButton { padding: 4px 10px; }")
+        zoom_layout.addWidget(self.paint_fill_btn)
+
+        self.paint_brush_spin = QSpinBox()
+        self.paint_brush_spin.setRange(1, 20)
+        self.paint_brush_spin.setValue(3)
+        self.paint_brush_spin.setSuffix(" px")
+        self.paint_brush_spin.setToolTip("Brush radius for paint fill")
+        self.paint_brush_spin.setVisible(False)
+        self.paint_brush_spin.setFixedWidth(70)
+        self.paint_brush_spin.valueChanged.connect(
+            lambda v: setattr(self.mask_label, 'paint_brush_size', v))
+        zoom_layout.addWidget(self.paint_brush_spin)
 
         # Clear All Masks + Undo QA + Approve All — next to Redo, only visible during QA
         zoom_layout.addWidget(self.clear_masks_btn)
@@ -5835,6 +5929,16 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         else:
             self.log("Measure tool OFF")
 
+    def _toggle_paint_mode(self, checked):
+        """Toggle paint fill mode for mask editing during QA."""
+        self.mask_label.paint_mode = checked
+        if checked:
+            self.mask_label.setCursor(Qt.CrossCursor)
+            self.log("Paint fill ON - click and drag to fill mask gaps")
+        else:
+            self.mask_label.setCursor(Qt.ArrowCursor)
+            self.log("Paint fill OFF")
+
     def toggle_pixel_picker_mode(self):
         """Toggle pixel intensity picker on/off"""
         self.pixel_picker_mode = not getattr(self, 'pixel_picker_mode', False)
@@ -6176,6 +6280,8 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             'use_circular_constraint': self.use_circular_constraint,
             'circular_buffer_um2': self.circular_buffer_um2,
             'local_intensity_window': self.local_intensity_window,
+            'mask_smooth_enabled': self.mask_smooth_enabled,
+            'mask_smooth_gap_size': self.mask_smooth_gap_size,
             'coloc_channel_1': self.coloc_channel_1,
             'coloc_channel_2': self.coloc_channel_2,
             'grayscale_channel': self.grayscale_channel,
@@ -6479,6 +6585,23 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         local_win_layout.addWidget(local_win_spin)
         intensity_layout.addLayout(local_win_layout)
 
+        # Mask smoothing
+        smooth_check = QCheckBox("Smooth masks (fill small gaps)")
+        smooth_check.setChecked(self.mask_smooth_enabled)
+        smooth_check.setToolTip("Fill small pixel gaps in generated masks")
+        intensity_layout.addWidget(smooth_check)
+
+        smooth_layout_d1 = QHBoxLayout()
+        smooth_layout_d1.addWidget(QLabel("Max gap size:"))
+        smooth_slider = QSlider(Qt.Horizontal)
+        smooth_slider.setRange(1, 50)
+        smooth_slider.setValue(self.mask_smooth_gap_size)
+        smooth_layout_d1.addWidget(smooth_slider)
+        smooth_label = QLabel(f"{self.mask_smooth_gap_size} px")
+        smooth_slider.valueChanged.connect(lambda v: smooth_label.setText(f"{v} px"))
+        smooth_layout_d1.addWidget(smooth_label)
+        intensity_layout.addLayout(smooth_layout_d1)
+
         intensity_group.setLayout(intensity_layout)
         layout.addWidget(intensity_group)
 
@@ -6565,6 +6688,8 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         use_min_intensity = min_intensity_check.isChecked()
         min_intensity_percent = min_intensity_slider.value()
         local_intensity_window = local_win_spin.value()
+        self.mask_smooth_enabled = smooth_check.isChecked()
+        self.mask_smooth_gap_size = smooth_slider.value()
         mask_min_area = min_area_spin.value()
         mask_max_area = max_area_spin.value()
         mask_step_size = step_spin.value()
@@ -6634,6 +6759,8 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             'use_circular_constraint': use_circular_constraint,
             'circular_buffer_um2': circular_buffer_um2,
             'local_intensity_window': self.local_intensity_window,
+            'mask_smooth_enabled': self.mask_smooth_enabled,
+            'mask_smooth_gap_size': self.mask_smooth_gap_size,
         }
 
         script = self._build_cluster_script(settings, image_data, path)
@@ -6749,7 +6876,7 @@ def polygon_to_mask(polygon_points, shape):
 def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
                               pixel_size_um, img_name, use_min_intensity, min_intensity_percent,
                               use_circular_constraint=False, circular_buffer_um2=200,
-                              local_intensity_window=0):
+                              local_intensity_window=0, smooth_enabled=True, smooth_gap_size=4):
     """Create masks for ALL somas using competitive priority region growing.
 
     All somas grow simultaneously from a single shared priority queue.
@@ -6920,6 +7047,10 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
                     print(f"    Auto-rejected {{all_masks[soma_masks_start + idx]['area_um2']}} um2 "
                           f"(duplicate of {{all_masks[soma_masks_start + keep_idx]['area_um2']}} um2, both {{n_px}} px)")
 
+        # Smooth masks to fill small gaps
+        if smooth_enabled:
+            _smooth_masks(all_masks[soma_masks_start:], smooth_gap_size)
+
         # Enforce subset invariant for this soma's masks
         soma_masks_slice = all_masks[soma_masks_start:]
         _enforce_mask_subset_invariant(soma_masks_slice)
@@ -6932,7 +7063,7 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
                           soma_outline_mask=None, territory_map=None,
                           use_min_intensity=False, min_intensity_percent=0,
                           use_circular_constraint=False, circular_buffer_um2=200,
-                          local_intensity_window=0):
+                          local_intensity_window=0, smooth_enabled=True, smooth_gap_size=4):
     """Create nested cell masks using priority region growing from the soma outline."""
     import heapq
 
@@ -7104,6 +7235,10 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
                 print(f"    Auto-rejected {{masks[idx]['area_um2']}} um2 "
                       f"(duplicate of {{masks[keep_idx]['area_um2']}} um2, both {{n_px}} px)")
 
+    # Smooth masks to fill small gaps
+    if smooth_enabled:
+        _smooth_masks(masks, smooth_gap_size)
+
     # Enforce subset invariant
     _enforce_mask_subset_invariant(masks)
 
@@ -7164,6 +7299,8 @@ def process_image(img_name, img_info, input_dir, output_dir, settings):
     use_circular_constraint = settings.get('use_circular_constraint', False)
     circular_buffer_um2 = settings.get('circular_buffer_um2', 200)
     local_intensity_window = settings.get('local_intensity_window', 0)
+    smooth_enabled = settings.get('mask_smooth_enabled', True)
+    smooth_gap_size = settings.get('mask_smooth_gap_size', 4)
 
     # Load processed image
     processed_path = os.path.join(input_dir, img_info['processed_filename'])
@@ -7206,6 +7343,8 @@ def process_image(img_name, img_info, input_dir, output_dir, settings):
             use_circular_constraint=use_circular_constraint,
             circular_buffer_um2=circular_buffer_um2,
             local_intensity_window=local_intensity_window,
+            smooth_enabled=smooth_enabled,
+            smooth_gap_size=smooth_gap_size,
         )
     else:
         territory_map = None
@@ -7228,6 +7367,8 @@ def process_image(img_name, img_info, input_dir, output_dir, settings):
                 use_circular_constraint=use_circular_constraint,
                 circular_buffer_um2=circular_buffer_um2,
                 local_intensity_window=local_intensity_window,
+                smooth_enabled=smooth_enabled,
+                smooth_gap_size=smooth_gap_size,
             )
             masks.extend(m)
 
@@ -7879,6 +8020,8 @@ if __name__ == '__main__':
             self.use_circular_constraint = session.get('use_circular_constraint', False)
             self.circular_buffer_um2 = session.get('circular_buffer_um2', 200)
             self.local_intensity_window = session.get('local_intensity_window', 51)
+            self.mask_smooth_enabled = session.get('mask_smooth_enabled', True)
+            self.mask_smooth_gap_size = session.get('mask_smooth_gap_size', 4)
             self.coloc_channel_1 = session.get('coloc_channel_1', 0)
             self.coloc_channel_2 = session.get('coloc_channel_2', 1)
             self.grayscale_channel = session.get('grayscale_channel', 0)
@@ -11798,6 +11941,23 @@ if __name__ == '__main__':
         local_win_layout2.addWidget(local_win_spin2)
         layout.addLayout(local_win_layout2)
 
+        # Mask smoothing
+        smooth_check2 = QCheckBox("Smooth masks (fill small gaps)")
+        smooth_check2.setChecked(self.mask_smooth_enabled)
+        smooth_check2.setToolTip("Fill small pixel gaps in generated masks")
+        layout.addWidget(smooth_check2)
+
+        smooth_layout_d2 = QHBoxLayout()
+        smooth_layout_d2.addWidget(QLabel("  Max gap size:"))
+        smooth_slider2 = QSlider(Qt.Horizontal)
+        smooth_slider2.setRange(1, 50)
+        smooth_slider2.setValue(self.mask_smooth_gap_size)
+        smooth_layout_d2.addWidget(smooth_slider2)
+        smooth_label2 = QLabel(f"{self.mask_smooth_gap_size} px")
+        smooth_slider2.valueChanged.connect(lambda v: smooth_label2.setText(f"{v} px"))
+        smooth_layout_d2.addWidget(smooth_label2)
+        layout.addLayout(smooth_layout_d2)
+
         # Preview threshold button
         preview_thresh_btn = QPushButton("Preview Threshold on Current Image")
         preview_thresh_btn.setToolTip(
@@ -11925,6 +12085,8 @@ if __name__ == '__main__':
         self.use_min_intensity = min_intensity_check.isChecked()
         self.min_intensity_percent = min_intensity_slider.value()
         self.local_intensity_window = local_win_spin2.value()
+        self.mask_smooth_enabled = smooth_check2.isChecked()
+        self.mask_smooth_gap_size = smooth_slider2.value()
         self.mask_min_area = min_area_spin.value()
         self.mask_max_area = max_area_spin.value()
         self.mask_step_size = step_spin.value()
@@ -12093,7 +12255,8 @@ if __name__ == '__main__':
                             territory_roi_data, my_territory_label,
                             self.use_circular_constraint, self.circular_buffer_um2,
                             self.use_min_intensity, self.min_intensity_percent, img_name,
-                            self.local_intensity_window
+                            self.local_intensity_window,
+                            self.mask_smooth_enabled, self.mask_smooth_gap_size
                         ))
 
                     # Run serially (desktops are not set up for parallel work)
@@ -12707,6 +12870,10 @@ if __name__ == '__main__':
                         print(f"    ⚠️ Auto-rejected {all_masks[soma_masks_start + idx]['area_um2']} µm² "
                               f"(duplicate of {all_masks[soma_masks_start + keep_idx]['area_um2']} µm², both {n_px} px)")
 
+            # Smooth masks to fill small gaps
+            if self.mask_smooth_enabled:
+                _smooth_masks(all_masks[soma_masks_start:], self.mask_smooth_gap_size)
+
             # Enforce subset invariant for this soma's masks
             _enforce_mask_subset_invariant(all_masks[soma_masks_start:])
 
@@ -12928,6 +13095,10 @@ if __name__ == '__main__':
                     print(f"    ⚠️ Auto-rejected {masks[idx]['area_um2']} µm² "
                           f"(duplicate of {masks[keep_idx]['area_um2']} µm², both {n_px} px)")
 
+        # Smooth masks to fill small gaps
+        if self.mask_smooth_enabled:
+            _smooth_masks(masks, self.mask_smooth_gap_size)
+
         # Enforce subset invariant
         _enforce_mask_subset_invariant(masks)
 
@@ -13049,6 +13220,23 @@ if __name__ == '__main__':
         local_win_layout3.addWidget(local_win_spin3)
         layout.addLayout(local_win_layout3)
 
+        # Mask smoothing
+        smooth_check3 = QCheckBox("Smooth masks (fill small gaps)")
+        smooth_check3.setChecked(self.mask_smooth_enabled)
+        smooth_check3.setToolTip("Fill small pixel gaps in generated masks")
+        layout.addWidget(smooth_check3)
+
+        smooth_layout_d3 = QHBoxLayout()
+        smooth_layout_d3.addWidget(QLabel("  Max gap size:"))
+        smooth_slider3 = QSlider(Qt.Horizontal)
+        smooth_slider3.setRange(1, 50)
+        smooth_slider3.setValue(self.mask_smooth_gap_size)
+        smooth_layout_d3.addWidget(smooth_slider3)
+        smooth_label3 = QLabel(f"{self.mask_smooth_gap_size} px")
+        smooth_slider3.valueChanged.connect(lambda v: smooth_label3.setText(f"{v} px"))
+        smooth_layout_d3.addWidget(smooth_label3)
+        layout.addLayout(smooth_layout_d3)
+
         # Preview threshold button
         preview_thresh_btn_3d = QPushButton("Preview Threshold on Current Image")
         preview_thresh_btn_3d.setToolTip(
@@ -13094,6 +13282,8 @@ if __name__ == '__main__':
         self.use_min_intensity = min_intensity_check.isChecked()
         self.min_intensity_percent = min_intensity_slider.value()
         self.local_intensity_window = local_win_spin3.value()
+        self.mask_smooth_enabled = smooth_check3.isChecked()
+        self.mask_smooth_gap_size = smooth_slider3.value()
         self.mask_min_volume = min_vol_spin.value()
         self.mask_max_volume = max_vol_spin.value()
         self.mask_step_size = step_spin.value()
@@ -13364,6 +13554,8 @@ if __name__ == '__main__':
         self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
         self.undo_qa_btn.setVisible(True)
         self.regen_masks_btn.setVisible(True)
+        self.paint_fill_btn.setVisible(True)
+        self.paint_brush_spin.setVisible(True)
         self.clear_masks_btn.setEnabled(True)
         self.clear_masks_btn.setVisible(True)
 
@@ -14156,6 +14348,9 @@ if __name__ == '__main__':
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
             self.regen_masks_btn.setVisible(False)
+            self.paint_fill_btn.setVisible(False)
+            self.paint_fill_btn.setChecked(False)
+            self.paint_brush_spin.setVisible(False)
             self.clear_masks_btn.setVisible(False)
             self.clear_masks_btn.setEnabled(False)
             self.undo_qa_btn.setVisible(False)
@@ -14253,6 +14448,8 @@ if __name__ == '__main__':
             self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
             self.undo_qa_btn.setVisible(True)
             self.regen_masks_btn.setVisible(True)
+            self.paint_fill_btn.setVisible(True)
+            self.paint_brush_spin.setVisible(True)
             self.clear_masks_btn.setEnabled(True)
             self.clear_masks_btn.setVisible(True)
             self._show_current_mask()
