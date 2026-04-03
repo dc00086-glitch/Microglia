@@ -192,7 +192,8 @@ def _grow_masks_for_soma(args):
      soma_area_um2, soma_outline_roi,
      territory_roi_data, my_territory_label,
      use_circular_constraint, circular_buffer_um2,
-     use_min_intensity, min_intensity_percent, img_name) = args
+     use_min_intensity, min_intensity_percent, img_name,
+     local_intensity_window) = args
 
     y_min, y_max, x_min, x_max = roi_bounds
     roi = roi_data  # already float64
@@ -213,12 +214,17 @@ def _grow_masks_for_soma(args):
         max_radius_px = np.sqrt(constraint_area_px / np.pi)
         max_radius_px_sq = max_radius_px ** 2
 
-    # Intensity floor
+    # Intensity floor (local adaptive or global)
     intensity_floor = 0.0
+    intensity_floor_map = None
     if use_min_intensity and min_intensity_percent > 0:
-        roi_max = roi.max()
-        if roi_max > 0:
-            intensity_floor = roi_max * (min_intensity_percent / 100.0)
+        if local_intensity_window and local_intensity_window > 0:
+            local_max = ndimage.maximum_filter(roi, size=local_intensity_window)
+            intensity_floor_map = local_max * (min_intensity_percent / 100.0)
+        else:
+            roi_max = roi.max()
+            if roi_max > 0:
+                intensity_floor = roi_max * (min_intensity_percent / 100.0)
 
     # Territory constraint
     territory_roi = territory_roi_data
@@ -252,7 +258,8 @@ def _grow_masks_for_soma(args):
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = sr + dr, sc + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                    floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                    if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -263,7 +270,8 @@ def _grow_masks_for_soma(args):
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nr, nc = cy_roi + dr, cx_roi + dc
             if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
                     visited[nr, nc] = True
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -273,7 +281,8 @@ def _grow_masks_for_soma(args):
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nr, nc = r + dr, c + dc
             if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
                     visited[nr, nc] = True
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -2379,6 +2388,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_segmentation_method = 'none'  # 'none', 'competitive', 'watershed'
         self.use_circular_constraint = False
         self.circular_buffer_um2 = 200  # extra area (µm²) beyond target for circular boundary
+        self.local_intensity_window = 51  # local adaptive window size (0 = global)
         self.use_imagej = False
         # Colocalization mode - show images in color
         self.colocalization_mode = False
@@ -6162,6 +6172,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             'mask_segmentation_method': self.mask_segmentation_method,
             'use_circular_constraint': self.use_circular_constraint,
             'circular_buffer_um2': self.circular_buffer_um2,
+            'local_intensity_window': self.local_intensity_window,
             'coloc_channel_1': self.coloc_channel_1,
             'coloc_channel_2': self.coloc_channel_2,
             'grayscale_channel': self.grayscale_channel,
@@ -6451,6 +6462,20 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         slider_layout.addWidget(min_intensity_label)
         intensity_layout.addLayout(slider_layout)
 
+        # Local adaptive window
+        local_win_layout = QHBoxLayout()
+        local_win_layout.addWidget(QLabel("Local window:"))
+        local_win_spin = QSpinBox()
+        local_win_spin.setRange(0, 201)
+        local_win_spin.setSingleStep(10)
+        local_win_spin.setValue(self.local_intensity_window)
+        local_win_spin.setSuffix(" px")
+        local_win_spin.setToolTip(
+            "Size of local neighborhood for adaptive intensity threshold.\n"
+            "Helps with uneven lighting. 0 = global (original behavior).")
+        local_win_layout.addWidget(local_win_spin)
+        intensity_layout.addLayout(local_win_layout)
+
         intensity_group.setLayout(intensity_layout)
         layout.addWidget(intensity_group)
 
@@ -6536,6 +6561,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
 
         use_min_intensity = min_intensity_check.isChecked()
         min_intensity_percent = min_intensity_slider.value()
+        local_intensity_window = local_win_spin.value()
         mask_min_area = min_area_spin.value()
         mask_max_area = max_area_spin.value()
         mask_step_size = step_spin.value()
@@ -6550,6 +6576,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         # Save settings back to instance for next time
         self.use_min_intensity = use_min_intensity
         self.min_intensity_percent = min_intensity_percent
+        self.local_intensity_window = local_intensity_window
         self.mask_min_area = mask_min_area
         self.mask_max_area = mask_max_area
         self.mask_step_size = mask_step_size
@@ -6603,6 +6630,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             'min_intensity_percent': min_intensity_percent,
             'use_circular_constraint': use_circular_constraint,
             'circular_buffer_um2': circular_buffer_um2,
+            'local_intensity_window': self.local_intensity_window,
         }
 
         script = self._build_cluster_script(settings, image_data, path)
@@ -6618,6 +6646,8 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                     self.log(f"    {os.path.splitext(name)[0]}: {px} µm/px")
             self.log(f"  Segmentation: {seg_method}")
             self.log(f"  Min intensity: {'On (' + str(min_intensity_percent) + '%)' if use_min_intensity else 'Off'}")
+            if self.local_intensity_window > 0:
+                self.log(f"  Local adaptive window: {self.local_intensity_window} px")
             self.log(f"  Circular constraint: {'On (buffer=' + str(circular_buffer_um2) + ' µm²)' if use_circular_constraint else 'Off'}")
 
             n_images = len(image_data)
@@ -6715,7 +6745,8 @@ def polygon_to_mask(polygon_points, shape):
 
 def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
                               pixel_size_um, img_name, use_min_intensity, min_intensity_percent,
-                              use_circular_constraint=False, circular_buffer_um2=200):
+                              use_circular_constraint=False, circular_buffer_um2=200,
+                              local_intensity_window=0):
     """Create masks for ALL somas using competitive priority region growing.
 
     All somas grow simultaneously from a single shared priority queue.
@@ -6730,10 +6761,16 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
     largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
 
     intensity_floor = 0.0
+    intensity_floor_map = None
     if use_min_intensity and min_intensity_percent > 0:
-        img_max = processed_img.max()
-        if img_max > 0:
-            intensity_floor = img_max * (min_intensity_percent / 100.0)
+        if local_intensity_window and local_intensity_window > 0:
+            roi_f64 = processed_img.astype(np.float64)
+            local_max = ndimage.maximum_filter(roi_f64, size=local_intensity_window)
+            intensity_floor_map = local_max * (min_intensity_percent / 100.0)
+        else:
+            img_max = processed_img.max()
+            if img_max > 0:
+                intensity_floor = img_max * (min_intensity_percent / 100.0)
 
     roi = processed_img.astype(np.float64)
 
@@ -6775,7 +6812,8 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
                 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     nr, nc = sr + dr, sc + dc
                     if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                        if roi[nr, nc] >= intensity_floor:
+                        floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                        if roi[nr, nc] >= floor_val:
                             if max_radius_px_sq is not None:
                                 dy, dx = nr - cy, nc - cx
                                 if (dy * dy + dx * dx) > max_radius_px_sq:
@@ -6794,7 +6832,8 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
                 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     nr, nc = cy + dr, cx + dc
                     if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                        if roi[nr, nc] >= intensity_floor:
+                        floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                        if roi[nr, nc] >= floor_val:
                             if max_radius_px_sq is not None:
                                 dy, dx = nr - cy, nc - cx
                                 if (dy * dy + dx * dx) > max_radius_px_sq:
@@ -6818,7 +6857,8 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nr, nc = r + dr, c + dc
             if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                if roi[nr, nc] >= intensity_floor:
+                floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                if roi[nr, nc] >= floor_val:
                     if max_radius_px_sq is not None:
                         dy, dx = nr - sc_cy, nc - sc_cx
                         if (dy * dy + dx * dx) > max_radius_px_sq:
@@ -6885,7 +6925,8 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
                           processed_img, img_name, soma_area_um2,
                           soma_outline_mask=None, territory_map=None,
                           use_min_intensity=False, min_intensity_percent=0,
-                          use_circular_constraint=False, circular_buffer_um2=200):
+                          use_circular_constraint=False, circular_buffer_um2=200,
+                          local_intensity_window=0):
     """Create nested cell masks using priority region growing from the soma outline."""
     import heapq
 
@@ -6919,10 +6960,15 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
         max_radius_px_sq = max_radius_px ** 2
 
     intensity_floor = 0.0
+    intensity_floor_map = None
     if use_min_intensity and min_intensity_percent > 0:
-        roi_max = roi.max()
-        if roi_max > 0:
-            intensity_floor = roi_max * (min_intensity_percent / 100.0)
+        if local_intensity_window and local_intensity_window > 0:
+            local_max = ndimage.maximum_filter(roi, size=local_intensity_window)
+            intensity_floor_map = local_max * (min_intensity_percent / 100.0)
+        else:
+            roi_max = roi.max()
+            if roi_max > 0:
+                intensity_floor = roi_max * (min_intensity_percent / 100.0)
 
     territory_roi = None
     my_label = 0
@@ -6968,7 +7014,8 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = sr + dr, sc + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                    floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                    if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -6979,7 +7026,8 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nr, nc = cy_roi + dr, cx_roi + dc
             if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
                     visited[nr, nc] = True
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -6989,7 +7037,8 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nr, nc = r + dr, c + dc
             if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
                     visited[nr, nc] = True
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -7105,6 +7154,7 @@ def process_image(img_name, img_info, input_dir, output_dir, settings):
     min_intensity_percent = settings['min_intensity_percent']
     use_circular_constraint = settings.get('use_circular_constraint', False)
     circular_buffer_um2 = settings.get('circular_buffer_um2', 200)
+    local_intensity_window = settings.get('local_intensity_window', 0)
 
     # Load processed image
     processed_path = os.path.join(input_dir, img_info['processed_filename'])
@@ -7146,6 +7196,7 @@ def process_image(img_name, img_info, input_dir, output_dir, settings):
             use_min_intensity, min_intensity_percent,
             use_circular_constraint=use_circular_constraint,
             circular_buffer_um2=circular_buffer_um2,
+            local_intensity_window=local_intensity_window,
         )
     else:
         territory_map = None
@@ -7167,6 +7218,7 @@ def process_image(img_name, img_info, input_dir, output_dir, settings):
                 min_intensity_percent=min_intensity_percent,
                 use_circular_constraint=use_circular_constraint,
                 circular_buffer_um2=circular_buffer_um2,
+                local_intensity_window=local_intensity_window,
             )
             masks.extend(m)
 
@@ -7817,6 +7869,7 @@ if __name__ == '__main__':
             self.mask_segmentation_method = session.get('mask_segmentation_method', 'none')
             self.use_circular_constraint = session.get('use_circular_constraint', False)
             self.circular_buffer_um2 = session.get('circular_buffer_um2', 200)
+            self.local_intensity_window = session.get('local_intensity_window', 51)
             self.coloc_channel_1 = session.get('coloc_channel_1', 0)
             self.coloc_channel_2 = session.get('coloc_channel_2', 1)
             self.grayscale_channel = session.get('grayscale_channel', 0)
@@ -11722,6 +11775,20 @@ if __name__ == '__main__':
         slider_layout.addWidget(min_intensity_label)
         layout.addLayout(slider_layout)
 
+        # Local adaptive window
+        local_win_layout2 = QHBoxLayout()
+        local_win_layout2.addWidget(QLabel("  Local window:"))
+        local_win_spin2 = QSpinBox()
+        local_win_spin2.setRange(0, 201)
+        local_win_spin2.setSingleStep(10)
+        local_win_spin2.setValue(self.local_intensity_window)
+        local_win_spin2.setSuffix(" px")
+        local_win_spin2.setToolTip(
+            "Size of local neighborhood for adaptive intensity threshold.\n"
+            "Helps with uneven lighting. 0 = global (original behavior).")
+        local_win_layout2.addWidget(local_win_spin2)
+        layout.addLayout(local_win_layout2)
+
         # Preview threshold button
         preview_thresh_btn = QPushButton("Preview Threshold on Current Image")
         preview_thresh_btn.setToolTip(
@@ -11848,6 +11915,7 @@ if __name__ == '__main__':
         # Save settings
         self.use_min_intensity = min_intensity_check.isChecked()
         self.min_intensity_percent = min_intensity_slider.value()
+        self.local_intensity_window = local_win_spin2.value()
         self.mask_min_area = min_area_spin.value()
         self.mask_max_area = max_area_spin.value()
         self.mask_step_size = step_spin.value()
@@ -12015,7 +12083,8 @@ if __name__ == '__main__':
                             soma_area_um2, soma_outline_roi,
                             territory_roi_data, my_territory_label,
                             self.use_circular_constraint, self.circular_buffer_um2,
-                            self.use_min_intensity, self.min_intensity_percent, img_name
+                            self.use_min_intensity, self.min_intensity_percent, img_name,
+                            self.local_intensity_window
                         ))
 
                     # Run serially (desktops are not set up for parallel work)
@@ -12080,6 +12149,8 @@ if __name__ == '__main__':
             self.log(f"✓ Mask sizes: {', '.join(str(a) for a in area_list)} µm²")
             if self.use_min_intensity:
                 self.log(f"✓ Used minimum intensity: {self.min_intensity_percent}%")
+                if self.local_intensity_window > 0:
+                    self.log(f"  Local adaptive window: {self.local_intensity_window} px")
             if seg_method != 'none':
                 self.log(f"✓ Cell boundary segmentation: {seg_labels.get(seg_method, seg_method)}")
             if self.use_circular_constraint:
@@ -12434,12 +12505,18 @@ if __name__ == '__main__':
         sorted_areas = sorted(area_list_um2, reverse=True)
         largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
 
-        # Compute intensity floor
+        # Compute intensity floor (local adaptive or global)
         intensity_floor = 0.0
+        intensity_floor_map = None
         if self.use_min_intensity and self.min_intensity_percent > 0:
-            img_max = processed_img.max()
-            if img_max > 0:
-                intensity_floor = img_max * (self.min_intensity_percent / 100.0)
+            if self.local_intensity_window and self.local_intensity_window > 0:
+                roi_f64 = processed_img.astype(np.float64)
+                local_max = ndimage.maximum_filter(roi_f64, size=self.local_intensity_window)
+                intensity_floor_map = local_max * (self.min_intensity_percent / 100.0)
+            else:
+                img_max = processed_img.max()
+                if img_max > 0:
+                    intensity_floor = img_max * (self.min_intensity_percent / 100.0)
 
         roi = processed_img.astype(np.float64)
 
@@ -12487,7 +12564,8 @@ if __name__ == '__main__':
                     for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                         nr, nc = sr + dr, sc + dc
                         if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                            if roi[nr, nc] >= intensity_floor:
+                            floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                            if roi[nr, nc] >= floor_val:
                                 if max_radius_px_sq is not None:
                                     dy = nr - cy
                                     dx = nc - cx
@@ -12507,7 +12585,8 @@ if __name__ == '__main__':
                     for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                         nr, nc = cy + dr, cx + dc
                         if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                            if roi[nr, nc] >= intensity_floor:
+                            floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                            if roi[nr, nc] >= floor_val:
                                 if max_radius_px_sq is not None:
                                     dy = nr - cy
                                     dx = nc - cx
@@ -12552,7 +12631,8 @@ if __name__ == '__main__':
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    if roi[nr, nc] >= intensity_floor:
+                    floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                    if roi[nr, nc] >= floor_val:
                         if max_radius_px_sq is not None:
                             dy = nr - sc_cy
                             dx = nc - sc_cx
@@ -12670,12 +12750,17 @@ if __name__ == '__main__':
             max_radius_px = np.sqrt(constraint_area_px / np.pi)
             max_radius_px_sq = max_radius_px ** 2
 
-        # Compute intensity floor from user settings
+        # Compute intensity floor from user settings (local adaptive or global)
         intensity_floor = 0.0
+        intensity_floor_map = None
         if self.use_min_intensity and self.min_intensity_percent > 0:
-            roi_max = roi.max()
-            if roi_max > 0:
-                intensity_floor = roi_max * (self.min_intensity_percent / 100.0)
+            if self.local_intensity_window and self.local_intensity_window > 0:
+                local_max = ndimage.maximum_filter(roi, size=self.local_intensity_window)
+                intensity_floor_map = local_max * (self.min_intensity_percent / 100.0)
+            else:
+                roi_max = roi.max()
+                if roi_max > 0:
+                    intensity_floor = roi_max * (self.min_intensity_percent / 100.0)
 
         # Build territory constraint ROI if watershed territory_map is provided
         territory_roi = None
@@ -12730,7 +12815,8 @@ if __name__ == '__main__':
                 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     nr, nc = sr + dr, sc + dc
                     if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                        if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                        floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                        if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
                             visited[nr, nc] = True
                             heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -12742,7 +12828,8 @@ if __name__ == '__main__':
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = cy_roi + dr, cx_roi + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                    floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                    if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -12756,7 +12843,8 @@ if __name__ == '__main__':
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    if roi[nr, nc] >= intensity_floor and _in_territory(nr, nc) and _in_circle(nr, nc):
+                    floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
+                    if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
                         visited[nr, nc] = True
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
@@ -12932,6 +13020,20 @@ if __name__ == '__main__':
         slider_layout.addWidget(min_int_label)
         layout.addLayout(slider_layout)
 
+        # Local adaptive window
+        local_win_layout3 = QHBoxLayout()
+        local_win_layout3.addWidget(QLabel("  Local window:"))
+        local_win_spin3 = QSpinBox()
+        local_win_spin3.setRange(0, 201)
+        local_win_spin3.setSingleStep(10)
+        local_win_spin3.setValue(self.local_intensity_window)
+        local_win_spin3.setSuffix(" px")
+        local_win_spin3.setToolTip(
+            "Size of local neighborhood for adaptive intensity threshold.\n"
+            "Helps with uneven lighting. 0 = global (original behavior).")
+        local_win_layout3.addWidget(local_win_spin3)
+        layout.addLayout(local_win_layout3)
+
         # Preview threshold button
         preview_thresh_btn_3d = QPushButton("Preview Threshold on Current Image")
         preview_thresh_btn_3d.setToolTip(
@@ -12976,6 +13078,7 @@ if __name__ == '__main__':
         self.soma_max_radius_um = rad_spin.value()
         self.use_min_intensity = min_intensity_check.isChecked()
         self.min_intensity_percent = min_intensity_slider.value()
+        self.local_intensity_window = local_win_spin3.value()
         self.mask_min_volume = min_vol_spin.value()
         self.mask_max_volume = max_vol_spin.value()
         self.mask_step_size = step_spin.value()
