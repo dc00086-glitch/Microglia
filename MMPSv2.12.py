@@ -311,6 +311,9 @@ def _grow_masks_for_soma(args):
         mask_roi = np.zeros((h, w), dtype=np.uint8)
         for r, c in step_order[:n_pixels]:
             mask_roi[r, c] = 1
+        # Always include soma outline pixels
+        for r, c in growth_order[:soma_area_px]:
+            mask_roi[r, c] = 1
 
         full_mask = np.zeros(processed_img_shape, dtype=np.uint8)
         full_mask[y_min:y_max, x_min:x_max] = mask_roi
@@ -6889,6 +6892,9 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
             full_mask = np.zeros((h, w), dtype=np.uint8)
             for r, c in go[:n_pixels]:
                 full_mask[r, c] = 1
+            # Always include soma outline pixels
+            for r, c in go[:soma_area_px]:
+                full_mask[r, c] = 1
 
             actual_area_um2 = n_pixels * (pixel_size_um ** 2)
             print(f"    {{target_area_um2}} um2: {{n_pixels}} px = {{actual_area_um2:.1f}} um2 actual")
@@ -7066,6 +7072,9 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
 
         mask_roi = np.zeros((h, w), dtype=np.uint8)
         for r, c in step_order[:n_pixels]:
+            mask_roi[r, c] = 1
+        # Always include soma outline pixels
+        for r, c in growth_order[:soma_area_px]:
             mask_roi[r, c] = 1
 
         full_mask = np.zeros(processed_img.shape, dtype=np.uint8)
@@ -12666,6 +12675,9 @@ if __name__ == '__main__':
                 full_mask = np.zeros((h, w), dtype=np.uint8)
                 for r, c in go[:n_pixels]:
                     full_mask[r, c] = 1
+                # Always include soma outline pixels
+                for r, c in go[:soma_area_px]:
+                    full_mask[r, c] = 1
 
                 actual_area_um2 = n_pixels * (pixel_size_um ** 2)
                 print(f"    {target_area_um2} um2: {n_pixels} px = {actual_area_um2:.1f} um2 actual")
@@ -12879,6 +12891,9 @@ if __name__ == '__main__':
 
             mask_roi = np.zeros((h, w), dtype=np.uint8)
             for r, c in step_order[:n_pixels]:
+                mask_roi[r, c] = 1
+            # Always include soma outline pixels
+            for r, c in growth_order[:soma_area_px]:
                 mask_roi[r, c] = 1
 
             full_mask = np.zeros(processed_img.shape, dtype=np.uint8)
