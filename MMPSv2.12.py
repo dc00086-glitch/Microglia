@@ -1651,6 +1651,7 @@ class InteractiveImageLabel(QLabel):
         self.pixel_picker_mode = False
         # Paint fill mode
         self.paint_mode = False
+        self.erase_mode = False
         self.paint_brush_size = 3
         self._is_painting = False
 
@@ -1898,10 +1899,13 @@ class InteractiveImageLabel(QLabel):
             self._update_display()
             return
 
-        # Paint fill mode
-        if self.paint_mode and event.button() == Qt.LeftButton:
+        # Paint fill / pixel smoothing mode
+        if (self.paint_mode or self.erase_mode) and event.button() == Qt.LeftButton:
             if self.mask_overlay is not None:
-                self._paint_at(coords)
+                if self.erase_mode:
+                    self._erase_at(coords)
+                else:
+                    self._paint_at(coords)
                 self._is_painting = True
             return
 
@@ -1942,11 +1946,14 @@ class InteractiveImageLabel(QLabel):
 
     def mouseMoveEvent(self, event):
         """Handle mouse move for point/centroid dragging"""
-        # Paint fill dragging
-        if self.paint_mode and self._is_painting:
+        # Paint fill / pixel smoothing dragging
+        if (self.paint_mode or self.erase_mode) and self._is_painting:
             coords = self._to_image_coords(event.pos().x(), event.pos().y())
             if coords and self.mask_overlay is not None:
-                self._paint_at(coords)
+                if self.erase_mode:
+                    self._erase_at(coords)
+                else:
+                    self._paint_at(coords)
             return
 
         # Centroid dragging
@@ -1972,7 +1979,7 @@ class InteractiveImageLabel(QLabel):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release to finish dragging"""
-        if self.paint_mode and self._is_painting:
+        if (self.paint_mode or self.erase_mode) and self._is_painting:
             self._is_painting = False
             return
 
@@ -2042,6 +2049,19 @@ class InteractiveImageLabel(QLabel):
                     nr, nc = r + dr, c + dc
                     if 0 <= nr < h and 0 <= nc < w:
                         self.mask_overlay[nr, nc] = 1
+        self._update_display()
+
+    def _erase_at(self, coords):
+        """Erase mask pixels in a circle around coords (pixel smoothing)."""
+        r, c = int(coords[0]), int(coords[1])
+        h, w = self.mask_overlay.shape
+        bs = self.paint_brush_size
+        for dr in range(-bs, bs + 1):
+            for dc in range(-bs, bs + 1):
+                if dr * dr + dc * dc <= bs * bs:
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < h and 0 <= nc < w:
+                        self.mask_overlay[nr, nc] = 0
         self._update_display()
 
     def _draw_mask_overlay(self, painter):
@@ -2578,6 +2598,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.reject_current_mask()
             elif key == Qt.Key_P:
                 self.paint_fill_btn.toggle()
+            elif key == Qt.Key_E:
+                self.paint_erase_btn.toggle()
             elif key == Qt.Key_Left:
                 self.prev_mask()
             elif key == Qt.Key_Right:
@@ -3176,6 +3198,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
             lambda v: setattr(self.mask_label, 'paint_brush_size', v))
         zoom_layout.addWidget(self.paint_brush_spin)
 
+        # Pixel Smooth (erase) button — only visible during QA
+        self.paint_erase_btn = QPushButton("Pixel Smooth (E)")
+        self.paint_erase_btn.setCheckable(True)
+        self.paint_erase_btn.setVisible(False)
+        self.paint_erase_btn.setToolTip("Click and drag to remove stray mask pixels")
+        self.paint_erase_btn.toggled.connect(self._toggle_erase_mode)
+        self.paint_erase_btn.setStyleSheet(
+            "QPushButton:checked { border: 2px solid #F44336; background: #F44336; color: white; font-weight: bold; padding: 4px 10px; }"
+            "QPushButton { padding: 4px 10px; }")
+        zoom_layout.addWidget(self.paint_erase_btn)
+
         # Clear All Masks + Undo QA + Approve All — next to Redo, only visible during QA
         zoom_layout.addWidget(self.clear_masks_btn)
         zoom_layout.addWidget(self.undo_qa_btn)
@@ -3335,9 +3368,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
             px = "0.316"
         self.cluster_pixel_size = QLineEdit(px)
         param_layout.addRow("Pixel size (um/px):", self.cluster_pixel_size)
-        self.cluster_upscale_factor = QLineEdit("2")
-        self.cluster_upscale_factor.setToolTip("2 for 20x, 1 for 40x")
-        param_layout.addRow("Upscale factor:", self.cluster_upscale_factor)
         self.cluster_sholl_step = QLineEdit("0")
         self.cluster_sholl_step.setToolTip("0 = continuous / pixel-level")
         param_layout.addRow("Sholl step size (um):", self.cluster_sholl_step)
@@ -3409,10 +3439,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Validate parameters
         try:
             pixel_size = float(self.cluster_pixel_size.text())
-            upscale_factor = int(self.cluster_upscale_factor.text())
             sholl_step = float(self.cluster_sholl_step.text())
         except ValueError:
-            QMessageBox.warning(self, "Warning", "Invalid numeric parameter. Check pixel size, upscale factor, and sholl step.")
+            QMessageBox.warning(self, "Warning", "Invalid numeric parameter. Check pixel size and sholl step.")
             return
 
         largest_only = self.cluster_largest_only.isChecked()
@@ -3463,7 +3492,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # --- Generate the headless Jython wrapper script ---
         wrapper_script = self._build_imagej_wrapper_script(
-            pixel_size, upscale_factor, sholl_step, largest_only, analyses, pixel_size_map
+            pixel_size, sholl_step, largest_only, analyses, pixel_size_map
         )
         wrapper_path = os.path.join(save_dir, "mmps_imagej_cluster.py")
         with open(wrapper_path, 'w') as f:
@@ -3511,7 +3540,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             f"This submits a SLURM array job (one task per image)\n"
             f"plus a merge job that combines results when done.")
 
-    def _build_imagej_wrapper_script(self, pixel_size, upscale_factor, sholl_step, largest_only, analyses, pixel_size_map=None):
+    def _build_imagej_wrapper_script(self, pixel_size, sholl_step, largest_only, analyses, pixel_size_map=None):
         """Build the Jython script that runs all selected analyses headlessly."""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -3550,7 +3579,6 @@ import time
 
 PIXEL_SIZE = {pixel_size}
 PIXEL_SIZE_MAP = {repr(pixel_size_map or {})}
-UPSCALE_FACTOR = {upscale_factor}
 SHOLL_STEP = {sholl_step}
 LARGEST_ONLY = {largest_only}
 ANALYSES = {analyses}
@@ -3657,7 +3685,7 @@ def formatTime(seconds):
 # SKELETON ANALYSIS
 # ============================================================================
 
-def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
+def analyzeSkeleton(maskPath, pixelSize, outputDirPath):
     """Analyze skeleton of a single mask image."""
     from sc.fiji.analyzeSkeleton import AnalyzeSkeleton_
 
@@ -3694,16 +3722,6 @@ def analyzeSkeleton(maskPath, pixelSize, scaleFactor, outputDirPath):
     rt.reset()
 
     skel = mask.duplicate()
-    if scaleFactor > 1:
-        newWidth = int(mask.getWidth() * scaleFactor)
-        newHeight = int(mask.getHeight() * scaleFactor)
-        IJ.run(skel, "Size...", "width=" + str(newWidth) + " height=" + str(newHeight) + " interpolation=None")
-        scaledPixelSize = pixelSize / float(scaleFactor)
-        scaledCal = Calibration(skel)
-        scaledCal.pixelWidth = scaledPixelSize
-        scaledCal.pixelHeight = scaledPixelSize
-        scaledCal.setUnit("micron")
-        skel.setCalibration(scaledCal)
 
     IJ.setThreshold(skel, 1, 255)
     IJ.run(skel, "Convert to Mask", "")
@@ -3838,7 +3856,7 @@ def runSkeletonBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=
             eta = "estimating..."
         print("[" + str(idx + 1) + "/" + str(total) + "] " + maskFile + "  ETA: " + eta)
 
-        metrics = analyzeSkeleton(maskPath, pixelSize, UPSCALE_FACTOR, skelDir)
+        metrics = analyzeSkeleton(maskPath, pixelSize, skelDir)
         if metrics is not None:
             # Populate standard identifiers from metadata
             imgN, somaI, _ = parseMaskInfo(maskFile)
@@ -5933,11 +5951,27 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         """Toggle paint fill mode for mask editing during QA."""
         self.mask_label.paint_mode = checked
         if checked:
+            if self.paint_erase_btn.isChecked():
+                self.paint_erase_btn.setChecked(False)
             self.mask_label.setCursor(Qt.CrossCursor)
             self.log("Paint fill ON - click and drag to fill mask gaps")
         else:
-            self.mask_label.setCursor(Qt.ArrowCursor)
+            if not self.mask_label.erase_mode:
+                self.mask_label.setCursor(Qt.ArrowCursor)
             self.log("Paint fill OFF")
+
+    def _toggle_erase_mode(self, checked):
+        """Toggle pixel smoothing (erase) mode for mask editing during QA."""
+        self.mask_label.erase_mode = checked
+        if checked:
+            if self.paint_fill_btn.isChecked():
+                self.paint_fill_btn.setChecked(False)
+            self.mask_label.setCursor(Qt.CrossCursor)
+            self.log("Pixel smooth ON - click and drag to remove stray mask pixels")
+        else:
+            if not self.mask_label.paint_mode:
+                self.mask_label.setCursor(Qt.ArrowCursor)
+            self.log("Pixel smooth OFF")
 
     def toggle_pixel_picker_mode(self):
         """Toggle pixel intensity picker on/off"""
@@ -8586,7 +8620,7 @@ if __name__ == '__main__':
                        'area_um2', 'mask_area_um2', 'cell', 'mask name', 'image name',
                        'soma id', 'mask area (um2)', 'centroid x (px)',
                        'centroid y (px)', 'start radius (um)',
-                       'pixel_size_um', 'upscale_factor', 'skeleton_file',
+                       'pixel_size_um', 'skeleton_file',
                        'soma area (um2)'}
         try:
             with open(file_path, 'r') as f:
@@ -13556,6 +13590,7 @@ if __name__ == '__main__':
         self.regen_masks_btn.setVisible(True)
         self.paint_fill_btn.setVisible(True)
         self.paint_brush_spin.setVisible(True)
+        self.paint_erase_btn.setVisible(True)
         self.clear_masks_btn.setEnabled(True)
         self.clear_masks_btn.setVisible(True)
 
@@ -14351,6 +14386,8 @@ if __name__ == '__main__':
             self.paint_fill_btn.setVisible(False)
             self.paint_fill_btn.setChecked(False)
             self.paint_brush_spin.setVisible(False)
+            self.paint_erase_btn.setVisible(False)
+            self.paint_erase_btn.setChecked(False)
             self.clear_masks_btn.setVisible(False)
             self.clear_masks_btn.setEnabled(False)
             self.undo_qa_btn.setVisible(False)
@@ -14450,6 +14487,7 @@ if __name__ == '__main__':
             self.regen_masks_btn.setVisible(True)
             self.paint_fill_btn.setVisible(True)
             self.paint_brush_spin.setVisible(True)
+            self.paint_erase_btn.setVisible(True)
             self.clear_masks_btn.setEnabled(True)
             self.clear_masks_btn.setVisible(True)
             self._show_current_mask()
