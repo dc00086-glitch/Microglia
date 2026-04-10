@@ -94,7 +94,6 @@ def safe_tiff_read(filepath):
 def load_tiff_image(filepath):
     """Load TIFF image using PIL to handle all compression types"""
     img = Image.open(filepath)
-    # Convert to numpy array
     img_array = np.array(img)
     return img_array
 
@@ -107,7 +106,6 @@ def ensure_grayscale(img):
         # Handle RGBA (4 channels) by dropping alpha channel
         if img.shape[2] == 4:
             img = img[:, :, :3]  # Keep only RGB channels
-        # Convert RGB to grayscale
         img = (color.rgb2gray(img) * 255).astype(img.dtype)
     if img.ndim > 2:
         img = img.squeeze()
@@ -120,7 +118,6 @@ def extract_channel(img, channel_idx):
         return None
     if img.ndim == 3 and img.shape[2] > channel_idx:
         channel = img[:, :, channel_idx].astype(np.float32)
-        # Normalize to 0-255
         c_min, c_max = channel.min(), channel.max()
         if c_max > c_min:
             channel = (channel - c_min) / (c_max - c_min) * 255
@@ -315,7 +312,6 @@ def _grow_masks_for_soma(args):
                     visited[nr, nc] = True
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
-    # Build masks for each target area
     soma_area_px = soma_seed_count
     masks = []
     mask_pixel_counts = []
@@ -367,7 +363,6 @@ def _grow_masks_for_soma(args):
                 masks[idx]['approved'] = False
                 masks[idx]['duplicate'] = True
 
-    # Smooth masks to fill small gaps
     if smooth_enabled:
         _smooth_masks(masks, smooth_gap_size)
 
@@ -514,7 +509,6 @@ def _remove_branch_juts(points, centroid, max_iterations=3):
     if h <= 0 or w <= 0:
         return points
 
-    # Draw filled polygon into a mask
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(mask, [local_pts.reshape(-1, 1, 2)], 255)
 
@@ -548,7 +542,6 @@ def _remove_branch_juts(points, centroid, max_iterations=3):
     if not contours:
         return points
 
-    # Pick contour nearest centroid
     best_contour = None
     best_dist = float('inf')
     for cnt in contours:
@@ -600,7 +593,6 @@ def _remove_branch_juts(points, centroid, max_iterations=3):
 
         deep.sort(key=lambda x: -x[3])
 
-        # Try to find pairs of defects that form a narrow jut
         pruned = False
         used = set()
         for i in range(len(deep)):
@@ -639,7 +631,6 @@ def _remove_branch_juts(points, centroid, max_iterations=3):
                     arc_a = list(range(idx2, n)) + list(range(0, idx1 + 1))
                     arc_b = list(range(idx1, idx2 + 1))
 
-                    # Check which arc contains points closer to centroid
                     def arc_centroid_dist(arc):
                         if not arc:
                             return float('inf')
@@ -709,7 +700,6 @@ def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
         List of (row, col) polygon points, or None if failed
     """
     try:
-        # Ensure image is 2D
         if image is None:
             return None
         if image.ndim > 2:
@@ -718,7 +708,6 @@ def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
         h, w = image.shape[:2]
         cy, cx = int(centroid[0]), int(centroid[1])
 
-        # Extract region around centroid
         half = region_size // 2
         y1, y2 = max(0, cy - half), min(h, cy + half)
         x1, x2 = max(0, cx - half), min(w, cx + half)
@@ -727,27 +716,22 @@ def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
         if region.size == 0:
             return None
 
-        # Normalize region to 0-255
         region = region.astype(np.float64)
         rmin, rmax = region.min(), region.max()
         if rmax > rmin:
             region = (region - rmin) / (rmax - rmin) * 255
         region = region.astype(np.uint8)
 
-        # Apply Gaussian blur
         region = cv2.GaussianBlur(region, (5, 5), 1.5)
 
-        # Get local centroid coordinates
         local_cy, local_cx = cy - y1, cx - x1
 
-        # Use Otsu's method as base, adjust with sensitivity
         otsu_thresh, _ = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         # Adjust threshold based on sensitivity (higher = lower threshold = more inclusive)
         adjustment = (sensitivity - 50) / 100 * otsu_thresh * 0.8
         thresh_val = max(5, min(250, int(otsu_thresh - adjustment)))
 
-        # Try threshold
         _, binary = cv2.threshold(region, thresh_val, 255, cv2.THRESH_BINARY)
 
         # Morphological operations to clean up
@@ -755,11 +739,9 @@ def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
 
-        # Find contours
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
-            # Try adaptive threshold as fallback
             binary = cv2.adaptiveThreshold(region, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                            cv2.THRESH_BINARY, 21, -5)
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
@@ -768,7 +750,6 @@ def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
         if not contours:
             return None
 
-        # Find contour containing the centroid
         best_contour = None
         best_area = 0
         for contour in contours:
@@ -805,10 +786,8 @@ def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
         if area < 20:
             return None
 
-        # Simplify contour ensuring minimum points
         approx = _simplify_contour(best_contour)
 
-        # Convert back to image coordinates
         points = []
         for pt in approx:
             px, py = pt[0]
@@ -849,13 +828,11 @@ def auto_outline_region_growing(image, centroid, sensitivity=50, max_iterations=
         if not (0 <= cy < h and 0 <= cx < w):
             return None
 
-        # Normalize image for consistent comparison
         img_norm = image.astype(np.float64)
         imin, imax = img_norm.min(), img_norm.max()
         if imax > imin:
             img_norm = (img_norm - imin) / (imax - imin) * 255
 
-        # Get seed intensity
         seed_val = float(img_norm[cy, cx])
 
         # Tolerance based on sensitivity (higher = more tolerant)
@@ -873,7 +850,6 @@ def auto_outline_region_growing(image, centroid, sensitivity=50, max_iterations=
             y, x = queue.pop(0)
             iterations += 1
 
-            # Check 8-connected neighbors
             for dy in [-1, 0, 1]:
                 for dx in [-1, 0, 1]:
                     if dy == 0 and dx == 0:
@@ -886,21 +862,17 @@ def auto_outline_region_growing(image, centroid, sensitivity=50, max_iterations=
                             region[ny, nx] = True
                             queue.append((ny, nx))
 
-        # Check if region is reasonable
         if np.sum(region) < 20:
             return None
 
-        # Find contour of region
         region_uint8 = (region * 255).astype(np.uint8)
         contours, _ = cv2.findContours(region_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
             return None
 
-        # Get largest contour
         contour = max(contours, key=cv2.contourArea)
 
-        # Simplify ensuring minimum points
         approx = _simplify_contour(contour)
 
         points = [(pt[0][1], pt[0][0]) for pt in approx]  # (row, col) format
@@ -934,7 +906,6 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
         h, w = image.shape[:2]
         cy, cx = int(centroid[0]), int(centroid[1])
 
-        # Extract region
         half = region_size // 2
         y1, y2 = max(0, cy - half), min(h, cy + half)
         x1, x2 = max(0, cx - half), min(w, cx + half)
@@ -943,21 +914,17 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
         if region.size == 0:
             return None
 
-        # Normalize
         region = region.astype(np.float64)
         rmin, rmax = region.min(), region.max()
         if rmax > rmin:
             region = (region - rmin) / (rmax - rmin) * 255
         region = region.astype(np.uint8)
 
-        # Apply blur
         region = cv2.GaussianBlur(region, (5, 5), 0)
 
-        # Create markers - soma center is foreground marker
         markers = np.zeros(region.shape, dtype=np.int32)
         local_cx, local_cy = cx - x1, cy - y1
 
-        # Check bounds
         if not (0 <= local_cx < region.shape[1] and 0 <= local_cy < region.shape[0]):
             return None
 
@@ -970,10 +937,8 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
         cv2.rectangle(edge_mask, (0, 0), (region.shape[1]-1, region.shape[0]-1), 255, 3)
         markers[edge_mask > 0] = 2
 
-        # Convert to 3-channel for watershed
         region_color = cv2.cvtColor(region, cv2.COLOR_GRAY2BGR)
 
-        # Apply watershed
         cv2.watershed(region_color, markers)
 
         # Extract soma region (marker == 1)
@@ -984,7 +949,6 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
         soma_mask = cv2.morphologyEx(soma_mask, cv2.MORPH_CLOSE, kernel)
         soma_mask = cv2.morphologyEx(soma_mask, cv2.MORPH_OPEN, kernel)
 
-        # Find contour
         contours, _ = cv2.findContours(soma_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
@@ -992,13 +956,11 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
 
         contour = max(contours, key=cv2.contourArea)
 
-        # Check area is reasonable
         if cv2.contourArea(contour) < 20:
             return None
 
         approx = _simplify_contour(contour)
 
-        # Convert back to image coordinates
         points = [(pt[0][1] + y1, pt[0][0] + x1) for pt in approx]
         return points if len(points) >= MIN_OUTLINE_POINTS else None
 
@@ -1033,7 +995,6 @@ def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=15
         h, w = image.shape[:2]
         cy, cx = int(centroid[0]), int(centroid[1])
 
-        # Extract region
         half = region_size // 2
         y1, y2 = max(0, cy - half), min(h, cy + half)
         x1, x2 = max(0, cx - half), min(w, cx + half)
@@ -1042,18 +1003,15 @@ def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=15
         if region.size == 0:
             return None
 
-        # Normalize
         rmin, rmax = region.min(), region.max()
         if rmax > rmin:
             region = (region - rmin) / (rmax - rmin)
 
-        # Smooth image
         region = gaussian(region, sigma=2)
 
         # Initial circle
         local_cx, local_cy = cx - x1, cy - y1
 
-        # Check bounds
         if not (0 <= local_cx < region.shape[1] and 0 <= local_cy < region.shape[0]):
             return None
 
@@ -1070,7 +1028,6 @@ def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=15
         alpha = 0.01 + (100 - sensitivity) / 5000  # Smoothness
         beta = 0.1 + (100 - sensitivity) / 500     # Curvature
 
-        # Run active contour
         snake = active_contour(
             region, init,
             alpha=alpha, beta=beta,
@@ -1083,7 +1040,6 @@ def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=15
         step = max(1, len(snake) // target_pts)
         simplified = snake[::step]
 
-        # Convert back to image coordinates
         points = [(pt[1] + y1, pt[0] + x1) for pt in simplified]
         return points if len(points) >= MIN_OUTLINE_POINTS else None
 
@@ -1115,10 +1071,8 @@ def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
         # Try threshold first (most reliable)
         threshold_points = auto_outline_threshold(image, centroid, sensitivity, region_size)
 
-        # Try watershed
         watershed_points = auto_outline_watershed(image, centroid, sensitivity, region_size)
 
-        # Choose the better result based on some heuristics
         best_points = None
         best_score = 0
 
@@ -1129,13 +1083,11 @@ def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
             # Score based on: number of points (more = smoother), area, and compactness
             pts_array = np.array(points)
 
-            # Calculate area using shoelace formula
             n = len(pts_array)
             area = 0.5 * abs(sum(pts_array[i, 0] * pts_array[(i + 1) % n, 1] -
                                  pts_array[(i + 1) % n, 0] * pts_array[i, 1]
                                  for i in range(n)))
 
-            # Calculate perimeter
             perimeter = sum(np.sqrt((pts_array[(i + 1) % n, 0] - pts_array[i, 0]) ** 2 +
                                     (pts_array[(i + 1) % n, 1] - pts_array[i, 1]) ** 2)
                            for i in range(n))
@@ -1146,7 +1098,6 @@ def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
             else:
                 compactness = 0
 
-            # Score: prefer reasonable area and good compactness
             if area > 50 and area < 50000:  # Reasonable soma size
                 score = compactness * 100 + min(area / 100, 50)
                 if score > best_score:
@@ -1161,12 +1112,10 @@ def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
         if active_points is not None and len(active_points) >= MIN_OUTLINE_POINTS:
             return active_points
 
-        # Return whatever we have
         return threshold_points or watershed_points
 
     except Exception as e:
         print(f"Auto-outline hybrid error: {e}")
-        # Try simple threshold as fallback
         return auto_outline_threshold(image, centroid, sensitivity, region_size)
 
 
@@ -1311,23 +1260,19 @@ class BatchProcessingThread(QThread):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
                     img = load_tiff_image(img_path)
-                    # Extract only the selected channel for processing
                     if img.ndim == 3:
                         img = extract_channel(img, process_channel)
                     img_dtype = img.dtype
                     result = img.copy()
 
-                    # Apply optional rolling ball background subtraction
                     if rb_enabled:
                         background = restoration.rolling_ball(img, radius=radius)
                         result = img - background
                         result = np.clip(result, 0, np.iinfo(img_dtype).max)
 
-                    # Apply optional denoising
                     if denoise_enabled:
                         result = ndimage.median_filter(result, size=denoise_size)
 
-                    # Apply optional sharpening
                     if sharpen_enabled:
                         blurred = ndimage.gaussian_filter(result.astype(np.float32), sigma=2)
                         result_float = result.astype(np.float32)
@@ -1398,7 +1343,6 @@ class MorphologyCalculationThread(QThread):
                     mask_data['area_um2']
                 )
 
-                # Check if mask is on disk
                 if self.masks_dir:
                     img_basename = os.path.splitext(img_name)[0]
                     soma_id = mask_data['soma_id']
@@ -1415,7 +1359,6 @@ class MorphologyCalculationThread(QThread):
             all_results = [None] * total
             completed = 0
 
-            # Process all disk-based masks serially
             serial_indices.extend([idx for idx, _, _, _ in parallel_tasks])
 
             # Process remaining masks serially (in-memory)
@@ -1589,7 +1532,6 @@ class BackgroundRemovalThread(QThread):
                                     raw_img, ch_idx, radius, rb_enabled,
                                     denoise_enabled, denoise_size,
                                     sharpen_enabled, sharpen_amount)
-                                # Save extra channel to disk
                                 ch_path = os.path.join(
                                     self.output_dir,
                                     f"{name}_processed_ch{ch_idx + 1}.tif")
@@ -1631,7 +1573,6 @@ class InteractiveImageLabel(QLabel):
         # View center in image coordinates (0-1 normalized)
         self.view_center_x = 0.5
         self.view_center_y = 0.5
-        # Store the scaled pixmap for custom drawing
         self.scaled_pixmap = None
         # Point editing for polygon outlines
         self.point_edit_mode = False
@@ -1673,14 +1614,11 @@ class InteractiveImageLabel(QLabel):
         label_w = self.size().width()
         label_h = self.size().height()
 
-        # Calculate base scale to fit
         base_scale = min(label_w / img_w, label_h / img_h)
 
-        # Apply zoom
         final_w = int(img_w * base_scale * self.zoom_level)
         final_h = int(img_h * base_scale * self.zoom_level)
 
-        # Store the scaled pixmap for custom drawing in paintEvent
         self.scaled_pixmap = self.pix_source.scaled(
             final_w,
             final_h,
@@ -1748,11 +1686,9 @@ class InteractiveImageLabel(QLabel):
             painter.end()
             return
 
-        # Draw the pixmap at the correct pan offset position
         offset_x, offset_y = self._get_pan_offset()
         painter.drawPixmap(int(offset_x), int(offset_y), self.scaled_pixmap)
 
-        # Draw mask overlay
         if self.mask_overlay is not None:
             self._draw_mask_overlay(painter)
 
@@ -1774,23 +1710,19 @@ class InteractiveImageLabel(QLabel):
                 if 0 <= x <= self.width() and 0 <= y <= self.height():
                     painter.drawEllipse(int(x - 6), int(y - 6), 12, 12)
 
-        # Draw polygon points
         if self.polygon_mode and len(self.polygon_pts) > 0:
             self._draw_polygon(painter)
 
-        # Draw measurement overlay
         if self.measure_mode and self.measure_pt1 is not None:
             pen = QPen(QColor(255, 255, 0), 2, Qt.DashLine)
             painter.setPen(pen)
             x1, y1 = self._to_display_coords(self.measure_pt1)
-            # Draw first point marker
             painter.setBrush(QColor(255, 255, 0, 150))
             painter.drawEllipse(int(x1 - 5), int(y1 - 5), 10, 10)
             if self.measure_pt2 is not None:
                 x2, y2 = self._to_display_coords(self.measure_pt2)
                 painter.drawLine(int(x1), int(y1), int(x2), int(y2))
                 painter.drawEllipse(int(x2 - 5), int(y2 - 5), 10, 10)
-                # Draw distance label at midpoint
                 mx, my = (x1 + x2) / 2, (y1 + y2) / 2
                 if self.parent_widget and hasattr(self.parent_widget, '_get_measure_text'):
                     text = self.parent_widget._get_measure_text()
@@ -1802,7 +1734,6 @@ class InteractiveImageLabel(QLabel):
                     painter.setPen(QColor(0, 0, 0))
                     painter.drawText(int(mx - tw / 2 + 4), int(my - 2), text)
 
-        # Draw zoom indicator
         if self.zoom_level != 1.0:
             bg = self.palette().color(self.backgroundRole())
             bg.setAlpha(200)
@@ -1827,7 +1758,6 @@ class InteractiveImageLabel(QLabel):
         # Get first centroid (current soma)
         soma = self.centroids[0]
         img_h, img_w = self.pix_source.height(), self.pix_source.width()
-        # Convert to normalized coords
         self.view_center_x = soma[1] / img_w
         self.view_center_y = soma[0] / img_h
         self._update_display()
@@ -1888,7 +1818,6 @@ class InteractiveImageLabel(QLabel):
         # Measurement mode takes priority over other modes
         if self.measure_mode and event.button() == Qt.LeftButton:
             if self.measure_pt1 is None or self.measure_pt2 is not None:
-                # Start new measurement
                 self.measure_pt1 = coords
                 self.measure_pt2 = None
             else:
@@ -1931,7 +1860,6 @@ class InteractiveImageLabel(QLabel):
             if self.polygon_pts and event.button() == Qt.LeftButton and (event.modifiers() & Qt.ShiftModifier):
                 nearest_idx = self._find_nearest_point(event.pos())
                 if nearest_idx is not None:
-                    # Start dragging this point
                     self.selected_point_idx = nearest_idx
                     self.dragging_point = True
                     self._update_display()
@@ -1959,7 +1887,6 @@ class InteractiveImageLabel(QLabel):
             coords = self._to_image_coords(event.pos().x(), event.pos().y())
             if coords and self.dragging_centroid_idx < len(self.centroids):
                 self.centroids[self.dragging_centroid_idx] = coords
-                # Update parent's somas list
                 img_data = self.parent_widget.images.get(self.parent_widget.current_image_name)
                 if img_data and self.dragging_centroid_idx < len(img_data['somas']):
                     img_data['somas'][self.dragging_centroid_idx] = coords
@@ -1969,9 +1896,7 @@ class InteractiveImageLabel(QLabel):
         if self.dragging_point and self.selected_point_idx is not None and self.parent_widget:
             coords = self._to_image_coords(event.pos().x(), event.pos().y())
             if coords:
-                # Update the point position in parent's polygon_points
                 self.parent_widget.polygon_points[self.selected_point_idx] = coords
-                # Update our local copy too
                 self.polygon_pts = self.parent_widget.polygon_points.copy()
                 self._update_display()
 
@@ -2001,7 +1926,6 @@ class InteractiveImageLabel(QLabel):
             self.dragging_point = False
             # Keep the point selected for visibility but stop dragging
             if self.parent_widget and hasattr(self.parent_widget, 'polygon_points'):
-                # Ensure parent's points are updated
                 self.polygon_pts = self.parent_widget.polygon_points.copy()
                 self._update_display()
                 # Log the adjustment
@@ -2013,7 +1937,6 @@ class InteractiveImageLabel(QLabel):
         if not self.pix_source:
             return
 
-        # Convert click position to normalized image coordinates
         coords = self._to_image_coords(pos.x(), pos.y())
         if not coords:
             return
@@ -2023,7 +1946,6 @@ class InteractiveImageLabel(QLabel):
         self.view_center_x = coords[1] / img_w
         self.view_center_y = coords[0] / img_h
 
-        # Apply zoom
         if zoom_in:
             new_zoom = self.zoom_level * 1.5
         else:
@@ -2087,7 +2009,6 @@ class InteractiveImageLabel(QLabel):
         painter.setOpacity(1.0)
 
     def _draw_polygon(self, painter):
-        # Draw polygon lines
         pen = QPen(QColor(255, 165, 0), 3)
         painter.setPen(pen)
         for i in range(len(self.polygon_pts)):
@@ -2095,7 +2016,6 @@ class InteractiveImageLabel(QLabel):
             p2 = self._to_display_coords(self.polygon_pts[(i + 1) % len(self.polygon_pts)])
             painter.drawLine(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]))
 
-        # Draw polygon points - highlight selected/dragging point
         for i, pt in enumerate(self.polygon_pts):
             x, y = self._to_display_coords(pt)
             if i == self.selected_point_idx:
@@ -2118,7 +2038,6 @@ class InteractiveImageLabel(QLabel):
         pixmap_w = self.scaled_pixmap.width()
         pixmap_h = self.scaled_pixmap.height()
 
-        # Get pan offset from view center
         offset_x, offset_y = self._get_pan_offset()
 
         scale_x = pixmap_w / img_w
@@ -2135,7 +2054,6 @@ class InteractiveImageLabel(QLabel):
         pixmap_w = self.scaled_pixmap.width()
         pixmap_h = self.scaled_pixmap.height()
 
-        # Get pan offset from view center
         offset_x, offset_y = self._get_pan_offset()
 
         scale_x = img_w / pixmap_w
@@ -2231,7 +2149,6 @@ class ChannelSelectDialog(QDialog):
 
     def get_settings(self):
         """Return the selected channel settings and names"""
-        # Return by channel index
         channels = {i: check.isChecked() for i, check in enumerate(self.ch_checks)}
         return {
             'channels': channels,
@@ -2315,7 +2232,6 @@ class CSVMergeDialog(QDialog):
         found = {}
         if not base_dir or not os.path.isdir(base_dir):
             return found
-        # Check for simple morphology results
         simple = os.path.join(base_dir, "combined_morphology_results.csv")
         if os.path.isfile(simple):
             found['simple'] = simple
@@ -2323,7 +2239,6 @@ class CSVMergeDialog(QDialog):
         combined = os.path.join(base_dir, "ImageJ_Combined_Results.csv")
         if os.path.isfile(combined):
             found['combined'] = combined
-        # Check subdirectories for individual analysis results
         skel = os.path.join(base_dir, "skeleton_results", "Skeleton_Analysis_Results.csv")
         if os.path.isfile(skel):
             found['skeleton'] = skel
@@ -2346,7 +2261,6 @@ class CSVMergeDialog(QDialog):
             self._path_labels[csv_type].setText(os.path.basename(path))
             self._path_labels[csv_type].setStyleSheet("color: black; font-style: normal;")
             self._checks[csv_type].setChecked(True)
-            # Update browse directory for convenience
             self._initial_dir = os.path.dirname(path)
 
     def get_selected_files(self):
@@ -2462,7 +2376,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self._qa_finalized_somas = set()  # somas evicted from memory
         self._qa_soma_window_size = 10    # keep last N reviewed somas in memory
         self.soma_mode = False  # Initialize soma_mode to prevent crashes
-        # Initialize display adjustment values
         self.brightness_value = 0
         self.contrast_value = 0
         # Per-channel brightness for colocalization mode
@@ -2550,7 +2463,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 self.restart_polygon()
                 return
             elif key == Qt.Key_Delete:
-                # Delete this soma and skip to next
                 self.skip_delete_current_soma()
                 return
             elif key == Qt.Key_Return or key == Qt.Key_Enter:
@@ -2680,8 +2592,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         right_panel = self._create_right_panel()
         main_layout.addWidget(right_panel, 1)
 
-        # Try multiple approaches to ensure full screen
-        # Get the screen geometry
         from PyQt5.QtWidgets import QDesktopWidget
         screen = QDesktopWidget().screenGeometry()
         self.setGeometry(screen)
@@ -3432,7 +3342,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "Select at least one analysis to run.")
             return
 
-        # Validate parameters
         try:
             pixel_size = float(self.cluster_pixel_size.text())
             sholl_step = float(self.cluster_sholl_step.text())
@@ -3478,7 +3387,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if do_sholl:
             analyses.append("sholl")
 
-        # Build per-image pixel size map from session data
         pixel_size_map = {}
         for img_name, img_data in self.images.items():
             per_img_px = img_data.get('pixel_size')
@@ -5189,7 +5097,6 @@ TROUBLESHOOTING:
         save_dir = os.path.join(parent_dir, "SpreadAnalysis")
         os.makedirs(save_dir, exist_ok=True)
 
-        # Build per-image pixel size map from session data
         pixel_size_map = {}
         for img_name, img_data in self.images.items():
             per_img_px = img_data.get('pixel_size')
@@ -5763,7 +5670,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         if self.coloc_channel_1 >= n_channels or self.coloc_channel_2 >= n_channels:
             return {'coloc_status': 'invalid_channels'}
 
-        # Apply mask
         mask_bool = mask > 0
         if not np.any(mask_bool):
             return {'coloc_status': 'empty_mask'}
@@ -5840,7 +5746,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
 
     def show_shortcut_help(self):
         """Show context-sensitive keyboard shortcuts overlay"""
-        # Determine current mode
         mode = "General"
         if self.mask_qa_active:
             mode = "Mask QA"
@@ -5930,7 +5835,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         self.measure_mode = not self.measure_mode
         self.measure_btn.setChecked(self.measure_mode)
 
-        # Set mode on the active display label
         for label in [self.original_label, self.preview_label, self.processed_label, self.mask_label]:
             label.measure_mode = self.measure_mode
             if not self.measure_mode:
@@ -5994,7 +5898,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
 
         parts = [f"Pixel ({row}, {col})"]
 
-        # Show raw / color image channel values
         color_img = img_data.get('color_image')
         if color_img is None and img_data.get('raw_path'):
             try:
@@ -6137,7 +6040,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         pixel_size = known_um / dist_px
         ps_str = f"{pixel_size:.6f}"
 
-        # Set both X and Y
         self.pixel_size_x_input.setText(ps_str)
         self.pixel_size_y_input.setText(ps_str)
         self.pixel_size_link_btn.setChecked(True)
@@ -6283,10 +6185,8 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
 
     def _build_session_dict(self, session_file_path=None):
         """Build a serializable session dictionary from current state."""
-        # Determine the last completed workflow step
         last_step = self._determine_last_completed_step()
 
-        # Compute relative paths from the session file location
         session_dir = os.path.dirname(os.path.abspath(session_file_path)) if session_file_path else None
 
         session = {
@@ -6336,7 +6236,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                 if os.path.exists(candidate):
                     processed_path = candidate
 
-            # Build paths for extra cleaned channel TIFFs
             extra_channel_paths = {}
             if self.output_dir:
                 for ch_idx in range(3):
@@ -6346,7 +6245,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                     if os.path.exists(ch_candidate):
                         extra_channel_paths[str(ch_idx)] = ch_candidate
 
-            # Compute relative paths for portability across machines
             extra_channel_paths_rel = {}
             if session_dir:
                 for ch_str, ch_path in extra_channel_paths.items():
@@ -6455,7 +6353,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
 
     def _export_cluster_script_impl(self):
         """Internal implementation of cluster script export."""
-        # Validate that we have enough data
         has_outlines = any(
             img_data.get('soma_outlines') and img_data['selected']
             for img_data in self.images.values()
@@ -6495,7 +6392,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         except Exception:
             global_px = 0.316
 
-        # Build summary of what each image will use
         summary_lines = []
         for img_name in sorted(self.images.keys()):
             img_px = self._get_pixel_size(img_name)
@@ -6730,7 +6626,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             QMessageBox.warning(self, "Warning", "Min area must be <= Max area.")
             return
 
-        # Save settings back to instance for next time
         self.use_min_intensity = use_min_intensity
         self.min_intensity_percent = min_intensity_percent
         self.local_intensity_window = local_intensity_window
@@ -6746,7 +6641,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         if area_list[-1] != mask_max_area:
             area_list.append(mask_max_area)
 
-        # Build per-image soma data
         image_data = {}
         for img_name, img_data in self.images.items():
             if not img_data['selected'] or not img_data.get('soma_outlines'):
@@ -6778,7 +6672,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         os.makedirs(save_dir, exist_ok=True)
         path = os.path.join(save_dir, "cluster_mask_generation.py")
 
-        # Build the script content
         settings = {
             'pixel_size_um': pixel_size,
             'area_list_um2': area_list,
@@ -7537,7 +7430,6 @@ if __name__ == '__main__':
 
         self.mode_3d = checked
 
-        # Show/hide 3D-specific UI
         self.z_slider_widget.setVisible(checked)
         self.voxel_z_label.setVisible(checked)
         self.voxel_z_input.setVisible(checked)
@@ -7857,7 +7749,6 @@ if __name__ == '__main__':
         if dialog.exec_() != QDialog.Accepted:
             return
 
-        # Apply the pixel sizes
         changed = 0
         for img_name, (x_edit, y_edit) in inputs.items():
             x_text = x_edit.text().strip()
@@ -7913,7 +7804,6 @@ if __name__ == '__main__':
             return
 
         try:
-            # Use fastest available JSON parser
             self.log("Loading session file...")
             QApplication.processEvents()
             try:
@@ -7996,7 +7886,6 @@ if __name__ == '__main__':
                     remap_dir = QFileDialog.getExistingDirectory(
                         self, "Select Folder Containing Images")
                     if remap_dir:
-                        # Try to find each missing file by name in the remap directory
                         remap_found = 0
                         for img_name in list(missing):
                             # Search recursively for the file
@@ -8007,7 +7896,6 @@ if __name__ == '__main__':
                                 remap_found += 1
                         # Also remap output/masks dirs if they're under the same tree
                         if resolved_output_dir and not os.path.isdir(resolved_output_dir):
-                            # Try to find "Output" folder near images
                             out_candidates = glob.glob(os.path.join(remap_dir, '**', 'Output'), recursive=True)
                             if out_candidates:
                                 resolved_output_dir = out_candidates[0]
@@ -8184,7 +8072,6 @@ if __name__ == '__main__':
                     self.log("Session load cancelled by user.")
                     break
 
-                # Try to reload processed image from disk
                 processed_data = None
                 processed_path = img_session.get('processed_path')
                 if processed_path and os.path.exists(processed_path):
@@ -8268,7 +8155,6 @@ if __name__ == '__main__':
                 # Mask pixel data is loaded on demand via _reload_mask_from_disk
                 orig_status = img_session.get('status', 'loaded')
                 if orig_status in ('masks_generated', 'qa_complete', 'analyzed') and self.masks_dir:
-                    # Build a lookup of soma outlines for soma_area_um2
                     outline_lookup = {}
                     if not is_3d:
                         for ol in restored_outlines:
@@ -8326,7 +8212,6 @@ if __name__ == '__main__':
 
                         approval = True if orig_status in ('qa_complete', 'analyzed') else None
                         for soma_id, entries in soma_masks_pending.items():
-                            # Sort largest area first for consistency with QA ordering
                             entries.sort(key=lambda e: e[0], reverse=True)
                             # Detect duplicates: masks with the same file size on disk
                             # are likely pixel-identical (same growth_order prefix)
@@ -8386,7 +8271,6 @@ if __name__ == '__main__':
                 else:
                     self.current_image_name = sorted(self.images.keys())[0]
                 self._display_current_image()
-                # Set the file list selection to match
                 for row_i in range(self.file_list.count()):
                     item = self.file_list.item(row_i)
                     if item and item.data(Qt.UserRole) == self.current_image_name:
@@ -8418,7 +8302,6 @@ if __name__ == '__main__':
                     seen_somas.add(key)
                     self._qa_soma_order.append(key)
 
-            # Enable buttons based on restored state
             self._update_buttons_after_session_load()
 
             n_loaded = len(self.images)
@@ -8429,7 +8312,6 @@ if __name__ == '__main__':
             # Count masks from restored image data (no directory scan needed)
             n_mask_files = sum(len(d['masks']) for d in self.images.values())
 
-            # Determine last completed step
             last_step = session.get('last_completed_step', self._determine_last_completed_step())
             step_name = self._get_step_display_name(last_step)
             next_hint = self._get_next_step_hint(last_step)
@@ -8447,7 +8329,6 @@ if __name__ == '__main__':
             self.log(f"  Last completed step: {step_name}")
             self.log(f"  Next: {next_hint}")
 
-            # Check for in-progress checklist files
             soma_cl_path = self._get_checklist_path('soma_checklist.csv')
             mask_cl_path = self._get_checklist_path('mask_checklist.csv')
             if soma_cl_path and os.path.exists(soma_cl_path):
@@ -8503,7 +8384,6 @@ if __name__ == '__main__':
         if has_outlines:
             self.batch_generate_masks_btn.setEnabled(True)
 
-        # Enable QA and calculate buttons based on image statuses
         has_masks = any(d['status'] in ('masks_generated', 'qa_complete', 'analyzed') for d in self.images.values())
         has_qa_complete = any(d['status'] in ('qa_complete', 'analyzed') for d in self.images.values())
         if has_masks:
@@ -8512,7 +8392,6 @@ if __name__ == '__main__':
         if has_qa_complete:
             self.batch_calculate_btn.setEnabled(True)
 
-        # Check for partially-outlined session and offer to resume
         if has_somas and has_outlines:
             total_somas = sum(len(d['somas']) for d in self.images.values()
                               if d['selected'] and d['status'] in ('somas_picked', 'outlined'))
@@ -8529,7 +8408,6 @@ if __name__ == '__main__':
                     self.start_batch_outlining()
                     return  # Don't check QA if resuming outlining
 
-        # Check for partially-QA'd masks and offer to resume
         if has_masks:
             total_masks = sum(len(d['masks']) for d in self.images.values()
                               if d['selected'] and d['status'] in ('masks_generated', 'qa_complete', 'analyzed'))
@@ -8571,14 +8449,12 @@ if __name__ == '__main__':
         if len(sholl_markers & headers_lower) >= 2:
             return 'sholl'
 
-        # Check for pre-prefixed combined data
         has_sholl_prefix = any(h.startswith('sholl_') for h in headers_lower)
         has_skel_prefix = any(h.startswith('skel_') for h in headers_lower)
         has_fractal_prefix = any(h.startswith('fractal_') for h in headers_lower)
         if sum([has_sholl_prefix, has_skel_prefix, has_fractal_prefix]) >= 2:
             return 'combined'
 
-        # Check for Skeleton
         skel_markers = {'num_branches', 'num_junctions', 'skeleton_area_um2',
                         'num_end_points', 'avg_branch_length_um'}
         if len(skel_markers & headers_lower) >= 2:
@@ -8621,7 +8497,6 @@ if __name__ == '__main__':
             with open(file_path, 'r') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    # Extract cell_name based on type
                     if csv_type == 'sholl':
                         cell_name = row.get('Mask Name', row.get('Cell', row.get('cell_name', '')))
                     else:
@@ -8630,7 +8505,6 @@ if __name__ == '__main__':
                     if not cell_name:
                         continue
 
-                    # Extract area for area-aware matching
                     area = None
                     if csv_type == 'sholl':
                         area_str = row.get('Mask Area (um2)', '')
@@ -8651,7 +8525,6 @@ if __name__ == '__main__':
                             except (ValueError, TypeError):
                                 pass
 
-                    # Build prefixed data columns
                     prefix_map = {'sholl': 'sholl_', 'skeleton': 'skel_', 'fractal': 'fractal_'}
                     prefix = prefix_map.get(csv_type, '')
 
@@ -8695,10 +8568,8 @@ if __name__ == '__main__':
         import csv
         import re as _re
 
-        # Determine initial directory for file dialog
         initial_dir = self.output_dir if self.output_dir else os.path.expanduser("~")
 
-        # Show the CSV merge dialog
         dlg = CSVMergeDialog(self, initial_dir=initial_dir)
         if dlg.exec_() != QDialog.Accepted:
             return
@@ -8708,7 +8579,6 @@ if __name__ == '__main__':
             QMessageBox.information(self, "No Files", "No CSV files were selected.")
             return
 
-        # Set output_dir from the first selected file's directory
         if not self.output_dir:
             first_path = next(iter(selected_files.values()))
             self.output_dir = os.path.dirname(first_path)
@@ -8716,7 +8586,6 @@ if __name__ == '__main__':
         self.log("=" * 50)
         self.log("Importing ImageJ results...")
 
-        # Load each selected CSV by its declared type
         sholl_data = {}   # {cell_key: {'data': {...}, 'area': int|None}}
         skeleton_data = {}
         fractal_data = {}
@@ -8781,7 +8650,6 @@ if __name__ == '__main__':
 
         if not morphology_rows:
             self.log("  No morphology results to merge with. Saving ImageJ results separately.")
-            # Save a combined ImageJ-only file
             all_ij_data = {}
             for cell_name, entry in sholl_data.items():
                 all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(entry['data'])
@@ -8807,7 +8675,6 @@ if __name__ == '__main__':
             matched_skel = 0
             matched_fractal = 0
 
-            # Collect all new column names
             new_sholl_keys = set()
             new_skel_keys = set()
             new_fractal_keys = set()
@@ -8867,7 +8734,6 @@ if __name__ == '__main__':
                 ]:
                     if not lookup:
                         continue
-                    # Try exact match with area first, then without area
                     match_data = lookup.get(key) or lookup.get(key_no_area)
                     if match_data:
                         row.update(match_data)
@@ -8878,9 +8744,7 @@ if __name__ == '__main__':
                         elif counter_name == 'fractal':
                             matched_fractal += 1
 
-            # Write merged results
             all_keys = morph_fieldnames + sorted(new_sholl_keys) + sorted(new_skel_keys) + sorted(new_fractal_keys)
-            # Remove duplicates while preserving order
             seen = set()
             ordered_keys = []
             for k in all_keys:
@@ -9011,7 +8875,6 @@ if __name__ == '__main__':
             channel_group.setLayout(channel_layout)
             layout.addWidget(channel_group)
 
-            # Connect channel sliders
             def make_channel_updater(ch, value_label):
                 def updater(value):
                     value_label.setText(str(value))
@@ -9053,7 +8916,6 @@ if __name__ == '__main__':
         contrast_group.setLayout(contrast_layout)
         layout.addWidget(contrast_group)
 
-        # Connect sliders to update labels and live preview
         def update_brightness(value):
             brightness_value_label.setText(str(value))
             self.brightness_value = value
@@ -9100,7 +8962,6 @@ if __name__ == '__main__':
             )
             return
 
-        # Use the current image to detect channel count
         sample_color_img = None
         if self.current_image_name and self.current_image_name in self.images:
             img_data = self.images[self.current_image_name]
@@ -9240,7 +9101,6 @@ if __name__ == '__main__':
                 current_tab = self.tabs.currentIndex()
                 img_data = self.images[self.current_image_name]
 
-                # Determine which image to display based on current tab
                 use_color = self.show_color_view
                 if current_tab == 0:  # Original
                     if 'raw_path' in img_data:
@@ -9249,7 +9109,6 @@ if __name__ == '__main__':
                             adjusted = self._apply_display_adjustments_color(raw_img)
                             pixmap = self._array_to_pixmap_color(adjusted)
                         else:
-                            # Use selected channel for grayscale
                             if raw_img.ndim == 3:
                                 gray_img = extract_channel(raw_img, self.grayscale_channel)
                             else:
@@ -9327,7 +9186,6 @@ if __name__ == '__main__':
         # Work with a copy so we don't modify the original
         adjusted = img.astype(np.float32).copy()
 
-        # Normalize to 0-255 range first
         img_min = adjusted.min()
         img_max = adjusted.max()
         if img_max > img_min:
@@ -9381,7 +9239,6 @@ if __name__ == '__main__':
                     rgb[:, :, 2] = adjusted[:, :, 2]  # Blue
                 adjusted = rgb
 
-        # Normalize each channel to 0-255
         for i in range(3):
             channel = adjusted[:, :, i]
             c_min, c_max = channel.min(), channel.max()
@@ -9404,7 +9261,6 @@ if __name__ == '__main__':
         if brightness_b != 0:
             adjusted[:, :, 2] = adjusted[:, :, 2] + (brightness_b * 1.5)
 
-        # Apply global brightness/contrast on top
         if self.brightness_value != 0:
             adjusted = adjusted + (self.brightness_value * 1.5)
 
@@ -9430,24 +9286,20 @@ if __name__ == '__main__':
         processed = img_data['processed']
         processed_channels = img_data.get('processed_channels', {})
 
-        # Start with a copy of the original color image
         if color_img.ndim != 3:
             return None
 
-        # Build RGB composite
         h, w = color_img.shape[:2]
         c = min(color_img.shape[2], 3)
         composite = np.zeros((h, w, 3), dtype=np.float32)
 
         for i in range(c):
             if i in processed_channels:
-                # Use the cleaned version for this channel
                 composite[:, :, i] = processed_channels[i].astype(np.float32)
             elif i == self.grayscale_channel:
                 # Primary channel always uses the processed result
                 composite[:, :, i] = processed.astype(np.float32)
             else:
-                # Use original channel
                 composite[:, :, i] = color_img[:, :, i].astype(np.float32)
 
         return composite
@@ -9458,7 +9310,6 @@ if __name__ == '__main__':
         if not folder:
             return
 
-        # Apply current colocalization mode settings to display
         if self.colocalization_mode and not self.mode_3d:
             self.show_color_view = True
             self.color_toggle_btn.setText("Show Grayscale (C)")
@@ -9473,7 +9324,6 @@ if __name__ == '__main__':
         files = []
         for ext in exts:
             files.extend(glob.glob(os.path.join(folder, ext)))
-        # Remove duplicates in case filesystem is case-insensitive
         files = list(set(files))
         self.images = {}
         self.file_list.clear()
@@ -9634,7 +9484,6 @@ if __name__ == '__main__':
                 pixmap = self._array_to_pixmap_color(adjusted)
                 self.original_label.set_image(pixmap)
             else:
-                # Use only the selected channel for grayscale display
                 if raw_img.ndim == 3:
                     raw_gray = extract_channel(raw_img, self.grayscale_channel)
                 else:
@@ -9646,7 +9495,6 @@ if __name__ == '__main__':
             if img_data['processed'] is not None:
                 # Processed images - show color or grayscale based on toggle
                 if self.show_color_view and 'color_image' in img_data:
-                    # Build composite with processed channel replacing original
                     proc_color = self._build_processed_color_image(img_data)
                     if proc_color is not None:
                         adjusted_proc = self._apply_display_adjustments_color(proc_color)
@@ -9679,7 +9527,6 @@ if __name__ == '__main__':
             return
         try:
             img_data = self.images[self.current_image_name]
-            # Load raw stack if needed
             if img_data.get('raw_stack') is None:
                 try:
                     stack = load_zstack(img_data['raw_path'])
@@ -9689,7 +9536,6 @@ if __name__ == '__main__':
                     self.log(f"ERROR loading: {e}")
                     return
             self._update_z_slider_for_image()
-            # Show original slice
             raw_stack = img_data['raw_stack']
             sl = self._get_slice_for_display(raw_stack)
             adjusted = self._apply_display_adjustments(sl)
@@ -9822,14 +9668,12 @@ if __name__ == '__main__':
 
         img_data = self.images[self.current_image_name]
         raw_img = load_tiff_image(img_data['raw_path'])
-        # Extract only the selected channel for processing
         if raw_img.ndim == 3:
             channel_img = extract_channel(raw_img, self.grayscale_channel)
         else:
             channel_img = raw_img
         result = channel_img.copy()
 
-        # Apply optional rolling ball background subtraction
         rb_enabled = self.rb_check.isChecked()
         if rb_enabled:
             radius = self.rb_slider.value()
@@ -9837,12 +9681,10 @@ if __name__ == '__main__':
             result = channel_img - background
             result = np.clip(result, 0, channel_img.max())
 
-        # Apply optional denoising
         if self.denoise_check.isChecked():
             denoise_size = self.denoise_spin.value()
             result = ndimage.median_filter(result, size=denoise_size)
 
-        # Apply optional sharpening
         if self.sharpen_check.isChecked():
             sharpen_amount = self.sharpen_slider.value() / 10.0
             blurred = ndimage.gaussian_filter(result.astype(np.float32), sigma=2)
@@ -9852,7 +9694,6 @@ if __name__ == '__main__':
 
         # Store the preview (without adjustments)
         img_data['preview'] = result
-        # Apply display adjustments for viewing
         adjusted = self._apply_display_adjustments(result)
         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
         self.preview_label.set_image(pixmap)
@@ -9905,7 +9746,6 @@ if __name__ == '__main__':
         Pixels below threshold are shown in red on top of the grayscale image,
         so the user can see exactly what gets excluded from masks.
         """
-        # Determine which image to preview
         if img_name is None:
             img_name = self.current_image_name
         if not img_name or img_name not in self.images:
@@ -9931,7 +9771,6 @@ if __name__ == '__main__':
             mid = processed.shape[0] // 2
             processed = processed[mid]
 
-        # Compute threshold
         img_max = processed.max()
         if img_max == 0:
             QMessageBox.warning(self, "Warning", "Image is entirely black.")
@@ -9943,7 +9782,6 @@ if __name__ == '__main__':
         norm = norm / img_max * 255.0
         gray8 = np.clip(norm, 0, 255).astype(np.uint8)
 
-        # Create RGB from grayscale
         rgb = np.stack([gray8, gray8, gray8], axis=-1)
 
         # Mark sub-threshold pixels red
@@ -9957,7 +9795,6 @@ if __name__ == '__main__':
         excluded_px = int(below.sum())
         excluded_pct = excluded_px / total_px * 100.0
 
-        # Create popup dialog
         preview_dlg = QDialog(self)
         preview_dlg.setWindowTitle(
             f"Intensity Threshold Preview — {intensity_percent}%")
@@ -10022,7 +9859,6 @@ if __name__ == '__main__':
         sharpen_enabled = self.sharpen_check.isChecked()
         sharpen_amount = self.sharpen_slider.value() / 10.0
 
-        # Determine which channels to clean
         channels_to_clean = self._get_channels_to_clean()
         process_channel = self.grayscale_channel
 
@@ -10086,7 +9922,6 @@ if __name__ == '__main__':
             self._update_file_list_item(img_name)
             if img_name == self.current_image_name:
                 if self.show_color_view and 'color_image' in self.images[img_name]:
-                    # Use processed channel in color composite
                     proc_color = self._build_processed_color_image(self.images[img_name])
                     if proc_color is not None:
                         adjusted = self._apply_display_adjustments_color(proc_color)
@@ -10131,7 +9966,6 @@ if __name__ == '__main__':
                 check_mark = "☑" if self.images[img_name]['selected'] else "☐"
                 status = self.images[img_name]['status']
 
-                # Add visual indicators for different statuses
                 status_icons = {
                     'loaded': '⚪',
                     'processed': '🟢',
@@ -10198,7 +10032,6 @@ if __name__ == '__main__':
             process_list.append((img_data['raw_path'], img_name, rb_r, rb_enabled,
                                  dn_enabled, dn_size, sh_enabled, sh_amount))
 
-        # Use the 3D preprocessing thread from 3DMicroglia
         from PyQt5.QtCore import QThread, pyqtSignal
 
         class _PreprocessThread3D(QThread):
@@ -10454,7 +10287,6 @@ if __name__ == '__main__':
     def _load_image_for_soma_picking_3d(self):
         """Load Z-stack for 3D soma picking."""
         img_data = self.images[self.current_image_name]
-        # Ensure raw stack loaded
         if img_data.get('raw_stack') is None:
             try:
                 raw = load_zstack(img_data['raw_path'])
@@ -10485,7 +10317,6 @@ if __name__ == '__main__':
         if not self.current_image_name:
             return coords
         img_data = self.images[self.current_image_name]
-        # Get the grayscale image to search
         if img_data['processed'] is not None:
             gray = img_data['processed']
         elif 'color_image' in img_data:
@@ -10581,13 +10412,11 @@ if __name__ == '__main__':
             self.log("No somas to undo")
             return
 
-        # Remove the last soma, its ID, and its group
         removed_soma = img_data['somas'].pop()
         removed_id = img_data['soma_ids'].pop() if img_data['soma_ids'] else None
         if img_data.get('soma_groups'):
             img_data['soma_groups'].pop()
 
-        # Update the display with adjustments
         if self.show_color_view and 'color_image' in img_data:
             # Use processed channel in color composite if available
             proc_color = self._build_processed_color_image(img_data)
@@ -10720,7 +10549,6 @@ if __name__ == '__main__':
             QMessageBox.warning(self, "Warning", "No somas to outline")
             return
 
-        # Find first unoutlined soma
         first_unoutlined = self._find_next_unoutlined_idx()
         if first_unoutlined is None:
             QMessageBox.information(self, "Complete", "All somas are already outlined!")
@@ -10801,11 +10629,9 @@ if __name__ == '__main__':
         if result == 0:
             return  # Cancelled
 
-        # Update auto settings from dialog
         self.auto_outline_method.setCurrentIndex(method_combo.currentIndex())
         self.auto_outline_sensitivity.setValue(sens_spin.value())
 
-        # Initialize outlining state
         self.batch_mode = True
         self.polygon_points = []
         self.processed_label.polygon_mode = True
@@ -10819,7 +10645,6 @@ if __name__ == '__main__':
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.done_btn.setEnabled(False)
-        # Reset stale interaction state
         self.z_key_held = False
         for label in [self.processed_label, self.original_label, self.preview_label, self.mask_label]:
             label.measure_mode = False
@@ -10827,20 +10652,17 @@ if __name__ == '__main__':
             label.measure_pt2 = None
         self.measure_mode = False
 
-        # Store for review mode
         self.auto_outlined_points = {}  # {queue_idx: points}
         self.failed_auto_outlines = []  # List of queue_idx that failed
         self.review_mode = False
         self.current_review_idx = 0
         self.current_outline_idx = 0
 
-        # Show outline controls and progress bar
         self.outline_controls_widget.setVisible(True)
         self.outline_method_display.setCurrentIndex(self.auto_outline_method.currentIndex())
         self.outline_sens_display.setValue(self.auto_outline_sensitivity.value())
         self._update_outline_progress()
 
-        # Create soma_checklist.csv to track outline progress
         cl_path = self._get_checklist_path('soma_checklist.csv')
         if cl_path:
             rows = []
@@ -10903,7 +10725,6 @@ if __name__ == '__main__':
             img_data = self.images[img_name]
             soma = img_data['somas'][soma_idx]
 
-            # Get image for outlining
             outline_img = self._get_image_for_outlining(img_data)
             if outline_img is None:
                 fail_count += 1
@@ -10920,7 +10741,6 @@ if __name__ == '__main__':
                 fail_count += 1
                 self.failed_auto_outlines.append(i)
             else:
-                # Remove branch juts from auto outline
                 points = _remove_branch_juts(points, soma)
                 self.auto_outlined_points[i] = list(points)
                 success_count += 1
@@ -10930,7 +10750,6 @@ if __name__ == '__main__':
         if fail_count > 0:
             self.log(f"⚠ Failed: {fail_count} (will need manual)")
 
-        # Check if too many failed
         if fail_count > len(self.outlining_queue) * 0.5:
             reply = QMessageBox.question(
                 self, "Many Failures",
@@ -10946,14 +10765,12 @@ if __name__ == '__main__':
                 self.start_batch_outlining()  # Restart
                 return
 
-        # Start review mode
         self._start_review_mode()
 
     def _start_review_mode(self):
         """Start reviewing auto-outlined somas one by one"""
         self.review_mode = True
 
-        # Reset stale UI state that could block interaction
         self.z_key_held = False
         for label in [self.processed_label, self.original_label, self.preview_label, self.mask_label]:
             label.measure_mode = False
@@ -11025,7 +10842,6 @@ if __name__ == '__main__':
                 except Exception:
                     pass
 
-        # Ensure color_image is loaded for color toggle support
         if 'color_image' not in img_data and 'raw_path' in img_data:
             try:
                 raw_img = load_tiff_image(img_data['raw_path'])
@@ -11058,7 +10874,6 @@ if __name__ == '__main__':
             f"{img_name} | {soma_id} | {status}"
         )
 
-        # Enable/disable buttons
         self.auto_outline_btn.setEnabled(True)
         self.manual_draw_btn.setEnabled(True)
         self.accept_outline_btn.setEnabled(len(self.polygon_points) >= 3)
@@ -11091,13 +10906,10 @@ if __name__ == '__main__':
             # Extract the selected channel from color image for grayscale display
             color_img = img_data['color_image']
             if color_img.ndim == 3 and color_img.shape[2] > self.grayscale_channel:
-                # Get the selected channel
                 channel_img = color_img[:, :, self.grayscale_channel].astype(np.float32)
-                # Normalize
                 c_min, c_max = channel_img.min(), channel_img.max()
                 if c_max > c_min:
                     channel_img = (channel_img - c_min) / (c_max - c_min) * 255
-                # Apply display adjustments
                 adjusted = self._apply_display_adjustments(channel_img.astype(np.uint8))
                 return self._array_to_pixmap(adjusted, skip_rescale=True)
         # Default: use processed image with adjustments
@@ -11106,7 +10918,6 @@ if __name__ == '__main__':
             # Fallback: try raw image as grayscale
             proc = self._get_image_for_outlining(img_data)
         if proc is None:
-            # Return a blank pixmap to avoid crash
             blank = np.zeros((100, 100), dtype=np.uint8)
             return self._array_to_pixmap(blank)
         adjusted = self._apply_display_adjustments(proc)
@@ -11138,7 +10949,6 @@ if __name__ == '__main__':
                 except Exception:
                     pass
 
-        # Ensure color_image is loaded for color toggle support
         if 'color_image' not in img_data and 'raw_path' in img_data:
             try:
                 raw_img = load_tiff_image(img_data['raw_path'])
@@ -11176,13 +10986,11 @@ if __name__ == '__main__':
             soma_id = img_data['soma_ids'][soma_idx]
             pixmap = self._get_outlining_pixmap(img_data)
             self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
-            # Update status to show point count
             self.nav_status_label.setText(
                 f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
                 f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
             )
 
-        # Enable accept button when we have enough points
         if len(self.polygon_points) >= 3:
             self.accept_outline_btn.setEnabled(True)
 
@@ -11204,7 +11012,6 @@ if __name__ == '__main__':
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
                     f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
                 )
-            # Update accept button state
             self.accept_outline_btn.setEnabled(len(self.polygon_points) >= 3)
         else:
             self.log("⚠️ No points to undo")
@@ -11227,7 +11034,6 @@ if __name__ == '__main__':
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
                     f"Image: {img_name} | ID: {soma_id} | Points: {len(self.polygon_points)}"
                 )
-            # Disable accept button since no points
             self.accept_outline_btn.setEnabled(False)
         else:
             self.log("⚠️ No points to clear")
@@ -11242,7 +11048,6 @@ if __name__ == '__main__':
             QMessageBox.critical(self, "Error", f"Failed to confirm outline:\n{e}\n\nSee log for details.")
 
     def _finish_polygon_impl(self):
-        # Reset zoom state to prevent getting stuck
         self.z_key_held = False
         self.processed_label.selected_point_idx = None
         self.processed_label.dragging_point = False
@@ -11258,7 +11063,6 @@ if __name__ == '__main__':
 
         img_name, soma_idx = self.outlining_queue[queue_idx]
         img_data = self.images[img_name]
-        # Determine image shape for mask creation
         outline_img = self._get_image_for_outlining(img_data)
         if outline_img is not None:
             mask_shape = outline_img.shape[:2]
@@ -11275,7 +11079,6 @@ if __name__ == '__main__':
         mask = self._polygon_to_mask(self.polygon_points, mask_shape)
         soma_id = img_data['soma_ids'][soma_idx]
 
-        # Calculate soma area from the outline
         pixel_size = self._get_pixel_size(img_name)
         soma_area_um2 = np.sum(mask) * (pixel_size ** 2)
 
@@ -11294,10 +11097,8 @@ if __name__ == '__main__':
         self.log(f"✓ {soma_id} approved (soma area: {soma_area_um2:.1f} µm²)")
         self.polygon_points = []
 
-        # Update outline progress
         self._update_outline_progress()
 
-        # Update soma_checklist.csv
         cl_path = self._get_checklist_path('soma_checklist.csv')
         if cl_path and os.path.exists(cl_path):
             checklist_key = f"{img_name}_{soma_id}"
@@ -11306,13 +11107,10 @@ if __name__ == '__main__':
         # Auto-save after each outline
         self._auto_save()
 
-        # Enable Redo button after first outline is complete
         self.redo_outline_btn.setEnabled(True)
 
-        # Reset accept button for next soma
         self.accept_outline_btn.setEnabled(False)
 
-        # Move to next unoutlined soma
         next_idx = self._find_next_unoutlined_idx(start_from=queue_idx + 1)
         if next_idx is None:
             self._finish_outlining()
@@ -11346,7 +11144,6 @@ if __name__ == '__main__':
             QMessageBox.warning(self, "Warning", "No outlines to redo")
             return
 
-        # Remove the outline
         self.images[last_outline_img]['soma_outlines'].remove(last_outline_data)
 
         # Delete the exported soma file if it exists
@@ -11358,7 +11155,6 @@ if __name__ == '__main__':
 
         self.log(f"↩ Undid outline for {last_outline_data['soma_id']} - ready to redo")
 
-        # Update outline progress
         self._update_outline_progress()
 
         # Go back to that soma for re-outlining
@@ -11403,13 +11199,11 @@ if __name__ == '__main__':
                 os.remove(soma_file)
                 self.log(f"  Deleted: {os.path.basename(soma_file)}")
 
-        # Remove any existing outline for this soma
         img_data['soma_outlines'] = [
             ol for ol in img_data.get('soma_outlines', [])
             if not (ol['soma_idx'] == soma_idx and ol['soma_id'] == soma_id)
         ]
 
-        # Remove the soma from the image data
         if soma_idx < len(img_data['somas']):
             img_data['somas'].pop(soma_idx)
         if soma_idx < len(img_data['soma_ids']):
@@ -11422,7 +11216,6 @@ if __name__ == '__main__':
             if ol['soma_idx'] > soma_idx:
                 ol['soma_idx'] -= 1
 
-        # Remove from outlining queue and fix indices
         self.outlining_queue.pop(queue_idx)
         for i in range(len(self.outlining_queue)):
             q_img, q_idx = self.outlining_queue[i]
@@ -11519,19 +11312,16 @@ if __name__ == '__main__':
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
 
-        # Get the image for outlining
         outline_img = self._get_image_for_outlining(img_data)
         if outline_img is None:
             QMessageBox.warning(self, "Warning", "No processed image available")
             return
 
-        # Get method and sensitivity
         method = self._get_auto_outline_method()
         sensitivity = self.auto_outline_sensitivity.value()
 
         self.log(f"Auto-outlining {soma_id} using {self.auto_outline_method.currentText()}...")
 
-        # Run auto-outline
         try:
             points = method(outline_img, soma, sensitivity)
         except Exception as e:
@@ -11547,15 +11337,12 @@ if __name__ == '__main__':
             )
             return
 
-        # Remove branch juts from auto outline
         points = _remove_branch_juts(points, soma)
 
-        # Set the polygon points and display
         self.polygon_points = list(points)
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
 
-        # Enable point editing mode
         self.processed_label.point_edit_mode = True
         self.processed_label.selected_point_idx = None
 
@@ -11566,7 +11353,6 @@ if __name__ == '__main__':
         self.log(f"✓ Auto-outlined {soma_id} with {len(self.polygon_points)} points")
         self.log("  → Shift+drag points to adjust, then press Enter or [Accept]")
 
-        # Enable accept button for review
         self.accept_outline_btn.setEnabled(True)
         self.manual_draw_btn.setEnabled(True)  # Can still switch to manual
 
@@ -11629,15 +11415,12 @@ if __name__ == '__main__':
                 failed_somas.append(soma_id)
                 continue
 
-            # Remove branch juts from auto outline
             points = _remove_branch_juts(points, soma)
 
-            # Create mask from points
             mask = self._polygon_to_mask(points, outline_img.shape)
             pixel_size = self._get_pixel_size(img_name)
             soma_area_um2 = np.sum(mask) * (pixel_size ** 2)
 
-            # Save outline
             img_data['soma_outlines'].append({
                 'soma_idx': soma_idx,
                 'soma_id': soma_id,
@@ -11656,7 +11439,6 @@ if __name__ == '__main__':
         if fail_count > 0:
             self.log(f"⚠ Failed to auto-outline {fail_count} somas: {', '.join(failed_somas)}")
 
-        # Update outline progress
         self._update_outline_progress()
 
         # Check if all done — find first queue entry without an outline
@@ -11664,7 +11446,6 @@ if __name__ == '__main__':
         if next_idx is None:
             self._finish_outlining()
         else:
-            # Load the first failed soma for manual outlining
             self._load_soma_for_outlining(next_idx)
             self.auto_outline_btn.setEnabled(True)
             self.manual_draw_btn.setEnabled(True)
@@ -11678,7 +11459,6 @@ if __name__ == '__main__':
 
     def start_manual_outline(self):
         """Switch to manual outline mode - clear any auto points and let user draw"""
-        # Clear any existing points
         self.polygon_points = []
         self.processed_label.selected_point_idx = None
         self.processed_label.dragging_point = False
@@ -11729,13 +11509,11 @@ if __name__ == '__main__':
         if reply == QMessageBox.No:
             return
         
-        # Clear masks from all images
         masks_cleared = 0
         for img_name, img_data in self.images.items():
             if img_data['masks']:
                 masks_cleared += len(img_data['masks'])
                 img_data['masks'] = []
-                # Update status back to 'outlined'
                 if img_data['status'] in ['masks_generated', 'qa_complete', 'morphology_calculated']:
                     img_data['status'] = 'outlined'
                     self._update_file_list_item(img_name)
@@ -11749,7 +11527,6 @@ if __name__ == '__main__':
                 except Exception as e:
                     self.log(f"Warning: Could not delete {os.path.basename(mask_file)}: {e}")
         
-        # Disable buttons that depend on masks
         self.batch_qa_btn.setEnabled(False)
         self.batch_calculate_btn.setEnabled(False)
         self.clear_masks_btn.setEnabled(False)
@@ -11834,7 +11611,6 @@ if __name__ == '__main__':
         self.processed_label.selected_point_idx = None
         self.redo_outline_btn.setEnabled(False)  # Disable redo button when outlining complete
 
-        # Disable outline buttons
         self.auto_outline_btn.setEnabled(False)
         self.manual_draw_btn.setEnabled(False)
         self.accept_outline_btn.setEnabled(False)
@@ -11860,7 +11636,6 @@ if __name__ == '__main__':
         if self.mode_3d:
             self._batch_generate_masks_3d()
             return
-        # Show mask generation settings dialog first
         dialog = QDialog(self)
         dialog.setWindowTitle("Mask Generation Settings")
         dialog.setModal(True)
@@ -12009,7 +11784,6 @@ if __name__ == '__main__':
         seg_combo.addItem("None (independent growth)", "none")
         seg_combo.addItem("Competitive Growth (shared priority queue)", "competitive")
         seg_combo.addItem("Watershed Territories (pre-computed basins)", "watershed")
-        # Set current selection
         for idx in range(seg_combo.count()):
             if seg_combo.itemData(idx) == self.mask_segmentation_method:
                 seg_combo.setCurrentIndex(idx)
@@ -12106,11 +11880,9 @@ if __name__ == '__main__':
         dialog.setLayout(layout)
         dialog.setMinimumWidth(400)
 
-        # Show dialog and get result
         if dialog.exec_() != QDialog.Accepted:
             return  # User cancelled
 
-        # Save settings
         self.use_min_intensity = min_intensity_check.isChecked()
         self.min_intensity_percent = min_intensity_slider.value()
         self.local_intensity_window = local_win_spin2.value()
@@ -12127,7 +11899,6 @@ if __name__ == '__main__':
         try:
             pixel_size = self._get_pixel_size()
 
-            # Build area list from user settings
             area_list = list(range(self.mask_min_area, self.mask_max_area + 1, self.mask_step_size))
             if area_list[-1] != self.mask_max_area:
                 area_list.append(self.mask_max_area)
@@ -12139,7 +11910,6 @@ if __name__ == '__main__':
                                  if data['selected'] and data['soma_outlines'])
             current_count = 0
 
-            # Create TEMPMASKCHECKLIST folder for per-image checklists
             temp_cl_dir = None
             if self.output_dir:
                 temp_cl_dir = os.path.join(self.output_dir, 'TEMPMASKCHECKLIST')
@@ -12168,7 +11938,6 @@ if __name__ == '__main__':
                 if img_pixel_size != pixel_size:
                     self.log(f"  Using per-image pixel size: {img_pixel_size} µm/px")
 
-                # Write per-image checklist CSV into TEMPMASKCHECKLIST
                 img_cl_path = None
                 if temp_cl_dir:
                     img_basename = os.path.splitext(img_name)[0]
@@ -12232,7 +12001,6 @@ if __name__ == '__main__':
                     self.progress_status_label.setText(f"Generating masks: {img_name} ({n_somas} somas)")
                     QApplication.processEvents()
 
-                    # Prepare arguments for parallel execution
                     task_args = []
                     for soma_data in img_data['soma_outlines']:
                         centroid = soma_data['centroid']
@@ -12254,12 +12022,10 @@ if __name__ == '__main__':
 
                         roi = processed_img[y_min:y_max, x_min:x_max].astype(np.float64)
 
-                        # Extract soma outline ROI
                         soma_outline_roi = None
                         if soma_outline is not None:
                             soma_outline_roi = soma_outline[y_min:y_max, x_min:x_max]
 
-                        # Extract territory ROI
                         territory_roi_data = None
                         my_territory_label = 0
                         if territory_map is not None:
@@ -12375,7 +12141,6 @@ if __name__ == '__main__':
 
     def regenerate_masks_current_image(self):
         """Regenerate masks for the image currently shown in QA with custom settings."""
-        # Determine which image we're looking at
         if self.mask_qa_active and self.all_masks_flat and self.mask_qa_idx < len(self.all_masks_flat):
             img_name = self.all_masks_flat[self.mask_qa_idx]['image_name']
         elif self.current_image_name and self.current_image_name in self.images:
@@ -12390,7 +12155,6 @@ if __name__ == '__main__':
             QMessageBox.warning(self, "Warning", f"{img_name} has no soma outlines.")
             return
 
-        # Show settings dialog
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Redo Masks — {os.path.splitext(img_name)[0]}")
         dialog.setModal(True)
@@ -12521,7 +12285,6 @@ if __name__ == '__main__':
         if dialog.exec_() != QDialog.Accepted:
             return
 
-        # Read settings
         regen_min = min_area_spin.value()
         regen_max = max_area_spin.value()
         regen_step = step_spin.value()
@@ -12537,7 +12300,6 @@ if __name__ == '__main__':
 
         pixel_size = self._get_pixel_size(img_name)
 
-        # Delete old mask files from disk for this image
         if self.masks_dir and os.path.isdir(self.masks_dir):
             img_basename = os.path.splitext(img_name)[0]
             for f in os.listdir(self.masks_dir):
@@ -12547,11 +12309,9 @@ if __name__ == '__main__':
                     except Exception:
                         pass
 
-        # Remove old masks from all_masks_flat
         self.all_masks_flat = [flat for flat in self.all_masks_flat
                                if flat['image_name'] != img_name]
 
-        # Clear existing masks for this image
         img_data['masks'] = []
 
         # Temporarily override settings for this generation
@@ -12564,7 +12324,6 @@ if __name__ == '__main__':
         self.use_circular_constraint = regen_circular_check.isChecked()
         self.circular_buffer_um2 = regen_buffer_spin.value()
 
-        # Generate new masks
         circ_info = f", circular buffer {self.circular_buffer_um2} µm²" if self.use_circular_constraint else ""
         self.log(f"Redoing masks for {img_name}: {regen_min}-{regen_max} µm², "
                  f"step {regen_step}, intensity {regen_intensity}%{circ_info}")
@@ -12602,11 +12361,9 @@ if __name__ == '__main__':
         if self.masks_dir and os.path.isdir(self.masks_dir):
             self._export_all_masks_to_disk(img_name, img_data['masks'])
 
-        # Update status
         img_data['status'] = 'masks_generated'
         self._update_file_list_item(img_name)
 
-        # Add new masks to all_masks_flat
         if img_data['selected']:
             for mask_data in img_data['masks']:
                 self.all_masks_flat.append({
@@ -12658,7 +12415,6 @@ if __name__ == '__main__':
             img_norm = (img_norm - imin) / (imax - imin) * 255.0
         img_u8 = img_norm.astype(np.uint8)
 
-        # Compute gradient magnitude for watershed landscape
         grad_x = _cv2.Sobel(img_u8, _cv2.CV_64F, 1, 0, ksize=3)
         grad_y = _cv2.Sobel(img_u8, _cv2.CV_64F, 0, 1, ksize=3)
         gradient = np.sqrt(grad_x ** 2 + grad_y ** 2)
@@ -12679,7 +12435,6 @@ if __name__ == '__main__':
             else:
                 _cv2.circle(markers, (cx, cy), max(3, int(5 / pixel_size_um)), label, -1)
 
-        # Convert gradient to 3-channel for cv2.watershed
         grad_color = _cv2.cvtColor(gradient, _cv2.COLOR_GRAY2BGR)
         _cv2.watershed(grad_color, markers)
 
@@ -12843,7 +12598,6 @@ if __name__ == '__main__':
                         owner_map[nr, nc] = si
                         heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
 
-        # Build mask dicts for each soma at each target area
         all_masks = []
         for si, soma_data in enumerate(soma_outlines_data):
             soma_idx = soma_data['soma_idx']
@@ -12899,7 +12653,6 @@ if __name__ == '__main__':
                         print(f"    ⚠️ Auto-rejected {all_masks[soma_masks_start + idx]['area_um2']} µm² "
                               f"(duplicate of {all_masks[soma_masks_start + keep_idx]['area_um2']} µm², both {n_px} px)")
 
-            # Smooth masks to fill small gaps
             if self.mask_smooth_enabled:
                 _smooth_masks(all_masks[soma_masks_start:], self.mask_smooth_gap_size)
 
@@ -12925,7 +12678,6 @@ if __name__ == '__main__':
         masks = []
         cy, cx = int(centroid[0]), int(centroid[1])
 
-        # Convert all target areas to pixels and find the largest
         sorted_areas = sorted(area_list_um2, reverse=True)
         largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
 
@@ -12974,7 +12726,6 @@ if __name__ == '__main__':
         territory_roi = None
         if territory_map is not None:
             territory_roi = territory_map[y_min:y_max, x_min:x_max]
-            # Find this soma's label from the centroid position
             my_label = territory_roi[cy_roi, cx_roi]
             if my_label <= 0:
                 # Centroid fell on a boundary — search nearby for our label
@@ -13047,7 +12798,6 @@ if __name__ == '__main__':
 
             growth_order.append((r, c))
 
-            # Add 4-connected neighbors to the heap
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
@@ -13124,7 +12874,6 @@ if __name__ == '__main__':
                     print(f"    ⚠️ Auto-rejected {masks[idx]['area_um2']} µm² "
                           f"(duplicate of {masks[keep_idx]['area_um2']} µm², both {n_px} px)")
 
-        # Smooth masks to fill small gaps
         if self.mask_smooth_enabled:
             _smooth_masks(masks, self.mask_smooth_gap_size)
 
@@ -13305,7 +13054,6 @@ if __name__ == '__main__':
         if dialog.exec_() != QDialog.Accepted:
             return
 
-        # Save settings
         self.soma_intensity_tolerance = tol_spin.value()
         self.soma_max_radius_um = rad_spin.value()
         self.use_min_intensity = min_intensity_check.isChecked()
@@ -13381,7 +13129,6 @@ if __name__ == '__main__':
                         'soma_idx': si,
                     })
 
-                # Generate masks
                 if seg_method == 'competitive' and len(soma_data_list) > 1:
                     self.log(f"  Competitive 3D growth for {len(soma_data_list)} cells")
                     self.progress_status_label.setText(f"Competitive 3D growth: {img_name}")
@@ -13542,7 +13289,6 @@ if __name__ == '__main__':
         # Deferred checklist: track updates in memory, flush with auto-save
         self._qa_checklist_dirty = {}
 
-        # Find first unreviewed mask to resume from
         auto_rejected_count = self._qa_auto_rejected_count
         manually_reviewed_count = self._qa_approved_count + self._qa_user_rejected_count
         reviewed_count = auto_rejected_count + manually_reviewed_count
@@ -13557,7 +13303,6 @@ if __name__ == '__main__':
         if manually_reviewed_count > 0:
             self._evict_old_qa_masks()
 
-        # Create mask_qa_checklist.csv to track QA progress
         qa_cl_path = self._get_checklist_path('mask_qa_checklist.csv')
         if qa_cl_path:
             cl_rows = []
@@ -13622,7 +13367,6 @@ if __name__ == '__main__':
         if not self.all_masks_flat or self.mask_qa_idx >= len(self.all_masks_flat):
             return
 
-        # Determine which soma we're currently on
         current_flat = self.all_masks_flat[self.mask_qa_idx]
         current_soma_key = (current_flat['image_name'], current_flat['mask_data']['soma_id'])
 
@@ -13662,7 +13406,6 @@ if __name__ == '__main__':
             img_data = self.images[img_name]
             if img_data.get('processed') is None:
                 continue  # already freed
-            # Check using per-image soma count
             img_somas = self._qa_image_soma_count.get(img_name, 0)
             img_finalized = sum(1 for k in self._qa_finalized_somas if k[0] == img_name)
             if img_finalized >= img_somas:
@@ -13713,7 +13456,6 @@ if __name__ == '__main__':
         if os.path.exists(mask_path):
             try:
                 mask_arr = safe_tiff_read(mask_path)
-                # Convert back from 0/255 to 0/1
                 mask_data['mask'] = (mask_arr > 0).astype(np.uint8)
                 return True
             except Exception as e:
@@ -13806,7 +13548,6 @@ if __name__ == '__main__':
                     self.log(f"Cannot display mask - file not found on disk")
                     return
 
-            # Ensure processed image is 2D for grayscale display
             if processed_img.ndim > 2:
                 processed_img = ensure_grayscale(processed_img)
 
@@ -13830,7 +13571,6 @@ if __name__ == '__main__':
             else:
                 adjusted = self._apply_display_adjustments(processed_img)
                 pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
-            # Show the clicked soma center as a centroid marker
             soma_centroid = []
             soma_idx = mask_data.get('soma_idx')
             if soma_idx is not None and soma_idx < len(img_data.get('somas', [])):
@@ -13861,7 +13601,6 @@ if __name__ == '__main__':
             f"Area: {mask_data.get('area_um2', 0)} um^2 | {status_text}"
         )
 
-        # Update progress bar
         self.mask_qa_progress_bar.setValue(reviewed)
 
     def _show_current_mask_3d(self, flat_data, mask_data, img_name, img_data):
@@ -13878,14 +13617,12 @@ if __name__ == '__main__':
             self.current_image_name = img_name
             self._update_z_slider_for_image()
 
-        # Find Z-slice with most mask voxels
         if mask_3d is not None and mask_3d.ndim == 3:
             z_sums = mask_3d.sum(axis=(1, 2))
             best_z = int(np.argmax(z_sums))
             self.current_z_slice = best_z
             self.z_slider.setValue(best_z)
 
-        # Get processed stack for background
         stack = img_data.get('processed') or img_data.get('raw_stack')
         if stack is None:
             return
@@ -13895,13 +13632,11 @@ if __name__ == '__main__':
         adjusted = self._apply_display_adjustments(sl)
         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
 
-        # Get mask slice
         mask_slice = None
         if mask_3d is not None and mask_3d.ndim == 3:
             z_clamped = max(0, min(mask_3d.shape[0] - 1, z))
             mask_slice = mask_3d[z_clamped]
 
-        # Get soma centroid on this slice
         soma_centroid = []
         soma_idx = mask_data.get('soma_idx')
         if soma_idx is not None and soma_idx < len(img_data.get('somas', [])):
@@ -13946,7 +13681,6 @@ if __name__ == '__main__':
         current_soma_id = mask_data.get('soma_id', '')
         current_img = flat_data['image_name']
 
-        # Use volume for 3D, area for 2D
         if self.mode_3d:
             current_size = mask_data.get('volume_um3', 0)
             size_key = 'volume_um3'
@@ -14091,7 +13825,6 @@ if __name__ == '__main__':
         mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
         mask_path = os.path.join(self.masks_dir, mask_filename)
 
-        # Get the mask array
         mask = mask_data.get('mask')
         if mask is None:
             self.log(f"   ⚠️ No mask data for {soma_id} - skipping export")
@@ -14101,7 +13834,6 @@ if __name__ == '__main__':
         self.log(
             f"   🔍 Mask {soma_id}: shape={mask.shape}, dtype={mask.dtype}, min={np.min(mask)}, max={np.max(mask)}, nonzero={np.count_nonzero(mask)}")
 
-        # Check if mask has any data
         if not np.any(mask):
             self.log(f"   ⚠️ Mask {soma_id} is empty (all zeros) - skipping export")
             return
@@ -14120,10 +13852,8 @@ if __name__ == '__main__':
             self.log(f"      Unique values in original: {np.unique(mask)}")
             return
 
-        # Get pixel size
         px_x, px_y = self._get_pixel_size_xy(img_name)
 
-        # Save as TIFF with calibration
         try:
             tifffile.imwrite(
                 mask_path,
@@ -14209,12 +13939,10 @@ if __name__ == '__main__':
             self.log("   ⚠️ No somas directory set - cannot export")
             return
 
-        # Create unique filename matching the mask naming convention
         img_basename = os.path.splitext(img_name)[0]
         soma_filename = f"{img_basename}_{soma_id}_soma.tif"
         soma_path = os.path.join(self.somas_dir, soma_filename)
 
-        # Check if mask has any data
         if not np.any(mask):
             self.log(f"   ⚠️ Soma outline {soma_id} is empty - skipping export")
             return
@@ -14231,7 +13959,6 @@ if __name__ == '__main__':
             self.log(f"   ⚠️ Soma outline {soma_id} became empty after conversion")
             return
 
-        # Save as TIFF with calibration
         try:
             tifffile.imwrite(
                 soma_path,
@@ -14314,7 +14041,6 @@ if __name__ == '__main__':
         if delete_3d:
             self._delete_rejected_3d_mask(img_name, mask_data)
         else:
-            # Delete rejected 2D mask TIFF from disk immediately
             self._delete_rejected_mask_tiff(img_name, mask_data)
         self._evict_old_qa_masks()
 
@@ -14388,7 +14114,6 @@ if __name__ == '__main__':
             self.undo_qa_btn.setVisible(False)
             self.mask_qa_progress_bar.setVisible(False)
 
-            # Update image statuses
             for img_name, img_data in self.images.items():
                 if img_data['selected'] and img_data['status'] == 'masks_generated':
                     img_data['status'] = 'qa_complete'
@@ -14446,7 +14171,6 @@ if __name__ == '__main__':
         # Mask files are kept on disk (written during generation) —
         # only the in-memory approval state is reset.
 
-        # Reset approval state and decrement running counters
         was = "approved" if decision['was_approved'] else "rejected"
         if decision['was_approved']:
             self._qa_approved_count = max(0, self._qa_approved_count - 1)
@@ -14507,7 +14231,6 @@ if __name__ == '__main__':
                      f"{n_approved} approved | {n_rejected} rejected | "
                      f"{n_unreviewed} unreviewed | {n_duplicates} duplicates")
 
-            # Filter to only approved, non-duplicate masks
             approved_masks = [flat for flat in self.all_masks_flat
                               if flat['mask_data'].get('approved') is True
                               and not flat['mask_data'].get('duplicate', False)]
@@ -14553,7 +14276,6 @@ if __name__ == '__main__':
             self.progress_bar.setValue(0)
             self.start_timer()  # Start the timer
 
-            # Disable the calculate button during processing
             self.batch_calculate_btn.setEnabled(False)
 
             # Build per-image pixel size map (stores (x, y) tuples)
@@ -14577,12 +14299,10 @@ if __name__ == '__main__':
                 masks_dir=self.masks_dir, soma_group_map=soma_group_map
             )
 
-            # Connect signals
             self.morph_thread.progress.connect(self._on_morph_progress)
             self.morph_thread.finished.connect(self._on_morph_finished)
             self.morph_thread.error_occurred.connect(self._on_morph_error)
 
-            # Start the thread
             self.morph_thread.start()
 
         except Exception as e:
@@ -14635,7 +14355,6 @@ if __name__ == '__main__':
                             coloc_count += 1
             self.log(f"✓ Colocalization calculated for {coloc_count}/{len(all_results)} cells")
 
-        # Collect metadata for images
         self.log("=" * 50)
         self.log("Checking metadata... (any missing info will be requested)")
         if not self.collect_metadata_for_images():
@@ -14644,7 +14363,6 @@ if __name__ == '__main__':
 
         self._save_batch_results(all_results)
 
-        # Update statuses
         for img_name, img_data in self.images.items():
             if img_data['selected'] and img_data['status'] == 'qa_complete':
                 img_data['status'] = 'analyzed'
@@ -14664,7 +14382,6 @@ if __name__ == '__main__':
         self.log("=" * 50)
         self._auto_save()
 
-        # Build success message
         success_msg = f"Simple characteristics calculated for {len(all_results)} cells!\n\n"
         if self.colocalization_mode:
             coloc_ok = sum(1 for r in all_results if r.get('coloc_status') == 'ok')
@@ -14709,7 +14426,6 @@ if __name__ == '__main__':
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
-        # Create table-like layout
         from PyQt5.QtWidgets import QScrollArea, QTableWidget, QTableWidgetItem, QHeaderView
 
         table = QTableWidget()
@@ -14717,7 +14433,6 @@ if __name__ == '__main__':
         table.setHorizontalHeaderLabels(["Image Name", "Animal ID", "Treatment"])
         table.setRowCount(len(selected_images))
 
-        # Make first column read-only, stretch to fit
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.Interactive)
@@ -14752,7 +14467,6 @@ if __name__ == '__main__':
         cancel_btn = QPushButton("Cancel")
 
         def save_labels():
-            # Save all the labels back to the images
             for row in range(table.rowCount()):
                 img_name = table.item(row, 0).text()
                 animal_id = table.item(row, 1).text().strip()
@@ -14805,7 +14519,6 @@ if __name__ == '__main__':
         scroll_content = QWidget()
         scroll_layout = QVBoxLayout(scroll_content)
 
-        # Create input fields for each image
         image_inputs = {}
         for img_name in selected_images:
             img_group = QGroupBox(img_name)
@@ -14833,7 +14546,6 @@ if __name__ == '__main__':
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
 
-        # Add buttons
         button_layout = QHBoxLayout()
         ok_btn = QPushButton("OK")
         ok_btn.setDefault(True)
@@ -14865,7 +14577,6 @@ if __name__ == '__main__':
         for full_name, img_data in self.images.items():
             img_by_base[os.path.splitext(full_name)[0]] = img_data
 
-        # Add animal_id and treatment to each result
         for result in results:
             img_name_base = result['image_name']
             img_data = img_by_base.get(img_name_base)
@@ -14884,7 +14595,6 @@ if __name__ == '__main__':
         for r in results:
             all_keys_set.update(r.keys())
         keys = list(all_keys_set)
-        # Remove these to reorder them
         for key in ['soma_id', 'image_name', 'animal_id', 'treatment', 'soma_idx', 'soma_group']:
             if key in keys:
                 keys.remove(key)
@@ -15016,7 +14726,6 @@ if __name__ == '__main__':
         self.start_timer()
         self.batch_calculate_btn.setEnabled(False)
 
-        # Use a worker thread
         from PyQt5.QtCore import QThread, pyqtSignal
 
         class _MorphThread3D(QThread):
@@ -15222,7 +14931,6 @@ def _generate_microglia_icon():
 def _get_app_icon():
     """Load MMPS app icon from common locations, or generate a default."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Check for icon files in order of preference
     icon_names = ['MMPS.icns', 'MMPS.ico', 'MMPS.png', 'MMPS.icn']
     search_dirs = [
         script_dir,
@@ -15259,7 +14967,6 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
 
-    # Set application icon
     icon = _get_app_icon()
     if icon:
         app.setWindowIcon(icon)
