@@ -1904,6 +1904,10 @@ class InteractiveImageLabel(QLabel):
         """Handle mouse release to finish dragging"""
         if (self.paint_mode or self.erase_mode) and self._is_painting:
             self._is_painting = False
+            if self.erase_mode:
+                n_removed = self._flood_disconnect()
+                if n_removed and n_removed > 0 and self.parent_widget:
+                    self.parent_widget._cascade_erase_to_smaller_masks()
             return
 
         # Centroid drag release - snap to brightest pixel within 5 µm
@@ -1982,6 +1986,25 @@ class InteractiveImageLabel(QLabel):
                     if 0 <= nr < h and 0 <= nc < w:
                         self.mask_overlay[nr, nc] = 0
         self._update_display()
+
+    def _flood_disconnect(self):
+        """After erasing, remove mask pixels no longer connected to the soma centroid."""
+        if self.mask_overlay is None or not self.centroids:
+            return 0
+        cy, cx = int(self.centroids[0][0]), int(self.centroids[0][1])
+        h, w = self.mask_overlay.shape
+        if cy < 0 or cy >= h or cx < 0 or cx >= w:
+            return 0
+        if self.mask_overlay[cy, cx] == 0:
+            return 0
+        labeled, _ = ndimage.label(self.mask_overlay)
+        keep_label = labeled[cy, cx]
+        disconnected = (self.mask_overlay > 0) & (labeled != keep_label)
+        n_removed = int(np.count_nonzero(disconnected))
+        if n_removed > 0:
+            self.mask_overlay[disconnected] = 0
+            self._update_display()
+        return n_removed
 
     def _draw_mask_overlay(self, painter):
         if self.mask_overlay is None:
@@ -5871,6 +5894,33 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             if not self.mask_label.paint_mode:
                 self.mask_label.setCursor(Qt.ArrowCursor)
             self.log("Pixel smooth OFF")
+
+    def _cascade_erase_to_smaller_masks(self):
+        """After flood-disconnect on current mask, remove those pixels from all smaller masks."""
+        if not self.all_masks_flat or self.mask_qa_idx >= len(self.all_masks_flat):
+            return
+        flat_data = self.all_masks_flat[self.mask_qa_idx]
+        current_mask_data = flat_data['mask_data']
+        current_mask = current_mask_data.get('mask')
+        if current_mask is None:
+            return
+        current_img = flat_data['image_name']
+        current_soma_id = current_mask_data.get('soma_id', '')
+        current_area = current_mask_data.get('area_um2', 0)
+
+        soma_key = (current_img, current_soma_id)
+        for idx in self._qa_soma_mask_index.get(soma_key, []):
+            other_flat = self.all_masks_flat[idx]
+            other_mask_data = other_flat['mask_data']
+            if other_mask_data.get('area_um2', 0) >= current_area:
+                continue
+            other_mask = other_mask_data.get('mask')
+            if other_mask is None:
+                continue
+            violation = (other_mask > 0) & (current_mask == 0)
+            n_bad = int(np.count_nonzero(violation))
+            if n_bad > 0:
+                other_mask[violation] = 0
 
     def toggle_pixel_picker_mode(self):
         """Toggle pixel intensity picker on/off"""
