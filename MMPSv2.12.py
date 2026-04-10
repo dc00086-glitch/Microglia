@@ -1899,7 +1899,6 @@ class InteractiveImageLabel(QLabel):
             self._update_display()
             return
 
-        # Paint fill / pixel smoothing mode
         if (self.paint_mode or self.erase_mode) and event.button() == Qt.LeftButton:
             if self.mask_overlay is not None:
                 if self.erase_mode:
@@ -1946,7 +1945,6 @@ class InteractiveImageLabel(QLabel):
 
     def mouseMoveEvent(self, event):
         """Handle mouse move for point/centroid dragging"""
-        # Paint fill / pixel smoothing dragging
         if (self.paint_mode or self.erase_mode) and self._is_painting:
             coords = self._to_image_coords(event.pos().x(), event.pos().y())
             if coords and self.mask_overlay is not None:
@@ -2052,7 +2050,6 @@ class InteractiveImageLabel(QLabel):
         self._update_display()
 
     def _erase_at(self, coords):
-        """Erase mask pixels in a circle around coords (pixel smoothing)."""
         r, c = int(coords[0]), int(coords[1])
         h, w = self.mask_overlay.shape
         bs = self.paint_brush_size
@@ -3198,7 +3195,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
             lambda v: setattr(self.mask_label, 'paint_brush_size', v))
         zoom_layout.addWidget(self.paint_brush_spin)
 
-        # Pixel Smooth (erase) button — only visible during QA
         self.paint_erase_btn = QPushButton("Pixel Smooth (E)")
         self.paint_erase_btn.setCheckable(True)
         self.paint_erase_btn.setVisible(False)
@@ -5961,7 +5957,6 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             self.log("Paint fill OFF")
 
     def _toggle_erase_mode(self, checked):
-        """Toggle pixel smoothing (erase) mode for mask editing during QA."""
         self.mask_label.erase_mode = checked
         if checked:
             if self.paint_fill_btn.isChecked():
