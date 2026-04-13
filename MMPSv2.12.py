@@ -4786,7 +4786,7 @@ MERGE_JOB_ID=$(sbatch --parsable \\
     --output=mmps_imagej_merge_%j.out \\
     --error=mmps_imagej_merge_%j.err \\
     --wrap="{module_line}
-python \\"$SCRIPT_DIR/merge_results.py\\" \\"$MMPS_OUTPUT_DIR\\""
+python3 \\"$SCRIPT_DIR/merge_results.py\\" \\"$MMPS_OUTPUT_DIR\\""
 )
 
 echo "Submitted merge job:  $MERGE_JOB_ID (runs after array completes)"
@@ -4799,7 +4799,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
     def _build_merge_script(self, analyses):
         """Build the Python3 script that merges per-image CSVs after all array tasks complete."""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        script = f'''#!/usr/bin/env python
+        script = f'''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 MMPS Merge Results Script
@@ -4809,7 +4809,7 @@ Combines per-image CSV files from array job tasks into single result files.
 Called automatically by the SLURM merge job after all array tasks complete.
 
 Usage:
-    python merge_results.py /path/to/mmps_output
+    python3 merge_results.py /path/to/mmps_output
 """
 
 import os
@@ -4850,7 +4850,7 @@ def merge_csvs(results_dir, pattern, output_name):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python merge_results.py /path/to/mmps_output")
+        print("Usage: python3 merge_results.py /path/to/mmps_output")
         sys.exit(1)
 
     mmps_output = sys.argv[1]
@@ -5008,7 +5008,7 @@ TROUBLESHOOTING:
   - Sholl analysis requires the SNT plugin (included in standard Fiji)
   - Skeleton analysis requires the AnalyzeSkeleton plugin (included in standard Fiji)
   - To re-run the merge manually:
-      python merge_results.py /path/to/mmps_output
+      python3 merge_results.py /path/to/mmps_output
 """
 
     # ------------------------------------------------------------------
@@ -5159,7 +5159,7 @@ TROUBLESHOOTING:
     def _build_spread_analysis_script(self, pixel_size, pixel_size_map=None):
         """Build the standalone Python script for cell spread / morphology analysis."""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        script = f'''#!/usr/bin/env python
+        script = f'''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 MMPS Cell Spread / Morphology Cluster Analysis Script
@@ -6773,7 +6773,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         settings_json = json.dumps(settings, indent=4).replace(': true', ': True').replace(': false', ': False').replace(': null', ': None')
         image_data_json = json.dumps(image_data, indent=4).replace(': true', ': True').replace(': false', ': False').replace(': null', ': None')
 
-        script = '''#!/usr/bin/env python
+        script = '''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Cluster Mask Generation Script
