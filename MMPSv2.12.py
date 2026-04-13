@@ -8648,13 +8648,39 @@ if __name__ == '__main__':
             loaded = self._load_imagej_csv(fp, csv_type)
 
             if csv_type == 'combined':
-                # Split combined data into categories
+                # Split combined data into categories by known column names.
+                # The combined CSV from the cluster merge has raw column names
+                # (no prefixes), so we match on known skeleton/sholl/fractal columns.
+                _skeleton_cols = {
+                    'num_branches', 'num_junctions', 'num_end_points',
+                    'num_junction_voxels', 'num_slab_voxels', 'num_triple_points',
+                    'num_quadruple_points', 'max_branch_length_um', 'avg_branch_length_um',
+                    'longest_shortest_path_um', 'total_skeleton_length_um',
+                    'skeleton_area_um2', 'branching_density',
+                    'mask_area_um2', 'mask_perimeter_um', 'mask_circularity',
+                    'mask_aspect_ratio', 'mask_roundness', 'mask_solidity',
+                }
+                _sholl_cols = {
+                    'primary_branches', 'intersecting_radii', 'sum_of_intersections',
+                    'mean_of_intersections', 'median_of_intersections',
+                    'skewness_sampled', 'kurtosis_sampled', 'max_intersections',
+                    'max_intersection_radius', 'ramification_index_sampled',
+                    'centroid_radius', 'centroid_value', 'enclosing_radius',
+                    'critical_radius', 'critical_value',
+                }
                 for cell_name, entry in loaded.items():
                     rd = entry['data']
                     area = entry['area']
-                    s = {k: v for k, v in rd.items() if k.startswith('sholl_')}
-                    k_data = {k: v for k, v in rd.items() if k.startswith('skel_')}
-                    fr = {k: v for k, v in rd.items() if k.startswith('fractal_') or k.startswith('hull_')}
+                    s = {}
+                    k_data = {}
+                    fr = {}
+                    for k, v in rd.items():
+                        if k.startswith('sholl_') or k in _sholl_cols or k.startswith('regression_'):
+                            s['sholl_' + k if not k.startswith('sholl_') else k] = v
+                        elif k.startswith('skel_') or k in _skeleton_cols:
+                            k_data['skel_' + k if not k.startswith('skel_') else k] = v
+                        elif k.startswith('fractal_') or k.startswith('hull_'):
+                            fr[k] = v
                     if s:
                         sholl_data[cell_name] = {'data': s, 'area': area}
                     if k_data:
