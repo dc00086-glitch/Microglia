@@ -3686,8 +3686,7 @@ def analyzeSkeleton(maskPath, pixelSize, outputDirPath):
             avgBranchLength = 0.0
     except:
         if numBranches > 0 and numSlabVoxels > 0:
-            effectivePx = pixelSize / float(scaleFactor) if scaleFactor > 1 else pixelSize
-            avgBranchLength = (numSlabVoxels * effectivePx) / float(numBranches)
+            avgBranchLength = (numSlabVoxels * pixelSize) / float(numBranches)
         else:
             avgBranchLength = 0.0
 
@@ -3704,8 +3703,7 @@ def analyzeSkeleton(maskPath, pixelSize, outputDirPath):
     if avgBranchLength > 0 and numBranches > 0:
         totalSkeletonLength = avgBranchLength * numBranches
     else:
-        effectivePx = pixelSize / float(scaleFactor) if scaleFactor > 1 else pixelSize
-        totalSkeletonLength = numSlabVoxels * effectivePx
+        totalSkeletonLength = numSlabVoxels * pixelSize
 
     skelProcessor = skel.getProcessor()
     skelWidth = skel.getWidth()
@@ -3715,8 +3713,7 @@ def analyzeSkeleton(maskPath, pixelSize, outputDirPath):
         for x in range(skelWidth):
             if skelProcessor.getPixel(x, y) > 0:
                 skelPixelCount += 1
-    effectivePx = pixelSize / float(scaleFactor) if scaleFactor > 1 else pixelSize
-    skeletonArea = skelPixelCount * (effectivePx * effectivePx)
+    skeletonArea = skelPixelCount * (pixelSize * pixelSize)
 
     imgName, somaId, areaUm2 = parseMaskInfo(os.path.basename(maskPath))
 
