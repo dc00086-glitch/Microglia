@@ -8721,6 +8721,18 @@ if __name__ == '__main__':
             except Exception as e:
                 self.log(f"  ERROR reading morphology results: {e}")
 
+        # Build descriptive filename from what's being merged
+        merge_parts = []
+        if morphology_rows:
+            merge_parts.append("Morphology")
+        if sholl_data:
+            merge_parts.append("Sholl")
+        if skeleton_data:
+            merge_parts.append("Skeleton")
+        if fractal_data:
+            merge_parts.append("Fractal+Hull")
+        merged_filename = f"Merged Data Set ({', '.join(merge_parts)}).csv" if merge_parts else "Merged Data Set.csv"
+
         if not morphology_rows:
             self.log("  No morphology results to merge with. Saving ImageJ results separately.")
             all_ij_data = {}
@@ -8732,7 +8744,7 @@ if __name__ == '__main__':
                 all_ij_data.setdefault(cell_name, {'cell_name': cell_name}).update(entry['data'])
 
             if all_ij_data:
-                combined_ij_path = os.path.join(self.output_dir, "imagej_combined_results.csv")
+                combined_ij_path = os.path.join(self.output_dir, merged_filename)
                 all_keys = set()
                 for d in all_ij_data.values():
                     all_keys.update(d.keys())
@@ -8825,7 +8837,7 @@ if __name__ == '__main__':
                     seen.add(k)
                     ordered_keys.append(k)
 
-            merged_path = os.path.join(self.output_dir, "combined_all_results.csv")
+            merged_path = os.path.join(self.output_dir, merged_filename)
             with open(merged_path, 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=ordered_keys, extrasaction='ignore')
                 writer.writeheader()
@@ -8847,9 +8859,9 @@ if __name__ == '__main__':
             summary += f"Fractal/Hull: {len(fractal_data)} cells\n"
         if morphology_rows:
             summary += f"\nMerged with {len(morphology_rows)} morphology results\n"
-            summary += f"Output: combined_all_results.csv"
+            summary += f"Output: {merged_filename}"
         else:
-            summary += "\nSaved as: imagej_combined_results.csv"
+            summary += f"\nSaved as: {merged_filename}"
 
         QMessageBox.information(self, "Import Complete", summary)
 
