@@ -2,308 +2,163 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
   <title>Antibody Dilution Calculator</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-    :root {
-      --blue: #2563eb;
-      --blue-light: #dbeafe;
-      --bg: #f1f5f9;
-      --card: #ffffff;
-      --border: #e2e8f0;
-      --text: #1e293b;
-      --muted: #64748b;
-      --error: #dc2626;
-      --success-bg: #f0f9ff;
-      --success-border: #bae6fd;
-      --radius: 12px;
-    }
-
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--bg);
-      color: var(--text);
+      background: #f1f5f9;
+      color: #1e293b;
       min-height: 100vh;
-      padding: 24px 16px 120px;
+      padding: 24px 16px 160px;
+      -webkit-text-size-adjust: 100%;
     }
 
-    .container {
-      max-width: 520px;
-      margin: 0 auto;
-    }
+    .container { max-width: 520px; margin: 0 auto; }
 
-    h1 {
-      font-size: 1.5rem;
-      font-weight: 700;
-      margin-bottom: 6px;
-    }
+    h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 6px; }
 
-    .subtitle {
-      color: var(--muted);
-      font-size: 0.875rem;
-      margin-bottom: 24px;
-    }
+    .subtitle { color: #64748b; font-size: 0.875rem; margin-bottom: 24px; }
 
     .card {
-      background: var(--card);
-      border-radius: var(--radius);
-      border: 1px solid var(--border);
+      background: #fff;
+      border-radius: 12px;
+      border: 1px solid #e2e8f0;
       padding: 20px;
       margin-bottom: 16px;
     }
 
     .card-title {
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--muted);
-      margin-bottom: 12px;
+      font-size: 0.75rem; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: #64748b; margin-bottom: 12px;
     }
 
-    /* Mode tabs */
-    .mode-tabs {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
+    .mode-tabs { display: flex; flex-direction: column; gap: 8px; }
 
     .mode-tab {
-      padding: 10px 14px;
-      border-radius: 8px;
-      border: 1.5px solid var(--border);
-      background: transparent;
-      text-align: left;
-      cursor: pointer;
-      font-size: 0.875rem;
-      color: var(--text);
-      transition: all 0.15s;
-    }
-
-    .mode-tab:hover {
-      border-color: var(--blue);
-      background: var(--blue-light);
+      padding: 10px 14px; border-radius: 8px;
+      border: 1.5px solid #e2e8f0; background: transparent;
+      text-align: left; font-size: 0.875rem; color: #1e293b;
+      -webkit-appearance: none; cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
     }
 
     .mode-tab.active {
-      border-color: var(--blue);
-      background: var(--blue-light);
-      color: var(--blue);
-      font-weight: 600;
+      border-color: #2563eb; background: #dbeafe;
+      color: #2563eb; font-weight: 600;
     }
 
-    .mode-tab .tab-desc {
-      font-size: 0.75rem;
-      color: var(--muted);
-      margin-top: 2px;
-      font-weight: 400;
+    .tab-desc { font-size: 0.75rem; color: #64748b; margin-top: 2px; font-weight: 400; }
+    .mode-tab.active .tab-desc { color: #1d4ed8; }
+
+    .field { margin-bottom: 14px; }
+    .field label { display: block; font-size: 0.8125rem; font-weight: 500; margin-bottom: 5px; color: #64748b; }
+    .field-row { display: flex; gap: 8px; }
+
+    .field-row input, .field-row select, .text-input {
+      padding: 10px 12px; border-radius: 8px;
+      border: 1.5px solid #e2e8f0; font-size: 16px;
+      font-family: inherit; color: #1e293b; background: #fff;
+      -webkit-appearance: none; appearance: none;
     }
 
-    .mode-tab.active .tab-desc {
-      color: #1d4ed8;
+    .field-row input, .text-input { flex: 1; }
+    .field-row select { flex: 0 0 80px; }
+
+    .field-row input:focus, .field-row select:focus, .text-input:focus {
+      outline: none; border-color: #2563eb;
     }
 
-    /* Fields */
-    .field {
-      margin-bottom: 14px;
-    }
+    .ratio-wrap { display: flex; align-items: center; gap: 8px; }
+    .ratio-wrap .prefix { font-size: 1rem; font-weight: 600; color: #64748b; white-space: nowrap; }
 
-    .field label {
-      display: block;
-      font-size: 0.8125rem;
-      font-weight: 500;
-      margin-bottom: 5px;
-      color: var(--muted);
-    }
-
-    .field-row {
-      display: flex;
-      gap: 8px;
-    }
-
-    .field-row input,
-    .field-row select,
-    input[type="number"],
-    input[type="text"] {
-      flex: 1;
-      padding: 9px 12px;
-      border-radius: 8px;
-      border: 1.5px solid var(--border);
-      font-size: 0.9375rem;
-      font-family: inherit;
-      color: var(--text);
-      background: #fff;
-      outline: none;
-      transition: border-color 0.15s;
-      -webkit-appearance: none;
-      appearance: none;
-    }
-
-    input:focus, select:focus {
-      border-color: var(--blue);
-    }
-
-    .field-row select {
-      flex: 0 0 80px;
-      cursor: pointer;
-    }
-
-    /* Ratio field */
-    .ratio-wrap {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .ratio-wrap .prefix {
-      font-size: 1rem;
-      font-weight: 600;
-      color: var(--muted);
-      white-space: nowrap;
-    }
-
-    .ratio-wrap input {
-      flex: 1;
-    }
-
-    /* Button */
     .calc-btn {
-      width: 100%;
-      padding: 14px;
-      background: var(--blue);
-      color: #fff;
-      font-size: 1.0625rem;
-      font-weight: 600;
-      border: none;
-      border-radius: 10px;
-      cursor: pointer;
-      -webkit-tap-highlight-color: transparent;
-      -webkit-appearance: none;
-      touch-action: manipulation;
-      user-select: none;
-      transition: background 0.15s;
+      display: block; width: 100%; padding: 14px;
+      background: #2563eb; color: #fff;
+      font-size: 17px; font-weight: 600;
+      border: none; border-radius: 10px;
       font-family: inherit;
+      -webkit-appearance: none; appearance: none;
+      -webkit-tap-highlight-color: transparent;
+      touch-action: manipulation;
+      cursor: pointer;
     }
 
-    .calc-btn:hover { background: #1d4ed8; }
     .calc-btn:active { background: #1e40af; }
 
-    /* Error */
-    .error {
-      color: var(--error);
-      font-size: 0.875rem;
-      margin-top: 10px;
-      padding: 10px 14px;
-      background: #fef2f2;
-      border-radius: 8px;
-      border: 1px solid #fecaca;
-      display: none;
+    .error-msg {
+      color: #dc2626; font-size: 0.875rem; margin-top: 10px;
+      padding: 10px 14px; background: #fef2f2;
+      border-radius: 8px; border: 1px solid #fecaca;
     }
 
-    /* Results */
+    .hidden { display: none !important; }
+
     .results {
-      display: none;
-      background: var(--success-bg);
-      border: 1.5px solid var(--success-border);
-      border-radius: var(--radius);
-      padding: 20px;
-      margin-top: 16px;
+      background: #f0f9ff; border: 1.5px solid #bae6fd;
+      border-radius: 12px; padding: 20px; margin-top: 16px;
     }
-
-    .results.visible { display: block; }
 
     .results-title {
-      font-size: 0.75rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--muted);
-      margin-bottom: 14px;
+      font-size: 0.75rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: #64748b; margin-bottom: 14px;
     }
 
-    .ratio-display {
-      font-size: 2rem;
-      font-weight: 700;
-      color: var(--blue);
-      margin-bottom: 16px;
-    }
-
-    .ratio-display span {
-      font-size: 1rem;
-      color: var(--muted);
-      font-weight: 500;
-    }
+    .ratio-display { font-size: 2rem; font-weight: 700; color: #2563eb; margin-bottom: 16px; }
+    .ratio-label { font-size: 1rem; color: #64748b; font-weight: 500; }
 
     .section-label {
-      font-size: 0.75rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--muted);
-      margin: 14px 0 8px;
+      font-size: 0.75rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.06em;
+      color: #64748b; margin: 14px 0 8px;
     }
 
     .result-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 8px 0;
-      border-bottom: 1px solid var(--border);
-      font-size: 0.9375rem;
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 0; border-bottom: 1px solid #e2e8f0; font-size: 0.9375rem;
     }
 
     .result-row:last-child { border-bottom: none; }
+    .result-row .val { font-weight: 700; color: #2563eb; }
 
-    .result-row .label { color: var(--text); }
-
-    .result-row .value {
-      font-weight: 700;
-      font-variant-numeric: tabular-nums;
-      color: var(--blue);
-    }
-
-    .divider {
-      height: 1px;
-      background: var(--border);
-      margin: 12px 0;
-    }
+    .divider { height: 1px; background: #e2e8f0; margin: 12px 0; }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>Antibody Dilution Calculator</h1>
-    <p class="subtitle">Calculate volumes for primary antibody staining</p>
+    <p class="subtitle">Calculate volumes for antibody staining</p>
 
-    <!-- Mode Selection -->
     <div class="card">
       <div class="card-title">What do you know?</div>
       <div class="mode-tabs">
-        <button class="mode-tab active" data-mode="totalRatio">
+        <button class="mode-tab active" id="tab-totalRatio" onclick="setMode('totalRatio')">
           Total Volume + Dilution Ratio
-          <div class="tab-desc">e.g. I want 1 mL at 1:1000 — how much antibody?</div>
+          <div class="tab-desc">e.g. 1 mL at 1:1000 — how much antibody?</div>
         </button>
-        <button class="mode-tab" data-mode="antibodyRatio">
+        <button class="mode-tab" id="tab-antibodyRatio" onclick="setMode('antibodyRatio')">
           Antibody Volume + Dilution Ratio
-          <div class="tab-desc">e.g. I have 2 µL antibody at 1:500 — what total volume?</div>
+          <div class="tab-desc">e.g. 2 µL antibody at 1:500 — what total?</div>
         </button>
-        <button class="mode-tab" data-mode="totalAntibody">
+        <button class="mode-tab" id="tab-totalAntibody" onclick="setMode('totalAntibody')">
           Total Volume + Antibody Volume
-          <div class="tab-desc">e.g. I used 5 µL in 1 mL — what was my dilution?</div>
+          <div class="tab-desc">e.g. 5 µL in 1 mL — what dilution?</div>
         </button>
       </div>
     </div>
 
-    <!-- Inputs -->
     <div class="card">
       <div class="card-title">Inputs</div>
 
-      <!-- Total volume -->
       <div class="field" id="field-total">
         <label>Total Volume (per sample)</label>
         <div class="field-row">
-          <input type="number" id="totalVolume" placeholder="e.g. 1" min="0" step="any" />
+          <input type="text" inputmode="decimal" id="totalVolume" placeholder="e.g. 1" />
           <select id="totalUnit">
             <option value="uL">µL</option>
             <option value="mL" selected>mL</option>
@@ -312,11 +167,10 @@
         </div>
       </div>
 
-      <!-- Antibody volume -->
-      <div class="field" id="field-antibody" style="display:none">
+      <div class="field hidden" id="field-antibody">
         <label>Antibody Volume (per sample)</label>
         <div class="field-row">
-          <input type="number" id="antibodyVolume" placeholder="e.g. 1" min="0" step="any" />
+          <input type="text" inputmode="decimal" id="antibodyVolume" placeholder="e.g. 1" />
           <select id="antibodyUnit">
             <option value="uL" selected>µL</option>
             <option value="mL">mL</option>
@@ -325,110 +179,88 @@
         </div>
       </div>
 
-      <!-- Dilution ratio -->
       <div class="field" id="field-ratio">
         <label>Dilution Ratio (1 : X)</label>
         <div class="ratio-wrap">
           <span class="prefix">1 :</span>
-          <input type="number" id="dilutionRatio" placeholder="e.g. 1000" min="1" step="any" />
+          <input type="text" inputmode="decimal" id="dilutionRatio" placeholder="e.g. 1000" />
         </div>
       </div>
 
-      <!-- Number of samples -->
       <div class="field">
         <label>Number of Samples</label>
-        <input type="number" id="numSamples" value="1" min="1" step="1" style="max-width:120px" />
+        <input type="text" inputmode="numeric" id="numSamples" value="1" class="text-input" style="max-width:120px" />
       </div>
 
-      <button class="calc-btn" id="calcBtn" type="button" ontouchend="handleTouch(event)">Calculate</button>
-      <div class="error" id="errorMsg"></div>
+      <button class="calc-btn" onclick="doCalc()">Calculate</button>
+
+      <div id="errorBox" class="error-msg hidden"></div>
     </div>
 
-    <!-- Results -->
-    <div class="results" id="results">
+    <div id="resultsBox" class="results hidden">
       <div class="results-title">Results</div>
-      <div class="ratio-display" id="ratioDisplay"></div>
+      <div id="ratioLine" class="ratio-display"></div>
       <div id="resultsBody"></div>
     </div>
   </div>
 
   <script>
-    // ── Unit conversion ──────────────────────────────────────────────────────
+    var currentMode = 'totalRatio';
+
+    function setMode(m) {
+      currentMode = m;
+      // Update tabs
+      document.getElementById('tab-totalRatio').className = (m === 'totalRatio') ? 'mode-tab active' : 'mode-tab';
+      document.getElementById('tab-antibodyRatio').className = (m === 'antibodyRatio') ? 'mode-tab active' : 'mode-tab';
+      document.getElementById('tab-totalAntibody').className = (m === 'totalAntibody') ? 'mode-tab active' : 'mode-tab';
+      // Show/hide fields
+      var showTotal = (m === 'totalRatio' || m === 'totalAntibody');
+      var showAb = (m === 'antibodyRatio' || m === 'totalAntibody');
+      var showRatio = (m === 'totalRatio' || m === 'antibodyRatio');
+      document.getElementById('field-total').className = showTotal ? 'field' : 'field hidden';
+      document.getElementById('field-antibody').className = showAb ? 'field' : 'field hidden';
+      document.getElementById('field-ratio').className = showRatio ? 'field' : 'field hidden';
+      // Hide results
+      document.getElementById('resultsBox').className = 'results hidden';
+      document.getElementById('errorBox').className = 'error-msg hidden';
+    }
+
     function toUL(val, unit) {
       if (unit === 'mL') return val * 1000;
-      if (unit === 'L')  return val * 1000000;
+      if (unit === 'L') return val * 1000000;
       return val;
     }
 
-    function formatVol(ul) {
-      if (ul >= 1000000) return fmt(ul / 1000000) + ' L';
-      if (ul >= 1000)    return fmt(ul / 1000) + ' mL';
-      return fmt(ul) + ' µL';
-    }
-
-    function fmt(n) {
-      // Up to 4 significant figures, strip trailing zeros
+    function fmtNum(n) {
       return parseFloat(n.toPrecision(4)).toString();
     }
 
-    // ── Mode switching ────────────────────────────────────────────────────────
-    const tabs = document.querySelectorAll('.mode-tab');
-    let currentMode = 'totalRatio';
-
-    tabs.forEach(tab => {
-      tab.addEventListener('click', () => {
-        tabs.forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-        currentMode = tab.dataset.mode;
-        updateFields();
-        clearResults();
-      });
-    });
-
-    function updateFields() {
-      const showTotal    = currentMode === 'totalRatio'    || currentMode === 'totalAntibody';
-      const showAntibody = currentMode === 'antibodyRatio' || currentMode === 'totalAntibody';
-      const showRatio    = currentMode === 'totalRatio'    || currentMode === 'antibodyRatio';
-
-      document.getElementById('field-total').style.display    = showTotal    ? '' : 'none';
-      document.getElementById('field-antibody').style.display = showAntibody ? '' : 'none';
-      document.getElementById('field-ratio').style.display    = showRatio    ? '' : 'none';
+    function fmtVol(ul) {
+      if (ul >= 1000000) return fmtNum(ul / 1000000) + ' L';
+      if (ul >= 1000) return fmtNum(ul / 1000) + ' mL';
+      return fmtNum(ul) + ' \u00B5L';
     }
 
-    // ── Calculate ─────────────────────────────────────────────────────────────
-    document.getElementById('calcBtn').addEventListener('click', function(e) {
-      e.preventDefault();
-      document.activeElement.blur(); // dismiss keyboard first
-      setTimeout(calculate, 50);    // slight delay so iOS repaints after keyboard closes
-    });
-
-    // Touch handler for iOS — ontouchend fires even when keyboard is open
-    function handleTouch(e) {
-      e.preventDefault();
-      document.activeElement.blur();
-      setTimeout(calculate, 50);
-    }
-
-    // Allow Enter key
-    document.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        document.activeElement.blur();
-        setTimeout(calculate, 50);
-      }
-    });
-
-    // Safe number getter — handles iOS quirks with number inputs
-    function getNum(id) {
+    function getVal(id) {
       var el = document.getElementById(id);
       if (!el) return NaN;
-      var v = el.value;
-      if (v === '' || v === undefined || v === null) return NaN;
-      return Number(v);
+      var s = (el.value || '').replace(/[^0-9.\-]/g, '');
+      if (s === '') return NaN;
+      return Number(s);
     }
 
-    function calculate() {
-      clearResults();
+    function doCalc() {
+      // Dismiss keyboard
+      if (document.activeElement) { document.activeElement.blur(); }
+
+      // Small delay for iOS keyboard dismiss
+      setTimeout(runCalc, 120);
+    }
+
+    function runCalc() {
+      // Hide previous
+      document.getElementById('resultsBox').className = 'results hidden';
+      document.getElementById('errorBox').className = 'error-msg hidden';
 
       var samples = parseInt(document.getElementById('numSamples').value, 10);
       if (isNaN(samples) || samples < 1) samples = 1;
@@ -436,100 +268,79 @@
       var abPerSample, totalPerSample, diluentPerSample, ratio;
 
       if (currentMode === 'totalRatio') {
-        var tv  = getNum('totalVolume');
-        var dr  = getNum('dilutionRatio');
+        var tv = getVal('totalVolume');
+        var dr = getVal('dilutionRatio');
         var tvu = document.getElementById('totalUnit').value;
-        if (isNaN(tv) || tv <= 0) return showError('Enter a valid total volume.');
-        if (isNaN(dr) || dr <= 0) return showError('Enter a valid dilution ratio.');
-        totalPerSample   = toUL(tv, tvu);
-        ratio            = dr;
-        abPerSample      = totalPerSample / ratio;
+        if (isNaN(tv) || tv <= 0) { showErr('Enter a valid total volume.'); return; }
+        if (isNaN(dr) || dr <= 0) { showErr('Enter a valid dilution ratio.'); return; }
+        totalPerSample = toUL(tv, tvu);
+        ratio = dr;
+        abPerSample = totalPerSample / ratio;
         diluentPerSample = totalPerSample - abPerSample;
 
       } else if (currentMode === 'antibodyRatio') {
-        var av  = getNum('antibodyVolume');
-        var dr2 = getNum('dilutionRatio');
+        var av = getVal('antibodyVolume');
+        var dr2 = getVal('dilutionRatio');
         var avu = document.getElementById('antibodyUnit').value;
-        if (isNaN(av) || av <= 0) return showError('Enter a valid antibody volume.');
-        if (isNaN(dr2) || dr2 <= 0) return showError('Enter a valid dilution ratio.');
-        abPerSample      = toUL(av, avu);
-        ratio            = dr2;
-        totalPerSample   = abPerSample * ratio;
+        if (isNaN(av) || av <= 0) { showErr('Enter a valid antibody volume.'); return; }
+        if (isNaN(dr2) || dr2 <= 0) { showErr('Enter a valid dilution ratio.'); return; }
+        abPerSample = toUL(av, avu);
+        ratio = dr2;
+        totalPerSample = abPerSample * ratio;
         diluentPerSample = totalPerSample - abPerSample;
 
-      } else { // totalAntibody
-        var tv2 = getNum('totalVolume');
-        var av2 = getNum('antibodyVolume');
+      } else {
+        var tv2 = getVal('totalVolume');
+        var av2 = getVal('antibodyVolume');
         var tvu2 = document.getElementById('totalUnit').value;
         var avu2 = document.getElementById('antibodyUnit').value;
-        if (isNaN(tv2) || tv2 <= 0) return showError('Enter a valid total volume.');
-        if (isNaN(av2) || av2 <= 0) return showError('Enter a valid antibody volume.');
-        totalPerSample   = toUL(tv2, tvu2);
-        abPerSample      = toUL(av2, avu2);
-        if (abPerSample >= totalPerSample) return showError('Antibody volume must be less than total volume.');
-        ratio            = totalPerSample / abPerSample;
+        if (isNaN(tv2) || tv2 <= 0) { showErr('Enter a valid total volume.'); return; }
+        if (isNaN(av2) || av2 <= 0) { showErr('Enter a valid antibody volume.'); return; }
+        totalPerSample = toUL(tv2, tvu2);
+        abPerSample = toUL(av2, avu2);
+        if (abPerSample >= totalPerSample) { showErr('Antibody volume must be less than total volume.'); return; }
+        ratio = totalPerSample / abPerSample;
         diluentPerSample = totalPerSample - abPerSample;
       }
 
-      showResults({
-        ratio,
-        samples,
-        abPerSample,
-        diluentPerSample,
-        totalPerSample,
-        abTotal:      abPerSample      * samples,
-        diluentTotal: diluentPerSample * samples,
-        totalTotal:   totalPerSample   * samples,
-      });
-    }
+      // Build results HTML
+      var ratioText = '<span class="ratio-label">Dilution ratio</span><br>1 : ' + fmtNum(ratio);
+      document.getElementById('ratioLine').innerHTML = ratioText;
 
-    function showResults(r) {
-      document.getElementById('ratioDisplay').innerHTML =
-        `<span>Dilution ratio</span><br>1 : ${fmt(r.ratio)}`;
-
-      let html = '';
-
-      if (r.samples > 1) {
-        html += `<div class="section-label">Per Sample</div>`;
-        html += row('Antibody',        r.abPerSample);
-        html += row('Diluent / Buffer', r.diluentPerSample);
-        html += row('Total',           r.totalPerSample);
-        html += `<div class="divider"></div>`;
-        html += `<div class="section-label">All ${r.samples} Samples Combined</div>`;
-        html += row('Antibody',        r.abTotal);
-        html += row('Diluent / Buffer', r.diluentTotal);
-        html += row('Total',           r.totalTotal);
+      var h = '';
+      if (samples > 1) {
+        h += '<div class="section-label">Per Sample</div>';
+        h += makeRow('Antibody', abPerSample);
+        h += makeRow('Diluent / Buffer', diluentPerSample);
+        h += makeRow('Total', totalPerSample);
+        h += '<div class="divider"></div>';
+        h += '<div class="section-label">All ' + samples + ' Samples Combined</div>';
+        h += makeRow('Antibody', abPerSample * samples);
+        h += makeRow('Diluent / Buffer', diluentPerSample * samples);
+        h += makeRow('Total', totalPerSample * samples);
       } else {
-        html += row('Antibody Volume',        r.abPerSample);
-        html += row('Diluent / Buffer Volume', r.diluentPerSample);
-        html += row('Total Volume',           r.totalPerSample);
+        h += makeRow('Antibody Volume', abPerSample);
+        h += makeRow('Diluent / Buffer Volume', diluentPerSample);
+        h += makeRow('Total Volume', totalPerSample);
       }
 
-      document.getElementById('resultsBody').innerHTML = html;
-      var resultsEl = document.getElementById('results');
-      resultsEl.classList.add('visible');
-      // Delay scroll so iOS has time to reflow after keyboard dismissal
+      document.getElementById('resultsBody').innerHTML = h;
+      document.getElementById('resultsBox').className = 'results';
+
+      // Scroll to results after iOS reflow
       setTimeout(function() {
-        resultsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      }, 100);
+        document.getElementById('resultsBox').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 150);
     }
 
-    function row(label, ul) {
-      return `<div class="result-row">
-        <span class="label">${label}</span>
-        <span class="value">${formatVol(ul)}</span>
-      </div>`;
+    function makeRow(label, ul) {
+      return '<div class="result-row"><span>' + label + '</span><span class="val">' + fmtVol(ul) + '</span></div>';
     }
 
-    function showError(msg) {
-      const el = document.getElementById('errorMsg');
+    function showErr(msg) {
+      var el = document.getElementById('errorBox');
       el.textContent = msg;
-      el.style.display = 'block';
-    }
-
-    function clearResults() {
-      document.getElementById('errorMsg').style.display = 'none';
-      document.getElementById('results').classList.remove('visible');
+      el.className = 'error-msg';
     }
   </script>
 </body>
