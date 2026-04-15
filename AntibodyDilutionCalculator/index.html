@@ -26,7 +26,7 @@
       background: var(--bg);
       color: var(--text);
       min-height: 100vh;
-      padding: 24px 16px 48px;
+      padding: 24px 16px 120px;
     }
 
     .container {
@@ -171,14 +171,18 @@
     /* Button */
     .calc-btn {
       width: 100%;
-      padding: 12px;
+      padding: 14px;
       background: var(--blue);
       color: #fff;
-      font-size: 1rem;
+      font-size: 1.0625rem;
       font-weight: 600;
       border: none;
       border-radius: 10px;
       cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-appearance: none;
+      touch-action: manipulation;
+      user-select: none;
       transition: background 0.15s;
       font-family: inherit;
     }
@@ -336,7 +340,7 @@
         <input type="number" id="numSamples" value="1" min="1" step="1" style="max-width:120px" />
       </div>
 
-      <button class="calc-btn" id="calcBtn">Calculate</button>
+      <button class="calc-btn" id="calcBtn" type="button" ontouchend="handleTouch(event)">Calculate</button>
       <div class="error" id="errorMsg"></div>
     </div>
 
@@ -392,52 +396,76 @@
     }
 
     // ── Calculate ─────────────────────────────────────────────────────────────
-    document.getElementById('calcBtn').addEventListener('click', calculate);
+    document.getElementById('calcBtn').addEventListener('click', function(e) {
+      e.preventDefault();
+      document.activeElement.blur(); // dismiss keyboard first
+      setTimeout(calculate, 50);    // slight delay so iOS repaints after keyboard closes
+    });
+
+    // Touch handler for iOS — ontouchend fires even when keyboard is open
+    function handleTouch(e) {
+      e.preventDefault();
+      document.activeElement.blur();
+      setTimeout(calculate, 50);
+    }
 
     // Allow Enter key
-    document.addEventListener('keydown', e => {
-      if (e.key === 'Enter') calculate();
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        document.activeElement.blur();
+        setTimeout(calculate, 50);
+      }
     });
+
+    // Safe number getter — handles iOS quirks with number inputs
+    function getNum(id) {
+      var el = document.getElementById(id);
+      if (!el) return NaN;
+      var v = el.value;
+      if (v === '' || v === undefined || v === null) return NaN;
+      return Number(v);
+    }
 
     function calculate() {
       clearResults();
 
-      const samples = parseInt(document.getElementById('numSamples').value) || 1;
-      if (samples < 1) return showError('Number of samples must be at least 1.');
+      var samples = parseInt(document.getElementById('numSamples').value, 10);
+      if (isNaN(samples) || samples < 1) samples = 1;
 
-      let abPerSample, totalPerSample, diluentPerSample, ratio;
+      var abPerSample, totalPerSample, diluentPerSample, ratio;
 
       if (currentMode === 'totalRatio') {
-        const tv  = parseFloat(document.getElementById('totalVolume').value);
-        const dr  = parseFloat(document.getElementById('dilutionRatio').value);
-        const tvu = document.getElementById('totalUnit').value;
-        if (!tv || tv <= 0) return showError('Enter a valid total volume.');
-        if (!dr || dr <= 0) return showError('Enter a valid dilution ratio.');
+        var tv  = getNum('totalVolume');
+        var dr  = getNum('dilutionRatio');
+        var tvu = document.getElementById('totalUnit').value;
+        if (isNaN(tv) || tv <= 0) return showError('Enter a valid total volume.');
+        if (isNaN(dr) || dr <= 0) return showError('Enter a valid dilution ratio.');
         totalPerSample   = toUL(tv, tvu);
         ratio            = dr;
         abPerSample      = totalPerSample / ratio;
         diluentPerSample = totalPerSample - abPerSample;
 
       } else if (currentMode === 'antibodyRatio') {
-        const av  = parseFloat(document.getElementById('antibodyVolume').value);
-        const dr  = parseFloat(document.getElementById('dilutionRatio').value);
-        const avu = document.getElementById('antibodyUnit').value;
-        if (!av || av <= 0) return showError('Enter a valid antibody volume.');
-        if (!dr || dr <= 0) return showError('Enter a valid dilution ratio.');
+        var av  = getNum('antibodyVolume');
+        var dr2 = getNum('dilutionRatio');
+        var avu = document.getElementById('antibodyUnit').value;
+        if (isNaN(av) || av <= 0) return showError('Enter a valid antibody volume.');
+        if (isNaN(dr2) || dr2 <= 0) return showError('Enter a valid dilution ratio.');
         abPerSample      = toUL(av, avu);
-        ratio            = dr;
+        ratio            = dr2;
         totalPerSample   = abPerSample * ratio;
         diluentPerSample = totalPerSample - abPerSample;
 
       } else { // totalAntibody
-        const tv  = parseFloat(document.getElementById('totalVolume').value);
-        const av  = parseFloat(document.getElementById('antibodyVolume').value);
-        const tvu = document.getElementById('totalUnit').value;
-        const avu = document.getElementById('antibodyUnit').value;
-        if (!tv || tv <= 0) return showError('Enter a valid total volume.');
-        if (!av || av <= 0) return showError('Enter a valid antibody volume.');
-        totalPerSample   = toUL(tv, tvu);
-        abPerSample      = toUL(av, avu);
+        var tv2 = getNum('totalVolume');
+        var av2 = getNum('antibodyVolume');
+        var tvu2 = document.getElementById('totalUnit').value;
+        var avu2 = document.getElementById('antibodyUnit').value;
+        if (isNaN(tv2) || tv2 <= 0) return showError('Enter a valid total volume.');
+        if (isNaN(av2) || av2 <= 0) return showError('Enter a valid antibody volume.');
+        totalPerSample   = toUL(tv2, tvu2);
+        abPerSample      = toUL(av2, avu2);
         if (abPerSample >= totalPerSample) return showError('Antibody volume must be less than total volume.');
         ratio            = totalPerSample / abPerSample;
         diluentPerSample = totalPerSample - abPerSample;
@@ -478,8 +506,12 @@
       }
 
       document.getElementById('resultsBody').innerHTML = html;
-      document.getElementById('results').classList.add('visible');
-      document.getElementById('results').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      var resultsEl = document.getElementById('results');
+      resultsEl.classList.add('visible');
+      // Delay scroll so iOS has time to reflow after keyboard dismissal
+      setTimeout(function() {
+        resultsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 100);
     }
 
     function row(label, ul) {
