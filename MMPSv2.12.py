@@ -8521,6 +8521,8 @@ if __name__ == '__main__':
                     'max_intersection_radius', 'ramification_index_sampled',
                     'centroid_radius', 'centroid_value', 'enclosing_radius',
                     'critical_radius', 'critical_value',
+                    'kurtosis_fit', 'ramification_index_fit', 'mean_value',
+                    'polynomial_degree',
                 }
                 for cell_name, entry in loaded.items():
                     rd = entry['data']
