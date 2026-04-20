@@ -2438,6 +2438,21 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.toggle_color_view()
             return
 
+        # R/G/B toggle individual channels in colocalization color view
+        if self.colocalization_mode and self.show_color_view:
+            if key == Qt.Key_R:
+                self.display_channels[0] = not self.display_channels.get(0, True)
+                self._refresh_color_display()
+                return
+            elif key == Qt.Key_G:
+                self.display_channels[1] = not self.display_channels.get(1, True)
+                self._refresh_color_display()
+                return
+            elif key == Qt.Key_B:
+                self.display_channels[2] = not self.display_channels.get(2, True)
+                self._refresh_color_display()
+                return
+
         # Handle polygon outlining mode shortcuts
         if self.processed_label.polygon_mode:
             if key == Qt.Key_Backspace:
