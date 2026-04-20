@@ -8685,13 +8685,38 @@ if __name__ == '__main__':
                         elif counter_name == 'fractal':
                             matched_fractal += 1
 
-            all_keys = morph_fieldnames + sorted(new_sholl_keys) + sorted(new_skel_keys) + sorted(new_fractal_keys)
-            seen = set()
-            ordered_keys = []
-            for k in all_keys:
-                if k not in seen:
-                    seen.add(k)
-                    ordered_keys.append(k)
+            all_keys = set(morph_fieldnames) | new_sholl_keys | new_skel_keys | new_fractal_keys
+            _final_columns = [
+                'image_name', 'animal_id', 'treatment', 'soma_group', 'soma_id', 'soma_idx',
+                'area_um2', 'avg_centroid_distance', 'eccentricity', 'major_axis_um',
+                'mask_area', 'minor_axis_um', 'perimeter', 'roundness', 'soma_area',
+                'sholl_centroid_radius', 'sholl_centroid_value', 'sholl_critical_radius',
+                'sholl_critical_value', 'sholl_enclosing_radius', 'sholl_intersecting_radii',
+                'sholl_kurtosis_sampled', 'sholl_kurtosis_fit',
+                'sholl_max_intersection_radius', 'sholl_max_intersections',
+                'sholl_mean_of_intersections', 'sholl_mean_value',
+                'sholl_median_of_intersections', 'sholl_polynomial_degree',
+                'sholl_primary_branches',
+                'sholl_ramification_index_sampled', 'sholl_ramification_index_fit',
+                'sholl_regression_coeff_log_log', 'sholl_regression_coeff_log_log_p10_p90',
+                'sholl_regression_coeff_semi_log', 'sholl_regression_coeff_semi_log_p10_p90',
+                'sholl_regression_intercept_log_log', 'sholl_regression_intercept_log_log_p10_p90',
+                'sholl_regression_intercept_semi_log', 'sholl_regression_intercept_semi_log_p10_p90',
+                'sholl_skewness_sampled', 'sholl_sum_of_intersections',
+                'skel_avg_branch_length_um', 'skel_branching_density',
+                'skel_longest_shortest_path_um', 'skel_mask_perimeter_um',
+                'skel_max_branch_length_um', 'skel_num_branches', 'skel_num_end_points',
+                'skel_num_junction_voxels', 'skel_num_junctions', 'skel_num_quadruple_points',
+                'skel_num_slab_voxels', 'skel_num_triple_points', 'skel_skeleton_area_um2',
+                'skel_total_skeleton_length_um',
+                'fractal_dimension', 'fractal_foreground_area_um2', 'fractal_lacunarity_large',
+                'fractal_lacunarity_mean', 'fractal_lacunarity_small', 'fractal_num_scales',
+                'fractal_r_squared',
+                'hull_area_um2', 'hull_circularity', 'hull_density', 'hull_max_span_um',
+                'hull_perimeter_um', 'hull_span_ratio',
+                'Day',
+            ]
+            ordered_keys = [k for k in _final_columns if k in all_keys]
 
             merged_path = os.path.join(self.output_dir, merged_filename)
             with open(merged_path, 'w', newline='') as f:
