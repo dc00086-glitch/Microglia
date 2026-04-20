@@ -3025,6 +3025,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.pixel_picker_btn.setCheckable(True)
         display_btn_layout.addWidget(self.pixel_picker_btn)
 
+        self.save_color_btn = QPushButton("Save Color TIFF")
+        self.save_color_btn.setToolTip("Save the current processed color image as a TIFF file")
+        self.save_color_btn.clicked.connect(self._save_processed_color_tiff)
+        display_btn_layout.addWidget(self.save_color_btn)
+
         # Help button
         help_btn = QPushButton("?")
         help_btn.setFixedWidth(35)
@@ -9269,6 +9274,39 @@ if __name__ == '__main__':
                 composite[:, :, i] = color_img[:, :, i].astype(np.float32)
 
         return composite
+
+    def _save_processed_color_tiff(self):
+        """Save the current processed color composite as a TIFF file."""
+        if not self.current_image_name:
+            QMessageBox.warning(self, "No Image", "No image is currently loaded.")
+            return
+        img_data = self.images.get(self.current_image_name)
+        if not img_data:
+            QMessageBox.warning(self, "No Image", "No image data found.")
+            return
+
+        composite = self._build_processed_color_image(img_data)
+        if composite is None:
+            QMessageBox.warning(self, "No Color Data",
+                                "Cannot build color image. Make sure you have a multi-channel image and it has been processed.")
+            return
+
+        adjusted = self._apply_display_adjustments_color(composite)
+        color_uint8 = np.clip(adjusted, 0, 255).astype(np.uint8)
+
+        stem = os.path.splitext(self.current_image_name)[0]
+        default_name = f"{stem}_processed_color.tif"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Processed Color TIFF", default_name,
+            "TIFF Files (*.tif *.tiff);;All Files (*)")
+        if not save_path:
+            return
+
+        try:
+            tifffile.imwrite(save_path, color_uint8)
+            self.log(f"Saved processed color TIFF: {save_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Failed to save: {e}")
 
     def select_folder(self):
         title = "Select Z-Stack Folder" if self.mode_3d else "Select Image Folder"
