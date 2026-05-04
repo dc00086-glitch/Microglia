@@ -5,6 +5,7 @@
 import sys
 import os
 import time
+import math
 import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -304,6 +305,10 @@ class InteractiveImageLabel(QLabel):
         self.polygon_pts = []
         self.soma_mode = False
         self.polygon_mode = False
+        # Measurement tool state
+        self.measure_mode = False
+        self.measure_pt1 = None  # (row, col) image coords
+        self.measure_pt2 = None
         self.setMinimumSize(400, 400)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("border: 2px solid #cccccc; background-color: #f5f5f5;")
@@ -344,6 +349,26 @@ class InteractiveImageLabel(QLabel):
                 painter.drawEllipse(int(x - 6), int(y - 6), 12, 12)
         if self.polygon_mode and len(self.polygon_pts) > 0:
             self._draw_polygon(painter)
+        if self.measure_mode and self.measure_pt1 is not None:
+            pen = QPen(QColor(255, 255, 0), 2, Qt.DashLine)
+            painter.setPen(pen)
+            x1, y1 = self._to_display_coords(self.measure_pt1)
+            painter.setBrush(QColor(255, 255, 0, 150))
+            painter.drawEllipse(int(x1 - 5), int(y1 - 5), 10, 10)
+            if self.measure_pt2 is not None:
+                x2, y2 = self._to_display_coords(self.measure_pt2)
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+                painter.drawEllipse(int(x2 - 5), int(y2 - 5), 10, 10)
+                mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                if self.parent_widget and hasattr(self.parent_widget, '_get_measure_text'):
+                    text = self.parent_widget._get_measure_text()
+                    painter.setPen(QColor(0, 0, 0))
+                    painter.setBrush(QColor(255, 255, 200, 220))
+                    fm = painter.fontMetrics()
+                    tw = fm.horizontalAdvance(text) + 8
+                    painter.drawRect(int(mx - tw / 2), int(my - 18), tw, 20)
+                    painter.setPen(QColor(0, 0, 0))
+                    painter.drawText(int(mx - tw / 2 + 4), int(my - 2), text)
         painter.end()
 
     def resizeEvent(self, event):
@@ -452,6 +477,17 @@ class InteractiveImageLabel(QLabel):
     def mousePressEvent(self, event):
         coords = self._to_image_coords(event.pos().x(), event.pos().y())
         if not coords:
+            return
+        # Measurement mode takes priority over other modes
+        if self.measure_mode and event.button() == Qt.LeftButton:
+            if self.measure_pt1 is None or self.measure_pt2 is not None:
+                self.measure_pt1 = coords
+                self.measure_pt2 = None
+            else:
+                self.measure_pt2 = coords
+                if self.parent_widget and hasattr(self.parent_widget, '_show_measurement'):
+                    self.parent_widget._show_measurement()
+            self.repaint()
             return
         if self.soma_mode and self.parent_widget:
             self.parent_widget.add_soma(coords)
@@ -605,6 +641,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.pixel_size_input = QLineEdit(str(self.pixel_size))
         form_layout.addRow("Pixel size (μm/px):", self.pixel_size_input)
         param_layout.addLayout(form_layout)
+
+        # Measure + Calibrate buttons (draw a line on the scale bar to set pixel size)
+        calib_layout = QHBoxLayout()
+        self.measure_btn = QPushButton("Measure")
+        self.measure_btn.setCheckable(True)
+        self.measure_btn.setToolTip("Click two points on the image to measure distance in pixels")
+        self.measure_btn.clicked.connect(self.toggle_measure_mode)
+        calib_layout.addWidget(self.measure_btn)
+        self.calibrate_btn = QPushButton("Calibrate")
+        self.calibrate_btn.setToolTip("Calculate pixel size from a measured known distance (draw a line on the scale bar first)")
+        self.calibrate_btn.clicked.connect(self._calibrate_from_measurement)
+        calib_layout.addWidget(self.calibrate_btn)
+        param_layout.addLayout(calib_layout)
 
         self.use_imagej = False
 
@@ -835,6 +884,137 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.reject_mask_btn.setVisible(False)
 
         return panel
+
+    # ========================================================================
+    # MEASUREMENT / PIXEL CALIBRATION
+    # ========================================================================
+    def _get_active_label(self):
+        """Return the InteractiveImageLabel in the currently visible tab."""
+        idx = self.tabs.currentIndex()
+        labels = [self.original_label, self.preview_label, self.processed_label, self.mask_label]
+        if 0 <= idx < len(labels):
+            return labels[idx]
+        return self.processed_label
+
+    def toggle_measure_mode(self):
+        """Toggle the measurement tool on/off across all image tabs."""
+        active = self.measure_btn.isChecked()
+        for label in (self.original_label, self.preview_label, self.processed_label, self.mask_label):
+            label.measure_mode = active
+            if not active:
+                label.measure_pt1 = None
+                label.measure_pt2 = None
+            label.repaint()
+        if active:
+            self.log("Measure tool ON - click two points to measure distance")
+        else:
+            self.log("Measure tool OFF")
+
+    def _get_measure_text(self):
+        """Get formatted measurement text for the on-image overlay."""
+        label = self._get_active_label()
+        if not label or label.measure_pt1 is None or label.measure_pt2 is None:
+            return ""
+        try:
+            ps = float(self.pixel_size_input.text())
+        except ValueError:
+            ps = self.pixel_size
+        pt1 = label.measure_pt1
+        pt2 = label.measure_pt2
+        dx = pt2[1] - pt1[1]  # columns = X
+        dy = pt2[0] - pt1[0]  # rows = Y
+        dist_px = math.sqrt(dx * dx + dy * dy)
+        dist_um = dist_px * ps
+        return f"{dist_um:.2f} um ({dist_px:.0f} px)"
+
+    def _show_measurement(self):
+        """Log the measurement result after the second click."""
+        text = self._get_measure_text()
+        if text:
+            self.log(f"Measurement: {text}")
+
+    def _calibrate_from_measurement(self):
+        """Use the current measurement to calculate pixel size from a known distance."""
+        label = self._get_active_label()
+        if not label or label.measure_pt1 is None or label.measure_pt2 is None:
+            QMessageBox.information(
+                self, "Calibrate",
+                "Draw a measurement line first: click 'Measure', then click two points on the scale bar."
+            )
+            return
+
+        pt1 = label.measure_pt1
+        pt2 = label.measure_pt2
+        dx = abs(pt2[1] - pt1[1])
+        dy = abs(pt2[0] - pt1[0])
+        dist_px = math.sqrt(dx * dx + dy * dy)
+
+        if dist_px < 1:
+            QMessageBox.warning(self, "Calibrate", "Measurement line is too short.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Calibrate Pixel Size")
+        dialog.setModal(True)
+        layout = QVBoxLayout()
+
+        layout.addWidget(QLabel(f"Measured distance: {dist_px:.1f} pixels  (dx={dx:.0f}, dy={dy:.0f})"))
+        layout.addSpacing(5)
+
+        known_input = QLineEdit()
+        known_input.setPlaceholderText("e.g. 100")
+        form = QFormLayout()
+        form.addRow("Known distance (μm):", known_input)
+        layout.addLayout(form)
+
+        layout.addSpacing(5)
+
+        result_label = QLabel("")
+        result_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(result_label)
+
+        def _update_preview():
+            try:
+                known_um = float(known_input.text())
+                if known_um <= 0:
+                    result_label.setText("")
+                    return
+                ps = known_um / dist_px
+                result_label.setText(f"Pixel size = {ps:.6f} μm/px")
+            except ValueError:
+                result_label.setText("")
+
+        known_input.textChanged.connect(_update_preview)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+        apply_btn = QPushButton("Apply")
+        apply_btn.setDefault(True)
+        apply_btn.setStyleSheet("QPushButton { font-weight: bold; }")
+        apply_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(apply_btn)
+        layout.addLayout(btn_layout)
+
+        dialog.setLayout(layout)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        try:
+            known_um = float(known_input.text())
+            if known_um <= 0:
+                return
+        except ValueError:
+            return
+
+        pixel_size = known_um / dist_px
+        ps_str = f"{pixel_size:.6f}"
+        self.pixel_size_input.setText(ps_str)
+        self.pixel_size = pixel_size
+        self.log(f"Pixel size calibrated: {ps_str} μm/px  (from {known_um} μm / {dist_px:.1f} px)")
 
     def update_timer_display(self):
         """Update the timer display during processing"""
