@@ -128,18 +128,13 @@ class BatchProcessingThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, denoise_enabled, denoise_size, sharpen_enabled,
-                    sharpen_amount, tophat_enabled, tophat_size) in enumerate(
+                    sharpen_amount) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
                     img = load_tiff_image(img_path)
                     img = ensure_grayscale(img)
                     img_dtype = img.dtype
-
-                    # Apply top-hat background removal FIRST (before rolling ball)
-                    if tophat_enabled:
-                        selem = morphology.disk(tophat_size)
-                        img = morphology.white_tophat(img, selem)
 
                     # Apply rolling ball background removal
                     background = restoration.rolling_ball(img, radius=radius)
@@ -255,18 +250,13 @@ class BackgroundRemovalThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, denoise_enabled, denoise_size, sharpen_enabled,
-                    sharpen_amount, tophat_enabled, tophat_size) in enumerate(
+                    sharpen_amount) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
                     img = load_tiff_image(img_path)
                     img = ensure_grayscale(img)
                     img_dtype = img.dtype
-
-                    # Apply top-hat background removal FIRST (before rolling ball)
-                    if tophat_enabled:
-                        selem = morphology.disk(tophat_size)
-                        img = morphology.white_tophat(img, selem)
 
                     # Apply rolling ball background removal
                     background = restoration.rolling_ball(img, radius=radius)
@@ -642,32 +632,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
         form_layout.addRow("Pixel size (μm/px):", self.pixel_size_input)
         param_layout.addLayout(form_layout)
 
-        # Measure + Calibrate buttons (draw a line on the scale bar to set pixel size)
-        calib_layout = QHBoxLayout()
-        self.measure_btn = QPushButton("Measure")
-        self.measure_btn.setCheckable(True)
-        self.measure_btn.setToolTip("Click two points on the image to measure distance in pixels")
-        self.measure_btn.clicked.connect(self.toggle_measure_mode)
-        calib_layout.addWidget(self.measure_btn)
-        self.calibrate_btn = QPushButton("Calibrate")
-        self.calibrate_btn.setToolTip("Calculate pixel size from a measured known distance (draw a line on the scale bar first)")
-        self.calibrate_btn.clicked.connect(self._calibrate_from_measurement)
-        calib_layout.addWidget(self.calibrate_btn)
-        param_layout.addLayout(calib_layout)
+        # Calibrate button: click, then click two points on a scale bar to set pixel size
+        self.calibrate_btn = QPushButton("Calibrate from scale bar")
+        self.calibrate_btn.setToolTip("Click, then click two points on a scale bar of known length to set pixel size")
+        self.calibrate_btn.clicked.connect(self.start_calibration)
+        param_layout.addWidget(self.calibrate_btn)
 
         self.use_imagej = False
 
         rb_layout = QHBoxLayout()
-        # Top-hat background removal controls (will be added to Additional Processing section)
-        self.tophat_check = QCheckBox("Apply Top-Hat Background Removal (applied FIRST)")
-        self.tophat_check.setChecked(False)
-        self.tophat_check.setToolTip("Morphological top-hat transform to remove background before rolling ball")
-
-        # Top-hat size spinbox (disk radius for structuring element)
-        self.tophat_spinbox = QSpinBox()
-        self.tophat_spinbox.setRange(1, 50)
-        self.tophat_spinbox.setValue(15)  # Default size
-
         rb_layout.addWidget(QLabel("Rolling ball radius:"))
         self.rb_slider = QSlider(Qt.Horizontal)
         self.rb_slider.setRange(5, 150)
@@ -720,18 +693,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.sharpen_slider.valueChanged.connect(lambda v: self.sharpen_label.setText(f"{v / 10:.1f}"))
         sharpen_layout.addWidget(self.sharpen_label)
         extra_layout.addLayout(sharpen_layout)
-
-        extra_layout.addSpacing(8)
-
-        # Top-hat background removal (applied BEFORE rolling ball)
-        extra_layout.addWidget(self.tophat_check)
-
-        tophat_layout = QHBoxLayout()
-        tophat_layout.addWidget(QLabel("  Disk radius:"))
-        tophat_layout.addWidget(self.tophat_spinbox)
-        tophat_layout.addWidget(QLabel("(structuring element size)"))
-        tophat_layout.addStretch()
-        extra_layout.addLayout(tophat_layout)
 
         extra_processing_group.setLayout(extra_layout)
         param_layout.addWidget(extra_processing_group)
@@ -896,19 +857,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
             return labels[idx]
         return self.processed_label
 
-    def toggle_measure_mode(self):
-        """Toggle the measurement tool on/off across all image tabs."""
-        active = self.measure_btn.isChecked()
+    def _set_measure_mode(self, active):
+        """Enable or disable measurement mode on every image tab and clear stale points."""
         for label in (self.original_label, self.preview_label, self.processed_label, self.mask_label):
             label.measure_mode = active
-            if not active:
-                label.measure_pt1 = None
-                label.measure_pt2 = None
+            label.measure_pt1 = None
+            label.measure_pt2 = None
             label.repaint()
-        if active:
-            self.log("Measure tool ON - click two points to measure distance")
-        else:
-            self.log("Measure tool OFF")
+
+    def start_calibration(self):
+        """Begin pixel-size calibration: arm measure mode and wait for two clicks."""
+        self._calibration_pending = True
+        self._set_measure_mode(True)
+        self.log("Calibrate: click two points along a scale bar of known length.")
 
     def _get_measure_text(self):
         """Get formatted measurement text for the on-image overlay."""
@@ -928,10 +889,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         return f"{dist_um:.2f} um ({dist_px:.0f} px)"
 
     def _show_measurement(self):
-        """Log the measurement result after the second click."""
+        """After the second click, log the measurement and run the calibration dialog."""
         text = self._get_measure_text()
         if text:
             self.log(f"Measurement: {text}")
+        if getattr(self, '_calibration_pending', False):
+            self._calibration_pending = False
+            self._calibrate_from_measurement()
+            self._set_measure_mode(False)
 
     def _calibrate_from_measurement(self):
         """Use the current measurement to calculate pixel size from a known distance."""
@@ -1395,13 +1360,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         raw_img = load_tiff_image(img_data['raw_path'])
         raw_img = ensure_grayscale(raw_img)
 
-        # Apply top-hat background removal FIRST (before rolling ball)
-        if self.tophat_check.isChecked():
-            tophat_size = self.tophat_spinbox.value()
-            selem = morphology.disk(tophat_size)
-            raw_img = morphology.white_tophat(raw_img, selem)
-
-        # Now apply rolling ball background removal
+        # Apply rolling ball background removal
         background = restoration.rolling_ball(raw_img, radius=radius)
         result = raw_img - background
         result = np.clip(result, 0, raw_img.max())
@@ -1426,10 +1385,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
         self.preview_label.set_image(pixmap)
         self.tabs.setCurrentIndex(1)
-        steps = []
-        if self.tophat_check.isChecked():
-            steps.append(f"TopHat(r={self.tophat_spinbox.value()})")
-        steps.append(f"RB={radius}")
+        steps = [f"RB={radius}"]
         if self.denoise_check.isChecked():
             steps.append(f"Denoise={self.denoise_spin.value()}")
         if self.sharpen_check.isChecked():
@@ -1450,14 +1406,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         denoise_size = self.denoise_spin.value()
         sharpen_enabled = self.sharpen_check.isChecked()
         sharpen_amount = self.sharpen_slider.value() / 10.0
-        tophat_enabled = self.tophat_check.isChecked()
-        tophat_size = self.tophat_spinbox.value()
 
         process_list = []
         for img_name, img_data in selected_images:
             process_list.append((img_data['raw_path'], img_name, radius,
-                                 denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount,
-                                 tophat_enabled, tophat_size))
+                                 denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount))
 
         self.thread = BackgroundRemovalThread(process_list, self.output_dir)
         self.thread.status_update.connect(self.log)
