@@ -441,13 +441,19 @@ class InteractiveImageLabel(QLabel):
         return x, y
 
     def _to_image_coords(self, display_x, display_y):
-        if not self.parent_widget or not hasattr(self.parent_widget, 'get_current_processed_image'):
+        # Prefer the parent's processed image (used by soma/polygon flows that
+        # operate on actual pixel data); fall back to the loaded pixmap so
+        # calibration / measurement also works on the Original tab before any
+        # processing has been done.
+        img_h = img_w = None
+        if self.parent_widget and hasattr(self.parent_widget, 'get_current_processed_image'):
+            current_img = self.parent_widget.get_current_processed_image()
+            if current_img is not None:
+                img_h, img_w = current_img.shape[:2]
+        if img_h is None and self.pix_source is not None:
+            img_h, img_w = self.pix_source.height(), self.pix_source.width()
+        if img_h is None:
             return None
-        current_img = self.parent_widget.get_current_processed_image()
-        if current_img is None:
-            return None
-        img_shape = current_img.shape
-        img_h, img_w = img_shape[:2]
         label_w, label_h = self.size().width(), self.size().height()
         current_pixmap = self.pixmap()
         if current_pixmap:
