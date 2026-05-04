@@ -46,6 +46,21 @@ def ensure_grayscale(img):
     return img
 
 
+def extract_channel(img, channel_idx):
+    """Extract a single channel from a color image and rescale to uint8."""
+    if img is None:
+        return None
+    if img.ndim == 3 and img.shape[2] > channel_idx:
+        channel = img[:, :, channel_idx].astype(np.float32)
+        c_min, c_max = channel.min(), channel.max()
+        if c_max > c_min:
+            channel = (channel - c_min) / (c_max - c_min) * 255
+        return channel.astype(np.uint8)
+    if img.ndim == 2:
+        return img
+    return ensure_grayscale(img)
+
+
 
 
 class MorphologyCalculator:
@@ -517,6 +532,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Initialize display adjustment values
         self.brightness_value = 0
         self.contrast_value = 0
+        # RGB color view (toggled with C). Channels are mapped:
+        #   index 0 -> R, 1 -> G, 2 -> B
+        # grayscale_channel is the source channel that gets cleaned/processed.
+        # IBA1 typically lives on green (1); DAPI on blue (2).
+        self.show_color_view = False
+        self.display_channels = {0: True, 1: True, 2: True}
+        self.channel_brightness = {'R': 0, 'G': 0, 'B': 0}
+        self.grayscale_channel = 1
         # Mask generation settings (defaults)
         self.use_min_intensity = True
         self.min_intensity_percent = 30
@@ -525,6 +548,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def keyPressEvent(self, event):
         key = event.key()
+
+        # C toggles RGB color view on Original / Processed tabs
+        if key == Qt.Key_C:
+            self.toggle_color_view()
+            return
 
         # Handle polygon outlining mode shortcuts
         if self.processed_label.polygon_mode:
@@ -784,9 +812,21 @@ class MicrogliaAnalysisGUI(QMainWindow):
         layout.addWidget(self.tabs, stretch=1)
 
         # Display adjustments button (no stretch)
+        display_btn_row = QHBoxLayout()
         display_adjust_btn = QPushButton("Display Adjustments")
         display_adjust_btn.clicked.connect(self.open_display_adjustments)
-        layout.addWidget(display_adjust_btn, stretch=0)
+        display_btn_row.addWidget(display_adjust_btn)
+        # Color view toggle (also bound to C). Channels button only shows when color is on.
+        self.color_toggle_btn = QPushButton("Show Color (C)")
+        self.color_toggle_btn.setToolTip("Toggle RGB color view (DAPI / IBA1 colocalization)")
+        self.color_toggle_btn.clicked.connect(self.toggle_color_view)
+        display_btn_row.addWidget(self.color_toggle_btn)
+        self.channel_select_btn = QPushButton("Channels...")
+        self.channel_select_btn.setToolTip("Choose which RGB channels to display and which to clean")
+        self.channel_select_btn.clicked.connect(self.open_channel_selector)
+        self.channel_select_btn.setVisible(False)
+        display_btn_row.addWidget(self.channel_select_btn)
+        layout.addLayout(display_btn_row, stretch=0)
 
         # Progress bar with timer
         progress_container = QHBoxLayout()
@@ -1128,9 +1168,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 if current_tab == 0:  # Original
                     if 'raw_path' in img_data:
                         raw_img = load_tiff_image(img_data['raw_path'])
-                        raw_img = ensure_grayscale(raw_img)
-                        adjusted = self._apply_display_adjustments(raw_img)
-                        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                        if self.show_color_view and raw_img is not None and raw_img.ndim == 3:
+                            adjusted = self._apply_display_adjustments_color(raw_img)
+                            pixmap = self._array_to_pixmap_color(adjusted)
+                        else:
+                            raw_img = ensure_grayscale(raw_img)
+                            adjusted = self._apply_display_adjustments(raw_img)
+                            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         self.original_label.set_image(pixmap)
                 elif current_tab == 1:  # Preview
                     if 'preview' in img_data and img_data['preview'] is not None:
@@ -1139,8 +1183,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         self.preview_label.set_image(pixmap)
                 elif current_tab == 2:  # Processed
                     if img_data['processed'] is not None:
-                        adjusted = self._apply_display_adjustments(img_data['processed'])
-                        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                        if self.show_color_view:
+                            composite = self._build_processed_color_composite(img_data)
+                            if composite is not None:
+                                adjusted = self._apply_display_adjustments_color(composite)
+                                pixmap = self._array_to_pixmap_color(adjusted)
+                            else:
+                                adjusted = self._apply_display_adjustments(img_data['processed'])
+                                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                        else:
+                            adjusted = self._apply_display_adjustments(img_data['processed'])
+                            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         # Preserve soma markers if in soma picking mode
                         if self.soma_mode:
                             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
@@ -1159,6 +1212,172 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.log(f"ERROR updating display: {str(e)}")
             import traceback
             traceback.print_exc()
+
+    # ========================================================================
+    # RGB COLOR VIEW (hotkey C)
+    # ========================================================================
+    def toggle_color_view(self):
+        """Flip between grayscale and RGB color display on Original / Processed tabs."""
+        self.show_color_view = not self.show_color_view
+        if hasattr(self, 'color_toggle_btn'):
+            self.color_toggle_btn.setText(
+                "Show Grayscale (C)" if self.show_color_view else "Show Color (C)"
+            )
+        if hasattr(self, 'channel_select_btn'):
+            self.channel_select_btn.setVisible(self.show_color_view)
+        self.log(f"Color view: {'ON' if self.show_color_view else 'OFF'}")
+        self.update_display()
+
+    def open_channel_selector(self):
+        """Dialog to enable/disable Red, Green, Blue channels and pick the
+        processing/grayscale channel."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Channel Display")
+        dialog.setModal(True)
+        layout = QVBoxLayout()
+
+        layout.addWidget(QLabel("Show channels:"))
+        ch_checks = {}
+        for idx, name in enumerate(("Red", "Green", "Blue")):
+            cb = QCheckBox(name)
+            cb.setChecked(self.display_channels.get(idx, True))
+            layout.addWidget(cb)
+            ch_checks[idx] = cb
+
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("Process / clean from channel (default: green = IBA1):"))
+        from PyQt5.QtWidgets import QComboBox
+        proc_combo = QComboBox()
+        proc_combo.addItems(["Red (Ch1)", "Green (Ch2)", "Blue (Ch3)"])
+        proc_combo.setCurrentIndex(self.grayscale_channel)
+        layout.addWidget(proc_combo)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+        apply_btn = QPushButton("Apply")
+        apply_btn.setDefault(True)
+        apply_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(apply_btn)
+        layout.addLayout(btn_layout)
+
+        dialog.setLayout(layout)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        for idx, cb in ch_checks.items():
+            self.display_channels[idx] = cb.isChecked()
+        self.grayscale_channel = proc_combo.currentIndex()
+        self.update_display()
+
+    def _load_color_for_display(self, img_data):
+        """Return the original RGB array (HxWx3+) for the current image, or
+        None if the file is not a color image."""
+        if 'raw_path' not in img_data:
+            return None
+        try:
+            raw = load_tiff_image(img_data['raw_path'])
+        except Exception:
+            return None
+        if raw is None or raw.ndim != 3:
+            return None
+        if raw.shape[2] == 4:
+            raw = raw[:, :, :3]
+        return raw
+
+    def _build_processed_color_composite(self, img_data):
+        """Replace the grayscale_channel slice of the original RGB with the
+        processed grayscale image. Used on the Processed tab in color view."""
+        color_img = self._load_color_for_display(img_data)
+        if color_img is None:
+            return None
+        processed = img_data.get('processed')
+        if processed is None:
+            return color_img
+        h, w = color_img.shape[:2]
+        c = min(color_img.shape[2], 3)
+        composite = np.zeros((h, w, 3), dtype=np.float32)
+        for i in range(c):
+            if i == self.grayscale_channel:
+                composite[:, :, i] = processed.astype(np.float32)
+            else:
+                composite[:, :, i] = color_img[:, :, i].astype(np.float32)
+        return composite
+
+    def _apply_display_adjustments_color(self, img):
+        """Per-channel brightness + global contrast/brightness for color images."""
+        if img is None:
+            return None
+
+        adjusted = img.astype(np.float32).copy()
+
+        if adjusted.ndim == 2:
+            adjusted = np.stack([adjusted, adjusted, adjusted], axis=-1)
+        elif adjusted.ndim == 3:
+            if adjusted.shape[2] == 4:
+                adjusted = adjusted[:, :, :3]
+            elif adjusted.shape[2] < 3:
+                h, w, c = adjusted.shape
+                rgb = np.zeros((h, w, 3), dtype=np.float32)
+                for i in range(c):
+                    rgb[:, :, i] = adjusted[:, :, i]
+                adjusted = rgb
+
+        for i in range(3):
+            channel = adjusted[:, :, i]
+            c_min, c_max = channel.min(), channel.max()
+            if c_max > c_min:
+                adjusted[:, :, i] = (channel - c_min) / (c_max - c_min) * 255.0
+
+        for i, key in enumerate(('R', 'G', 'B')):
+            b = self.channel_brightness.get(key, 0)
+            if b:
+                adjusted[:, :, i] = adjusted[:, :, i] + (b * 1.5)
+
+        if self.brightness_value != 0:
+            adjusted = adjusted + (self.brightness_value * 1.5)
+
+        if self.contrast_value != 0:
+            if self.contrast_value > 0:
+                factor = 1.0 + (self.contrast_value / 100.0) * 2.0
+            else:
+                factor = 1.0 + (self.contrast_value / 100.0) * 0.9
+            midpoint = 127.5
+            adjusted = (adjusted - midpoint) * factor + midpoint
+
+        adjusted = np.clip(adjusted, 0, 255)
+        return adjusted.astype(np.uint8)
+
+    def _array_to_pixmap_color(self, arr):
+        """Convert an RGB numpy array to QPixmap, masking disabled channels."""
+        if arr is None:
+            return self._create_blank_pixmap()
+
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        elif arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[:, :, :3]
+        elif arr.ndim == 3 and arr.shape[2] < 3:
+            h, w, c = arr.shape
+            rgb = np.zeros((h, w, 3), dtype=arr.dtype)
+            for i in range(c):
+                rgb[:, :, i] = arr[:, :, i]
+            arr = rgb
+
+        arr_display = arr.copy()
+        for i in range(min(3, arr_display.shape[2])):
+            if not self.display_channels.get(i, True):
+                arr_display[:, :, i] = 0
+
+        arr8 = arr_display.clip(0, 255).astype(np.uint8)
+        arr8 = np.ascontiguousarray(arr8)
+        h, w, _ = arr8.shape
+        bytes_per_line = 3 * w
+        img = QImage(arr8.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        img = img.copy()
+        return QPixmap.fromImage(img)
 
     def _apply_display_adjustments(self, img):
         """Apply brightness and contrast adjustments for display only (does not modify original data)"""
@@ -1313,15 +1532,28 @@ class MicrogliaAnalysisGUI(QMainWindow):
         try:
             img_data = self.images[self.current_image_name]
             raw_img = load_tiff_image(img_data['raw_path'])
-            raw_img = ensure_grayscale(raw_img)
-            # Apply display adjustments
-            adjusted_raw = self._apply_display_adjustments(raw_img)
-            pixmap = self._array_to_pixmap(adjusted_raw, skip_rescale=True)
+            # Original tab
+            if self.show_color_view and raw_img is not None and raw_img.ndim == 3:
+                adjusted_raw = self._apply_display_adjustments_color(raw_img)
+                pixmap = self._array_to_pixmap_color(adjusted_raw)
+            else:
+                gray = ensure_grayscale(raw_img)
+                adjusted_raw = self._apply_display_adjustments(gray)
+                pixmap = self._array_to_pixmap(adjusted_raw, skip_rescale=True)
             self.original_label.set_image(pixmap)
+            # Processed tab
             if img_data['processed'] is not None:
-                # Apply display adjustments to processed image too
-                adjusted_proc = self._apply_display_adjustments(img_data['processed'])
-                pixmap_proc = self._array_to_pixmap(adjusted_proc, skip_rescale=True)
+                if self.show_color_view:
+                    composite = self._build_processed_color_composite(img_data)
+                    if composite is not None:
+                        adjusted_proc = self._apply_display_adjustments_color(composite)
+                        pixmap_proc = self._array_to_pixmap_color(adjusted_proc)
+                    else:
+                        adjusted_proc = self._apply_display_adjustments(img_data['processed'])
+                        pixmap_proc = self._array_to_pixmap(adjusted_proc, skip_rescale=True)
+                else:
+                    adjusted_proc = self._apply_display_adjustments(img_data['processed'])
+                    pixmap_proc = self._array_to_pixmap(adjusted_proc, skip_rescale=True)
                 self.processed_label.set_image(pixmap_proc, centroids=img_data['somas'])
             else:
                 self.processed_label.set_image(self._create_blank_pixmap())
