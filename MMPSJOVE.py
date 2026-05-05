@@ -528,6 +528,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.all_masks_flat = []
         self.mask_qa_idx = 0
         self.mask_qa_active = False
+        # History of recent QA decisions for the B-key undo (mirrors MMPSv2.12)
+        self.last_qa_decisions = []
         self.soma_mode = False  # Initialize soma_mode to prevent crashes
         # Initialize display adjustment values
         self.brightness_value = 0
@@ -548,6 +550,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self._color_shortcut = QShortcut(QKeySequence("C"), self)
         self._color_shortcut.setContext(Qt.ApplicationShortcut)
         self._color_shortcut.activated.connect(self.toggle_color_view)
+        # B undoes the most recent mask-QA decision (jumps back to that mask)
+        self._undo_qa_shortcut = QShortcut(QKeySequence("B"), self)
+        self._undo_qa_shortcut.setContext(Qt.ApplicationShortcut)
+        self._undo_qa_shortcut.activated.connect(self.undo_last_qa)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -2557,6 +2563,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Auto-approve ALL smaller masks from the SAME soma in the SAME image
         auto_approved = []
+        cascaded_indices = []  # for the QA-undo log
         for i, other_flat in enumerate(self.all_masks_flat):
             other_mask = other_flat['mask_data']
             other_img = other_flat['image_name']
@@ -2568,8 +2575,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
                     other_mask['approved'] is None):
                 other_mask['approved'] = True
                 auto_approved.append((i + 1, other_mask['area_um2']))
+                cascaded_indices.append(i)
                 # Export auto-approved masks too
                 self._export_approved_mask(other_flat)
+
+        # Record this decision so the B-key undo can roll it back
+        self.last_qa_decisions.append({
+            'idx': self.mask_qa_idx,
+            'was_approved': True,
+            'cascaded': cascaded_indices,
+        })
 
         if auto_approved:
             self.log(f"   ⚡ Auto-approved {len(auto_approved)} smaller masks for {current_soma_id}:")
@@ -2718,6 +2733,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.log(f"✗ Rejected: {mask_data['soma_id']} ({mask_data['area_um2']} µm²)")
 
+        # Record this decision so the B-key undo can roll it back
+        self.last_qa_decisions.append({
+            'idx': self.mask_qa_idx,
+            'was_approved': False,
+            'cascaded': [],
+        })
+
         if self.mask_qa_idx < len(self.all_masks_flat) - 1:
             self.mask_qa_idx += 1
             self._show_current_mask()
@@ -2730,6 +2752,75 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if self.mask_qa_idx < len(self.all_masks_flat) - 1:
             self.mask_qa_idx += 1
             self._show_current_mask()
+
+    def _mask_export_path(self, flat_data):
+        """Deterministic on-disk path used by _export_approved_mask."""
+        if not self.masks_dir:
+            return None
+        img_name = flat_data['image_name']
+        mask_data = flat_data['mask_data']
+        img_basename = os.path.splitext(img_name)[0]
+        soma_id = mask_data['soma_id']
+        area_um2 = mask_data.get('area_um2', 0)
+        return os.path.join(
+            self.masks_dir,
+            f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+        )
+
+    def undo_last_qa(self):
+        """Undo the most recent mask-QA decision (B hotkey).
+        Reverts approve/reject in memory, deletes any exported mask files
+        produced by the cascade, jumps mask_qa_idx back to that mask, and
+        re-arms the QA UI if it had completed."""
+        if not self.last_qa_decisions:
+            self.log("⚠️ No QA decisions to undo")
+            return
+
+        decision = self.last_qa_decisions.pop()
+        idx = decision['idx']
+        if idx >= len(self.all_masks_flat):
+            return
+
+        flat_data = self.all_masks_flat[idx]
+        mask_data = flat_data['mask_data']
+        was_approved = decision['was_approved']
+
+        # Reset the original decision and any cascaded auto-approvals
+        affected = [idx] + list(decision.get('cascaded', []))
+        for i in affected:
+            if 0 <= i < len(self.all_masks_flat):
+                self.all_masks_flat[i]['mask_data']['approved'] = None
+
+        # If this approve cascade exported files, remove them so disk and memory
+        # stay in sync. Rejects don't write files, so nothing to delete.
+        if was_approved:
+            for i in affected:
+                p = self._mask_export_path(self.all_masks_flat[i])
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+
+        # Revert image status if QA had been marked complete
+        for img_name, img_data in self.images.items():
+            if img_data['status'] == 'qa_complete':
+                if any(flat['mask_data']['approved'] is None for flat in self.all_masks_flat
+                       if flat['image_name'] == img_name):
+                    img_data['status'] = 'masks_generated'
+                    self._update_file_list_item(img_name)
+
+        was = "approved" if was_approved else "rejected"
+        self.log(f"↩ Undid {was}: {mask_data['soma_id']} ({mask_data['area_um2']} µm²)")
+
+        # Re-arm QA mode and jump back to that mask
+        self.mask_qa_active = True
+        self.mask_qa_idx = idx
+        self.approve_mask_btn.setEnabled(True)
+        self.reject_mask_btn.setEnabled(True)
+        self._show_current_mask()
+        if hasattr(self, 'tabs'):
+            self.tabs.setCurrentIndex(3)
 
     def prev_mask(self):
         if not self.mask_qa_active:
