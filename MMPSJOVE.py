@@ -1085,6 +1085,39 @@ class MicrogliaAnalysisGUI(QMainWindow):
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
+        # Per-channel brightness (only takes effect when RGB color view is on)
+        channel_group = QGroupBox("Channel Brightness (RGB color view)")
+        channel_layout = QVBoxLayout()
+        channel_sliders = {}
+        for key, name, css in (('R', 'Red', 'red'), ('G', 'Green', 'green'), ('B', 'Blue', 'blue')):
+            row = QHBoxLayout()
+            lbl = QLabel(f"{name}:")
+            lbl.setStyleSheet(f"color: {css}; font-weight: bold;")
+            lbl.setFixedWidth(50)
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(-100, 100)
+            slider.setValue(self.channel_brightness.get(key, 0))
+            value_lbl = QLabel(str(self.channel_brightness.get(key, 0)))
+            value_lbl.setFixedWidth(40)
+            row.addWidget(lbl)
+            row.addWidget(slider)
+            row.addWidget(value_lbl)
+            channel_layout.addLayout(row)
+            channel_sliders[key] = (slider, value_lbl)
+        channel_group.setLayout(channel_layout)
+        layout.addWidget(channel_group)
+
+        def make_channel_updater(ch, value_lbl):
+            def updater(value):
+                value_lbl.setText(str(value))
+                self.channel_brightness[ch] = value
+                if self.show_color_view:
+                    self.update_display()
+            return updater
+
+        for key, (slider, value_lbl) in channel_sliders.items():
+            slider.valueChanged.connect(make_channel_updater(key, value_lbl))
+
         # Brightness slider
         brightness_group = QGroupBox("Brightness")
         brightness_layout = QVBoxLayout()
@@ -1137,6 +1170,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         def reset_values():
             brightness_slider.setValue(0)
             contrast_slider.setValue(0)
+            for slider, _ in channel_sliders.values():
+                slider.setValue(0)
 
         reset_btn.clicked.connect(reset_values)
 
@@ -1151,9 +1186,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         dialog.exec_()
 
     def reset_display_adjustments(self):
-        """Reset brightness and contrast to default"""
+        """Reset brightness, contrast, and per-channel brightness to defaults"""
         self.brightness_value = 0
         self.contrast_value = 0
+        self.channel_brightness = {'R': 0, 'G': 0, 'B': 0}
         self.update_display()
 
     def update_display(self):
