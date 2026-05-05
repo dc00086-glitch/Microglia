@@ -579,6 +579,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 # Done picking somas for current image
                 self.done_with_current()
                 return
+            elif key == Qt.Key_Backspace:
+                # Remove the most recently added soma on the current image
+                self.undo_last_soma()
+                return
             elif key == Qt.Key_Escape:
                 # Cancel soma picking
                 if self.batch_mode and self.soma_picking_queue:
@@ -1840,6 +1844,23 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.processed_label.set_image(pixmap, centroids=img_data['somas'])
         self.log(f"✓ {self.current_image_name}: Soma {len(img_data['somas'])} added | ID: {soma_id}")
         self._load_image_for_soma_picking()
+
+    def undo_last_soma(self):
+        """Remove the most recently added soma from the current image (Backspace)."""
+        if not self.current_image_name:
+            return
+        img_data = self.images[self.current_image_name]
+        if not img_data.get('somas'):
+            self.log("⚠️ No somas to undo on this image")
+            return
+        coords = img_data['somas'].pop()
+        soma_id = img_data['soma_ids'].pop() if img_data.get('soma_ids') else None
+        pixmap = self._array_to_pixmap(img_data['processed'])
+        self.processed_label.set_image(pixmap, centroids=img_data['somas'])
+        if soma_id:
+            self.log(f"↩ Removed soma {soma_id} ({len(img_data['somas'])} remaining)")
+        else:
+            self.log(f"↩ Removed last soma ({len(img_data['somas'])} remaining)")
 
     def done_with_current(self):
         if not self.current_image_name:
