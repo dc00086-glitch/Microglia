@@ -744,12 +744,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_outline_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_outline_btn)
         
-        # Add Undo Last Outline button (pops the last completed soma outline)
-        self.redo_outline_btn = QPushButton("↩ Undo Last Outline")
+        # Add Redo Last Outline button
+        self.redo_outline_btn = QPushButton("↩ Redo Last Outline")
         self.redo_outline_btn.clicked.connect(self.redo_last_outline)
         self.redo_outline_btn.setEnabled(False)
         self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
-        self.redo_outline_btn.setToolTip("Delete the most recently completed soma outline and redraw it")
         batch_layout.addWidget(self.redo_outline_btn)
 
         # Undo Last Point button (active while outlining; equivalent to Backspace / Z)
@@ -2025,40 +2024,40 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self._load_soma_for_outlining(queue_idx + 1)
 
     def redo_last_outline(self):
-        """Undo the most recently completed soma outline so it can be redrawn."""
+        """Delete the last completed outline and go back to redo it"""
         # Find the last outline across all images
         last_outline_img = None
         last_outline_data = None
-
+        
         for img_name, img_data in self.images.items():
             if img_data['soma_outlines']:
                 last_outline_img = img_name
                 last_outline_data = img_data['soma_outlines'][-1]
-
+        
         if not last_outline_data:
-            QMessageBox.warning(self, "Warning", "No outlines to undo")
+            QMessageBox.warning(self, "Warning", "No outlines to redo")
             return
-
+        
         reply = QMessageBox.question(
-            self, 'Undo Last Outline',
-            f"Delete outline for {last_outline_data['soma_id']} and redraw it?",
+            self, 'Redo Last Outline',
+            f"Delete outline for {last_outline_data['soma_id']} and redo it?",
             QMessageBox.Yes | QMessageBox.No
         )
-
+        
         if reply == QMessageBox.No:
             return
-
+        
         # Remove the last outline
         self.images[last_outline_img]['soma_outlines'].pop()
-
+        
         # Delete the exported soma file if it exists
         if self.masks_dir:
             soma_id = last_outline_data['soma_id']
             soma_file = os.path.join(self.masks_dir, f"{os.path.splitext(last_outline_img)[0]}_{soma_id}_soma.tif")
             if os.path.exists(soma_file):
                 os.remove(soma_file)
-
-        self.log(f"↩ Deleted outline for {last_outline_data['soma_id']} - redraw it")
+        
+        self.log(f"↩ Deleted outline for {last_outline_data['soma_id']} - ready to redo")
         
         # Go back to that soma for re-outlining
         queue_idx = len([data for img_data in self.images.values() for data in img_data['soma_outlines']])
