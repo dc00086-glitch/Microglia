@@ -535,7 +535,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # RGB color view (toggled with C). Channels are mapped:
         #   index 0 -> R, 1 -> G, 2 -> B
         # grayscale_channel is the source channel that gets cleaned/processed.
-        # IBA1 typically lives on green (1); DAPI on blue (2).
         self.show_color_view = False
         self.display_channels = {0: True, 1: True, 2: True}
         self.channel_brightness = {'R': 0, 'G': 0, 'B': 0}
@@ -818,7 +817,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         display_btn_row.addWidget(display_adjust_btn)
         # Color view toggle (also bound to C). Channels button only shows when color is on.
         self.color_toggle_btn = QPushButton("Show Color (C)")
-        self.color_toggle_btn.setToolTip("Toggle RGB color view (DAPI / IBA1 colocalization)")
+        self.color_toggle_btn.setToolTip("Toggle RGB color view")
         self.color_toggle_btn.clicked.connect(self.toggle_color_view)
         display_btn_row.addWidget(self.color_toggle_btn)
         self.channel_select_btn = QPushButton("Channels...")
@@ -1281,7 +1280,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             ch_checks[idx] = cb
 
         layout.addSpacing(8)
-        layout.addWidget(QLabel("Process / clean from channel (default: green = IBA1):"))
+        layout.addWidget(QLabel("Process / clean from channel:"))
         from PyQt5.QtWidgets import QComboBox
         proc_combo = QComboBox()
         proc_combo.addItems(["Red (Ch1)", "Green (Ch2)", "Blue (Ch3)"])
