@@ -121,7 +121,7 @@ class MorphologyCalculator:
             if soma_area_um2 is not None:
                 params['soma_area'] = soma_area_um2
             else:
-                params['soma_area'] = props.area * 0.1 * (self.pixel_size ** 2)
+                params['soma_area'] = np.nan
         else:
             params = {k: 0 for k in ['perimeter', 'mask_area', 'eccentricity',
                                      'roundness', 'average_centroid_distance', 'soma_area']}
