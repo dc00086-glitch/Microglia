@@ -1246,8 +1246,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         self.original_label.set_image(pixmap)
                 elif current_tab == 1:  # Preview
                     if 'preview' in img_data and img_data['preview'] is not None:
-                        adjusted = self._apply_display_adjustments(img_data['preview'])
-                        pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                        if self.show_color_view:
+                            composite = self._color_composite_for_channel(img_data, img_data['preview'])
+                            if composite is not None:
+                                adjusted = self._apply_display_adjustments_color(composite)
+                                pixmap = self._array_to_pixmap_color(adjusted)
+                            else:
+                                adjusted = self._apply_display_adjustments(img_data['preview'])
+                                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+                        else:
+                            adjusted = self._apply_display_adjustments(img_data['preview'])
+                            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         self.preview_label.set_image(pixmap)
                 elif current_tab == 2:  # Processed
                     if img_data['processed'] is not None:
@@ -1285,8 +1294,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
     # RGB COLOR VIEW (hotkey C)
     # ========================================================================
     def toggle_color_view(self):
-        """Flip between grayscale and RGB color display on Original / Processed tabs.
-        Re-renders both tabs so whichever the user switches to is current."""
+        """Flip between grayscale and RGB color display.
+        Refreshes Original, Preview, Processed, and (if QA is active) Masks
+        so whichever tab the user switches to is already correct."""
         self.show_color_view = not self.show_color_view
         if hasattr(self, 'color_toggle_btn'):
             self.color_toggle_btn.setText(
@@ -1295,10 +1305,49 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if hasattr(self, 'channel_select_btn'):
             self.channel_select_btn.setVisible(self.show_color_view)
         self.log(f"Color view: {'ON' if self.show_color_view else 'OFF'}")
-        # Refresh Original AND Processed up front so both tabs are correct
-        self._display_current_image()
-        # Also refresh whatever tab is currently visible (covers Preview, Masks)
-        self.update_display()
+        self._refresh_all_tabs()
+
+    def _refresh_all_tabs(self):
+        """Re-render every image tab so they all reflect the current
+        show_color_view / channel settings."""
+        try:
+            self._display_current_image()       # Original + Processed
+        except Exception as e:
+            self.log(f"ERROR refreshing original/processed: {e}")
+        try:
+            self._refresh_preview_label()       # Preview
+        except Exception as e:
+            self.log(f"ERROR refreshing preview: {e}")
+        if self.mask_qa_active:
+            try:
+                self._show_current_mask()       # Masks (during QA)
+            except Exception as e:
+                self.log(f"ERROR refreshing mask: {e}")
+        try:
+            self.update_display()               # currently visible tab
+        except Exception:
+            pass
+
+    def _refresh_preview_label(self):
+        """Re-render the Preview tab using the cached preview array."""
+        if not self.current_image_name or self.current_image_name not in self.images:
+            return
+        img_data = self.images[self.current_image_name]
+        preview = img_data.get('preview')
+        if preview is None:
+            return
+        if self.show_color_view:
+            composite = self._color_composite_for_channel(img_data, preview)
+            if composite is not None:
+                adjusted = self._apply_display_adjustments_color(composite)
+                pixmap = self._array_to_pixmap_color(adjusted)
+            else:
+                adjusted = self._apply_display_adjustments(preview)
+                pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+        else:
+            adjusted = self._apply_display_adjustments(preview)
+            pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
+        self.preview_label.set_image(pixmap)
 
     def open_channel_selector(self):
         """Dialog to enable/disable Red, Green, Blue channels and pick the
@@ -1359,24 +1408,29 @@ class MicrogliaAnalysisGUI(QMainWindow):
             raw = raw[:, :, :3]
         return raw
 
-    def _build_processed_color_composite(self, img_data):
-        """Replace the grayscale_channel slice of the original RGB with the
-        processed grayscale image. Used on the Processed tab in color view."""
+    def _color_composite_for_channel(self, img_data, channel_array):
+        """Return an RGB composite where the grayscale_channel slice is replaced
+        by channel_array (e.g. the processed/preview/mask-background image).
+        Returns the original RGB if channel_array is None, or None if the
+        source image isn't color."""
         color_img = self._load_color_for_display(img_data)
         if color_img is None:
             return None
-        processed = img_data.get('processed')
-        if processed is None:
+        if channel_array is None:
             return color_img
         h, w = color_img.shape[:2]
         c = min(color_img.shape[2], 3)
         composite = np.zeros((h, w, 3), dtype=np.float32)
         for i in range(c):
             if i == self.grayscale_channel:
-                composite[:, :, i] = processed.astype(np.float32)
+                composite[:, :, i] = channel_array.astype(np.float32)
             else:
                 composite[:, :, i] = color_img[:, :, i].astype(np.float32)
         return composite
+
+    def _build_processed_color_composite(self, img_data):
+        """Backwards-compatible shim: composite for the processed channel."""
+        return self._color_composite_for_channel(img_data, img_data.get('processed'))
 
     def _apply_display_adjustments_color(self, img):
         """Per-channel brightness + global contrast/brightness for color images."""
@@ -2588,7 +2642,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         processed_img = flat_data['processed_img']
         img_name = flat_data['image_name']
 
-        pixmap = self._array_to_pixmap(processed_img)
+        # Render background in color when color view is on (Masks tab)
+        if self.show_color_view and img_name in self.images:
+            composite = self._color_composite_for_channel(self.images[img_name], processed_img)
+            if composite is not None:
+                adjusted = self._apply_display_adjustments_color(composite)
+                pixmap = self._array_to_pixmap_color(adjusted)
+            else:
+                pixmap = self._array_to_pixmap(processed_img)
+        else:
+            pixmap = self._array_to_pixmap(processed_img)
         self.mask_label.set_image(pixmap, mask_overlay=mask_data['mask'])
 
         status = mask_data.get('approved')
