@@ -10,10 +10,10 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QListWidget, QSlider, QSpinBox,
     QGroupBox, QMessageBox, QTextEdit, QLineEdit, QFormLayout, QTabWidget,
     QProgressBar, QListWidgetItem, QDialog, QScrollArea, QTableWidget, QTableWidgetItem, QHeaderView,
-    QCheckBox
+    QCheckBox, QShortcut
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QKeySequence
 from PIL import Image
 import tifffile
 from skimage import restoration, color, measure
@@ -544,14 +544,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.min_intensity_percent = 30
         self.use_imagej = False
         self.init_ui()
+        # Application-wide shortcut so C toggles color view regardless of focus
+        self._color_shortcut = QShortcut(QKeySequence("C"), self)
+        self._color_shortcut.setContext(Qt.ApplicationShortcut)
+        self._color_shortcut.activated.connect(self.toggle_color_view)
 
     def keyPressEvent(self, event):
         key = event.key()
-
-        # C toggles RGB color view on Original / Processed tabs
-        if key == Qt.Key_C:
-            self.toggle_color_view()
-            return
 
         # Handle polygon outlining mode shortcuts
         if self.processed_label.polygon_mode:
@@ -1252,7 +1251,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
     # RGB COLOR VIEW (hotkey C)
     # ========================================================================
     def toggle_color_view(self):
-        """Flip between grayscale and RGB color display on Original / Processed tabs."""
+        """Flip between grayscale and RGB color display on Original / Processed tabs.
+        Re-renders both tabs so whichever the user switches to is current."""
         self.show_color_view = not self.show_color_view
         if hasattr(self, 'color_toggle_btn'):
             self.color_toggle_btn.setText(
@@ -1261,6 +1261,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if hasattr(self, 'channel_select_btn'):
             self.channel_select_btn.setVisible(self.show_color_view)
         self.log(f"Color view: {'ON' if self.show_color_view else 'OFF'}")
+        # Refresh Original AND Processed up front so both tabs are correct
+        self._display_current_image()
+        # Also refresh whatever tab is currently visible (covers Preview, Masks)
         self.update_display()
 
     def open_channel_selector(self):
