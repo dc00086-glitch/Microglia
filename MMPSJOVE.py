@@ -2350,9 +2350,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         reversed_area_list = sorted(area_list_um2, reverse=True)
 
         for i, target_area_um2 in enumerate(reversed_area_list):
-            if target_area_um2 == 200:
-                continue
-
             target_area_px = target_area_um2 / (pixel_size_um ** 2)
 
             # Calculate minimum intensity threshold if enabled
