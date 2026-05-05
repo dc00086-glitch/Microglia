@@ -750,6 +750,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.redo_outline_btn.setEnabled(False)
         self.redo_outline_btn.setStyleSheet("background-color: #FFE4B5;")
         batch_layout.addWidget(self.redo_outline_btn)
+
+        # Undo Last Point button (active while outlining; equivalent to Backspace / Z)
+        self.undo_point_btn = QPushButton("↩ Undo Last Point (Backspace)")
+        self.undo_point_btn.clicked.connect(self.undo_last_polygon_point)
+        self.undo_point_btn.setEnabled(False)
+        self.undo_point_btn.setStyleSheet("background-color: #FFE4B5;")
+        self.undo_point_btn.setToolTip("Remove the most recent point of the polygon currently being drawn")
+        batch_layout.addWidget(self.undo_point_btn)
         
         self.batch_generate_masks_btn = QPushButton("Generate All Masks")
         self.batch_generate_masks_btn.clicked.connect(self.batch_generate_masks)
@@ -1891,6 +1899,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.original_label.polygon_mode = False
         self.preview_label.polygon_mode = False
         self.mask_label.polygon_mode = False
+        self.undo_point_btn.setEnabled(True)
         self._load_soma_for_outlining(0)
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
@@ -2127,6 +2136,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.batch_mode = False
         self.processed_label.polygon_mode = False
         self.redo_outline_btn.setEnabled(False)  # Disable redo button when outlining complete
+        self.undo_point_btn.setEnabled(False)
         for img_name, img_data in self.images.items():
             if img_data['selected'] and len(img_data['soma_outlines']) == len(img_data['somas']):
                 img_data['status'] = 'outlined'
