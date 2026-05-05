@@ -554,6 +554,22 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self._undo_qa_shortcut = QShortcut(QKeySequence("B"), self)
         self._undo_qa_shortcut.setContext(Qt.ApplicationShortcut)
         self._undo_qa_shortcut.activated.connect(self.undo_last_qa)
+        # Mask-QA hotkeys: A/R/Space/Left/Right. App-wide context so they fire
+        # regardless of which widget has focus, but disabled outside QA so they
+        # don't steal keys from text inputs in normal use.
+        self._qa_shortcuts = []
+        for keyseq, slot in (
+            ("A", self.approve_current_mask),
+            ("R", self.reject_current_mask),
+            ("Space", self.approve_current_mask),
+            ("Left", self.prev_mask),
+            ("Right", self.next_mask),
+        ):
+            sc = QShortcut(QKeySequence(keyseq), self)
+            sc.setContext(Qt.ApplicationShortcut)
+            sc.setEnabled(False)
+            sc.activated.connect(slot)
+            self._qa_shortcuts.append(sc)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -2289,7 +2305,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
                     masks = self._create_annulus_masks(
                         centroid, area_list, pixel_size, soma_idx, soma_id,
-                        img_data['processed'], img_name, soma_area_um2  # Pass soma area
+                        img_data['processed'], img_name, soma_area_um2,
+                        soma_outline=soma_data.get('outline')
                     )
                     img_data['masks'].extend(masks)
 
@@ -2329,8 +2346,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed: {e}")
 
     def _create_annulus_masks(self, centroid, area_list_um2, pixel_size_um, soma_idx, soma_id, processed_img, img_name,
-                              soma_area_um2):
-        """Create cell masks with unique soma ID and constant soma area"""
+                              soma_area_um2, soma_outline=None):
+        """Create cell masks with unique soma ID and constant soma area.
+
+        The soma outline (and pixels inside it) is unioned into every mask, and
+        each mask is forced to be a strict superset of all smaller masks for
+        the same soma — so the 300 µm² mask contains every pixel of the 200 µm²
+        mask plus more, and so on up to 800.
+        """
         from skimage.filters import threshold_otsu
         from skimage.measure import label
         from scipy.ndimage import shift
@@ -2347,9 +2370,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
         roi = processed_img[y_min:y_max, x_min:x_max].copy()
         centroid_in_roi = (cy - y_min, cx - x_min)
 
-        reversed_area_list = sorted(area_list_um2, reverse=True)
+        # Pre-compute the soma outline as a binary uint8 of full image size.
+        soma_bin = None
+        if soma_outline is not None:
+            soma_bin = (np.asarray(soma_outline) > 0).astype(np.uint8)
+            if soma_bin.shape != processed_img.shape:
+                soma_bin = None  # shape mismatch → ignore rather than crash
 
-        for i, target_area_um2 in enumerate(reversed_area_list):
+        # Iterate smallest → largest so each mask can be unioned with the
+        # previous (smaller) one to enforce the subset invariant.
+        ordered_area_list = sorted(area_list_um2)
+        prev_full_mask = None
+
+        for i, target_area_um2 in enumerate(ordered_area_list):
             target_area_px = target_area_um2 / (pixel_size_um ** 2)
 
             # Calculate minimum intensity threshold if enabled
@@ -2413,14 +2446,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
             full_mask = np.zeros(processed_img.shape, dtype=np.uint8)
             full_mask[y_min:y_max, x_min:x_max] = mask
 
-            # Mask saving now happens during QA approval (see _export_approved_mask)
-            # This avoids saving masks that will be rejected
-            # if self.masks_dir and np.any(full_mask):
-            #     image_name_base = os.path.splitext(img_name)[0]
-            #     mask_filename = f"{image_name_base}_{soma_id}_area{int(target_area_um2)}.tif"
-            #     mask_path = os.path.join(self.masks_dir, mask_filename)
-            #     tifffile.imwrite(mask_path, full_mask)
+            # 1) Always include the user-traced soma outline (and its interior).
+            if soma_bin is not None:
+                full_mask = np.maximum(full_mask, soma_bin)
 
+            # 2) Enforce the subset invariant: every larger mask contains every
+            #    pixel of the previous smaller mask, plus more.
+            if prev_full_mask is not None:
+                full_mask = np.maximum(full_mask, prev_full_mask)
+
+            prev_full_mask = full_mask
+
+            # Mask saving now happens during QA approval (see _export_approved_mask)
             masks.append({
                 'image_name': img_name,
                 'soma_idx': soma_idx,
@@ -2525,6 +2562,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.mask_qa_active = True
         self.mask_qa_idx = 0
+        self._set_qa_shortcuts(True)
 
         self.approve_mask_btn.setEnabled(True)
         self.reject_mask_btn.setEnabled(True)
@@ -2771,6 +2809,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
             self.mask_qa_idx += 1
             self._show_current_mask()
 
+    def _set_qa_shortcuts(self, enabled):
+        """Enable / disable A/R/Space/Left/Right shortcuts as a group."""
+        for sc in getattr(self, '_qa_shortcuts', []):
+            sc.setEnabled(enabled)
+
     def _mask_export_path(self, flat_data):
         """Deterministic on-disk path used by _export_approved_mask."""
         if not self.masks_dir:
@@ -2834,6 +2877,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Re-arm QA mode and jump back to that mask
         self.mask_qa_active = True
         self.mask_qa_idx = idx
+        self._set_qa_shortcuts(True)
         self.approve_mask_btn.setEnabled(True)
         self.reject_mask_btn.setEnabled(True)
         self._show_current_mask()
@@ -2852,6 +2896,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         if all_reviewed:
             self.mask_qa_active = False
+            self._set_qa_shortcuts(False)
             self.approve_mask_btn.setEnabled(False)
             self.reject_mask_btn.setEnabled(False)
             self.prev_btn.setEnabled(False)
