@@ -1365,14 +1365,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
             layout.addWidget(cb)
             ch_checks[idx] = cb
 
-        layout.addSpacing(8)
-        layout.addWidget(QLabel("Process / clean from channel:"))
-        from PyQt5.QtWidgets import QComboBox
-        proc_combo = QComboBox()
-        proc_combo.addItems(["Red (Ch1)", "Green (Ch2)", "Blue (Ch3)"])
-        proc_combo.setCurrentIndex(self.grayscale_channel)
-        layout.addWidget(proc_combo)
-
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         cancel_btn = QPushButton("Cancel")
@@ -1390,7 +1382,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         for idx, cb in ch_checks.items():
             self.display_channels[idx] = cb.isChecked()
-        self.grayscale_channel = proc_combo.currentIndex()
         self.update_display()
 
     def _load_color_for_display(self, img_data):
