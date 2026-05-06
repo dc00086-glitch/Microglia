@@ -548,8 +548,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.channel_brightness = {'R': 0, 'G': 0, 'B': 0}
         self.grayscale_channel = 1
         # Which channel of an RGB image holds the microglia signal.
-        # -1 = Auto / luminance-weighted gray; 0/1/2 = R/G/B channel only.
-        self.microglia_channel = -1
+        # 0 = Red (default), 1 = Green, 2 = Blue.
+        self.microglia_channel = 0
         # Mask generation settings (defaults)
         self.use_min_intensity = True
         self.min_intensity_percent = 30
@@ -709,11 +709,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         microglia_ch_row = QHBoxLayout()
         microglia_ch_row.addWidget(QLabel("Microglia channel:"))
         self.microglia_channel_combo = QComboBox()
-        self.microglia_channel_combo.addItems(["Auto (luminance)", "Red", "Green", "Blue"])
-        self.microglia_channel_combo.setCurrentIndex(self.microglia_channel + 1)
+        self.microglia_channel_combo.addItems(["Red", "Green", "Blue"])
+        self.microglia_channel_combo.setCurrentIndex(self.microglia_channel)
         self.microglia_channel_combo.setToolTip(
-            "When loading an RGB image, extract this channel for processing\n"
-            "instead of the luminance-weighted grayscale."
+            "When loading an RGB image, extract this channel for processing.\n"
+            "Default is Red; pick Green or Blue if your microglia stain is there."
         )
         self.microglia_channel_combo.currentIndexChanged.connect(self._on_microglia_channel_changed)
         microglia_ch_row.addWidget(self.microglia_channel_combo)
@@ -1426,22 +1426,22 @@ class MicrogliaAnalysisGUI(QMainWindow):
         return raw
 
     def _microglia_grayscale(self, img):
-        """Convert an image to grayscale using the user-selected microglia
-        channel. If the picker is on Auto (-1), or the image is already
-        grayscale, falls back to ensure_grayscale (luminance-weighted)."""
+        """Extract the user-selected microglia channel as grayscale.
+        Already-grayscale images pass through unchanged."""
         if img is None:
             return None
         if img.ndim < 3:
             return img
         ch = self.microglia_channel
-        if ch in (0, 1, 2) and img.shape[2] > ch:
+        if 0 <= ch <= 2 and img.shape[2] > ch:
             return extract_channel(img, ch)
+        # Channel index out of range for this image -> luminance fallback
         return ensure_grayscale(img)
 
     def _on_microglia_channel_changed(self, idx):
-        """Combo index 0 = Auto, 1=R, 2=G, 3=B -> microglia_channel = idx-1."""
-        self.microglia_channel = idx - 1
-        names = ['Auto (luminance)', 'Red', 'Green', 'Blue']
+        """Combo index 0 = R, 1 = G, 2 = B -> microglia_channel = idx."""
+        self.microglia_channel = idx
+        names = ['Red', 'Green', 'Blue']
         self.log(f"Microglia channel set to: {names[idx]}")
         self._refresh_all_tabs()
 
