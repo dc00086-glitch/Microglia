@@ -2513,6 +2513,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 'soma_area_um2': soma_area_um2  # Store constant soma area from outline
             })
 
+        # QA walks masks in the order they appear here; we want largest first
+        # so that approving cascades down to all smaller masks for the soma.
+        masks.sort(key=lambda m: m['area_um2'], reverse=True)
         return masks
 
     def _iterative_threshold_mask(self, roi, centroid, target_area, max_iterations=30, tolerance=100,
@@ -2862,6 +2865,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if self.mask_qa_idx < len(self.all_masks_flat) - 1:
             self.mask_qa_idx += 1
             self._show_current_mask()
+            self._log_current_mask("→")
 
     def _set_qa_shortcuts(self, enabled):
         """Enable / disable A/R/Space/Left/Right shortcuts as a group."""
@@ -2944,6 +2948,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if self.mask_qa_idx > 0:
             self.mask_qa_idx -= 1
             self._show_current_mask()
+            self._log_current_mask("←")
+
+    def _log_current_mask(self, prefix=""):
+        """Log which mask is currently displayed during QA navigation."""
+        if not self.all_masks_flat or self.mask_qa_idx >= len(self.all_masks_flat):
+            return
+        flat = self.all_masks_flat[self.mask_qa_idx]
+        m = flat['mask_data']
+        status = m.get('approved')
+        status_str = "approved" if status is True else "rejected" if status is False else "unreviewed"
+        self.log(f"{prefix} Mask {self.mask_qa_idx + 1}/{len(self.all_masks_flat)} | "
+                 f"{flat['image_name']} | {m['soma_id']} | {m['area_um2']} µm² | {status_str}")
 
     def _check_qa_complete(self):
         all_reviewed = all(flat['mask_data']['approved'] is not None for flat in self.all_masks_flat)
