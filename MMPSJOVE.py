@@ -542,13 +542,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.contrast_value = 0
         # RGB color view (toggled with C). Channels are mapped:
         #   index 0 -> R, 1 -> G, 2 -> B
-        # grayscale_channel is the source channel that gets cleaned/processed.
         self.show_color_view = False
         self.display_channels = {0: True, 1: True, 2: True}
         self.channel_brightness = {'R': 0, 'G': 0, 'B': 0}
-        self.grayscale_channel = 1
         # Which channel of an RGB image holds the microglia signal.
-        # 0 = Red (default), 1 = Green, 2 = Blue.
+        # 0 = Red (default), 1 = Green, 2 = Blue. The color composite drops
+        # the processed/preview grayscale into this same slot so the cleaned
+        # data shows in its true channel color.
         self.microglia_channel = 0
         # Mask generation settings (defaults)
         self.use_min_intensity = True
@@ -1446,7 +1446,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self._refresh_all_tabs()
 
     def _color_composite_for_channel(self, img_data, channel_array):
-        """Return an RGB composite where the grayscale_channel slice is replaced
+        """Return an RGB composite where the microglia_channel slice is replaced
         by channel_array (e.g. the processed/preview/mask-background image).
         Returns the original RGB if channel_array is None, or None if the
         source image isn't color."""
@@ -1459,7 +1459,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         c = min(color_img.shape[2], 3)
         composite = np.zeros((h, w, 3), dtype=np.float32)
         for i in range(c):
-            if i == self.grayscale_channel:
+            if i == self.microglia_channel:
                 composite[:, :, i] = channel_array.astype(np.float32)
             else:
                 composite[:, :, i] = color_img[:, :, i].astype(np.float32)
