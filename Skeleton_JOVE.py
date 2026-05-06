@@ -1,0 +1,342 @@
+# -*- coding: utf-8 -*-
+"""
+Batch Skeleton Analysis for MMPS-exported masks.
+
+For each cell mask, skeletonizes the binary mask and runs AnalyzeSkeleton
+(SHORTEST_BRANCH pruning, prune ends, calculate shortest path) to extract
+branch / junction / end-point counts plus length metrics.
+
+Mask shape descriptors (area, perimeter, circularity, AR, roundness, solidity)
+are also captured straight from the original mask with ImageJ's Measure.
+
+Usage: Open in Fiji and run. A dialog will ask for masks dir, output dir,
+and pixel size.
+"""
+
+from ij import IJ, ImagePlus
+from ij.gui import GenericDialog
+from ij.measure import Calibration, ResultsTable
+from sc.fiji.analyzeSkeleton import AnalyzeSkeleton_
+
+import os
+import csv
+import re
+
+
+def openImageQuiet(path):
+    """Open an image without the Bio-Formats options dialog."""
+    try:
+        from loci.plugins import BF
+        import loci.plugins
+        ImporterOptions = getattr(loci.plugins, 'in').ImporterOptions
+        opts = ImporterOptions()
+        opts.setId(path)
+        opts.setWindowless(True)
+        imps = BF.openImagePlus(opts)
+        if imps and len(imps) > 0:
+            return imps[0]
+        return None
+    except Exception:
+        return IJ.openImage(path)
+
+
+def parseMaskInfo(maskFilename):
+    """Extract image name, soma ID, and area from mask filename.
+    e.g. 'Image_soma_586_510_area400_mask.tif'
+      -> ('Image', 'soma_586_510', 400)"""
+    m = re.match(r'^(.+?)_(soma_\d+_\d+)_area(\d+)_mask\.tif$', maskFilename)
+    if m:
+        return m.group(1), m.group(2), int(m.group(3))
+    return maskFilename, 'unknown', 0
+
+
+def filterLargestMasks(maskFiles):
+    """Keep only the largest area mask per cell (image + soma combination).
+    E.g. if a cell has area300, area400, area500, only area500 is kept."""
+    best = {}  # (imgName, somaId) -> (area, filename)
+    for f in maskFiles:
+        imgName, somaId, area = parseMaskInfo(f)
+        key = (imgName, somaId)
+        if key not in best or area > best[key][0]:
+            best[key] = (area, f)
+    kept = set(v[1] for v in best.values())
+    return [f for f in maskFiles if f in kept]
+
+
+def analyzeSkeleton(maskPath, pixelSize, outputDirPath):
+    """Skeletonize the mask and run AnalyzeSkeleton on it. Returns metrics dict
+    or None on failure. All measurements use the original mask resolution."""
+    print("Processing: " + os.path.basename(maskPath))
+
+    # Open mask
+    mask = openImageQuiet(maskPath)
+    if mask is None:
+        print("  ERROR: Could not open mask")
+        return None
+
+    # Set calibration
+    cal = Calibration(mask)
+    cal.pixelWidth = pixelSize
+    cal.pixelHeight = pixelSize
+    cal.setUnit("micron")
+    mask.setCalibration(cal)
+
+    # --- Mask measurements ---
+    maskProcessor = mask.getProcessor()
+    maskWidth = mask.getWidth()
+    maskHeight = mask.getHeight()
+
+    maskPixelCount = 0
+    for y in range(maskHeight):
+        for x in range(maskWidth):
+            if maskProcessor.getPixel(x, y) > 0:
+                maskPixelCount += 1
+
+    maskArea = maskPixelCount * (pixelSize * pixelSize)
+
+    # Measure shape properties on the original mask
+    IJ.setThreshold(mask, 1, 255)
+    IJ.run(mask, "Set Measurements...", "area perimeter shape redirect=None decimal=3")
+    IJ.run(mask, "Measure", "")
+    rt = ResultsTable.getResultsTable()
+
+    maskPerimeter = rt.getValue("Perim.", 0)
+    maskCircularity = rt.getValue("Circ.", 0)
+    maskAR = rt.getValue("AR", 0)
+    maskRound = rt.getValue("Round", 0)
+    maskSolidity = rt.getValue("Solidity", 0)
+
+    rt.reset()
+
+    # --- Skeletonization ---
+    skel = mask.duplicate()
+
+    # Ensure binary
+    IJ.setThreshold(skel, 1, 255)
+    IJ.run(skel, "Convert to Mask", "")
+
+    # Skeletonize
+    IJ.run(skel, "Skeletonize (2D/3D)", "")
+
+    # Clear any ROI
+    IJ.run(skel, "Select None", "")
+
+    # Extract cell name from mask filename
+    baseName = os.path.basename(maskPath)
+    cellName = re.sub(r'_area[2-8]\d{2}_mask\.tif$', '', baseName)
+    if cellName == baseName:
+        cellName = re.sub(r'_area\d+_mask\.tif$', '', baseName)
+    if cellName == baseName or cellName.endswith('_mask'):
+        cellName = re.sub(r'_mask\.tif$', '', baseName)
+
+    # Save skeleton image
+    skelPath = os.path.join(outputDirPath, cellName + "_skeleton.tif")
+    IJ.save(skel, skelPath)
+    print("  Saved skeleton: " + os.path.basename(skelPath))
+
+    # Analyze skeleton with SHORTEST_BRANCH pruning
+    analyzer = AnalyzeSkeleton_()
+    analyzer.setup("", skel)
+
+    result = analyzer.run(
+        AnalyzeSkeleton_.SHORTEST_BRANCH,
+        True,   # prune ends
+        True,   # calculate shortest path
+        None,   # original image
+        True,   # silent
+        False   # verbose
+    )
+
+    # Get results arrays
+    branches = result.getBranches()
+    junctions = result.getJunctions()
+    endPoints = result.getEndPoints()
+    junctionVoxels = result.getJunctionVoxels()
+    slabVoxels = result.getSlabs()
+    triplePoints = result.getTriples()
+    quadruplePoints = result.getQuadruples()
+    maxBranchLength = result.getMaximumBranchLength()
+    shortestPathList = result.getShortestPathList()
+
+    numBranches = int(branches[0]) if len(branches) > 0 else 0
+    numSlabVoxels = int(slabVoxels[0]) if len(slabVoxels) > 0 else 0
+
+    # Average branch length
+    try:
+        avgBranchLengthArray = result.getAverageBranchLength()
+        if avgBranchLengthArray is not None and len(avgBranchLengthArray) > 0:
+            avgBranchLength = float(avgBranchLengthArray[0])
+        else:
+            avgBranchLength = 0.0
+    except:
+        if numBranches > 0 and numSlabVoxels > 0:
+            avgBranchLength = (numSlabVoxels * pixelSize) / float(numBranches)
+        else:
+            avgBranchLength = 0.0
+
+    # Longest shortest path
+    longestShortestPath = 0.0
+    try:
+        if shortestPathList and len(shortestPathList) > 0:
+            if hasattr(shortestPathList[0], '__len__') and len(shortestPathList[0]) > 0:
+                longestShortestPath = float(max(shortestPathList[0]))
+            elif shortestPathList[0]:
+                longestShortestPath = float(shortestPathList[0])
+    except:
+        longestShortestPath = 0.0
+
+    # Total skeleton length
+    if avgBranchLength > 0 and numBranches > 0:
+        totalSkeletonLength = avgBranchLength * numBranches
+    else:
+        totalSkeletonLength = numSlabVoxels * pixelSize
+
+    # Skeleton area (in calibrated units)
+    skelProcessor = skel.getProcessor()
+    skelWidth = skel.getWidth()
+    skelHeight = skel.getHeight()
+
+    skelPixelCount = 0
+    for y in range(skelHeight):
+        for x in range(skelWidth):
+            if skelProcessor.getPixel(x, y) > 0:
+                skelPixelCount += 1
+
+    skeletonArea = skelPixelCount * (pixelSize * pixelSize)
+
+    # Assemble metrics
+    metrics = {
+        'mask_file': os.path.basename(maskPath),
+        'cell_name': cellName,
+        'skeleton_file': os.path.basename(skelPath),
+        'pixel_size_um': pixelSize,
+
+        # Mask measurements
+        'mask_area_um2': maskArea,
+        'mask_perimeter_um': maskPerimeter,
+        'mask_circularity': maskCircularity,
+        'mask_aspect_ratio': maskAR,
+        'mask_roundness': maskRound,
+        'mask_solidity': maskSolidity,
+
+        # Skeleton measurements (calibrated in um)
+        'num_branches': numBranches,
+        'num_junctions': int(junctions[0]) if len(junctions) > 0 else 0,
+        'num_end_points': int(endPoints[0]) if len(endPoints) > 0 else 0,
+        'num_junction_voxels': int(junctionVoxels[0]) if len(junctionVoxels) > 0 else 0,
+        'num_slab_voxels': numSlabVoxels,
+        'num_triple_points': int(triplePoints[0]) if len(triplePoints) > 0 else 0,
+        'num_quadruple_points': int(quadruplePoints[0]) if len(quadruplePoints) > 0 else 0,
+        'max_branch_length_um': float(maxBranchLength[0]) if len(maxBranchLength) > 0 else 0,
+        'avg_branch_length_um': avgBranchLength,
+        'longest_shortest_path_um': longestShortestPath,
+        'total_skeleton_length_um': totalSkeletonLength,
+        'skeleton_area_um2': skeletonArea,
+    }
+
+    # Branching density
+    if maskArea > 0:
+        metrics['branching_density'] = skeletonArea / maskArea
+    else:
+        metrics['branching_density'] = 0
+
+    mask.close()
+    skel.close()
+
+    print("  SUCCESS: " + str(numBranches) + " branches, " +
+          str(metrics['num_junctions']) + " junctions, " +
+          str(numSlabVoxels) + " slab voxels")
+    print("  Mask area: " + str(round(maskArea, 2)) + " um^2")
+    print("  Skeleton area: " + str(round(skeletonArea, 2)) + " um^2")
+    print("  Avg branch length: " + str(round(avgBranchLength, 2)) + " um")
+    print("  Total skeleton length: " + str(round(totalSkeletonLength, 2)) + " um")
+
+    return metrics
+
+
+def main():
+    # Check if launched from combined analysis with a preset
+    try:
+        from java.lang import System
+        defaultLargest = System.getProperty("mmps.largestOnly", "false") == "true"
+    except Exception:
+        defaultLargest = False
+
+    # --- User dialog ---
+    gd = GenericDialog("MMPS Skeleton Analysis")
+    gd.addDirectoryField("Masks Directory", "")
+    gd.addDirectoryField("Output Directory", "")
+    gd.addNumericField("Pixel Size (um/pixel)", 0.21, 4)
+    gd.addCheckbox("Only analyze largest mask per cell", defaultLargest)
+    gd.showDialog()
+    if gd.wasCanceled():
+        return
+
+    masksDirPath = gd.getNextString()
+    outputDirPath = gd.getNextString()
+    pixelSize = gd.getNextNumber()
+    largestOnly = gd.getNextBoolean()
+
+    print("=" * 60)
+    print("SKELETON ANALYSIS - BATCH PROCESSOR")
+    print("=" * 60)
+
+    # Find mask files
+    maskFiles = sorted([f for f in os.listdir(masksDirPath)
+                        if f.endswith('_mask.tif') and not f.startswith('.')])
+
+    if len(maskFiles) == 0:
+        print("ERROR: No mask files found")
+        return
+
+    if largestOnly:
+        totalBefore = len(maskFiles)
+        maskFiles = filterLargestMasks(maskFiles)
+        print("Largest-only filter: " + str(totalBefore) + " masks -> " + str(len(maskFiles)) + " (one per cell)")
+
+    print("Found " + str(len(maskFiles)) + " mask files")
+    print("Pixel size: " + str(pixelSize) + " um/pixel")
+    print("")
+
+    allResults = []
+
+    for maskFile in maskFiles:
+        maskPath = os.path.join(masksDirPath, maskFile)
+
+        metrics = analyzeSkeleton(maskPath, pixelSize, outputDirPath)
+
+        if metrics is not None:
+            allResults.append(metrics)
+
+    # Save results
+    if len(allResults) > 0:
+        outputPath = os.path.join(outputDirPath, "Skeleton_Analysis_Results.csv")
+
+        # Column order
+        idCols = ['cell_name', 'mask_file', 'skeleton_file', 'pixel_size_um']
+        maskCols = ['mask_area_um2', 'mask_perimeter_um', 'mask_circularity',
+                    'mask_aspect_ratio', 'mask_roundness', 'mask_solidity']
+        skelCols = ['num_branches', 'num_junctions', 'num_end_points',
+                    'num_junction_voxels', 'num_slab_voxels', 'num_triple_points',
+                    'num_quadruple_points', 'max_branch_length_um',
+                    'avg_branch_length_um', 'longest_shortest_path_um',
+                    'total_skeleton_length_um', 'skeleton_area_um2', 'branching_density']
+
+        columns = idCols + maskCols + skelCols
+
+        with open(outputPath, 'wb') as f:
+            writer = csv.DictWriter(f, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(allResults)
+
+        print("\n" + "=" * 60)
+        print("COMPLETED: " + str(len(allResults)) + " cells processed")
+        print("Results: " + outputPath)
+        print("Skeleton images saved to: " + outputDirPath)
+        print("=" * 60)
+    else:
+        print("\nERROR: No cells processed successfully")
+
+
+if __name__ == '__main__':
+    main()
