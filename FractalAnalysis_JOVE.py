@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
+# Batch Fractal Analysis (Box-Counting) for MMPS-exported masks.
 """
-Batch Fractal Analysis (Box-Counting) for MMPS-exported masks.
-
 Computes fractal dimension and lacunarity for each cell mask using
 the box-counting method. No external plugins required - all math is
 implemented here.

@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
+# Batch Sholl Analysis for MMPS-exported masks and soma outlines.
 """
-Batch Sholl Analysis for MMPS-exported masks and soma outlines.
-
 Replicates the Sholl analysis math from the reference script, adapted to
 work with masks and soma centroids exported by the MMPS microglia analysis
 pipeline.

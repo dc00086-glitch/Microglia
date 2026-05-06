@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
+# Batch Skeleton Analysis for MMPS-exported masks.
 """
-Batch Skeleton Analysis for MMPS-exported masks.
-
 For each cell mask, skeletonizes the binary mask and runs AnalyzeSkeleton
 (SHORTEST_BRANCH pruning, prune ends, calculate shortest path) to extract
 branch / junction / end-point counts plus length metrics.
