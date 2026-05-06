@@ -145,12 +145,15 @@ class BatchProcessingThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, denoise_enabled, denoise_size, sharpen_enabled,
-                    sharpen_amount) in enumerate(
+                    sharpen_amount, microglia_channel) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
                     img = load_tiff_image(img_path)
-                    img = ensure_grayscale(img)
+                    if microglia_channel in (0, 1, 2) and img is not None and img.ndim == 3 and img.shape[2] > microglia_channel:
+                        img = extract_channel(img, microglia_channel)
+                    else:
+                        img = ensure_grayscale(img)
                     img_dtype = img.dtype
                     background = restoration.rolling_ball(img, radius=radius)
                     result = img - background
@@ -265,12 +268,15 @@ class BackgroundRemovalThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, denoise_enabled, denoise_size, sharpen_enabled,
-                    sharpen_amount) in enumerate(
+                    sharpen_amount, microglia_channel) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
                     img = load_tiff_image(img_path)
-                    img = ensure_grayscale(img)
+                    if microglia_channel in (0, 1, 2) and img is not None and img.ndim == 3 and img.shape[2] > microglia_channel:
+                        img = extract_channel(img, microglia_channel)
+                    else:
+                        img = ensure_grayscale(img)
                     img_dtype = img.dtype
                     background = restoration.rolling_ball(img, radius=radius)
                     result = img - background
@@ -541,6 +547,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.display_channels = {0: True, 1: True, 2: True}
         self.channel_brightness = {'R': 0, 'G': 0, 'B': 0}
         self.grayscale_channel = 1
+        # Which channel of an RGB image holds the microglia signal.
+        # -1 = Auto / luminance-weighted gray; 0/1/2 = R/G/B channel only.
+        self.microglia_channel = -1
         # Mask generation settings (defaults)
         self.use_min_intensity = True
         self.min_intensity_percent = 30
@@ -693,6 +702,23 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.calibrate_btn.setToolTip("Click, then click two points on a scale bar of known length to set pixel size")
         self.calibrate_btn.clicked.connect(self.start_calibration)
         param_layout.addWidget(self.calibrate_btn)
+
+        # Microglia channel picker: which channel of an RGB image holds the
+        # microglia signal. Used everywhere the pipeline converts to grayscale.
+        from PyQt5.QtWidgets import QComboBox
+        microglia_ch_row = QHBoxLayout()
+        microglia_ch_row.addWidget(QLabel("Microglia channel:"))
+        self.microglia_channel_combo = QComboBox()
+        self.microglia_channel_combo.addItems(["Auto (luminance)", "Red", "Green", "Blue"])
+        self.microglia_channel_combo.setCurrentIndex(self.microglia_channel + 1)
+        self.microglia_channel_combo.setToolTip(
+            "When loading an RGB image, extract this channel for processing\n"
+            "instead of the luminance-weighted grayscale."
+        )
+        self.microglia_channel_combo.currentIndexChanged.connect(self._on_microglia_channel_changed)
+        microglia_ch_row.addWidget(self.microglia_channel_combo)
+        microglia_ch_row.addStretch()
+        param_layout.addLayout(microglia_ch_row)
 
         self.use_imagej = False
 
@@ -1240,7 +1266,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                             adjusted = self._apply_display_adjustments_color(raw_img)
                             pixmap = self._array_to_pixmap_color(adjusted)
                         else:
-                            raw_img = ensure_grayscale(raw_img)
+                            raw_img = self._microglia_grayscale(raw_img)
                             adjusted = self._apply_display_adjustments(raw_img)
                             pixmap = self._array_to_pixmap(adjusted, skip_rescale=True)
                         self.original_label.set_image(pixmap)
@@ -1398,6 +1424,26 @@ class MicrogliaAnalysisGUI(QMainWindow):
         if raw.shape[2] == 4:
             raw = raw[:, :, :3]
         return raw
+
+    def _microglia_grayscale(self, img):
+        """Convert an image to grayscale using the user-selected microglia
+        channel. If the picker is on Auto (-1), or the image is already
+        grayscale, falls back to ensure_grayscale (luminance-weighted)."""
+        if img is None:
+            return None
+        if img.ndim < 3:
+            return img
+        ch = self.microglia_channel
+        if ch in (0, 1, 2) and img.shape[2] > ch:
+            return extract_channel(img, ch)
+        return ensure_grayscale(img)
+
+    def _on_microglia_channel_changed(self, idx):
+        """Combo index 0 = Auto, 1=R, 2=G, 3=B -> microglia_channel = idx-1."""
+        self.microglia_channel = idx - 1
+        names = ['Auto (luminance)', 'Red', 'Green', 'Blue']
+        self.log(f"Microglia channel set to: {names[idx]}")
+        self._refresh_all_tabs()
 
     def _color_composite_for_channel(self, img_data, channel_array):
         """Return an RGB composite where the grayscale_channel slice is replaced
@@ -1654,7 +1700,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 adjusted_raw = self._apply_display_adjustments_color(raw_img)
                 pixmap = self._array_to_pixmap_color(adjusted_raw)
             else:
-                gray = ensure_grayscale(raw_img)
+                gray = self._microglia_grayscale(raw_img)
                 adjusted_raw = self._apply_display_adjustments(gray)
                 pixmap = self._array_to_pixmap(adjusted_raw, skip_rescale=True)
             self.original_label.set_image(pixmap)
@@ -1708,7 +1754,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         img_data = self.images[self.current_image_name]
         radius = self.rb_slider.value()
         raw_img = load_tiff_image(img_data['raw_path'])
-        raw_img = ensure_grayscale(raw_img)
+        raw_img = self._microglia_grayscale(raw_img)
         background = restoration.rolling_ball(raw_img, radius=radius)
         result = raw_img - background
         result = np.clip(result, 0, raw_img.max())
@@ -1755,9 +1801,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         sharpen_amount = self.sharpen_slider.value() / 10.0
 
         process_list = []
+        microglia_channel = self.microglia_channel
         for img_name, img_data in selected_images:
             process_list.append((img_data['raw_path'], img_name, radius,
-                                 denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount))
+                                 denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount,
+                                 microglia_channel))
         self.thread = BackgroundRemovalThread(process_list, self.output_dir)
         self.thread.status_update.connect(self.log)
         self.thread.progress.connect(self._update_progress)
@@ -1880,11 +1928,23 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.log("Click 'Done with Current' when finished with this image")
         self.log("=" * 50)
 
+    def _processed_pixmap_for_display(self, img_data):
+        """Return a QPixmap of the processed image, color-composited if
+        show_color_view is on. Used for soma picking, outlining, and any other
+        flow that renders the processed array with overlays so toggling C
+        doesn't kick the user back to the grayscale view."""
+        if self.show_color_view:
+            composite = self._build_processed_color_composite(img_data)
+            if composite is not None:
+                adjusted = self._apply_display_adjustments_color(composite)
+                return self._array_to_pixmap_color(adjusted)
+        return self._array_to_pixmap(img_data['processed'])
+
     def _load_image_for_soma_picking(self):
         if not self.current_image_name:
             return
         img_data = self.images[self.current_image_name]
-        pixmap = self._array_to_pixmap(img_data['processed'])
+        pixmap = self._processed_pixmap_for_display(img_data)
         self.processed_label.set_image(pixmap, centroids=img_data['somas'])
         self.tabs.setCurrentIndex(2)
         current_idx = self.soma_picking_queue.index(
@@ -1901,7 +1961,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         img_data['somas'].append(coords)
         soma_id = f"soma_{coords[0]}_{coords[1]}"
         img_data['soma_ids'].append(soma_id)
-        pixmap = self._array_to_pixmap(img_data['processed'])
+        pixmap = self._processed_pixmap_for_display(img_data)
         self.processed_label.set_image(pixmap, centroids=img_data['somas'])
         self.log(f"✓ {self.current_image_name}: Soma {len(img_data['somas'])} added | ID: {soma_id}")
         self._load_image_for_soma_picking()
@@ -1916,7 +1976,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             return
         coords = img_data['somas'].pop()
         soma_id = img_data['soma_ids'].pop() if img_data.get('soma_ids') else None
-        pixmap = self._array_to_pixmap(img_data['processed'])
+        pixmap = self._processed_pixmap_for_display(img_data)
         self.processed_label.set_image(pixmap, centroids=img_data['somas'])
         if soma_id:
             self.log(f"↩ Removed soma {soma_id} ({len(img_data['somas'])} remaining)")
@@ -2008,7 +2068,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         img_data = self.images[img_name]
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
-        pixmap = self._array_to_pixmap(img_data['processed'])
+        pixmap = self._processed_pixmap_for_display(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
         self.tabs.setCurrentIndex(2)
         self.nav_status_label.setText(
@@ -2025,7 +2085,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
             img_data = self.images[img_name]
             soma = img_data['somas'][soma_idx]
             soma_id = img_data['soma_ids'][soma_idx]
-            pixmap = self._array_to_pixmap(img_data['processed'])
+            pixmap = self._processed_pixmap_for_display(img_data)
             self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
             # Update status to show point count
             self.nav_status_label.setText(
@@ -2045,7 +2105,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 img_data = self.images[img_name]
                 soma = img_data['somas'][soma_idx]
                 soma_id = img_data['soma_ids'][soma_idx]
-                pixmap = self._array_to_pixmap(img_data['processed'])
+                pixmap = self._processed_pixmap_for_display(img_data)
                 self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
                 self.nav_status_label.setText(
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
@@ -2066,7 +2126,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 img_data = self.images[img_name]
                 soma = img_data['somas'][soma_idx]
                 soma_id = img_data['soma_ids'][soma_idx]
-                pixmap = self._array_to_pixmap(img_data['processed'])
+                pixmap = self._processed_pixmap_for_display(img_data)
                 self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
                 self.nav_status_label.setText(
                     f"Soma {queue_idx + 1}/{len(self.outlining_queue)} | "
@@ -2844,13 +2904,37 @@ class MicrogliaAnalysisGUI(QMainWindow):
         mask_data = flat_data['mask_data']
         mask_data['approved'] = False
 
+        current_soma_id = mask_data['soma_id']
+        current_area = mask_data['area_um2']
+        current_img = flat_data['image_name']
+
         self.log(f"✗ Rejected: {mask_data['soma_id']} ({mask_data['area_um2']} µm²)")
+
+        # Auto-reject ALL larger masks from the SAME soma in the SAME image:
+        # if this size is broken, anything bigger is at least as broken.
+        auto_rejected = []
+        cascaded_indices = []
+        for i, other_flat in enumerate(self.all_masks_flat):
+            other_mask = other_flat['mask_data']
+            other_img = other_flat['image_name']
+            if (other_img == current_img and
+                    other_mask['soma_id'] == current_soma_id and
+                    other_mask['area_um2'] > current_area and
+                    other_mask['approved'] is None):
+                other_mask['approved'] = False
+                auto_rejected.append((i + 1, other_mask['area_um2']))
+                cascaded_indices.append(i)
+
+        if auto_rejected:
+            self.log(f"   ⚡ Auto-rejected {len(auto_rejected)} larger masks for {current_soma_id}:")
+            for mask_num, area in auto_rejected:
+                self.log(f"      Mask #{mask_num} ({area} µm²)")
 
         # Record this decision so the B-key undo can roll it back
         self.last_qa_decisions.append({
             'idx': self.mask_qa_idx,
             'was_approved': False,
-            'cascaded': [],
+            'cascaded': cascaded_indices,
         })
 
         if self.mask_qa_idx < len(self.all_masks_flat) - 1:
