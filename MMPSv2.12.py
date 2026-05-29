@@ -198,8 +198,8 @@ def _enforce_mask_subset_invariant(masks):
             masks[smaller_idx]['mask'] = smaller_mask
             total_removed += n_bad
             print(f"    ⚠️ Subset fix: removed {n_bad} px from "
-                  f"{masks[smaller_idx].get('area_um2', '?')} µm² mask "
-                  f"(not in {masks[larger_idx].get('area_um2', '?')} µm² mask)")
+                  f"{masks[smaller_idx].get('target_area_um2', '?')} µm² mask "
+                  f"(not in {masks[larger_idx].get('target_area_um2', '?')} µm² mask)")
 
     return total_removed
 
@@ -347,7 +347,7 @@ def _grow_masks_for_soma(args):
             'image_name': img_name,
             'soma_idx': soma_idx,
             'soma_id': soma_id,
-            'area_um2': target_area_um2,
+            'target_area_um2': target_area_um2,
             'mask': full_mask,
             'approved': None,
             'soma_area_um2': soma_area_um2
@@ -1340,13 +1340,13 @@ class MorphologyCalculationThread(QThread):
                     os.path.splitext(img_name)[0],
                     mask_data['soma_id'],
                     mask_data['soma_idx'],
-                    mask_data['area_um2']
+                    mask_data['target_area_um2']
                 )
 
                 if self.masks_dir:
                     img_basename = os.path.splitext(img_name)[0]
                     soma_id = mask_data['soma_id']
-                    area_um2 = mask_data.get('area_um2', 0)
+                    area_um2 = mask_data.get('target_area_um2', 0)
                     mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
                     mask_path = os.path.join(self.masks_dir, mask_filename)
                     if os.path.exists(mask_path):
@@ -1383,7 +1383,7 @@ class MorphologyCalculationThread(QThread):
                 if mask_data.get('mask') is None and self.masks_dir:
                     img_basename = os.path.splitext(img_name)[0]
                     soma_id = mask_data['soma_id']
-                    area_um2 = mask_data.get('area_um2', 0)
+                    area_um2 = mask_data.get('target_area_um2', 0)
                     mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
                     mask_path = os.path.join(self.masks_dir, mask_filename)
                     if os.path.exists(mask_path):
@@ -1411,7 +1411,7 @@ class MorphologyCalculationThread(QThread):
                 params['image_name'] = meta[0]
                 params['soma_id'] = meta[1]
                 params['soma_idx'] = meta[2]
-                params['area_um2'] = meta[3]
+                params['target_area_um2'] = meta[3]
                 params['soma_group'] = self.soma_group_map.get((meta[0], meta[1]), '')
                 all_results[i] = params
                 mask_data['mask'] = None
@@ -3723,7 +3723,7 @@ def analyzeSkeleton(maskPath, pixelSize, outputDirPath):
         'treatment': '',
         'soma_id': somaId,
         'soma_idx': '',
-        'area_um2': areaUm2,
+        'target_area_um2': areaUm2,
         'mask_file': os.path.basename(maskPath),
         'cell_name': cellName,
         'skeleton_file': os.path.basename(skelPath),
@@ -3792,7 +3792,7 @@ def runSkeletonBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=
 
     if allResults:
         outputPath = os.path.join(skelDir, "Skeleton_Results_" + imageName + ".csv")
-        stdCols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx', 'area_um2']
+        stdCols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx', 'target_area_um2']
         idCols = ['cell_name', 'mask_file', 'skeleton_file']
         maskCols = ['mask_area_um2', 'mask_perimeter_um', 'mask_circularity',
                     'mask_aspect_ratio', 'mask_roundness', 'mask_solidity']
@@ -4112,7 +4112,7 @@ def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=N
                     'treatment': treat,
                     'soma_id': somaId,
                     'soma_idx': sidx,
-                    'area_um2': areaUm2,
+                    'target_area_um2': areaUm2,
                     'cell_name': cellName,
                     'mask_file': maskFile,
                 }}
@@ -4128,7 +4128,7 @@ def runFractalBatch(masksDir, outputDir, maskFiles, imageName="all", pixelSize=N
 
     if allResults:
         outputPath = os.path.join(resultsDir, "Fractal_Results_" + imageName + ".csv")
-        stdCols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx', 'area_um2']
+        stdCols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx', 'target_area_um2']
         idCols = ['cell_name', 'mask_file']
         fracCols = ['fractal_dimension', 'fractal_r_squared',
                     'fractal_lacunarity_mean', 'fractal_lacunarity_small',
@@ -4498,7 +4498,7 @@ def runShollBatch(masksDir, somasDir, outputDir, maskFiles, imageName="all", pix
                 metrics['treatment'] = treat
                 metrics['soma_id'] = somaId
                 metrics['soma_idx'] = sidx
-                metrics['area_um2'] = areaUm2
+                metrics['target_area_um2'] = areaUm2
                 metrics['centroid_x_px'] = centroid[0]
                 metrics['centroid_y_px'] = centroid[1]
                 metrics['start_radius_um'] = startRad
@@ -4900,7 +4900,7 @@ def main():
             for row in reader:
                 img = row.get('image_name', '')
                 soma = row.get('soma_id', '')
-                area = row.get('area_um2', row.get('mask_area_um2', ''))
+                area = row.get('target_area_um2', row.get('mask_area_um2', ''))
                 if area:
                     try:
                         area = str(int(float(area)))
@@ -4916,7 +4916,7 @@ def main():
 
     if combined:
         # Ensure standard ID columns come first
-        std_cols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx', 'area_um2']
+        std_cols = ['image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx', 'target_area_um2']
         all_cols = list(std_cols)
         for row in combined.values():
             for k in row.keys():
@@ -5404,7 +5404,7 @@ def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir, meta
             'treatment': treat,
             'soma_id': soma_id,
             'soma_idx': sidx,
-            'area_um2': area,
+            'target_area_um2': area,
         }}
         row.update(metrics)
         results.append(row)
@@ -5417,7 +5417,7 @@ def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir, meta
 
     fieldnames = [
         'image_name', 'animal_id', 'treatment', 'soma_id', 'soma_idx',
-        'area_um2',
+        'target_area_um2',
         'mask_area', 'perimeter', 'roundness', 'eccentricity',
         'cell_spread', 'soma_area',
         'polarity_index', 'principal_angle',
@@ -5904,13 +5904,13 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             return
         current_img = flat_data['image_name']
         current_soma_id = current_mask_data.get('soma_id', '')
-        current_area = current_mask_data.get('area_um2', 0)
+        current_area = current_mask_data.get('target_area_um2', 0)
 
         soma_key = (current_img, current_soma_id)
         for idx in self._qa_soma_mask_index.get(soma_key, []):
             other_flat = self.all_masks_flat[idx]
             other_mask_data = other_flat['mask_data']
-            if other_mask_data.get('area_um2', 0) >= current_area:
+            if other_mask_data.get('target_area_um2', 0) >= current_area:
                 continue
             other_mask = other_mask_data.get('mask')
             if other_mask is None:
@@ -6339,7 +6339,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                 if self.mode_3d:
                     mqa['volume_um3'] = mask.get('volume_um3', 0)
                 else:
-                    mqa['area_um2'] = mask.get('area_um2', 0)
+                    mqa['target_area_um2'] = mask.get('target_area_um2', 0)
                 mask_qa_state.append(mqa)
             img_session['mask_qa_state'] = mask_qa_state
 
@@ -7000,7 +7000,7 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
                 'image_name': img_name,
                 'soma_idx': soma_idx,
                 'soma_id': soma_id,
-                'area_um2': target_area_um2,
+                'target_area_um2': target_area_um2,
                 'mask': full_mask,
                 'soma_area_um2': soma_area_um2,
             }})
@@ -7014,8 +7014,8 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
                 keep_idx = indices[-1]
                 for idx in indices[:-1]:
                     all_masks[soma_masks_start + idx]['duplicate'] = True
-                    print(f"    Auto-rejected {{all_masks[soma_masks_start + idx]['area_um2']}} um2 "
-                          f"(duplicate of {{all_masks[soma_masks_start + keep_idx]['area_um2']}} um2, both {{n_px}} px)")
+                    print(f"    Auto-rejected {{all_masks[soma_masks_start + idx]['target_area_um2']}} um2 "
+                          f"(duplicate of {{all_masks[soma_masks_start + keep_idx]['target_area_um2']}} um2, both {{n_px}} px)")
 
         # Smooth masks to fill small gaps
         if smooth_enabled:
@@ -7188,7 +7188,7 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
             'image_name': img_name,
             'soma_idx': soma_idx,
             'soma_id': soma_id,
-            'area_um2': target_area_um2,
+            'target_area_um2': target_area_um2,
             'mask': full_mask,
             'soma_area_um2': soma_area_um2,
         }})
@@ -7202,8 +7202,8 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
             keep_idx = indices[-1]
             for idx in indices[:-1]:
                 masks[idx]['duplicate'] = True
-                print(f"    Auto-rejected {{masks[idx]['area_um2']}} um2 "
-                      f"(duplicate of {{masks[keep_idx]['area_um2']}} um2, both {{n_px}} px)")
+                print(f"    Auto-rejected {{masks[idx]['target_area_um2']}} um2 "
+                      f"(duplicate of {{masks[keep_idx]['target_area_um2']}} um2, both {{n_px}} px)")
 
     # Smooth masks to fill small gaps
     if smooth_enabled:
@@ -7355,7 +7355,7 @@ def process_image(img_name, img_info, input_dir, output_dir, settings):
         if mask is None or not np.any(mask):
             continue
 
-        mask_filename = f"{{img_basename}}_{{mask_data['soma_id']}}_area{{int(mask_data['area_um2'])}}_mask.tif"
+        mask_filename = f"{{img_basename}}_{{mask_data['soma_id']}}_area{{int(mask_data['target_area_um2'])}}_mask.tif"
         mask_path = os.path.join(masks_dir, mask_filename)
 
         mask_8bit = (mask > 0).astype(np.uint8) * 255
@@ -8230,7 +8230,7 @@ if __name__ == '__main__':
                             if is_3d:
                                 mask_entry['volume_um3'] = qs.get('volume_um3', 0)
                             else:
-                                mask_entry['area_um2'] = qs.get('area_um2', 0)
+                                mask_entry['target_area_um2'] = qs.get('target_area_um2', qs.get('area_um2', 0))
                             self.images[img_name]['masks'].append(mask_entry)
                     elif all_mask_files is not None and os.path.isdir(self.masks_dir):
                         # FALLBACK: old session without mask_qa_state — scan directory
@@ -8284,7 +8284,7 @@ if __name__ == '__main__':
                                 if is_3d:
                                     mask_entry['volume_um3'] = size_val
                                 else:
-                                    mask_entry['area_um2'] = size_val
+                                    mask_entry['target_area_um2'] = size_val
                                 mask_entry['soma_area_um2'] = outline_lookup.get(soma_id, 0)
                                 self.images[img_name]['masks'].append(mask_entry)
 
@@ -8328,7 +8328,7 @@ if __name__ == '__main__':
 
             # Rebuild all_masks_flat from loaded masks (sorted by soma pick order, then largest-first)
             self.all_masks_flat = []
-            size_key = 'volume_um3' if is_3d else 'area_um2'
+            size_key = 'volume_um3' if is_3d else 'target_area_um2'
             for iname, idata in self.images.items():
                 if not idata['selected']:
                     continue
@@ -8536,7 +8536,7 @@ if __name__ == '__main__':
         import re as _re
         data = {}
         id_columns = {'cell_name', 'image_name', 'soma_id', 'mask_file',
-                       'area_um2', 'mask_area_um2', 'cell', 'mask name', 'image name',
+                       'target_area_um2', 'mask_area_um2', 'cell', 'mask name', 'image name',
                        'soma id', 'mask area (um2)', 'centroid x (px)',
                        'centroid y (px)', 'start radius (um)',
                        'pixel_size_um', 'skeleton_file',
@@ -8566,7 +8566,7 @@ if __name__ == '__main__':
                             if m:
                                 area = int(m.group(1))
                     else:
-                        area_str = row.get('area_um2', row.get('mask_area_um2', ''))
+                        area_str = row.get('target_area_um2', row.get('mask_area_um2', ''))
                         if area_str:
                             try:
                                 area = int(float(area_str))
@@ -8804,7 +8804,7 @@ if __name__ == '__main__':
             for row in morphology_rows:
                 img_name = row.get('image_name', '')
                 soma_id = row.get('soma_id', '')
-                morph_area_str = row.get('area_um2', '')
+                morph_area_str = row.get('target_area_um2', '')
                 try:
                     morph_area = int(float(morph_area_str)) if morph_area_str else None
                 except (ValueError, TypeError):
@@ -12062,7 +12062,7 @@ if __name__ == '__main__':
 
                     if img_cl_path and os.path.exists(img_cl_path):
                         for m in masks:
-                            m_key = f"{img_name}_{m['soma_id']}_area{m['area_um2']}"
+                            m_key = f"{img_name}_{m['soma_id']}_area{m['target_area_um2']}"
                             self._update_checklist_row(img_cl_path, 0, m_key, 1, 1)
 
                     current_count += n_img_somas
@@ -12152,7 +12152,7 @@ if __name__ == '__main__':
                     # Mark checklists after all somas done
                     if img_cl_path and os.path.exists(img_cl_path):
                         for m in img_data['masks']:
-                            m_key = f"{img_name}_{m['soma_id']}_area{m['area_um2']}"
+                            m_key = f"{img_name}_{m['soma_id']}_area{m['target_area_um2']}"
                             self._update_checklist_row(img_cl_path, 0, m_key, 1, 1)
 
                 # Export ALL generated masks to disk immediately so they
@@ -12718,7 +12718,7 @@ if __name__ == '__main__':
                     'image_name': img_name,
                     'soma_idx': soma_idx,
                     'soma_id': soma_id,
-                    'area_um2': target_area_um2,
+                    'target_area_um2': target_area_um2,
                     'mask': full_mask,
                     'approved': None,
                     'soma_area_um2': soma_area_um2
@@ -12736,8 +12736,8 @@ if __name__ == '__main__':
                     for idx in indices[:-1]:
                         all_masks[soma_masks_start + idx]['approved'] = False
                         all_masks[soma_masks_start + idx]['duplicate'] = True
-                        print(f"    ⚠️ Auto-rejected {all_masks[soma_masks_start + idx]['area_um2']} µm² "
-                              f"(duplicate of {all_masks[soma_masks_start + keep_idx]['area_um2']} µm², both {n_px} px)")
+                        print(f"    ⚠️ Auto-rejected {all_masks[soma_masks_start + idx]['target_area_um2']} µm² "
+                              f"(duplicate of {all_masks[soma_masks_start + keep_idx]['target_area_um2']} µm², both {n_px} px)")
 
             if self.mask_smooth_enabled:
                 _smooth_masks(all_masks[soma_masks_start:], self.mask_smooth_gap_size)
@@ -12938,7 +12938,7 @@ if __name__ == '__main__':
                 'image_name': img_name,
                 'soma_idx': soma_idx,
                 'soma_id': soma_id,
-                'area_um2': target_area_um2,
+                'target_area_um2': target_area_um2,
                 'mask': full_mask,
                 'approved': None,
                 'soma_area_um2': soma_area_um2
@@ -12957,8 +12957,8 @@ if __name__ == '__main__':
                 for idx in indices[:-1]:
                     masks[idx]['approved'] = False
                     masks[idx]['duplicate'] = True
-                    print(f"    ⚠️ Auto-rejected {masks[idx]['area_um2']} µm² "
-                          f"(duplicate of {masks[keep_idx]['area_um2']} µm², both {n_px} px)")
+                    print(f"    ⚠️ Auto-rejected {masks[idx]['target_area_um2']} µm² "
+                          f"(duplicate of {masks[keep_idx]['target_area_um2']} µm², both {n_px} px)")
 
         if self.mask_smooth_enabled:
             _smooth_masks(masks, self.mask_smooth_gap_size)
@@ -13321,7 +13321,7 @@ if __name__ == '__main__':
                 continue
             # Sort masks: by soma pick order (soma_idx), then largest area first
             # within each soma so QA flows big→small
-            size_key = 'volume_um3' if self.mode_3d else 'area_um2'
+            size_key = 'volume_um3' if self.mode_3d else 'target_area_um2'
             sorted_masks = sorted(img_data['masks'],
                                   key=lambda m: (m.get('soma_idx', 0), -m.get(size_key, 0)))
             for mask_data in sorted_masks:
@@ -13398,7 +13398,7 @@ if __name__ == '__main__':
                     size_val = md.get('volume_um3', 0)
                     key = f"{flat['image_name']}_{md.get('soma_id', '')}_vol{size_val}"
                 else:
-                    size_val = md.get('area_um2', 0)
+                    size_val = md.get('target_area_um2', 0)
                     key = f"{flat['image_name']}_{md.get('soma_id', '')}_area{size_val}"
                 passed = 1 if md.get('approved') is True else 0
                 cl_rows.append([key, str(passed)])
@@ -13512,7 +13512,7 @@ if __name__ == '__main__':
             return
         img_basename = os.path.splitext(img_name)[0]
         soma_id = mask_data['soma_id']
-        area_um2 = mask_data.get('area_um2', 0)
+        area_um2 = mask_data.get('target_area_um2', 0)
         mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
         mask_path = os.path.join(self.masks_dir, mask_filename)
         if os.path.exists(mask_path):
@@ -13535,7 +13535,7 @@ if __name__ == '__main__':
 
         img_basename = os.path.splitext(img_name)[0]
         soma_id = mask_data['soma_id']
-        area_um2 = mask_data.get('area_um2', 0)
+        area_um2 = mask_data.get('target_area_um2', 0)
         mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
         mask_path = os.path.join(self.masks_dir, mask_filename)
 
@@ -13684,7 +13684,7 @@ if __name__ == '__main__':
             f"Mask {self.mask_qa_idx + 1 - auto_rejected}/{masks_needing_review} | "
             f"Reviewed: {reviewed}/{masks_needing_review} | "
             f"{img_name} | {mask_data.get('soma_id', '')} | "
-            f"Area: {mask_data.get('area_um2', 0)} um^2 | {status_text}"
+            f"Area: {mask_data.get('target_area_um2', 0)} um^2 | {status_text}"
         )
 
         self.mask_qa_progress_bar.setValue(reviewed)
@@ -13772,8 +13772,8 @@ if __name__ == '__main__':
             size_key = 'volume_um3'
             size_unit = 'um^3'
         else:
-            current_size = mask_data.get('area_um2', 0)
-            size_key = 'area_um2'
+            current_size = mask_data.get('target_area_um2', 0)
+            size_key = 'target_area_um2'
             size_unit = 'um^2'
 
         self.log(f"APPROVED | {current_img} | {current_soma_id} | {size_key}: {current_size} {size_unit}")
@@ -13867,7 +13867,7 @@ if __name__ == '__main__':
                     size_val = mask_data.get('volume_um3', 0)
                     cl_key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_vol{size_val}"
                 else:
-                    size_val = mask_data.get('area_um2', 0)
+                    size_val = mask_data.get('target_area_um2', 0)
                     cl_key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{size_val}"
                 self._qa_checklist_dirty[cl_key] = 1
 
@@ -13904,7 +13904,7 @@ if __name__ == '__main__':
         mask_data = flat_data['mask_data']
         img_name = flat_data['image_name']
         soma_id = mask_data['soma_id']
-        area_um2 = mask_data.get('area_um2', 0)
+        area_um2 = mask_data.get('target_area_um2', 0)
 
         # Create unique filename with area to distinguish different masks for same soma
         img_basename = os.path.splitext(img_name)[0]
@@ -13975,7 +13975,7 @@ if __name__ == '__main__':
                 continue
 
             soma_id = mask_data['soma_id']
-            area_um2 = mask_data.get('area_um2', 0)
+            area_um2 = mask_data.get('target_area_um2', 0)
             mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
             mask_path = os.path.join(self.masks_dir, mask_filename)
 
@@ -14100,7 +14100,7 @@ if __name__ == '__main__':
             self._qa_user_rejected_count += 1
 
         if not self.mode_3d:
-            self.log(f"Rejected: {mask_data.get('soma_id', '')} ({mask_data.get('area_um2', 0)} um^2)")
+            self.log(f"Rejected: {mask_data.get('soma_id', '')} ({mask_data.get('target_area_um2', 0)} um^2)")
         else:
             vol = mask_data.get('volume_um3', 0)
             self.log(f"Rejected: {mask_data.get('soma_id', '')} ({vol} um^3)")
@@ -14109,7 +14109,7 @@ if __name__ == '__main__':
         if self.mode_3d:
             key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_vol{mask_data.get('volume_um3', 0)}"
         else:
-            key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{mask_data.get('area_um2', 0)}"
+            key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{mask_data.get('target_area_um2', 0)}"
         self._qa_checklist_dirty[key] = 1
 
         # Show next mask FIRST so UI feels instant
@@ -14273,7 +14273,7 @@ if __name__ == '__main__':
                 img_data['status'] = 'masks_generated'
                 self._update_file_list_item(img_name)
 
-        self.log(f"↩ Undid {was}: {mask_data['soma_id']} ({mask_data['area_um2']} µm²)")
+        self.log(f"↩ Undid {was}: {mask_data['soma_id']} ({mask_data['target_area_um2']} µm²)")
 
         # Jump QA back to that mask
         if hasattr(self, 'all_masks_flat') and self.all_masks_flat:
@@ -14342,7 +14342,7 @@ if __name__ == '__main__':
                 for i, flat in enumerate(self.all_masks_flat[:5]):
                     self.log(f"  mask {i}: approved={flat['mask_data'].get('approved')}, "
                              f"soma_id={flat['mask_data'].get('soma_id')}, "
-                             f"area={flat['mask_data'].get('area_um2')}")
+                             f"area={flat['mask_data'].get('target_area_um2')}")
                 # Also check images directly
                 for iname, idata in self.images.items():
                     self.log(f"  image '{iname}': status={idata['status']}, "
@@ -14715,7 +14715,7 @@ if __name__ == '__main__':
         with open(metadata_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['mask_filename', 'soma_filename', 'image_name', 'soma_id', 'soma_idx',
-                             'soma_x', 'soma_y', 'soma_area_um2', 'cell_area_um2',
+                             'soma_x', 'soma_y', 'soma_area_um2', 'target_area_um2',
                              'perimeter', 'eccentricity', 'roundness',
                              'avg_centroid_distance', 'polarity_index', 'principal_angle',
                              'major_axis_um', 'minor_axis_um', 'animal_id', 'treatment'])
@@ -14743,7 +14743,7 @@ if __name__ == '__main__':
                     f"{soma_x:.2f}",
                     f"{soma_y:.2f}",
                     result.get('soma_area', 0),
-                    result.get('area_um2', 0),
+                    result.get('target_area_um2', 0),
                     result.get('perimeter', 0),
                     result.get('eccentricity', 0),
                     result.get('roundness', 0),
