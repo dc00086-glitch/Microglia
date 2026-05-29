@@ -3319,8 +3319,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         slurm_layout.addRow("CPUs per task:", self.cluster_cpus)
         self.cluster_job_name = QLineEdit("mmps_imagej")
         slurm_layout.addRow("Job name:", self.cluster_job_name)
-        self.cluster_module_load = QLineEdit("module load lang/python/cpython_3.11.3_gcc122 && export JAVA_HOME=$SCRATCH/jdk-21 && export PATH=$SCRATCH/jdk-21/bin:$PATH")
-        self.cluster_module_load.setToolTip("Loads Python 3.11 for merge scripts; SNT (Sholl analysis) requires Java 21+.")
+        self.cluster_module_load = QLineEdit("module load lang/gcc/12.2.0 && module load lang/python/cpython_3.11.3_gcc122 && export JAVA_HOME=$SCRATCH/jdk-21 && export PATH=$SCRATCH/jdk-21/bin:$PATH")
+        self.cluster_module_load.setToolTip("Module loads for each SLURM job (gcc required before Python). SNT requires Java 21+.")
         slurm_layout.addRow("Module load:", self.cluster_module_load)
         slurm_group.setLayout(slurm_layout)
         layout.addWidget(slurm_group)
@@ -4758,18 +4758,6 @@ echo "Images found: $NUM_IMAGES"
 echo "Fiji: $FIJI"
 echo "======================================"
 
-# --- Detect Python command (python3 or python) ---
-if command -v python3 &> /dev/null; then
-    PYTHON=python3
-elif command -v python &> /dev/null; then
-    PYTHON=python
-else
-    echo "ERROR: Neither python3 nor python found after module load."
-    echo "  Check your module load command: {module_load}"
-    exit 1
-fi
-echo "Python: $PYTHON ($($PYTHON --version 2>&1))"
-
 # --- Submit the array job (one task per image) ---
 ARRAY_JOB_ID=$(sbatch --parsable \\
     --job-name={job_name} \\
@@ -4788,6 +4776,9 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
 echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
 
 # --- Submit the merge job (runs after all array tasks complete) ---
+# NOTE: The merge job is a brand-new SLURM job with its own environment.
+# It does NOT inherit modules from the submitting shell or the array job.
+# The module_line inside --wrap ensures python3 is available.
 MERGE_JOB_ID=$(sbatch --parsable \\
     --job-name={job_name}_merge \\
     --partition={partition} \\
@@ -4797,8 +4788,7 @@ MERGE_JOB_ID=$(sbatch --parsable \\
     --dependency=afterok:$ARRAY_JOB_ID \\
     --output=mmps_imagej_merge_%j.out \\
     --error=mmps_imagej_merge_%j.err \\
-    --wrap="{module_line}
-PYTHON=\\$(command -v python3 || command -v python) && \\$PYTHON \\"$SCRIPT_DIR/merge_results.py\\" \\"$MMPS_OUTPUT_DIR\\""
+    --wrap="{module_line} && command -v python3 > /dev/null 2>&1 || {{ echo 'ERROR: python3 not found after module load. Check your module load command.'; exit 1; }} && python3 \\"$SCRIPT_DIR/merge_results.py\\" \\"$MMPS_OUTPUT_DIR\\""
 )
 
 echo "Submitted merge job:  $MERGE_JOB_ID (runs after array completes)"
@@ -5076,8 +5066,8 @@ TROUBLESHOOTING:
         slurm_layout.addRow("CPUs per task:", self.spread_cpus)
         self.spread_job_name = QLineEdit("mmps_spread")
         slurm_layout.addRow("Job name:", self.spread_job_name)
-        self.spread_module_load = QLineEdit("module load lang/python/cpython_3.11.3_gcc122")
-        self.spread_module_load.setToolTip("Python 3.11 for spread analysis; requires numpy, tifffile, scikit-image")
+        self.spread_module_load = QLineEdit("module load lang/gcc/12.2.0 && module load lang/python/cpython_3.11.3_gcc122")
+        self.spread_module_load.setToolTip("Module loads for each SLURM job (gcc required before Python). Needs numpy, tifffile, scikit-image.")
         slurm_layout.addRow("Module load:", self.spread_module_load)
         slurm_group.setLayout(slurm_layout)
         layout.addWidget(slurm_group)
@@ -5605,18 +5595,6 @@ echo "Output dir: $MMPS_OUTPUT_DIR"
 echo "Images found: $NUM_IMAGES"
 echo "======================================"
 
-# --- Detect Python command (python3 or python) ---
-if command -v python3 &> /dev/null; then
-    PYTHON=python3
-elif command -v python &> /dev/null; then
-    PYTHON=python
-else
-    echo "ERROR: Neither python3 nor python found after module load."
-    echo "  Check your module load command: {module_load}"
-    exit 1
-fi
-echo "Python: $PYTHON ($($PYTHON --version 2>&1))"
-
 # --- Submit the array job (one task per image) ---
 ARRAY_JOB_ID=$(sbatch --parsable \\
     --job-name={job_name} \\
@@ -5627,13 +5605,13 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --array=0-${{MAX_INDEX}} \\
     --output=mmps_spread_%A_%a.out \\
     --error=mmps_spread_%A_%a.err \\
-    --wrap="{module_line}
-PYTHON=\\$(command -v python3 || command -v python) && \\$PYTHON \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\"
+    --wrap="{module_line} && command -v python3 > /dev/null 2>&1 || {{ echo 'ERROR: python3 not found after module load.'; exit 1; }} && python3 \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\"
 ")
 
 echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
 
 # --- Submit the merge job (runs after all array tasks complete) ---
+# NOTE: Each SLURM job gets a fresh shell — modules must be loaded in each --wrap.
 MERGE_JOB_ID=$(sbatch --parsable \\
     --job-name={job_name}_merge \\
     --partition={partition} \\
@@ -5643,8 +5621,7 @@ MERGE_JOB_ID=$(sbatch --parsable \\
     --dependency=afterok:$ARRAY_JOB_ID \\
     --output=mmps_spread_merge_%j.out \\
     --error=mmps_spread_merge_%j.err \\
-    --wrap="{module_line}
-PYTHON=\\$(command -v python3 || command -v python) && \\$PYTHON \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\" --merge-only"
+    --wrap="{module_line} && command -v python3 > /dev/null 2>&1 || {{ echo 'ERROR: python3 not found after module load.'; exit 1; }} && python3 \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\" --merge-only"
 )
 
 echo "Submitted merge job:  $MERGE_JOB_ID (runs after array completes)"
