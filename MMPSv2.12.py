@@ -4758,6 +4758,18 @@ echo "Images found: $NUM_IMAGES"
 echo "Fiji: $FIJI"
 echo "======================================"
 
+# --- Detect Python command (python3 or python) ---
+if command -v python3 &> /dev/null; then
+    PYTHON=python3
+elif command -v python &> /dev/null; then
+    PYTHON=python
+else
+    echo "ERROR: Neither python3 nor python found after module load."
+    echo "  Check your module load command: {module_load}"
+    exit 1
+fi
+echo "Python: $PYTHON ($($PYTHON --version 2>&1))"
+
 # --- Submit the array job (one task per image) ---
 ARRAY_JOB_ID=$(sbatch --parsable \\
     --job-name={job_name} \\
@@ -4786,7 +4798,7 @@ MERGE_JOB_ID=$(sbatch --parsable \\
     --output=mmps_imagej_merge_%j.out \\
     --error=mmps_imagej_merge_%j.err \\
     --wrap="{module_line}
-python3 \\"$SCRIPT_DIR/merge_results.py\\" \\"$MMPS_OUTPUT_DIR\\""
+PYTHON=\\$(command -v python3 || command -v python) && \\$PYTHON \\"$SCRIPT_DIR/merge_results.py\\" \\"$MMPS_OUTPUT_DIR\\""
 )
 
 echo "Submitted merge job:  $MERGE_JOB_ID (runs after array completes)"
@@ -5593,6 +5605,18 @@ echo "Output dir: $MMPS_OUTPUT_DIR"
 echo "Images found: $NUM_IMAGES"
 echo "======================================"
 
+# --- Detect Python command (python3 or python) ---
+if command -v python3 &> /dev/null; then
+    PYTHON=python3
+elif command -v python &> /dev/null; then
+    PYTHON=python
+else
+    echo "ERROR: Neither python3 nor python found after module load."
+    echo "  Check your module load command: {module_load}"
+    exit 1
+fi
+echo "Python: $PYTHON ($($PYTHON --version 2>&1))"
+
 # --- Submit the array job (one task per image) ---
 ARRAY_JOB_ID=$(sbatch --parsable \\
     --job-name={job_name} \\
@@ -5604,7 +5628,7 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --output=mmps_spread_%A_%a.out \\
     --error=mmps_spread_%A_%a.err \\
     --wrap="{module_line}
-python \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\"
+PYTHON=\\$(command -v python3 || command -v python) && \\$PYTHON \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\"
 ")
 
 echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
@@ -5620,7 +5644,7 @@ MERGE_JOB_ID=$(sbatch --parsable \\
     --output=mmps_spread_merge_%j.out \\
     --error=mmps_spread_merge_%j.err \\
     --wrap="{module_line}
-python \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\" --merge-only"
+PYTHON=\\$(command -v python3 || command -v python) && \\$PYTHON \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\" --merge-only"
 )
 
 echo "Submitted merge job:  $MERGE_JOB_ID (runs after array completes)"
