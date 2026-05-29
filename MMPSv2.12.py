@@ -2832,15 +2832,16 @@ class MicrogliaAnalysisGUI(QMainWindow):
         batch_layout.addWidget(self.batch_outline_btn)
 
         # Hidden auto-outline settings (store state but not shown in panel)
+        # Auto-outline is locked to Hybrid method only.
         self.auto_outline_method = QComboBox()
         self.auto_outline_method.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
-        self.auto_outline_method.setCurrentIndex(0)
+        self.auto_outline_method.setCurrentIndex(4)  # Hybrid
         self.auto_outline_method.setVisible(False)
         self.auto_outline_sensitivity = QSlider(Qt.Horizontal)
         self.auto_outline_sensitivity.setRange(1, 90)
-        self.auto_outline_sensitivity.setValue(20)
+        self.auto_outline_sensitivity.setValue(10)
         self.auto_outline_sensitivity.setVisible(False)
-        self.sensitivity_label = QLabel("20")
+        self.sensitivity_label = QLabel("10")
         self.auto_outline_sensitivity.valueChanged.connect(
             lambda v: self.sensitivity_label.setText(str(v))
         )
@@ -2851,26 +2852,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
         outline_controls_layout.setContentsMargins(0, 0, 0, 0)
 
         # Auto-outline settings row (visible during outlining)
+        # Method is locked to Hybrid — only sensitivity is adjustable.
         auto_settings = QHBoxLayout()
-        auto_settings.addWidget(QLabel("Method:"))
-        self.outline_method_display = QComboBox()
-        self.outline_method_display.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
-        self.outline_method_display.setCurrentIndex(0)
-        self.outline_method_display.setMaximumWidth(110)
-        self.outline_method_display.currentIndexChanged.connect(
-            lambda idx: self.auto_outline_method.setCurrentIndex(idx)
-        )
-        auto_settings.addWidget(self.outline_method_display)
+        auto_settings.addWidget(QLabel("Method: Hybrid"))
         auto_settings.addWidget(QLabel("Sens:"))
         self.outline_sens_display = QSlider(Qt.Horizontal)
         self.outline_sens_display.setRange(1, 90)
-        self.outline_sens_display.setValue(50)
+        self.outline_sens_display.setValue(10)
         self.outline_sens_display.setMaximumWidth(60)
         self.outline_sens_display.valueChanged.connect(
             lambda v: self.auto_outline_sensitivity.setValue(v)
         )
         auto_settings.addWidget(self.outline_sens_display)
-        self.outline_sens_label = QLabel("50")
+        self.outline_sens_label = QLabel("10")
         self.outline_sens_display.valueChanged.connect(
             lambda v: self.outline_sens_label.setText(str(v))
         )
@@ -10691,13 +10685,9 @@ if __name__ == '__main__':
         auto_btn.setStyleSheet("border: 2px solid #4CAF50; font-weight: bold;")
         layout.addWidget(auto_btn)
 
-        # Auto settings
+        # Auto settings — method is locked to Hybrid, only sensitivity adjustable
         settings_layout = QHBoxLayout()
-        settings_layout.addWidget(QLabel("Method:"))
-        method_combo = QComboBox()
-        method_combo.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
-        method_combo.setCurrentIndex(self.auto_outline_method.currentIndex())
-        settings_layout.addWidget(method_combo)
+        settings_layout.addWidget(QLabel("Method: Hybrid"))
         settings_layout.addWidget(QLabel("Sens:"))
         sens_spin = QSpinBox()
         sens_spin.setRange(1, 90)
@@ -10715,7 +10705,7 @@ if __name__ == '__main__':
         if result == 0:
             return  # Cancelled
 
-        self.auto_outline_method.setCurrentIndex(method_combo.currentIndex())
+        self.auto_outline_method.setCurrentIndex(4)  # Always Hybrid
         self.auto_outline_sensitivity.setValue(sens_spin.value())
 
         self.batch_mode = True
@@ -10745,7 +10735,6 @@ if __name__ == '__main__':
         self.current_outline_idx = 0
 
         self.outline_controls_widget.setVisible(True)
-        self.outline_method_display.setCurrentIndex(self.auto_outline_method.currentIndex())
         self.outline_sens_display.setValue(self.auto_outline_sensitivity.value())
         self._update_outline_progress()
 
@@ -11351,16 +11340,8 @@ if __name__ == '__main__':
                 self._load_soma_for_outlining(next_idx)
 
     def _get_auto_outline_method(self):
-        """Get the selected auto-outline method function"""
-        method_idx = self.auto_outline_method.currentIndex()
-        methods = [
-            auto_outline_threshold,
-            auto_outline_region_growing,
-            auto_outline_watershed,
-            auto_outline_active_contours,
-            auto_outline_hybrid
-        ]
-        return methods[method_idx]
+        """Get the auto-outline method function. Locked to Hybrid."""
+        return auto_outline_hybrid
 
     def _get_image_for_outlining(self, img_data):
         """Get the appropriate grayscale image for auto-outlining"""
