@@ -1284,13 +1284,14 @@ class MorphologyCalculationThread(QThread):
     finished = pyqtSignal(list)  # list of results
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, approved_masks, pixel_size, use_imagej, images, output_dir=None, pixel_size_map=None, masks_dir=None, soma_group_map=None):
+    def __init__(self, approved_masks, pixel_size, use_imagej, images, output_dir=None, pixel_size_map=None, masks_dir=None, soma_group_map=None, processed_dir=None):
         super().__init__()
         self.approved_masks = approved_masks
         self.pixel_size = pixel_size
         self.use_imagej = use_imagej
         self.images = images
         self.output_dir = output_dir
+        self.processed_dir = processed_dir
         self.pixel_size_map = pixel_size_map or {}
         self.masks_dir = masks_dir
         self.soma_group_map = soma_group_map or {}
@@ -1354,12 +1355,15 @@ class MorphologyCalculationThread(QThread):
                 img_data = self.images[img_name]
 
                 processed_img = img_data.get('processed')
-                if processed_img is None and self.output_dir:
+                if processed_img is None:
                     name_stem = os.path.splitext(img_name)[0]
-                    processed_path = os.path.join(self.output_dir, f"{name_stem}_processed.tif")
-                    if os.path.exists(processed_path):
-                        processed_img = safe_tiff_read(processed_path)
-                        img_data['processed'] = processed_img
+                    for search_dir in [self.processed_dir, self.output_dir]:
+                        if search_dir:
+                            processed_path = os.path.join(search_dir, f"{name_stem}_processed.tif")
+                            if os.path.exists(processed_path):
+                                processed_img = safe_tiff_read(processed_path)
+                                img_data['processed'] = processed_img
+                                break
 
                 soma_centroid = img_data['somas'][mask_data['soma_idx']]
                 soma_area_um2 = mask_data.get('soma_area_um2', None)
@@ -2407,6 +2411,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.polygon_points = []
         self.output_dir = None
         self.masks_dir = None
+        self.processed_dir = None
         self.pixel_size = 0.316
         self.default_rolling_ball_radius = 50
         self.all_masks_flat = []
@@ -6282,21 +6287,23 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             # Build path to processed TIFF if it exists on disk
             processed_path = None
             name_stem = os.path.splitext(img_name)[0]
-            if self.output_dir:
-                candidate = os.path.join(
-                    self.output_dir, f"{name_stem}_processed.tif"
-                )
-                if os.path.exists(candidate):
-                    processed_path = candidate
+            proc_dir = getattr(self, 'processed_dir', self.output_dir)
+            for search_dir in [proc_dir, self.output_dir]:
+                if search_dir:
+                    candidate = os.path.join(search_dir, f"{name_stem}_processed.tif")
+                    if os.path.exists(candidate):
+                        processed_path = candidate
+                        break
 
             extra_channel_paths = {}
-            if self.output_dir:
-                for ch_idx in range(3):
-                    ch_candidate = os.path.join(
-                        self.output_dir, f"{name_stem}_processed_ch{ch_idx + 1}.tif"
-                    )
-                    if os.path.exists(ch_candidate):
-                        extra_channel_paths[str(ch_idx)] = ch_candidate
+            for search_dir in [proc_dir, self.output_dir]:
+                if search_dir:
+                    for ch_idx in range(3):
+                        ch_candidate = os.path.join(
+                            search_dir, f"{name_stem}_processed_ch{ch_idx + 1}.tif"
+                        )
+                        if os.path.exists(ch_candidate) and str(ch_idx) not in extra_channel_paths:
+                            extra_channel_paths[str(ch_idx)] = ch_candidate
 
             extra_channel_paths_rel = {}
             if session_dir:
@@ -7956,11 +7963,12 @@ if __name__ == '__main__':
                                 masks_candidate = os.path.join(out_candidates[0], 'masks')
                                 if os.path.isdir(masks_candidate):
                                     resolved_masks_dir = masks_candidate
-                                # Re-resolve processed paths
+                                # Re-resolve processed paths (check Processed Images subfolder first)
                                 for img_name, img_session in session['images'].items():
                                     if img_session.get('processed_path') and not os.path.exists(img_session['processed_path']):
                                         name_stem = os.path.splitext(img_name)[0]
-                                        candidate = os.path.join(resolved_output_dir, f"{name_stem}_processed.tif")
+                                        proc_sub = os.path.join(resolved_output_dir, "Processed Images", f"{name_stem}_processed.tif")
+                                        candidate = proc_sub if os.path.exists(proc_sub) else os.path.join(resolved_output_dir, f"{name_stem}_processed.tif")
                                         if os.path.exists(candidate):
                                             img_session['processed_path'] = candidate
                         self.log(f"Remapped {remap_found} image path(s) from selected folder")
@@ -8068,13 +8076,16 @@ if __name__ == '__main__':
                             self.masks_dir = os.path.join(new_output, "masks")
                         resolved_output_dir = new_output
                         resolved_masks_dir = self.masks_dir
-                        # Re-resolve processed_path for every image so lazy-load
-                        # picks up the new output folder instead of stale paths.
+                        # Re-resolve processed_path (check Processed Images subfolder first)
                         for img_name, img_session in session['images'].items():
                             name_stem = os.path.splitext(img_name)[0]
-                            candidate = os.path.join(new_output, f"{name_stem}_processed.tif")
-                            if os.path.exists(candidate):
-                                img_session['processed_path'] = candidate
+                            proc_sub = os.path.join(new_output, "Processed Images", f"{name_stem}_processed.tif")
+                            if os.path.exists(proc_sub):
+                                img_session['processed_path'] = proc_sub
+                            else:
+                                candidate = os.path.join(new_output, f"{name_stem}_processed.tif")
+                                if os.path.exists(candidate):
+                                    img_session['processed_path'] = candidate
                 else:
                     # User declined — clear the invalid paths so we don't
                     # error out later trying to write to them.
@@ -8083,6 +8094,8 @@ if __name__ == '__main__':
 
             if self.output_dir:
                 os.makedirs(self.output_dir, exist_ok=True)
+                self.processed_dir = os.path.join(self.output_dir, "Processed Images")
+                os.makedirs(self.processed_dir, exist_ok=True)
             if self.masks_dir:
                 os.makedirs(self.masks_dir, exist_ok=True)
                 self.somas_dir = os.path.join(self.output_dir, "somas") if self.output_dir else None
@@ -9506,11 +9519,14 @@ if __name__ == '__main__':
             else:
                 self.masks_dir = os.path.join(folder, "masks")
             self.somas_dir = os.path.join(folder, "somas")
+            self.processed_dir = os.path.join(folder, "Processed Images")
             os.makedirs(self.masks_dir, exist_ok=True)
             os.makedirs(self.somas_dir, exist_ok=True)
+            os.makedirs(self.processed_dir, exist_ok=True)
             self.log(f"Output folder: {folder}")
-            self.log(f"Masks will be saved to: {self.masks_dir}")
-            self.log(f"Somas will be saved to: {self.somas_dir}")
+            self.log(f"Processed images: {self.processed_dir}")
+            self.log(f"Masks: {self.masks_dir}")
+            self.log(f"Somas: {self.somas_dir}")
 
     def select_all_images(self):
         """Select all images and check all checkboxes"""
@@ -9976,7 +9992,7 @@ if __name__ == '__main__':
             process_list.append((img_data['raw_path'], img_name, radius, rb_enabled,
                                  denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount,
                                  channels_to_clean))
-        self.thread = BackgroundRemovalThread(process_list, self.output_dir)
+        self.thread = BackgroundRemovalThread(process_list, self.processed_dir)
         self.thread.status_update.connect(self.log)
         self.thread.progress.connect(self._update_progress)
         self.thread.finished_image.connect(self._handle_processed_image)
@@ -10170,7 +10186,7 @@ if __name__ == '__main__':
                     import traceback
                     self.error_occurred.emit(f"Fatal 3D processing error: {e}\n{traceback.format_exc()}")
 
-        self._preprocess_thread_3d = _PreprocessThread3D(process_list, self.output_dir, self.grayscale_channel)
+        self._preprocess_thread_3d = _PreprocessThread3D(process_list, getattr(self, 'processed_dir', self.output_dir), self.grayscale_channel)
         self._preprocess_thread_3d.status_update.connect(self.log)
         self._preprocess_thread_3d.progress.connect(lambda v: self.progress_bar.setValue(v))
         self._preprocess_thread_3d.finished_image.connect(self._handle_processed_image_3d)
@@ -10918,17 +10934,21 @@ if __name__ == '__main__':
         # Lazy-load processed image from disk if missing
         if img_data.get('processed') is None:
             processed_path = img_data.get('processed_path')
-            # If stored path is stale (e.g. session from another computer), fall back
-            # to constructing the path from the current output_dir.
             if not processed_path or not os.path.exists(processed_path):
-                if self.output_dir:
-                    processed_path = os.path.join(self.output_dir, f"{os.path.splitext(img_name)[0]}_processed.tif")
+                name_stem = os.path.splitext(img_name)[0]
+                proc_dir = getattr(self, 'processed_dir', None)
+                for search_dir in [proc_dir, self.output_dir]:
+                    if search_dir:
+                        candidate = os.path.join(search_dir, f"{name_stem}_processed.tif")
+                        if os.path.exists(candidate):
+                            processed_path = candidate
+                            break
                 else:
                     processed_path = None
             if processed_path and os.path.exists(processed_path):
                 try:
                     img_data['processed'] = safe_tiff_read(processed_path)
-                    img_data['processed_path'] = processed_path  # update stale path
+                    img_data['processed_path'] = processed_path
                 except Exception:
                     pass
 
@@ -11026,16 +11046,21 @@ if __name__ == '__main__':
         if img_data.get('processed') is None:
             processed_path = img_data.get('processed_path')
             # If stored path is stale (e.g. session from another computer), fall back
-            # to constructing the path from the current output_dir.
             if not processed_path or not os.path.exists(processed_path):
-                if self.output_dir:
-                    processed_path = os.path.join(self.output_dir, f"{os.path.splitext(img_name)[0]}_processed.tif")
+                name_stem = os.path.splitext(img_name)[0]
+                proc_dir = getattr(self, 'processed_dir', None)
+                for search_dir in [proc_dir, self.output_dir]:
+                    if search_dir:
+                        candidate = os.path.join(search_dir, f"{name_stem}_processed.tif")
+                        if os.path.exists(candidate):
+                            processed_path = candidate
+                            break
                 else:
                     processed_path = None
             if processed_path and os.path.exists(processed_path):
                 try:
                     img_data['processed'] = safe_tiff_read(processed_path)
-                    img_data['processed_path'] = processed_path  # update stale path
+                    img_data['processed_path'] = processed_path
                 except Exception:
                     pass
 
@@ -13557,12 +13582,15 @@ if __name__ == '__main__':
         if img_data.get('processed') is not None:
             return img_data['processed']
 
-        # Try to reload from disk — check stored path first, then output_dir
+        # Try to reload from disk — check stored path, then Processed Images dir, then output_dir
         name_stem = os.path.splitext(img_name)[0]
         candidates = []
         stored_path = img_data.get('processed_path')
         if stored_path:
             candidates.append(stored_path)
+        proc_dir = getattr(self, 'processed_dir', None)
+        if proc_dir:
+            candidates.append(os.path.join(proc_dir, f"{name_stem}_processed.tif"))
         if self.output_dir:
             candidates.append(os.path.join(self.output_dir, f"{name_stem}_processed.tif"))
 
@@ -14394,7 +14422,8 @@ if __name__ == '__main__':
             self.morph_thread = MorphologyCalculationThread(
                 approved_masks, pixel_size, use_imagej=False, images=self.images,
                 output_dir=self.output_dir, pixel_size_map=pixel_size_map,
-                masks_dir=self.masks_dir, soma_group_map=soma_group_map
+                masks_dir=self.masks_dir, soma_group_map=soma_group_map,
+                processed_dir=getattr(self, 'processed_dir', None)
             )
 
             self.morph_thread.progress.connect(self._on_morph_progress)
@@ -14770,23 +14799,6 @@ if __name__ == '__main__':
 
         self.log(f"Metadata saved to: {metadata_path}")
 
-        # Per-image results files
-        by_image = {}
-        for result in results:
-            img_name = result['image_name']
-            if img_name not in by_image:
-                by_image[img_name] = []
-            by_image[img_name].append(result)
-
-        for img_name, img_results in by_image.items():
-            img_path = os.path.join(self.output_dir, f"{img_name}_morphology_results.csv")
-            with open(img_path, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=ordered_keys, extrasaction='ignore')
-                writer.writeheader()
-                writer.writerows(img_results)
-
-        self.log(f"Per-image results saved for {len(by_image)} images")
-
         # Generate colocalization summary table if in coloc mode
         if self.colocalization_mode and coloc_present:
             self._save_coloc_summary(results)
@@ -15045,22 +15057,6 @@ if __name__ == '__main__':
             writer.writeheader()
             writer.writerows(results)
         self.log(f"Results saved to: {combined_path}")
-
-        # Per-image files
-        by_image = {}
-        for result in results:
-            img = result['image_name']
-            if img not in by_image:
-                by_image[img] = []
-            by_image[img].append(result)
-
-        for img_name, img_results in by_image.items():
-            path = os.path.join(self.output_dir, f"{img_name}_3d_morphology.csv")
-            with open(path, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-                writer.writeheader()
-                writer.writerows(img_results)
-        self.log(f"Per-image results saved for {len(by_image)} Z-stacks")
 
 
 def _generate_microglia_icon():
