@@ -240,17 +240,18 @@ def _grow_masks_for_soma(args):
         max_radius_px = np.sqrt(constraint_area_px / np.pi)
         max_radius_px_sq = max_radius_px ** 2
 
-    # Intensity floor (local adaptive or global)
+    # Intensity floor (local adaptive combined with global minimum)
     intensity_floor = 0.0
     intensity_floor_map = None
     if use_min_intensity and min_intensity_percent > 0:
+        roi_max = roi.max()
+        if roi_max > 0:
+            intensity_floor = roi_max * (min_intensity_percent / 100.0)
         if local_intensity_window and local_intensity_window > 0:
             local_max = ndimage.maximum_filter(roi, size=local_intensity_window)
-            intensity_floor_map = local_max * (min_intensity_percent / 100.0)
-        else:
-            roi_max = roi.max()
-            if roi_max > 0:
-                intensity_floor = roi_max * (min_intensity_percent / 100.0)
+            local_floor = local_max * (min_intensity_percent / 100.0)
+            # Use whichever is stricter: global floor or local floor
+            intensity_floor_map = np.maximum(local_floor, intensity_floor)
 
     # Territory constraint
     territory_roi = territory_roi_data
@@ -6867,14 +6868,14 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
     intensity_floor = 0.0
     intensity_floor_map = None
     if use_min_intensity and min_intensity_percent > 0:
+        img_max = processed_img.max()
+        if img_max > 0:
+            intensity_floor = img_max * (min_intensity_percent / 100.0)
         if local_intensity_window and local_intensity_window > 0:
             roi_f64 = processed_img.astype(np.float64)
             local_max = ndimage.maximum_filter(roi_f64, size=local_intensity_window)
-            intensity_floor_map = local_max * (min_intensity_percent / 100.0)
-        else:
-            img_max = processed_img.max()
-            if img_max > 0:
-                intensity_floor = img_max * (min_intensity_percent / 100.0)
+            local_floor = local_max * (min_intensity_percent / 100.0)
+            intensity_floor_map = np.maximum(local_floor, intensity_floor)
 
     roi = processed_img.astype(np.float64)
 
@@ -12542,18 +12543,18 @@ if __name__ == '__main__':
         sorted_areas = sorted(area_list_um2, reverse=True)
         largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
 
-        # Compute intensity floor (local adaptive or global)
+        # Compute intensity floor (local adaptive combined with global minimum)
         intensity_floor = 0.0
         intensity_floor_map = None
         if self.use_min_intensity and self.min_intensity_percent > 0:
+            img_max = processed_img.max()
+            if img_max > 0:
+                intensity_floor = img_max * (self.min_intensity_percent / 100.0)
             if self.local_intensity_window and self.local_intensity_window > 0:
                 roi_f64 = processed_img.astype(np.float64)
                 local_max = ndimage.maximum_filter(roi_f64, size=self.local_intensity_window)
-                intensity_floor_map = local_max * (self.min_intensity_percent / 100.0)
-            else:
-                img_max = processed_img.max()
-                if img_max > 0:
-                    intensity_floor = img_max * (self.min_intensity_percent / 100.0)
+                local_floor = local_max * (self.min_intensity_percent / 100.0)
+                intensity_floor_map = np.maximum(local_floor, intensity_floor)
 
         roi = processed_img.astype(np.float64)
 
@@ -12791,17 +12792,17 @@ if __name__ == '__main__':
             max_radius_px = np.sqrt(constraint_area_px / np.pi)
             max_radius_px_sq = max_radius_px ** 2
 
-        # Compute intensity floor from user settings (local adaptive or global)
+        # Compute intensity floor (local adaptive combined with global minimum)
         intensity_floor = 0.0
         intensity_floor_map = None
         if self.use_min_intensity and self.min_intensity_percent > 0:
+            roi_max = roi.max()
+            if roi_max > 0:
+                intensity_floor = roi_max * (self.min_intensity_percent / 100.0)
             if self.local_intensity_window and self.local_intensity_window > 0:
                 local_max = ndimage.maximum_filter(roi, size=self.local_intensity_window)
-                intensity_floor_map = local_max * (self.min_intensity_percent / 100.0)
-            else:
-                roi_max = roi.max()
-                if roi_max > 0:
-                    intensity_floor = roi_max * (self.min_intensity_percent / 100.0)
+                local_floor = local_max * (self.min_intensity_percent / 100.0)
+                intensity_floor_map = np.maximum(local_floor, intensity_floor)
 
         # Build territory constraint ROI if watershed territory_map is provided
         territory_roi = None
