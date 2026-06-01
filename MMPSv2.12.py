@@ -14572,14 +14572,23 @@ if __name__ == '__main__':
             crop_bg = (crop_bg - cmin) / (cmax - cmin) * 255
         crop_bg = crop_bg.astype(np.uint8)
 
-        # Adaptive thumbnail size: fit up to 16 in a grid
+        # Dynamic thumbnail size based on mask count
         n_masks = len(mask_items)
-        if n_masks <= 8:
-            n_cols = min(n_masks, 8)
+        if n_masks <= 3:
+            n_cols = n_masks
+            thumb_size = 300
+        elif n_masks <= 5:
+            n_cols = n_masks
+            thumb_size = 240
+        elif n_masks <= 8:
+            n_cols = n_masks
             thumb_size = 180
+        elif n_masks <= 12:
+            n_cols = 6
+            thumb_size = 160
         else:
-            n_cols = min(n_masks, 8)
-            thumb_size = 140
+            n_cols = 8
+            thumb_size = 130
 
         # Wrapping grid layout for 16+ masks
         from PyQt5.QtWidgets import QGridLayout
