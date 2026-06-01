@@ -14491,6 +14491,10 @@ if __name__ == '__main__':
                             coloc_count += 1
             self.log(f"✓ Colocalization calculated for {coloc_count}/{len(all_results)} cells")
 
+        # Calculate nearest neighbor distance for each cell
+        self.log("Calculating nearest neighbor distances...")
+        self._compute_nearest_neighbor_distances(all_results)
+
         self.log("=" * 50)
         self.log("Checking metadata... (any missing info will be requested)")
         if not self.collect_metadata_for_images():
@@ -14893,6 +14897,79 @@ if __name__ == '__main__':
         self.log("")
 
     # ----------------------------------------------------------------
+    # NEAREST NEIGHBOR DISTANCE
+    # ----------------------------------------------------------------
+
+    def _compute_nearest_neighbor_distances(self, all_results):
+        """Compute nearest neighbor distance (µm) for each cell.
+
+        For each cell, finds the Euclidean distance to the closest other
+        soma centroid in the same image, converted to µm using the pixel size.
+        Adds 'nearest_neighbor_um' to each result dict.
+        """
+        # Group results by image and collect soma positions
+        by_image = {}
+        for i, result in enumerate(all_results):
+            img_name = result.get('image_name', '')
+            soma_id = result.get('soma_id', '')
+            soma_idx = result.get('soma_idx', 0)
+            if img_name not in by_image:
+                by_image[img_name] = []
+            by_image[img_name].append((i, soma_id, soma_idx))
+
+        computed = 0
+        for img_name_base, cells in by_image.items():
+            # Find the full image name to get soma coordinates
+            img_data = None
+            for full_name, data in self.images.items():
+                if os.path.splitext(full_name)[0] == img_name_base:
+                    img_data = data
+                    break
+
+            if img_data is None or len(cells) < 2:
+                for idx, _, _ in cells:
+                    all_results[idx]['nearest_neighbor_um'] = 0.0
+                continue
+
+            px_x, px_y = self._get_pixel_size_xy(
+                next((fn for fn in self.images if os.path.splitext(fn)[0] == img_name_base), None))
+
+            # Build coordinate array for all somas in this image
+            coords = []
+            result_indices = []
+            for idx, soma_id, soma_idx in cells:
+                if soma_idx < len(img_data.get('somas', [])):
+                    soma = img_data['somas'][soma_idx]
+                    coords.append((float(soma[0]), float(soma[1])))
+                    result_indices.append(idx)
+                else:
+                    all_results[idx]['nearest_neighbor_um'] = 0.0
+
+            if len(coords) < 2:
+                for idx in result_indices:
+                    all_results[idx]['nearest_neighbor_um'] = 0.0
+                continue
+
+            coords_arr = np.array(coords)
+
+            for j, idx in enumerate(result_indices):
+                row_j, col_j = coords_arr[j]
+                min_dist = float('inf')
+                for k in range(len(coords_arr)):
+                    if k == j:
+                        continue
+                    row_k, col_k = coords_arr[k]
+                    dy = (row_j - row_k) * px_y
+                    dx = (col_j - col_k) * px_x
+                    dist = math.sqrt(dx * dx + dy * dy)
+                    if dist < min_dist:
+                        min_dist = dist
+                all_results[idx]['nearest_neighbor_um'] = round(min_dist, 2)
+                computed += 1
+
+        self.log(f"✓ Nearest neighbor distances computed for {computed} cells")
+
+    # ----------------------------------------------------------------
     # EXPORT: R SCRIPT GENERATOR
     # ----------------------------------------------------------------
 
@@ -14923,7 +15000,7 @@ if __name__ == '__main__':
             'perimeter', 'mask_area', 'eccentricity', 'roundness',
             'avg_centroid_distance', 'soma_area', 'polarity_index',
             'principal_angle', 'major_axis_um', 'minor_axis_um',
-            'cell_spread',
+            'cell_spread', 'nearest_neighbor_um',
         ]
         for c in candidate_cols:
             if c in columns:
@@ -15149,7 +15226,7 @@ theme_pub <- theme_classic(base_size = 14) +
             unit = ''
             if 'area' in col:
                 unit = ' (µm²)'
-            elif 'perimeter' in col or 'distance' in col or 'axis' in col or 'spread' in col:
+            elif 'perimeter' in col or 'distance' in col or 'axis' in col or 'spread' in col or 'neighbor' in col:
                 unit = ' (µm)'
             elif 'angle' in col:
                 unit = ' (degrees)'
