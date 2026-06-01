@@ -3021,7 +3021,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.tabs.addTab(self.processed_label, "Processed")
         self.mask_label = InteractiveImageLabel(self)
         self.mask_label.setText("No masks yet")
-        self.tabs.addTab(self.mask_label, "Masks")
+
+        # Masks tab: container that can switch between single-mask and grid view
+        self.mask_tab_container = QWidget()
+        mask_tab_layout = QVBoxLayout(self.mask_tab_container)
+        mask_tab_layout.setContentsMargins(0, 0, 0, 0)
+        mask_tab_layout.addWidget(self.mask_label)
+
+        # Grid QA view (hidden until QA starts)
+        self.qa_grid_scroll = QScrollArea()
+        self.qa_grid_scroll.setWidgetResizable(True)
+        self.qa_grid_scroll.setVisible(False)
+        mask_tab_layout.addWidget(self.qa_grid_scroll)
+
+        self.tabs.addTab(self.mask_tab_container, "Masks")
 
         # Give tabs most of the space (stretch factor)
         layout.addWidget(self.tabs, stretch=1)
@@ -13451,27 +13464,42 @@ if __name__ == '__main__':
         self.clear_masks_btn.setEnabled(True)
         self.clear_masks_btn.setVisible(True)
 
-        # Show and init progress bar — base it on masks that actually need
-        # human review (total minus auto-rejected duplicates).
-        masks_needing_review = len(self.all_masks_flat) - auto_rejected_count
-        self.mask_qa_progress_bar.setMaximum(masks_needing_review)
-        self.mask_qa_progress_bar.setValue(manually_reviewed_count)
+        # Show and init progress bar — base it on somas, not individual masks
+        self._qa_grid_soma_idx = 0
+        # Find first unreviewed soma
+        for si, soma_key in enumerate(self._qa_soma_order):
+            flat_indices = self._qa_soma_mask_index.get(soma_key, [])
+            if any(self.all_masks_flat[fi]['mask_data'].get('approved') is None
+                   and not self.all_masks_flat[fi]['mask_data'].get('duplicate')
+                   for fi in flat_indices):
+                self._qa_grid_soma_idx = si
+                break
+
+        total_somas = len(self._qa_soma_order)
+        reviewed_somas = sum(
+            1 for sk in self._qa_soma_order
+            if all(self.all_masks_flat[fi]['mask_data'].get('approved') is not None
+                   for fi in self._qa_soma_mask_index.get(sk, []))
+        )
+        self.mask_qa_progress_bar.setFormat("%v / %m somas reviewed")
+        self.mask_qa_progress_bar.setMaximum(total_somas)
+        self.mask_qa_progress_bar.setValue(reviewed_somas)
         self.mask_qa_progress_bar.setVisible(True)
 
-        self._show_current_mask()
+        # Enter grid view
+        self.mask_label.setVisible(False)
+        self.qa_grid_scroll.setVisible(True)
+        self._show_qa_grid()
         self.tabs.setCurrentIndex(3)
 
         self.log("=" * 50)
-        self.log("🎯 BATCH MASK QA MODE")
-        self.log(f"Total masks generated: {len(self.all_masks_flat)}")
-        # Report auto-rejected duplicates
+        self.log("🎯 GRID MASK QA MODE")
+        self.log(f"Total somas: {total_somas} | Masks: {len(self.all_masks_flat)}")
         if auto_rejected_count > 0:
-            self.log(f"⚠️ {auto_rejected_count} duplicate masks auto-rejected (identical to a smaller target area)")
-        if manually_reviewed_count > 0:
-            self.log(f"Resuming: {manually_reviewed_count}/{masks_needing_review} manually reviewed")
-        remaining = sum(1 for f in self.all_masks_flat if f['mask_data'].get('approved') is None)
-        self.log(f"Masks needing review: {remaining}")
-        self.log("Keyboard: A=Approve, R=Reject, ←→=Navigate, Space=Approve&Next")
+            self.log(f"⚠️ {auto_rejected_count} duplicate masks auto-rejected")
+        if reviewed_somas > 0:
+            self.log(f"Resuming: {reviewed_somas}/{total_somas} somas reviewed")
+        self.log("Double-click a mask to accept it (smaller auto-approved, larger auto-rejected)")
         self.log("=" * 50)
 
     def _evict_old_qa_masks(self):
@@ -14228,6 +14256,7 @@ if __name__ == '__main__':
         all_reviewed = total_decided >= len(self.all_masks_flat)
 
         if all_reviewed:
+            self._exit_grid_qa()
             self.mask_qa_active = False
             self.approve_mask_btn.setEnabled(False)
             self.reject_mask_btn.setEnabled(False)
@@ -14324,12 +14353,11 @@ if __name__ == '__main__':
 
         self.log(f"↩ Undid {was}: {mask_data['soma_id']} ({mask_data['target_area_um2']} µm²)")
 
-        # Jump QA back to that mask
+        # Jump QA back to that soma's grid
         if hasattr(self, 'all_masks_flat') and self.all_masks_flat:
-            for i, flat in enumerate(self.all_masks_flat):
-                if flat is flat_data:
-                    self.mask_qa_idx = i
-                    break
+            soma_key = (img_name, mask_data.get('soma_id', ''))
+            if soma_key in self._qa_soma_order_index:
+                self._qa_grid_soma_idx = self._qa_soma_order_index[soma_key]
 
             self.mask_qa_active = True
             self.approve_mask_btn.setEnabled(True)
@@ -14344,8 +14372,326 @@ if __name__ == '__main__':
             self.paint_erase_btn.setVisible(True)
             self.clear_masks_btn.setEnabled(True)
             self.clear_masks_btn.setVisible(True)
-            self._show_current_mask()
+            self.mask_label.setVisible(False)
+            self.qa_grid_scroll.setVisible(True)
+            self._show_qa_grid()
             self.tabs.setCurrentIndex(3)
+
+    # ----------------------------------------------------------------
+    # GRID QA VIEW
+    # ----------------------------------------------------------------
+
+    def _show_qa_grid(self):
+        """Show a grid of mask thumbnails for the current soma."""
+        if self._qa_grid_soma_idx >= len(self._qa_soma_order):
+            self._exit_grid_qa()
+            self._check_qa_complete()
+            return
+
+        soma_key = self._qa_soma_order[self._qa_grid_soma_idx]
+        img_name, soma_id = soma_key
+        flat_indices = self._qa_soma_mask_index.get(soma_key, [])
+
+        # Skip somas where all masks are already reviewed
+        non_dup_indices = [fi for fi in flat_indices
+                          if not self.all_masks_flat[fi]['mask_data'].get('duplicate')]
+        all_reviewed = all(self.all_masks_flat[fi]['mask_data'].get('approved') is not None
+                          for fi in non_dup_indices)
+        if all_reviewed and self._qa_grid_soma_idx < len(self._qa_soma_order) - 1:
+            self._qa_grid_soma_idx += 1
+            self._show_qa_grid()
+            return
+
+        self.current_image_name = img_name
+
+        # Load processed image
+        processed_img = self._ensure_processed_loaded(img_name)
+        if processed_img is None:
+            self.log(f"Cannot load image for {img_name}")
+            self._qa_grid_soma_idx += 1
+            self._show_qa_grid()
+            return
+        if processed_img.ndim > 2:
+            processed_img = ensure_grayscale(processed_img)
+
+        # Get soma centroid for cropping
+        img_data = self.images.get(img_name, {})
+        soma_idx = self.all_masks_flat[flat_indices[0]]['mask_data'].get('soma_idx', 0)
+        soma_centroid = None
+        if soma_idx < len(img_data.get('somas', [])):
+            soma_centroid = img_data['somas'][soma_idx]
+
+        # Get non-duplicate masks sorted largest first
+        size_key = 'volume_um3' if self.mode_3d else 'target_area_um2'
+        mask_items = []
+        for fi in flat_indices:
+            md = self.all_masks_flat[fi]['mask_data']
+            if md.get('duplicate'):
+                continue
+            mask_items.append((fi, md))
+        mask_items.sort(key=lambda x: -x[1].get(size_key, 0))
+
+        # Build grid widget
+        grid_widget = QWidget()
+        grid_layout = QVBoxLayout(grid_widget)
+        grid_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Header
+        total_somas = len(self._qa_soma_order)
+        header = QLabel(
+            f"<b>Soma {self._qa_grid_soma_idx + 1} / {total_somas}</b> | "
+            f"{os.path.splitext(img_name)[0]} | {soma_id} | "
+            f"{len(mask_items)} mask sizes"
+        )
+        header.setStyleSheet("font-size: 14px; padding: 5px;")
+        grid_layout.addWidget(header)
+
+        hint = QLabel("Double-click a mask to accept it. Smaller masks auto-approved, larger auto-rejected.")
+        hint.setStyleSheet("color: gray; padding-bottom: 8px;")
+        grid_layout.addWidget(hint)
+
+        # Thumbnail grid
+        thumb_container = QWidget()
+        thumb_layout = QHBoxLayout(thumb_container)
+        thumb_layout.setContentsMargins(0, 0, 0, 0)
+        thumb_layout.setSpacing(8)
+
+        # Compute crop region centered on soma
+        img_h, img_w = processed_img.shape[:2]
+        if soma_centroid:
+            cy, cx = int(soma_centroid[0]), int(soma_centroid[1])
+        else:
+            cy, cx = img_h // 2, img_w // 2
+
+        # Find the extent of the largest mask to determine crop size
+        largest_mask = None
+        for fi, md in mask_items:
+            if md.get('mask') is None:
+                self._reload_mask_from_disk(md, img_name)
+            if md.get('mask') is not None:
+                largest_mask = md['mask']
+                break
+
+        if largest_mask is not None:
+            mask_coords = np.argwhere(largest_mask > 0)
+            if len(mask_coords) > 0:
+                r_min, c_min = mask_coords.min(axis=0)
+                r_max, c_max = mask_coords.max(axis=0)
+                pad = max(30, (r_max - r_min) // 4, (c_max - c_min) // 4)
+                crop_r1 = max(0, r_min - pad)
+                crop_r2 = min(img_h, r_max + pad)
+                crop_c1 = max(0, c_min - pad)
+                crop_c2 = min(img_w, c_max + pad)
+            else:
+                crop_r1, crop_r2 = max(0, cy - 100), min(img_h, cy + 100)
+                crop_c1, crop_c2 = max(0, cx - 100), min(img_w, cx + 100)
+        else:
+            crop_r1, crop_r2 = max(0, cy - 100), min(img_h, cy + 100)
+            crop_c1, crop_c2 = max(0, cx - 100), min(img_w, cx + 100)
+
+        # Normalize processed image crop for display
+        crop_bg = processed_img[crop_r1:crop_r2, crop_c1:crop_c2].astype(np.float64)
+        cmin, cmax = crop_bg.min(), crop_bg.max()
+        if cmax > cmin:
+            crop_bg = (crop_bg - cmin) / (cmax - cmin) * 255
+        crop_bg = crop_bg.astype(np.uint8)
+
+        thumb_size = 200
+
+        for fi, md in mask_items:
+            target_area = md.get(size_key, 0)
+            approved = md.get('approved')
+
+            # Build thumbnail: grayscale background + green mask outline
+            bg_rgb = np.stack([crop_bg, crop_bg, crop_bg], axis=-1).copy()
+
+            mask = md.get('mask')
+            if mask is None:
+                self._reload_mask_from_disk(md, img_name)
+                mask = md.get('mask')
+
+            if mask is not None:
+                mask_crop = mask[crop_r1:crop_r2, crop_c1:crop_c2]
+                if np.any(mask_crop):
+                    mask_u8 = (mask_crop > 0).astype(np.uint8) * 255
+                    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(bg_rgb, contours, -1, (0, 255, 0), 2)
+
+            # Draw soma centroid marker
+            if soma_centroid:
+                sc_r = int(soma_centroid[0]) - crop_r1
+                sc_c = int(soma_centroid[1]) - crop_c1
+                if 0 <= sc_r < bg_rgb.shape[0] and 0 <= sc_c < bg_rgb.shape[1]:
+                    cv2.circle(bg_rgb, (sc_c, sc_r), 4, (255, 0, 0), -1)
+
+            # Scale to thumbnail
+            th, tw = bg_rgb.shape[:2]
+            scale = min(thumb_size / tw, thumb_size / th)
+            new_w, new_h = int(tw * scale), int(th * scale)
+            if new_w > 0 and new_h > 0:
+                bg_rgb = cv2.resize(bg_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            # Convert to QPixmap
+            bg_rgb = np.ascontiguousarray(bg_rgb)
+            qimg = QImage(bg_rgb.data, bg_rgb.shape[1], bg_rgb.shape[0],
+                         bg_rgb.shape[1] * 3, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg.copy())
+
+            # Create clickable thumbnail label
+            thumb_widget = QWidget()
+            thumb_widget_layout = QVBoxLayout(thumb_widget)
+            thumb_widget_layout.setContentsMargins(2, 2, 2, 2)
+            thumb_widget_layout.setSpacing(2)
+
+            thumb_label = QLabel()
+            thumb_label.setPixmap(pixmap)
+            thumb_label.setFixedSize(thumb_size, thumb_size)
+            thumb_label.setAlignment(Qt.AlignCenter)
+            thumb_label.setScaledContents(True)
+
+            # Style based on approval state
+            if approved is True:
+                border = "3px solid #4CAF50"
+            elif approved is False:
+                border = "3px solid #F44336"
+            else:
+                border = "2px solid gray"
+            thumb_label.setStyleSheet(f"border: {border}; background: black;")
+
+            # Store data for double-click handler
+            thumb_label._qa_flat_idx = fi
+            thumb_label._qa_mask_data = md
+            thumb_label._qa_soma_key = soma_key
+            thumb_label._qa_mask_items = mask_items
+            thumb_label.mouseDoubleClickEvent = lambda event, lbl=thumb_label: self._on_grid_thumb_double_click(lbl)
+
+            thumb_widget_layout.addWidget(thumb_label)
+
+            # Area label
+            unit = 'µm³' if self.mode_3d else 'µm²'
+            status = ""
+            if approved is True:
+                status = " ✓"
+            elif approved is False:
+                status = " ✗"
+            area_label = QLabel(f"{int(target_area)} {unit}{status}")
+            area_label.setAlignment(Qt.AlignCenter)
+            area_label.setStyleSheet("font-size: 12px; font-weight: bold;")
+            thumb_widget_layout.addWidget(area_label)
+
+            thumb_layout.addWidget(thumb_widget)
+
+        thumb_layout.addStretch()
+
+        scroll_inner = QScrollArea()
+        scroll_inner.setWidget(thumb_container)
+        scroll_inner.setWidgetResizable(False)
+        scroll_inner.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_inner.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_inner.setFixedHeight(thumb_size + 60)
+        grid_layout.addWidget(scroll_inner)
+
+        # Navigation buttons
+        nav_layout = QHBoxLayout()
+        back_btn = QPushButton("← Back")
+        back_btn.setEnabled(self._qa_grid_soma_idx > 0)
+        back_btn.clicked.connect(self._qa_grid_back)
+        back_btn.setFixedWidth(100)
+        nav_layout.addWidget(back_btn)
+
+        nav_layout.addStretch()
+
+        skip_btn = QPushButton("Skip →")
+        skip_btn.clicked.connect(self._qa_grid_next)
+        skip_btn.setFixedWidth(100)
+        nav_layout.addWidget(skip_btn)
+
+        grid_layout.addLayout(nav_layout)
+        grid_layout.addStretch()
+
+        # Set into scroll area
+        self.qa_grid_scroll.setWidget(grid_widget)
+
+        # Update progress bar
+        reviewed_somas = sum(
+            1 for sk in self._qa_soma_order
+            if all(self.all_masks_flat[fi]['mask_data'].get('approved') is not None
+                   for fi in self._qa_soma_mask_index.get(sk, []))
+        )
+        self.mask_qa_progress_bar.setValue(reviewed_somas)
+
+        # Update original label overlays
+        target_area = mask_items[0][1].get(size_key, 0) if mask_items else 0
+        self.original_label.info_text = f"{soma_id}"
+        self.original_label.info_text_right = os.path.splitext(img_name)[0]
+        self.original_label._update_display()
+
+    def _on_grid_thumb_double_click(self, thumb_label):
+        """Handle double-click on a grid thumbnail: accept this mask size."""
+        clicked_fi = thumb_label._qa_flat_idx
+        clicked_md = thumb_label._qa_mask_data
+        soma_key = thumb_label._qa_soma_key
+        mask_items = thumb_label._qa_mask_items
+
+        size_key = 'volume_um3' if self.mode_3d else 'target_area_um2'
+        clicked_size = clicked_md.get(size_key, 0)
+
+        img_name = soma_key[0]
+        soma_id = soma_key[1]
+
+        approved_count = 0
+        rejected_count = 0
+
+        for fi, md in mask_items:
+            target_size = md.get(size_key, 0)
+            if target_size <= clicked_size:
+                md['approved'] = True
+                approved_count += 1
+                self._qa_approved_count += 1
+            else:
+                md['approved'] = False
+                rejected_count += 1
+                self._qa_user_rejected_count += 1
+                self._delete_rejected_mask_tiff(img_name, md)
+
+        unit = 'µm³' if self.mode_3d else 'µm²'
+        self.log(f"✓ {soma_id}: accepted {int(clicked_size)} {unit} "
+                 f"({approved_count} approved, {rejected_count} rejected)")
+
+        # Advance to next soma
+        self._qa_grid_next()
+
+    def _qa_grid_next(self):
+        """Advance to the next unreviewed soma in the grid."""
+        start = self._qa_grid_soma_idx + 1
+        for si in range(start, len(self._qa_soma_order)):
+            soma_key = self._qa_soma_order[si]
+            flat_indices = self._qa_soma_mask_index.get(soma_key, [])
+            non_dup = [fi for fi in flat_indices
+                       if not self.all_masks_flat[fi]['mask_data'].get('duplicate')]
+            if any(self.all_masks_flat[fi]['mask_data'].get('approved') is None
+                   for fi in non_dup):
+                self._qa_grid_soma_idx = si
+                self._show_qa_grid()
+                return
+
+        # All reviewed
+        self._exit_grid_qa()
+        self._check_qa_complete()
+
+    def _qa_grid_back(self):
+        """Go back to the previous soma in the grid."""
+        if self._qa_grid_soma_idx > 0:
+            self._qa_grid_soma_idx -= 1
+            self._show_qa_grid()
+
+    def _exit_grid_qa(self):
+        """Exit grid QA mode, restore single-mask view."""
+        self.qa_grid_scroll.setVisible(False)
+        self.mask_label.setVisible(True)
+        self.original_label.info_text = None
+        self.original_label.info_text_right = None
+        self.original_label._update_display()
 
     def batch_calculate_morphology(self):
         if self.mode_3d:
