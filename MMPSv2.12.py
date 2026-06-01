@@ -1575,6 +1575,8 @@ class InteractiveImageLabel(QLabel):
         self.pixel_picker_mode = False
         # Info text overlay (top-left corner)
         self.info_text = None
+        # Info text overlay (top-right corner)
+        self.info_text_right = None
         # Paint fill mode
         self.paint_mode = False
         self.erase_mode = False
@@ -1733,6 +1735,22 @@ class InteractiveImageLabel(QLabel):
             painter.drawRect(8, 8, tw, th)
             painter.setPen(QColor(255, 255, 255))
             painter.drawText(14, 8 + fm.ascent() + 4, self.info_text)
+
+        # Info text overlay (top-right)
+        if self.info_text_right:
+            font = painter.font()
+            font.setPointSize(11)
+            font.setBold(True)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(self.info_text_right) + 12
+            th = fm.height() + 8
+            rx = self.width() - tw - 8
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 180))
+            painter.drawRect(rx, 8, tw, th)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(rx + 6, 8 + fm.ascent() + 4, self.info_text_right)
 
         if self.zoom_level != 1.0:
             y_offset = 5 if not self.info_text else 8 + painter.fontMetrics().height() + 16
@@ -13641,9 +13659,10 @@ if __name__ == '__main__':
                 soma_centroid = [img_data['somas'][soma_idx]]
             self.mask_label.set_image(pixmap, centroids=soma_centroid, mask_overlay=mask_data['mask'])
 
-            # Show mask size on original image panel (top-left)
+            # Show mask size and image name on original image panel
             target_area = mask_data.get('target_area_um2', 0)
             self.original_label.info_text = f"{int(target_area)} µm²"
+            self.original_label.info_text_right = os.path.splitext(img_name)[0]
             self.original_label._update_display()
 
             # Auto-zoom to mask center
@@ -13717,9 +13736,10 @@ if __name__ == '__main__':
 
         self.mask_label.set_image(pixmap, centroids=soma_centroid, mask_overlay=mask_slice)
 
-        # Show mask size on original image panel (top-left)
+        # Show mask size and image name on original image panel
         vol = mask_data.get('volume_um3', mask_data.get('actual_volume_um3', 0))
         self.original_label.info_text = f"{int(vol)} µm³"
+        self.original_label.info_text_right = os.path.splitext(img_name)[0]
         self.original_label._update_display()
 
         # Auto-zoom to mask center on this slice
@@ -14188,6 +14208,7 @@ if __name__ == '__main__':
             self.undo_qa_btn.setVisible(False)
             self.mask_qa_progress_bar.setVisible(False)
             self.original_label.info_text = None
+            self.original_label.info_text_right = None
             self.original_label._update_display()
 
             for img_name, img_data in self.images.items():
@@ -14764,6 +14785,90 @@ if __name__ == '__main__':
                 writer.writerows(img_results)
 
         self.log(f"Per-image results saved for {len(by_image)} images")
+
+        # Generate colocalization summary table if in coloc mode
+        if self.colocalization_mode and coloc_present:
+            self._save_coloc_summary(results)
+
+    def _save_coloc_summary(self, results):
+        """Save a per-image colocalization summary table for easy graphing.
+
+        Columns: image_name, animal_id, treatment, total_cells,
+        ch1_only_cells (e.g. Iba1+), coloc_cells (e.g. TREM2+Iba1+),
+        percent_coloc
+        """
+        import csv
+
+        ch1_idx = self.coloc_channel_1
+        ch2_idx = self.coloc_channel_2
+        ch1_name = self.channel_names.get(ch1_idx, f'Ch{ch1_idx + 1}')
+        ch2_name = self.channel_names.get(ch2_idx, f'Ch{ch2_idx + 1}')
+        if not ch1_name:
+            ch1_name = f'Ch{ch1_idx + 1}'
+        if not ch2_name:
+            ch2_name = f'Ch{ch2_idx + 1}'
+
+        # Group results by image
+        by_image = {}
+        for r in results:
+            img = r.get('image_name', '')
+            if img not in by_image:
+                by_image[img] = {'results': [], 'animal_id': r.get('animal_id', ''),
+                                 'treatment': r.get('treatment', '')}
+            by_image[img]['results'].append(r)
+
+        summary_rows = []
+        for img_name, data in sorted(by_image.items()):
+            img_results = data['results']
+            total_cells = len(img_results)
+
+            # Count cells by soma_group
+            coloc_cells = sum(1 for r in img_results if r.get('soma_group') == 'coloc')
+            single_cells = sum(1 for r in img_results if r.get('soma_group') == 'single_channel')
+
+            # If soma_groups weren't used, fall back to signal-based counting
+            if coloc_cells == 0 and single_cells == 0:
+                for r in img_results:
+                    if r.get('coloc_status') == 'ok' and r.get('n_coloc_pixels', 0) > 0:
+                        coloc_cells += 1
+                    else:
+                        single_cells += 1
+
+            percent_coloc = round((coloc_cells / total_cells) * 100, 2) if total_cells > 0 else 0.0
+
+            summary_rows.append({
+                'image_name': img_name,
+                'animal_id': data['animal_id'],
+                'treatment': data['treatment'],
+                'total_cells': total_cells,
+                f'{ch1_name}_only': single_cells,
+                f'{ch2_name}+{ch1_name}': coloc_cells,
+                'percent_coloc': percent_coloc,
+            })
+
+        if not summary_rows:
+            return
+
+        summary_path = os.path.join(self.output_dir, "colocalization_summary.csv")
+        fieldnames = ['image_name', 'animal_id', 'treatment', 'total_cells',
+                      f'{ch1_name}_only', f'{ch2_name}+{ch1_name}', 'percent_coloc']
+        with open(summary_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(summary_rows)
+
+        self.log(f"Colocalization summary saved to: {summary_path}")
+        self.log(f"  Columns: total_cells, {ch1_name}_only, {ch2_name}+{ch1_name}, percent_coloc")
+
+        # Log the summary table
+        self.log("")
+        self.log(f"{'Image':<30} {'Treatment':<15} {'Total':>6} {ch1_name + ' only':>10} {ch2_name + '+' + ch1_name:>12} {'% Coloc':>8}")
+        self.log("-" * 85)
+        for row in summary_rows:
+            self.log(f"{row['image_name']:<30} {row['treatment']:<15} "
+                     f"{row['total_cells']:>6} {row[f'{ch1_name}_only']:>10} "
+                     f"{row[f'{ch2_name}+{ch1_name}']:>12} {row['percent_coloc']:>7.1f}%")
+        self.log("")
 
     # ----------------------------------------------------------------
     # 3D MORPHOLOGY CALCULATION
