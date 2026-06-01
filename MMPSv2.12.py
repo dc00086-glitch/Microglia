@@ -235,7 +235,7 @@ def _grow_masks_for_soma(args):
     # Circular constraint
     max_radius_px_sq = None
     if use_circular_constraint:
-        constraint_area_um2 = sorted_areas[0] + circular_buffer_um2
+        constraint_area_um2 = sorted_areas[0] + sorted_areas[0] * 2
         constraint_area_px = constraint_area_um2 / (pixel_size_um ** 2)
         max_radius_px = np.sqrt(constraint_area_px / np.pi)
         max_radius_px_sq = max_radius_px ** 2
@@ -313,15 +313,14 @@ def _grow_masks_for_soma(args):
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
     soma_area_px = soma_seed_count
-    area_step = sorted_areas[0] - sorted_areas[1] if len(sorted_areas) > 1 else 100
     masks = []
     mask_pixel_counts = []
     for step_idx, target_area_um2 in enumerate(sorted_areas):
         target_px = int(target_area_um2 / (pixel_size_um ** 2))
 
-        # Per-step circular constraint: buffer grows by 2*step_size per mask
+        # Per-step circular constraint: buffer = 2x target area
         if use_circular_constraint:
-            step_buffer = circular_buffer_um2 + step_idx * 2 * area_step
+            step_buffer = target_area_um2 * 2
             step_constraint_um2 = target_area_um2 + step_buffer
             step_constraint_px = step_constraint_um2 / (pixel_size_um ** 2)
             step_radius_sq = step_constraint_px / np.pi
@@ -6864,7 +6863,7 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
     # Circular constraint
     max_radius_px_sq = None
     if use_circular_constraint:
-        constraint_area_um2 = sorted_areas[0] + circular_buffer_um2
+        constraint_area_um2 = sorted_areas[0] + sorted_areas[0] * 2
         constraint_area_px = constraint_area_um2 / (pixel_size_um ** 2)
         max_radius_px = np.sqrt(constraint_area_px / np.pi)
         max_radius_px_sq = max_radius_px ** 2
@@ -7048,7 +7047,7 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
     # Circular constraint
     max_radius_px_sq = None
     if use_circular_constraint:
-        constraint_area_um2 = sorted_areas[0] + circular_buffer_um2
+        constraint_area_um2 = sorted_areas[0] + sorted_areas[0] * 2
         constraint_area_px = constraint_area_um2 / (pixel_size_um ** 2)
         max_radius_px = np.sqrt(constraint_area_px / np.pi)
         max_radius_px_sq = max_radius_px ** 2
@@ -7139,14 +7138,13 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
     print(f"  {{soma_id}}: soma={{soma_seed_count}}px, grew to {{len(growth_order)}}px (target: {{largest_target_px}})")
 
     soma_area_px = soma_seed_count
-    area_step = sorted_areas[0] - sorted_areas[1] if len(sorted_areas) > 1 else 100
     mask_pixel_counts = []
     for step_idx, target_area_um2 in enumerate(sorted_areas):
         target_px = int(target_area_um2 / (pixel_size_um ** 2))
 
-        # Per-step circular constraint: buffer grows by 2*step_size per mask
+        # Per-step circular constraint: buffer = 2x target area
         if use_circular_constraint:
-            step_buffer = circular_buffer_um2 + step_idx * 2 * area_step
+            step_buffer = target_area_um2 * 2
             step_constraint_um2 = target_area_um2 + step_buffer
             step_constraint_px = step_constraint_um2 / (pixel_size_um ** 2)
             step_radius_sq = step_constraint_px / np.pi
@@ -12880,14 +12878,13 @@ if __name__ == '__main__':
         # min(target_px, len(growth_order)) naturally caps the mask smaller
         # If target < soma area, substitute the soma mask for that size
         soma_area_px = soma_seed_count
-        area_step = sorted_areas[0] - sorted_areas[1] if len(sorted_areas) > 1 else 100
         mask_pixel_counts = []
         for step_idx, target_area_um2 in enumerate(sorted_areas):
             target_px = int(target_area_um2 / (pixel_size_um ** 2))
 
-            # Per-step circular constraint: buffer grows by 2*step_size per mask
+            # Per-step circular constraint: buffer = 2x target area
             if self.use_circular_constraint:
-                step_buffer = self.circular_buffer_um2 + step_idx * 2 * area_step
+                step_buffer = target_area_um2 * 2
                 step_constraint_um2 = target_area_um2 + step_buffer
                 step_constraint_px = step_constraint_um2 / (pixel_size_um ** 2)
                 step_radius_sq = step_constraint_px / np.pi
