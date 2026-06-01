@@ -1325,7 +1325,7 @@ class MorphologyCalculationThread(QThread):
                     os.path.splitext(img_name)[0],
                     mask_data['soma_id'],
                     mask_data['soma_idx'],
-                    mask_data['target_area_um2']
+                    mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
                 )
 
                 if self.masks_dir:
@@ -6373,7 +6373,8 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                 if self.mode_3d:
                     mqa['volume_um3'] = mask.get('volume_um3', 0)
                 else:
-                    mqa['target_area_um2'] = mask.get('target_area_um2', 0)
+                    mqa['target_area_um2'] = mask.get('target_area_um2', mask.get('area_um2', 0))
+                    mqa['area_um2'] = mqa['target_area_um2']  # backward compat for older MMPS
                 mask_qa_state.append(mqa)
             img_session['mask_qa_state'] = mask_qa_state
 
@@ -14356,7 +14357,7 @@ if __name__ == '__main__':
                 img_data['status'] = 'masks_generated'
                 self._update_file_list_item(img_name)
 
-        self.log(f"↩ Undid {was}: {mask_data['soma_id']} ({mask_data['target_area_um2']} µm²)")
+        self.log(f"↩ Undid {was}: {mask_data['soma_id']} ({mask_data.get('target_area_um2', mask_data.get('area_um2', 0))} µm²)")
 
         # Jump QA back to that soma's grid
         if hasattr(self, 'all_masks_flat') and self.all_masks_flat:
