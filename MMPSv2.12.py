@@ -14969,7 +14969,23 @@ cat("Loaded", nrow(data), "cells from", length(unique(data$image_name)), "images
             script += '''
 # Convert treatment to factor for consistent ordering
 data$treatment <- factor(data$treatment)
+n_groups <- nlevels(data$treatment)
 cat("Treatments:", paste(levels(data$treatment), collapse = ", "), "\\n")
+cat("Number of groups:", n_groups, "\\n")
+
+# Auto-select statistical test based on number of groups
+if (n_groups == 2) {
+  cat("Statistical test: t-test (2 groups)\\n")
+  stat_method <- "t.test"
+} else if (n_groups >= 3) {
+  cat("Statistical test: ANOVA + Tukey HSD (3+ groups)\\n")
+  stat_method <- "anova"
+  if (!require("multcomp", quietly = TRUE)) install.packages("multcomp")
+  if (!require("emmeans", quietly = TRUE)) install.packages("emmeans")
+} else {
+  cat("Only 1 group — skipping statistical comparisons\\n")
+  stat_method <- "none"
+}
 '''
         if has_animal:
             script += '''cat("Animals:", length(unique(data$animal_id)), "\\n")
@@ -14993,7 +15009,127 @@ summary_stats <- data %>%
 
 print(summary_stats)
 write.csv(summary_stats, "summary_statistics.csv", row.names = FALSE)
+'''
+        if has_treatment:
+            anova_cols_str = ', '.join(f'"{c}"' for c in morph_cols)
+            script += f'''
+# --- Statistical tests ---
+if (stat_method == "anova" && n_groups >= 3) {{
+  cat("\\n============================================\\n")
+  cat("ANOVA + Tukey HSD Post-Hoc Tests\\n")
+  cat("============================================\\n\\n")
 
+  anova_results <- list()
+  tukey_results <- list()
+
+  for (metric in c({anova_cols_str})) {{
+    formula <- as.formula(paste(metric, "~ treatment"))
+    aov_fit <- aov(formula, data = data)
+    aov_summary <- summary(aov_fit)
+    f_val <- aov_summary[[1]]["treatment", "F value"]
+    p_val <- aov_summary[[1]]["treatment", "Pr(>F)"]
+
+    cat(metric, ": F =", round(f_val, 3), ", p =", format.pval(p_val, digits = 4), "\\n")
+
+    anova_results[[metric]] <- data.frame(
+      metric = metric,
+      F_value = round(f_val, 4),
+      p_value = p_val,
+      significant = ifelse(p_val < 0.05, "yes", "no")
+    )
+
+    # Tukey post-hoc for significant ANOVAs
+    if (p_val < 0.05) {{
+      tukey_fit <- TukeyHSD(aov_fit)
+      tukey_df <- as.data.frame(tukey_fit$treatment)
+      tukey_df$comparison <- rownames(tukey_df)
+      tukey_df$metric <- metric
+      tukey_results[[metric]] <- tukey_df
+      cat("  Tukey HSD pairwise comparisons:\\n")
+      for (j in seq_len(nrow(tukey_df))) {{
+        sig <- ifelse(tukey_df$`p adj`[j] < 0.001, "***",
+               ifelse(tukey_df$`p adj`[j] < 0.01, "**",
+               ifelse(tukey_df$`p adj`[j] < 0.05, "*", "ns")))
+        cat("    ", tukey_df$comparison[j], ": diff =",
+            round(tukey_df$diff[j], 3), ", p.adj =",
+            format.pval(tukey_df$`p adj`[j], digits = 4), sig, "\\n")
+      }}
+    }}
+  }}
+
+  # Save ANOVA results
+  anova_df <- do.call(rbind, anova_results)
+  write.csv(anova_df, "anova_results.csv", row.names = FALSE)
+  cat("\\nANOVA results saved to: anova_results.csv\\n")
+
+  # Save Tukey results
+  if (length(tukey_results) > 0) {{
+    tukey_df <- do.call(rbind, tukey_results)
+    write.csv(tukey_df, "tukey_posthoc_results.csv", row.names = FALSE)
+    cat("Tukey post-hoc saved to: tukey_posthoc_results.csv\\n")
+  }}
+
+  # Check normality assumption (Shapiro-Wilk per group)
+  cat("\\nNormality check (Shapiro-Wilk per group):\\n")
+  normality_warnings <- c()
+  for (metric in c({anova_cols_str})) {{
+    for (grp in levels(data$treatment)) {{
+      grp_data <- data[[metric]][data$treatment == grp]
+      grp_data <- grp_data[!is.na(grp_data)]
+      if (length(grp_data) >= 3 && length(grp_data) <= 5000) {{
+        sw <- shapiro.test(grp_data)
+        if (sw$p.value < 0.05) {{
+          normality_warnings <- c(normality_warnings,
+            paste0("  WARNING: ", metric, " (", grp, ") may not be normal, p=",
+                   format.pval(sw$p.value, digits = 3)))
+        }}
+      }}
+    }}
+  }}
+  if (length(normality_warnings) > 0) {{
+    cat(paste(normality_warnings, collapse = "\\n"), "\\n")
+    cat("  Consider Kruskal-Wallis test for non-normal data\\n")
+  }} else {{
+    cat("  All groups pass normality assumption\\n")
+  }}
+
+}} else if (stat_method == "t.test" && n_groups == 2) {{
+  cat("\\n============================================\\n")
+  cat("t-test Results (2 groups)\\n")
+  cat("============================================\\n\\n")
+
+  ttest_results <- list()
+  for (metric in c({anova_cols_str})) {{
+    grp_levels <- levels(data$treatment)
+    g1 <- data[[metric]][data$treatment == grp_levels[1]]
+    g2 <- data[[metric]][data$treatment == grp_levels[2]]
+    g1 <- g1[!is.na(g1)]
+    g2 <- g2[!is.na(g2)]
+    if (length(g1) >= 2 && length(g2) >= 2) {{
+      tt <- t.test(g1, g2)
+      sig <- ifelse(tt$p.value < 0.001, "***",
+             ifelse(tt$p.value < 0.01, "**",
+             ifelse(tt$p.value < 0.05, "*", "ns")))
+      cat(metric, ": t =", round(tt$statistic, 3),
+          ", p =", format.pval(tt$p.value, digits = 4), sig, "\\n")
+      ttest_results[[metric]] <- data.frame(
+        metric = metric,
+        t_statistic = round(tt$statistic, 4),
+        p_value = tt$p.value,
+        mean_diff = round(mean(g1) - mean(g2), 4),
+        significant = ifelse(tt$p.value < 0.05, "yes", "no")
+      )
+    }}
+  }}
+  if (length(ttest_results) > 0) {{
+    ttest_df <- do.call(rbind, ttest_results)
+    write.csv(ttest_df, "ttest_results.csv", row.names = FALSE)
+    cat("\\nt-test results saved to: ttest_results.csv\\n")
+  }}
+}}
+'''
+
+        script += '''
 # ============================================================================
 # PLOTS
 # ============================================================================
@@ -15027,8 +15163,16 @@ p_{col} <- ggplot(data, aes(x = {group_var}, y = {col}, fill = {group_var})) +
   theme(legend.position = "none")
 '''
             if has_treatment:
-                script += f'''  # Add statistical comparison
-p_{col} <- p_{col} + stat_compare_means(method = "t.test", label = "p.signif")
+                script += f'''
+# Add statistical comparison (auto-selects t-test or ANOVA)
+if (stat_method == "t.test") {{
+  p_{col} <- p_{col} + stat_compare_means(method = "t.test", label = "p.signif")
+}} else if (stat_method == "anova") {{
+  p_{col} <- p_{col} +
+    stat_compare_means(method = "anova", label.y.npc = 0.95) +
+    stat_compare_means(method = "t.test", comparisons = combn(levels(data$treatment), 2, simplify = FALSE),
+                       label = "p.signif", step.increase = 0.08)
+}}
 '''
             script += f'''ggsave("plot_{col}.png", p_{col}, width = 6, height = 5, dpi = 300)
 '''
@@ -15079,14 +15223,26 @@ if (file.exists(coloc_summary_file)) {
 
   # Percent colocalization by treatment
   if ("treatment" %in% names(coloc_summary)) {
+    coloc_summary$treatment <- factor(coloc_summary$treatment)
+    n_coloc_groups <- nlevels(coloc_summary$treatment)
+
     p_coloc <- ggplot(coloc_summary, aes(x = treatment, y = percent_coloc, fill = treatment)) +
       geom_boxplot(outlier.shape = NA, alpha = 0.7) +
       geom_jitter(width = 0.2, size = 2, alpha = 0.5) +
       labs(title = "Colocalization by Treatment",
            y = "% Colocalized Cells", x = "") +
       theme_pub +
-      theme(legend.position = "none") +
-      stat_compare_means(method = "t.test", label = "p.signif")
+      theme(legend.position = "none")
+
+    if (n_coloc_groups == 2) {
+      p_coloc <- p_coloc + stat_compare_means(method = "t.test", label = "p.signif")
+    } else if (n_coloc_groups >= 3) {
+      p_coloc <- p_coloc +
+        stat_compare_means(method = "anova", label.y.npc = 0.95) +
+        stat_compare_means(method = "t.test",
+                           comparisons = combn(levels(coloc_summary$treatment), 2, simplify = FALSE),
+                           label = "p.signif", step.increase = 0.08)
+    }
     ggsave("plot_percent_coloc.png", p_coloc, width = 6, height = 5, dpi = 300)
   }
 
