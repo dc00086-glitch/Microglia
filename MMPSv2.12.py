@@ -1050,73 +1050,55 @@ def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=15
 
 def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
     """
-    Hybrid approach: Try multiple methods and use the best result.
-    Falls back through: Threshold -> Watershed -> Active Contours
+    Hybrid approach: Runs threshold and watershed, picks the best result
+    by compactness score. Returns None if neither produces a valid outline.
 
     Args:
         image: Grayscale image (2D numpy array)
         centroid: (row, col) tuple of soma center
-        sensitivity: 0-100
+        sensitivity: 0.01-90, higher = larger outline
         region_size: Size of region around centroid
 
     Returns:
         List of (row, col) polygon points, or None if failed
     """
-    try:
-        if image is None:
-            return None
-        if image.ndim > 2:
-            image = image[:, :, 0] if image.shape[2] > 0 else image.squeeze()
+    if image is None:
+        return None
+    if image.ndim > 2:
+        image = image[:, :, 0] if image.shape[2] > 0 else image.squeeze()
 
-        # Try threshold first (most reliable)
-        threshold_points = auto_outline_threshold(image, centroid, sensitivity, region_size)
+    threshold_points = auto_outline_threshold(image, centroid, sensitivity, region_size)
+    watershed_points = auto_outline_watershed(image, centroid, sensitivity, region_size)
 
-        watershed_points = auto_outline_watershed(image, centroid, sensitivity, region_size)
+    best_points = None
+    best_score = 0
 
-        best_points = None
-        best_score = 0
+    for points in [threshold_points, watershed_points]:
+        if points is None or len(points) < MIN_OUTLINE_POINTS:
+            continue
 
-        for points, name in [(threshold_points, 'threshold'), (watershed_points, 'watershed')]:
-            if points is None or len(points) < MIN_OUTLINE_POINTS:
-                continue
+        pts_array = np.array(points)
+        n = len(pts_array)
+        area = 0.5 * abs(sum(pts_array[i, 0] * pts_array[(i + 1) % n, 1] -
+                             pts_array[(i + 1) % n, 0] * pts_array[i, 1]
+                             for i in range(n)))
 
-            # Score based on: number of points (more = smoother), area, and compactness
-            pts_array = np.array(points)
+        perimeter = sum(np.sqrt((pts_array[(i + 1) % n, 0] - pts_array[i, 0]) ** 2 +
+                                (pts_array[(i + 1) % n, 1] - pts_array[i, 1]) ** 2)
+                       for i in range(n))
 
-            n = len(pts_array)
-            area = 0.5 * abs(sum(pts_array[i, 0] * pts_array[(i + 1) % n, 1] -
-                                 pts_array[(i + 1) % n, 0] * pts_array[i, 1]
-                                 for i in range(n)))
+        if perimeter > 0:
+            compactness = 4 * np.pi * area / (perimeter ** 2)
+        else:
+            compactness = 0
 
-            perimeter = sum(np.sqrt((pts_array[(i + 1) % n, 0] - pts_array[i, 0]) ** 2 +
-                                    (pts_array[(i + 1) % n, 1] - pts_array[i, 1]) ** 2)
-                           for i in range(n))
+        if area > 50 and area < 50000:
+            score = compactness * 100 + min(area / 100, 50)
+            if score > best_score:
+                best_score = score
+                best_points = points
 
-            # Compactness (circularity) - closer to 1 is better for soma
-            if perimeter > 0:
-                compactness = 4 * np.pi * area / (perimeter ** 2)
-            else:
-                compactness = 0
-
-            if area > 50 and area < 50000:  # Reasonable soma size
-                score = compactness * 100 + min(area / 100, 50)
-                if score > best_score:
-                    best_score = score
-                    best_points = points
-
-        if best_points is not None:
-            return best_points
-
-        # If nothing worked, try active contours as last resort
-        active_points = auto_outline_active_contours(image, centroid, sensitivity, region_size)
-        if active_points is not None and len(active_points) >= MIN_OUTLINE_POINTS:
-            return active_points
-
-        return threshold_points or watershed_points
-
-    except Exception as e:
-        print(f"Auto-outline hybrid error: {e}")
-        return auto_outline_threshold(image, centroid, sensitivity, region_size)
+    return best_points
 
 
 class MorphologyCalculator:
@@ -2837,14 +2819,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.auto_outline_method.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
         self.auto_outline_method.setCurrentIndex(4)  # Hybrid
         self.auto_outline_method.setVisible(False)
-        self.auto_outline_sensitivity = QSlider(Qt.Horizontal)
-        self.auto_outline_sensitivity.setRange(1, 90)
-        self.auto_outline_sensitivity.setValue(10)
-        self.auto_outline_sensitivity.setVisible(False)
-        self.sensitivity_label = QLabel("10")
-        self.auto_outline_sensitivity.valueChanged.connect(
-            lambda v: self.sensitivity_label.setText(str(v))
-        )
+        self._auto_outline_sensitivity_value = 0.01
 
         # Outline controls container - shown only during active outlining
         self.outline_controls_widget = QWidget()
@@ -2853,22 +2828,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Auto-outline settings row (visible during outlining)
         # Method is locked to Hybrid — only sensitivity is adjustable.
+        from PyQt5.QtWidgets import QDoubleSpinBox
         auto_settings = QHBoxLayout()
         auto_settings.addWidget(QLabel("Method: Hybrid"))
         auto_settings.addWidget(QLabel("Sens:"))
-        self.outline_sens_display = QSlider(Qt.Horizontal)
-        self.outline_sens_display.setRange(1, 90)
-        self.outline_sens_display.setValue(10)
-        self.outline_sens_display.setMaximumWidth(60)
+        self.outline_sens_display = QDoubleSpinBox()
+        self.outline_sens_display.setRange(0.01, 90.0)
+        self.outline_sens_display.setValue(0.01)
+        self.outline_sens_display.setDecimals(2)
+        self.outline_sens_display.setSingleStep(1.0)
+        self.outline_sens_display.setMaximumWidth(80)
         self.outline_sens_display.valueChanged.connect(
-            lambda v: self.auto_outline_sensitivity.setValue(v)
+            lambda v: setattr(self, '_auto_outline_sensitivity_value', v)
         )
         auto_settings.addWidget(self.outline_sens_display)
-        self.outline_sens_label = QLabel("10")
-        self.outline_sens_display.valueChanged.connect(
-            lambda v: self.outline_sens_label.setText(str(v))
-        )
-        auto_settings.addWidget(self.outline_sens_label)
         outline_controls_layout.addLayout(auto_settings)
 
         # Action buttons row
@@ -10686,12 +10659,15 @@ if __name__ == '__main__':
         layout.addWidget(auto_btn)
 
         # Auto settings — method is locked to Hybrid, only sensitivity adjustable
+        from PyQt5.QtWidgets import QDoubleSpinBox
         settings_layout = QHBoxLayout()
         settings_layout.addWidget(QLabel("Method: Hybrid"))
         settings_layout.addWidget(QLabel("Sens:"))
-        sens_spin = QSpinBox()
-        sens_spin.setRange(1, 90)
-        sens_spin.setValue(self.auto_outline_sensitivity.value())
+        sens_spin = QDoubleSpinBox()
+        sens_spin.setRange(0.01, 90.0)
+        sens_spin.setDecimals(2)
+        sens_spin.setSingleStep(1.0)
+        sens_spin.setValue(self._auto_outline_sensitivity_value)
         settings_layout.addWidget(sens_spin)
         layout.addLayout(settings_layout)
 
@@ -10706,7 +10682,7 @@ if __name__ == '__main__':
             return  # Cancelled
 
         self.auto_outline_method.setCurrentIndex(4)  # Always Hybrid
-        self.auto_outline_sensitivity.setValue(sens_spin.value())
+        self._auto_outline_sensitivity_value = sens_spin.value()
 
         self.batch_mode = True
         self.polygon_points = []
@@ -10735,7 +10711,7 @@ if __name__ == '__main__':
         self.current_outline_idx = 0
 
         self.outline_controls_widget.setVisible(True)
-        self.outline_sens_display.setValue(self.auto_outline_sensitivity.value())
+        self.outline_sens_display.setValue(self._auto_outline_sensitivity_value)
         self._update_outline_progress()
 
         cl_path = self._get_checklist_path('soma_checklist.csv')
@@ -10779,7 +10755,7 @@ if __name__ == '__main__':
     def _run_auto_outline_all(self):
         """Run auto-outline on all somas, then start review mode"""
         method = self._get_auto_outline_method()
-        sensitivity = self.auto_outline_sensitivity.value()
+        sensitivity = self._auto_outline_sensitivity_value
 
         self.log("=" * 50)
         self.log(f"📐 AUTO-OUTLINING ALL SOMAS...")
@@ -11385,7 +11361,7 @@ if __name__ == '__main__':
             return
 
         method = self._get_auto_outline_method()
-        sensitivity = self.auto_outline_sensitivity.value()
+        sensitivity = self._auto_outline_sensitivity_value
 
         self.log(f"Auto-outlining {soma_id} using {self.auto_outline_method.currentText()}...")
 
@@ -11440,7 +11416,7 @@ if __name__ == '__main__':
             self, 'Auto-Outline All',
             f"Auto-outline {remaining} remaining soma(s)?\n\n"
             f"Method: {self.auto_outline_method.currentText()}\n"
-            f"Sensitivity: {self.auto_outline_sensitivity.value()}\n\n"
+            f"Sensitivity: {self._auto_outline_sensitivity_value}\n\n"
             "You can review and adjust each outline afterward.",
             QMessageBox.Yes | QMessageBox.No
         )
@@ -11449,7 +11425,7 @@ if __name__ == '__main__':
             return
 
         method = self._get_auto_outline_method()
-        sensitivity = self.auto_outline_sensitivity.value()
+        sensitivity = self._auto_outline_sensitivity_value
 
         success_count = 0
         fail_count = 0
