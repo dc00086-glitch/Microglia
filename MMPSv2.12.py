@@ -313,14 +313,16 @@ def _grow_masks_for_soma(args):
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc))
 
     soma_area_px = soma_seed_count
+    area_step = sorted_areas[0] - sorted_areas[1] if len(sorted_areas) > 1 else 100
     masks = []
     mask_pixel_counts = []
-    for target_area_um2 in sorted_areas:
+    for step_idx, target_area_um2 in enumerate(sorted_areas):
         target_px = int(target_area_um2 / (pixel_size_um ** 2))
 
-        # Per-step circular constraint: ring grows with each target
+        # Per-step circular constraint: buffer grows by 2*step_size per mask
         if use_circular_constraint:
-            step_constraint_um2 = target_area_um2 + circular_buffer_um2
+            step_buffer = circular_buffer_um2 + step_idx * 2 * area_step
+            step_constraint_um2 = target_area_um2 + step_buffer
             step_constraint_px = step_constraint_um2 / (pixel_size_um ** 2)
             step_radius_sq = step_constraint_px / np.pi
             step_order = [(r, c) for r, c in growth_order
@@ -1572,6 +1574,8 @@ class InteractiveImageLabel(QLabel):
         self.dragging_centroid_idx = None
         # Pixel intensity picker
         self.pixel_picker_mode = False
+        # Info text overlay (top-left corner)
+        self.info_text = None
         # Paint fill mode
         self.paint_mode = False
         self.erase_mode = False
@@ -1716,15 +1720,31 @@ class InteractiveImageLabel(QLabel):
                     painter.setPen(QColor(0, 0, 0))
                     painter.drawText(int(mx - tw / 2 + 4), int(my - 2), text)
 
+        # Info text overlay (top-left)
+        if self.info_text:
+            font = painter.font()
+            font.setPointSize(14)
+            font.setBold(True)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(self.info_text) + 12
+            th = fm.height() + 8
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 180))
+            painter.drawRect(8, 8, tw, th)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(14, 8 + fm.ascent() + 4, self.info_text)
+
         if self.zoom_level != 1.0:
+            y_offset = 5 if not self.info_text else 8 + painter.fontMetrics().height() + 16
             bg = self.palette().color(self.backgroundRole())
             bg.setAlpha(200)
             fg = self.palette().color(self.foregroundRole())
             painter.setPen(QPen(fg))
             painter.setBrush(bg)
-            painter.drawRect(5, 5, 70, 20)
+            painter.drawRect(5, y_offset, 70, 20)
             painter.setPen(fg)
-            painter.drawText(10, 20, f"Zoom: {self.zoom_level:.1f}x")
+            painter.drawText(10, y_offset + 15, f"Zoom: {self.zoom_level:.1f}x")
 
         painter.end()
 
@@ -7119,13 +7139,15 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
     print(f"  {{soma_id}}: soma={{soma_seed_count}}px, grew to {{len(growth_order)}}px (target: {{largest_target_px}})")
 
     soma_area_px = soma_seed_count
+    area_step = sorted_areas[0] - sorted_areas[1] if len(sorted_areas) > 1 else 100
     mask_pixel_counts = []
-    for target_area_um2 in sorted_areas:
+    for step_idx, target_area_um2 in enumerate(sorted_areas):
         target_px = int(target_area_um2 / (pixel_size_um ** 2))
 
-        # Per-step circular constraint: ring grows with each target
+        # Per-step circular constraint: buffer grows by 2*step_size per mask
         if use_circular_constraint:
-            step_constraint_um2 = target_area_um2 + circular_buffer_um2
+            step_buffer = circular_buffer_um2 + step_idx * 2 * area_step
+            step_constraint_um2 = target_area_um2 + step_buffer
             step_constraint_px = step_constraint_um2 / (pixel_size_um ** 2)
             step_radius_sq = step_constraint_px / np.pi
             step_order = [(r, c) for r, c in growth_order
@@ -12858,13 +12880,15 @@ if __name__ == '__main__':
         # min(target_px, len(growth_order)) naturally caps the mask smaller
         # If target < soma area, substitute the soma mask for that size
         soma_area_px = soma_seed_count
+        area_step = sorted_areas[0] - sorted_areas[1] if len(sorted_areas) > 1 else 100
         mask_pixel_counts = []
-        for target_area_um2 in sorted_areas:
+        for step_idx, target_area_um2 in enumerate(sorted_areas):
             target_px = int(target_area_um2 / (pixel_size_um ** 2))
 
-            # Per-step circular constraint: ring grows with each target
+            # Per-step circular constraint: buffer grows by 2*step_size per mask
             if self.use_circular_constraint:
-                step_constraint_um2 = target_area_um2 + self.circular_buffer_um2
+                step_buffer = self.circular_buffer_um2 + step_idx * 2 * area_step
+                step_constraint_um2 = target_area_um2 + step_buffer
                 step_constraint_px = step_constraint_um2 / (pixel_size_um ** 2)
                 step_radius_sq = step_constraint_px / np.pi
                 step_order = [(r, c) for r, c in growth_order
@@ -13620,6 +13644,11 @@ if __name__ == '__main__':
                 soma_centroid = [img_data['somas'][soma_idx]]
             self.mask_label.set_image(pixmap, centroids=soma_centroid, mask_overlay=mask_data['mask'])
 
+            # Show mask size on original image panel (top-left)
+            target_area = mask_data.get('target_area_um2', 0)
+            self.original_label.info_text = f"{int(target_area)} µm²"
+            self.original_label._update_display()
+
             # Auto-zoom to mask center
             mask_coords = np.argwhere(mask_data['mask'] > 0)
             if len(mask_coords) > 0:
@@ -13690,6 +13719,11 @@ if __name__ == '__main__':
                     soma_centroid = [(sy, sx)]
 
         self.mask_label.set_image(pixmap, centroids=soma_centroid, mask_overlay=mask_slice)
+
+        # Show mask size on original image panel (top-left)
+        vol = mask_data.get('volume_um3', mask_data.get('actual_volume_um3', 0))
+        self.original_label.info_text = f"{int(vol)} µm³"
+        self.original_label._update_display()
 
         # Auto-zoom to mask center on this slice
         if mask_slice is not None:
@@ -14156,6 +14190,8 @@ if __name__ == '__main__':
             self.clear_masks_btn.setEnabled(False)
             self.undo_qa_btn.setVisible(False)
             self.mask_qa_progress_bar.setVisible(False)
+            self.original_label.info_text = None
+            self.original_label._update_display()
 
             for img_name, img_data in self.images.items():
                 if img_data['selected'] and img_data['status'] == 'masks_generated':
