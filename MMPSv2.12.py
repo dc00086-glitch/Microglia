@@ -13449,6 +13449,36 @@ if __name__ == '__main__':
                 cl_rows.append([key, str(passed)])
             self._write_checklist(qa_cl_path, cl_rows, ['Mask', 'Passed QA'])
 
+        # Ask user which QA mode to use
+        mode_dialog = QDialog(self)
+        mode_dialog.setWindowTitle("QA Mode")
+        mode_dialog.setModal(True)
+        mode_layout = QVBoxLayout()
+        mode_layout.addWidget(QLabel("<b>Choose QA review mode:</b>"))
+
+        grid_btn = QPushButton("Grid View (Fast)")
+        grid_btn.setToolTip("See all mask sizes for each cell at once.\nDouble-click to accept a size.")
+        grid_btn.setStyleSheet("font-weight: bold; padding: 8px;")
+        grid_btn.clicked.connect(lambda: mode_dialog.done(1))
+        mode_layout.addWidget(grid_btn)
+
+        single_btn = QPushButton("Single Mask View (Paint/Erase)")
+        single_btn.setToolTip("Review one mask at a time.\nUse Paint (P) and Erase (E) to edit masks.")
+        single_btn.clicked.connect(lambda: mode_dialog.done(2))
+        mode_layout.addWidget(single_btn)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(lambda: mode_dialog.done(0))
+        mode_layout.addWidget(cancel_btn)
+
+        mode_dialog.setLayout(mode_layout)
+        mode_result = mode_dialog.exec_()
+
+        if mode_result == 0:
+            return
+
+        self._qa_use_grid = (mode_result == 1)
+
         self.approve_mask_btn.setEnabled(True)
         self.reject_mask_btn.setEnabled(True)
         self.approve_all_btn.setEnabled(True)
@@ -13459,51 +13489,73 @@ if __name__ == '__main__':
         self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
         self.undo_qa_btn.setVisible(True)
         self.regen_masks_btn.setVisible(True)
-        self.paint_fill_btn.setVisible(True)
-        self.paint_brush_spin.setVisible(True)
-        self.paint_erase_btn.setVisible(True)
         self.clear_masks_btn.setEnabled(True)
         self.clear_masks_btn.setVisible(True)
 
-        # Show and init progress bar — base it on somas, not individual masks
+        # Paint/erase only available in single-mask mode
+        self.paint_fill_btn.setVisible(not self._qa_use_grid)
+        self.paint_brush_spin.setVisible(not self._qa_use_grid)
+        self.paint_erase_btn.setVisible(not self._qa_use_grid)
+
         self._qa_grid_soma_idx = 0
         self._qa_skipped_somas = set()
         self._qa_grid_edit_return = False
-        # Find first unreviewed soma
-        for si, soma_key in enumerate(self._qa_soma_order):
-            flat_indices = self._qa_soma_mask_index.get(soma_key, [])
-            if any(self.all_masks_flat[fi]['mask_data'].get('approved') is None
-                   and not self.all_masks_flat[fi]['mask_data'].get('duplicate')
-                   for fi in flat_indices):
-                self._qa_grid_soma_idx = si
-                break
 
-        total_somas = len(self._qa_soma_order)
-        reviewed_somas = sum(
-            1 for sk in self._qa_soma_order
-            if all(self.all_masks_flat[fi]['mask_data'].get('approved') is not None
-                   for fi in self._qa_soma_mask_index.get(sk, []))
-        )
-        self.mask_qa_progress_bar.setFormat("%v / %m somas reviewed")
-        self.mask_qa_progress_bar.setMaximum(total_somas)
-        self.mask_qa_progress_bar.setValue(reviewed_somas)
         self.mask_qa_progress_bar.setVisible(True)
 
-        # Enter grid view
-        self.mask_label.setVisible(False)
-        self.qa_grid_scroll.setVisible(True)
-        self._show_qa_grid()
-        self.tabs.setCurrentIndex(3)
+        if self._qa_use_grid:
+            # Find first unreviewed soma
+            for si, soma_key in enumerate(self._qa_soma_order):
+                flat_indices = self._qa_soma_mask_index.get(soma_key, [])
+                if any(self.all_masks_flat[fi]['mask_data'].get('approved') is None
+                       and not self.all_masks_flat[fi]['mask_data'].get('duplicate')
+                       for fi in flat_indices):
+                    self._qa_grid_soma_idx = si
+                    break
 
-        self.log("=" * 50)
-        self.log("🎯 GRID MASK QA MODE")
-        self.log(f"Total somas: {total_somas} | Masks: {len(self.all_masks_flat)}")
-        if auto_rejected_count > 0:
-            self.log(f"⚠️ {auto_rejected_count} duplicate masks auto-rejected")
-        if reviewed_somas > 0:
-            self.log(f"Resuming: {reviewed_somas}/{total_somas} somas reviewed")
-        self.log("Double-click a mask to accept it (smaller auto-approved, larger auto-rejected)")
-        self.log("=" * 50)
+            total_somas = len(self._qa_soma_order)
+            reviewed_somas = sum(
+                1 for sk in self._qa_soma_order
+                if all(self.all_masks_flat[fi]['mask_data'].get('approved') is not None
+                       for fi in self._qa_soma_mask_index.get(sk, []))
+            )
+            self.mask_qa_progress_bar.setFormat("%v / %m somas reviewed")
+            self.mask_qa_progress_bar.setMaximum(total_somas)
+            self.mask_qa_progress_bar.setValue(reviewed_somas)
+
+            self.mask_label.setVisible(False)
+            self.qa_grid_scroll.setVisible(True)
+            self._show_qa_grid()
+            self.tabs.setCurrentIndex(3)
+
+            self.log("=" * 50)
+            self.log("🎯 GRID QA MODE")
+            self.log(f"Somas: {total_somas} | Masks: {len(self.all_masks_flat)}")
+            if auto_rejected_count > 0:
+                self.log(f"  {auto_rejected_count} duplicates auto-rejected")
+            self.log("Double-click a mask to accept (smaller auto-approved, larger auto-rejected)")
+            self.log("=" * 50)
+        else:
+            # Single-mask mode (original behavior)
+            masks_needing_review = len(self.all_masks_flat) - auto_rejected_count
+            self.mask_qa_progress_bar.setFormat("%v / %m masks reviewed")
+            self.mask_qa_progress_bar.setMaximum(masks_needing_review)
+            self.mask_qa_progress_bar.setValue(manually_reviewed_count)
+
+            self.mask_label.setVisible(True)
+            self.qa_grid_scroll.setVisible(False)
+            self._show_current_mask()
+            self.tabs.setCurrentIndex(3)
+
+            self.log("=" * 50)
+            self.log("🎯 SINGLE MASK QA MODE")
+            self.log(f"Masks: {len(self.all_masks_flat)}")
+            if auto_rejected_count > 0:
+                self.log(f"  {auto_rejected_count} duplicates auto-rejected")
+            if manually_reviewed_count > 0:
+                self.log(f"  Resuming: {manually_reviewed_count}/{masks_needing_review} reviewed")
+            self.log("A=Approve, R=Reject, ←→=Navigate, Space=Approve&Next, P=Paint, E=Erase")
+            self.log("=" * 50)
 
     def _evict_old_qa_masks(self):
         """Evict mask arrays for somas that are beyond the sliding window.
@@ -14136,8 +14188,12 @@ if __name__ == '__main__':
             self.log(f"   ❌ Failed to save {soma_filename}: {e}")
 
     def _advance_to_next_unreviewed(self):
-        """Skip to next unreviewed mask, or complete QA if all done"""
-        original_idx = self.mask_qa_idx
+        """Skip to next unreviewed mask, or complete QA if all done.
+        In grid mode, returns to the grid for the current soma instead."""
+        # If we're in grid QA mode, return to the grid
+        if getattr(self, '_qa_use_grid', False):
+            self._show_qa_grid()
+            return
 
         # Search forward for next unreviewed mask
         for idx in range(self.mask_qa_idx + 1, len(self.all_masks_flat)):
@@ -14210,6 +14266,9 @@ if __name__ == '__main__':
     def next_mask(self):
         if not self.mask_qa_active:
             return
+        if getattr(self, '_qa_use_grid', False):
+            self._qa_grid_next()
+            return
         if self.mask_qa_idx < len(self.all_masks_flat) - 1:
             self.mask_qa_idx += 1
             self._show_current_mask()
@@ -14217,7 +14276,7 @@ if __name__ == '__main__':
     def prev_mask(self):
         if not self.mask_qa_active:
             return
-        if self.qa_grid_scroll.isVisible() or getattr(self, '_qa_grid_edit_return', False):
+        if getattr(self, '_qa_use_grid', False):
             self._qa_grid_back()
             return
         if self.mask_qa_idx > 0:
@@ -14373,14 +14432,27 @@ if __name__ == '__main__':
             self.undo_qa_btn.setEnabled(len(self.last_qa_decisions) > 0)
             self.undo_qa_btn.setVisible(True)
             self.regen_masks_btn.setVisible(True)
-            self.paint_fill_btn.setVisible(True)
-            self.paint_brush_spin.setVisible(True)
-            self.paint_erase_btn.setVisible(True)
             self.clear_masks_btn.setEnabled(True)
             self.clear_masks_btn.setVisible(True)
-            self.mask_label.setVisible(False)
-            self.qa_grid_scroll.setVisible(True)
-            self._show_qa_grid()
+
+            if getattr(self, '_qa_use_grid', False):
+                self.paint_fill_btn.setVisible(False)
+                self.paint_brush_spin.setVisible(False)
+                self.paint_erase_btn.setVisible(False)
+                self.mask_label.setVisible(False)
+                self.qa_grid_scroll.setVisible(True)
+                self._show_qa_grid()
+            else:
+                self.paint_fill_btn.setVisible(True)
+                self.paint_brush_spin.setVisible(True)
+                self.paint_erase_btn.setVisible(True)
+                self.mask_label.setVisible(True)
+                self.qa_grid_scroll.setVisible(False)
+                for i, flat in enumerate(self.all_masks_flat):
+                    if flat is flat_data:
+                        self.mask_qa_idx = i
+                        break
+                self._show_current_mask()
             self.tabs.setCurrentIndex(3)
 
     # ----------------------------------------------------------------
@@ -14637,35 +14709,8 @@ if __name__ == '__main__':
         self.original_label._update_display()
 
     def _on_grid_thumb_click(self, event, thumb_label):
-        """Single-click: open this mask in full-size editable view for paint/erase."""
-        if event.button() != Qt.LeftButton:
-            return
-        fi = thumb_label._qa_flat_idx
-        md = thumb_label._qa_mask_data
-        img_name = thumb_label._qa_img_name
-
-        # Reload mask if needed
-        if md.get('mask') is None:
-            self._reload_mask_from_disk(md, img_name)
-        if md.get('mask') is None:
-            return
-
-        # Switch to single-mask view for editing
-        self.qa_grid_scroll.setVisible(False)
-        self.mask_label.setVisible(True)
-
-        # Store return info
-        self._qa_grid_edit_return = True
-
-        # Show the mask on mask_label
-        self.mask_qa_idx = fi
-        self._show_current_mask()
-        self.tabs.setCurrentIndex(3)
-
-        size_key = 'volume_um3' if self.mode_3d else 'target_area_um2'
-        unit = 'µm³' if self.mode_3d else 'µm²'
-        self.log(f"Editing {md.get('soma_id', '')} {int(md.get(size_key, 0))} {unit} — "
-                 f"use Paint (P) / Erase (E), then press Back to return to grid")
+        """Single-click in grid: no action (use double-click to accept)."""
+        pass
 
     def _on_grid_thumb_double_click(self, thumb_label):
         """Handle double-click on a grid thumbnail: accept this mask size."""
@@ -14733,15 +14778,7 @@ if __name__ == '__main__':
         self._handle_grid_qa_end()
 
     def _qa_grid_back(self):
-        """Go back to the previous soma in the grid, or return from edit mode."""
-        if getattr(self, '_qa_grid_edit_return', False):
-            self._qa_grid_edit_return = False
-            self.mask_label.setVisible(False)
-            self.qa_grid_scroll.setVisible(True)
-            self.paint_fill_btn.setChecked(False)
-            self.paint_erase_btn.setChecked(False)
-            self._show_qa_grid()
-            return
+        """Go back to the previous soma in the grid."""
         if self._qa_grid_soma_idx > 0:
             self._qa_grid_soma_idx -= 1
             self._show_qa_grid()
@@ -14782,11 +14819,9 @@ if __name__ == '__main__':
 
     def _exit_grid_qa(self):
         """Exit grid QA mode, restore single-mask view."""
-        self._qa_grid_edit_return = False
+        self._qa_use_grid = False
         self.qa_grid_scroll.setVisible(False)
         self.mask_label.setVisible(True)
-        self.paint_fill_btn.setChecked(False)
-        self.paint_erase_btn.setChecked(False)
         self.original_label.info_text = None
         self.original_label.info_text_right = None
         self.original_label._update_display()
