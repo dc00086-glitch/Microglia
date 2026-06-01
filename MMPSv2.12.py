@@ -13466,6 +13466,8 @@ if __name__ == '__main__':
 
         # Show and init progress bar — base it on somas, not individual masks
         self._qa_grid_soma_idx = 0
+        self._qa_skipped_somas = set()
+        self._qa_grid_edit_return = False
         # Find first unreviewed soma
         for si, soma_key in enumerate(self._qa_soma_order):
             flat_indices = self._qa_soma_mask_index.get(soma_key, [])
@@ -14214,6 +14216,9 @@ if __name__ == '__main__':
     def prev_mask(self):
         if not self.mask_qa_active:
             return
+        if self.qa_grid_scroll.isVisible() or getattr(self, '_qa_grid_edit_return', False):
+            self._qa_grid_back()
+            return
         if self.mask_qa_idx > 0:
             # Skip backwards past auto-rejected duplicates
             target = self.mask_qa_idx - 1
@@ -14384,23 +14389,23 @@ if __name__ == '__main__':
     def _show_qa_grid(self):
         """Show a grid of mask thumbnails for the current soma."""
         if self._qa_grid_soma_idx >= len(self._qa_soma_order):
-            self._exit_grid_qa()
-            self._check_qa_complete()
+            self._handle_grid_qa_end()
             return
 
         soma_key = self._qa_soma_order[self._qa_grid_soma_idx]
         img_name, soma_id = soma_key
         flat_indices = self._qa_soma_mask_index.get(soma_key, [])
 
-        # Skip somas where all masks are already reviewed
+        # Skip somas where all masks are already reviewed (but not skipped ones)
         non_dup_indices = [fi for fi in flat_indices
                           if not self.all_masks_flat[fi]['mask_data'].get('duplicate')]
         all_reviewed = all(self.all_masks_flat[fi]['mask_data'].get('approved') is not None
                           for fi in non_dup_indices)
-        if all_reviewed and self._qa_grid_soma_idx < len(self._qa_soma_order) - 1:
-            self._qa_grid_soma_idx += 1
-            self._show_qa_grid()
-            return
+        if all_reviewed and soma_key not in self._qa_skipped_somas:
+            if self._qa_grid_soma_idx < len(self._qa_soma_order) - 1:
+                self._qa_grid_soma_idx += 1
+                self._show_qa_grid()
+                return
 
         self.current_image_name = img_name
 
@@ -14433,28 +14438,26 @@ if __name__ == '__main__':
 
         # Build grid widget
         grid_widget = QWidget()
-        grid_layout = QVBoxLayout(grid_widget)
-        grid_layout.setContentsMargins(10, 10, 10, 10)
+        grid_main_layout = QVBoxLayout(grid_widget)
+        grid_main_layout.setContentsMargins(10, 10, 10, 10)
 
         # Header
         total_somas = len(self._qa_soma_order)
-        header = QLabel(
-            f"<b>Soma {self._qa_grid_soma_idx + 1} / {total_somas}</b> | "
-            f"{os.path.splitext(img_name)[0]} | {soma_id} | "
-            f"{len(mask_items)} mask sizes"
-        )
+        skipped_count = len(self._qa_skipped_somas)
+        header_text = (f"<b>Soma {self._qa_grid_soma_idx + 1} / {total_somas}</b> | "
+                      f"{os.path.splitext(img_name)[0]} | {soma_id} | "
+                      f"{len(mask_items)} masks")
+        if skipped_count > 0:
+            header_text += f" | <span style='color: orange;'>{skipped_count} skipped</span>"
+        header = QLabel(header_text)
         header.setStyleSheet("font-size: 14px; padding: 5px;")
-        grid_layout.addWidget(header)
+        grid_main_layout.addWidget(header)
 
-        hint = QLabel("Double-click a mask to accept it. Smaller masks auto-approved, larger auto-rejected.")
+        hint = QLabel("Double-click = accept (smaller approved, larger rejected). "
+                      "Single-click = open for paint/erase editing.")
         hint.setStyleSheet("color: gray; padding-bottom: 8px;")
-        grid_layout.addWidget(hint)
-
-        # Thumbnail grid
-        thumb_container = QWidget()
-        thumb_layout = QHBoxLayout(thumb_container)
-        thumb_layout.setContentsMargins(0, 0, 0, 0)
-        thumb_layout.setSpacing(8)
+        hint.setWordWrap(True)
+        grid_main_layout.addWidget(hint)
 
         # Compute crop region centered on soma
         img_h, img_w = processed_img.shape[:2]
@@ -14496,9 +14499,25 @@ if __name__ == '__main__':
             crop_bg = (crop_bg - cmin) / (cmax - cmin) * 255
         crop_bg = crop_bg.astype(np.uint8)
 
-        thumb_size = 200
+        # Adaptive thumbnail size: fit up to 16 in a grid
+        n_masks = len(mask_items)
+        if n_masks <= 8:
+            n_cols = min(n_masks, 8)
+            thumb_size = 180
+        else:
+            n_cols = min(n_masks, 8)
+            thumb_size = 140
 
-        for fi, md in mask_items:
+        # Wrapping grid layout for 16+ masks
+        from PyQt5.QtWidgets import QGridLayout
+        thumb_container = QWidget()
+        thumb_grid = QGridLayout(thumb_container)
+        thumb_grid.setSpacing(6)
+        thumb_grid.setContentsMargins(0, 0, 0, 0)
+
+        for idx, (fi, md) in enumerate(mask_items):
+            row = idx // n_cols
+            col = idx % n_cols
             target_area = md.get(size_key, 0)
             approved = md.get('approved')
 
@@ -14525,19 +14544,18 @@ if __name__ == '__main__':
                     cv2.circle(bg_rgb, (sc_c, sc_r), 4, (255, 0, 0), -1)
 
             # Scale to thumbnail
-            th, tw = bg_rgb.shape[:2]
-            scale = min(thumb_size / tw, thumb_size / th)
-            new_w, new_h = int(tw * scale), int(th * scale)
+            th_h, th_w = bg_rgb.shape[:2]
+            scale = min(thumb_size / th_w, thumb_size / th_h)
+            new_w, new_h = int(th_w * scale), int(th_h * scale)
             if new_w > 0 and new_h > 0:
                 bg_rgb = cv2.resize(bg_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-            # Convert to QPixmap
             bg_rgb = np.ascontiguousarray(bg_rgb)
             qimg = QImage(bg_rgb.data, bg_rgb.shape[1], bg_rgb.shape[0],
                          bg_rgb.shape[1] * 3, QImage.Format_RGB888)
             pixmap = QPixmap.fromImage(qimg.copy())
 
-            # Create clickable thumbnail label
+            # Create clickable thumbnail
             thumb_widget = QWidget()
             thumb_widget_layout = QVBoxLayout(thumb_widget)
             thumb_widget_layout.setContentsMargins(2, 2, 2, 2)
@@ -14548,8 +14566,8 @@ if __name__ == '__main__':
             thumb_label.setFixedSize(thumb_size, thumb_size)
             thumb_label.setAlignment(Qt.AlignCenter)
             thumb_label.setScaledContents(True)
+            thumb_label.setCursor(Qt.PointingHandCursor)
 
-            # Style based on approval state
             if approved is True:
                 border = "3px solid #4CAF50"
             elif approved is False:
@@ -14558,38 +14576,31 @@ if __name__ == '__main__':
                 border = "2px solid gray"
             thumb_label.setStyleSheet(f"border: {border}; background: black;")
 
-            # Store data for double-click handler
             thumb_label._qa_flat_idx = fi
             thumb_label._qa_mask_data = md
             thumb_label._qa_soma_key = soma_key
             thumb_label._qa_mask_items = mask_items
+            thumb_label._qa_img_name = img_name
+            # Double-click = accept; single-click = open for paint/erase
             thumb_label.mouseDoubleClickEvent = lambda event, lbl=thumb_label: self._on_grid_thumb_double_click(lbl)
+            thumb_label.mousePressEvent = lambda event, lbl=thumb_label: self._on_grid_thumb_click(event, lbl)
 
             thumb_widget_layout.addWidget(thumb_label)
 
-            # Area label
             unit = 'µm³' if self.mode_3d else 'µm²'
-            status = ""
+            status_str = ""
             if approved is True:
-                status = " ✓"
+                status_str = " ✓"
             elif approved is False:
-                status = " ✗"
-            area_label = QLabel(f"{int(target_area)} {unit}{status}")
+                status_str = " ✗"
+            area_label = QLabel(f"{int(target_area)} {unit}{status_str}")
             area_label.setAlignment(Qt.AlignCenter)
-            area_label.setStyleSheet("font-size: 12px; font-weight: bold;")
+            area_label.setStyleSheet("font-size: 11px; font-weight: bold;")
             thumb_widget_layout.addWidget(area_label)
 
-            thumb_layout.addWidget(thumb_widget)
+            thumb_grid.addWidget(thumb_widget, row, col)
 
-        thumb_layout.addStretch()
-
-        scroll_inner = QScrollArea()
-        scroll_inner.setWidget(thumb_container)
-        scroll_inner.setWidgetResizable(False)
-        scroll_inner.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_inner.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_inner.setFixedHeight(thumb_size + 60)
-        grid_layout.addWidget(scroll_inner)
+        grid_main_layout.addWidget(thumb_container)
 
         # Navigation buttons
         nav_layout = QHBoxLayout()
@@ -14602,14 +14613,14 @@ if __name__ == '__main__':
         nav_layout.addStretch()
 
         skip_btn = QPushButton("Skip →")
-        skip_btn.clicked.connect(self._qa_grid_next)
+        skip_btn.clicked.connect(self._qa_grid_skip)
+        skip_btn.setToolTip("Skip this soma (you'll be reminded at the end)")
         skip_btn.setFixedWidth(100)
         nav_layout.addWidget(skip_btn)
 
-        grid_layout.addLayout(nav_layout)
-        grid_layout.addStretch()
+        grid_main_layout.addLayout(nav_layout)
+        grid_main_layout.addStretch()
 
-        # Set into scroll area
         self.qa_grid_scroll.setWidget(grid_widget)
 
         # Update progress bar
@@ -14620,15 +14631,43 @@ if __name__ == '__main__':
         )
         self.mask_qa_progress_bar.setValue(reviewed_somas)
 
-        # Update original label overlays
-        target_area = mask_items[0][1].get(size_key, 0) if mask_items else 0
         self.original_label.info_text = f"{soma_id}"
         self.original_label.info_text_right = os.path.splitext(img_name)[0]
         self.original_label._update_display()
 
+    def _on_grid_thumb_click(self, event, thumb_label):
+        """Single-click: open this mask in full-size editable view for paint/erase."""
+        if event.button() != Qt.LeftButton:
+            return
+        fi = thumb_label._qa_flat_idx
+        md = thumb_label._qa_mask_data
+        img_name = thumb_label._qa_img_name
+
+        # Reload mask if needed
+        if md.get('mask') is None:
+            self._reload_mask_from_disk(md, img_name)
+        if md.get('mask') is None:
+            return
+
+        # Switch to single-mask view for editing
+        self.qa_grid_scroll.setVisible(False)
+        self.mask_label.setVisible(True)
+
+        # Store return info
+        self._qa_grid_edit_return = True
+
+        # Show the mask on mask_label
+        self.mask_qa_idx = fi
+        self._show_current_mask()
+        self.tabs.setCurrentIndex(3)
+
+        size_key = 'volume_um3' if self.mode_3d else 'target_area_um2'
+        unit = 'µm³' if self.mode_3d else 'µm²'
+        self.log(f"Editing {md.get('soma_id', '')} {int(md.get(size_key, 0))} {unit} — "
+                 f"use Paint (P) / Erase (E), then press Back to return to grid")
+
     def _on_grid_thumb_double_click(self, thumb_label):
         """Handle double-click on a grid thumbnail: accept this mask size."""
-        clicked_fi = thumb_label._qa_flat_idx
         clicked_md = thumb_label._qa_mask_data
         soma_key = thumb_label._qa_soma_key
         mask_items = thumb_label._qa_mask_items
@@ -14654,18 +14693,33 @@ if __name__ == '__main__':
                 self._qa_user_rejected_count += 1
                 self._delete_rejected_mask_tiff(img_name, md)
 
+        # Remove from skipped if it was skipped before
+        self._qa_skipped_somas.discard(soma_key)
+
         unit = 'µm³' if self.mode_3d else 'µm²'
         self.log(f"✓ {soma_id}: accepted {int(clicked_size)} {unit} "
                  f"({approved_count} approved, {rejected_count} rejected)")
 
-        # Advance to next soma
         self._qa_grid_next()
 
+    def _qa_grid_skip(self):
+        """Skip this soma — tracked for end-of-QA reminder."""
+        soma_key = self._qa_soma_order[self._qa_grid_soma_idx]
+        self._qa_skipped_somas.add(soma_key)
+        self.log(f"Skipped {soma_key[1]} (will remind at end)")
+        self._qa_grid_soma_idx += 1
+        if self._qa_grid_soma_idx >= len(self._qa_soma_order):
+            self._handle_grid_qa_end()
+        else:
+            self._show_qa_grid()
+
     def _qa_grid_next(self):
-        """Advance to the next unreviewed soma in the grid."""
+        """Advance to the next unreviewed/unskipped soma in the grid."""
         start = self._qa_grid_soma_idx + 1
         for si in range(start, len(self._qa_soma_order)):
             soma_key = self._qa_soma_order[si]
+            if soma_key in self._qa_skipped_somas:
+                continue
             flat_indices = self._qa_soma_mask_index.get(soma_key, [])
             non_dup = [fi for fi in flat_indices
                        if not self.all_masks_flat[fi]['mask_data'].get('duplicate')]
@@ -14675,20 +14729,63 @@ if __name__ == '__main__':
                 self._show_qa_grid()
                 return
 
-        # All reviewed
-        self._exit_grid_qa()
-        self._check_qa_complete()
+        self._handle_grid_qa_end()
 
     def _qa_grid_back(self):
-        """Go back to the previous soma in the grid."""
+        """Go back to the previous soma in the grid, or return from edit mode."""
+        if getattr(self, '_qa_grid_edit_return', False):
+            self._qa_grid_edit_return = False
+            self.mask_label.setVisible(False)
+            self.qa_grid_scroll.setVisible(True)
+            self.paint_fill_btn.setChecked(False)
+            self.paint_erase_btn.setChecked(False)
+            self._show_qa_grid()
+            return
         if self._qa_grid_soma_idx > 0:
             self._qa_grid_soma_idx -= 1
             self._show_qa_grid()
 
+    def _handle_grid_qa_end(self):
+        """Handle reaching the end of the grid — remind about skipped somas."""
+        if self._qa_skipped_somas:
+            skipped_list = [f"  {sk[1]} ({os.path.splitext(sk[0])[0]})"
+                           for sk in self._qa_skipped_somas]
+            reply = QMessageBox.question(
+                self, "Skipped Somas",
+                f"You skipped {len(self._qa_skipped_somas)} soma(s):\n\n"
+                + "\n".join(skipped_list[:20])
+                + ("\n  ..." if len(skipped_list) > 20 else "")
+                + "\n\nReview them now?",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                # Go to the first skipped soma
+                for si, sk in enumerate(self._qa_soma_order):
+                    if sk in self._qa_skipped_somas:
+                        self._qa_grid_soma_idx = si
+                        self._qa_skipped_somas.discard(sk)
+                        self._show_qa_grid()
+                        return
+            else:
+                # Reject all masks for skipped somas
+                for sk in self._qa_skipped_somas:
+                    for fi in self._qa_soma_mask_index.get(sk, []):
+                        md = self.all_masks_flat[fi]['mask_data']
+                        if md.get('approved') is None and not md.get('duplicate'):
+                            md['approved'] = False
+                            self._qa_user_rejected_count += 1
+                self.log(f"Rejected all masks for {len(self._qa_skipped_somas)} skipped somas")
+                self._qa_skipped_somas.clear()
+
+        self._exit_grid_qa()
+        self._check_qa_complete()
+
     def _exit_grid_qa(self):
         """Exit grid QA mode, restore single-mask view."""
+        self._qa_grid_edit_return = False
         self.qa_grid_scroll.setVisible(False)
         self.mask_label.setVisible(True)
+        self.paint_fill_btn.setChecked(False)
+        self.paint_erase_btn.setChecked(False)
         self.original_label.info_text = None
         self.original_label.info_text_right = None
         self.original_label._update_display()
