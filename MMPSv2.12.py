@@ -4817,9 +4817,8 @@ ARRAY_JOB_ID=$(sbatch --parsable \\
     --array=0-${{MAX_INDEX}} \\
     --output=mmps_imagej_%A_%a.out \\
     --error=mmps_imagej_%A_%a.err \\
-    --export=MMPS_OUTPUT_DIR \\
-    --wrap="{module_line}
-\\"$FIJI\\" --ij2 --headless --console --mem=3072m --run \\"$SCRIPT_DIR/{wrapper_basename}\\"
+    --export=ALL \\
+    --wrap="{module_line} && \\"$FIJI\\" --ij2 --headless --console --mem=3072m --run \\"$SCRIPT_DIR/{wrapper_basename}\\"
 ")
 
 echo "Submitted array job: $ARRAY_JOB_ID (tasks 0-$MAX_INDEX)"
