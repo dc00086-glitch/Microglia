@@ -14231,7 +14231,21 @@ if __name__ == '__main__':
             self.log("⚠️  Reached end. Use Previous to review any remaining masks.")
 
     def reject_current_mask(self):
-        if not self.mask_qa_active or self.mask_qa_idx >= len(self.all_masks_flat):
+        if not self.mask_qa_active:
+            return
+
+        # In grid mode, R key rejects all masks for the current soma
+        if getattr(self, '_qa_use_grid', False):
+            if self._qa_grid_soma_idx < len(self._qa_soma_order):
+                soma_key = self._qa_soma_order[self._qa_grid_soma_idx]
+                flat_indices = self._qa_soma_mask_index.get(soma_key, [])
+                mask_items = [(fi, self.all_masks_flat[fi]['mask_data'])
+                              for fi in flat_indices
+                              if not self.all_masks_flat[fi]['mask_data'].get('duplicate')]
+                self._qa_grid_reject_all(soma_key, mask_items)
+            return
+
+        if self.mask_qa_idx >= len(self.all_masks_flat):
             return
 
         flat_data = self.all_masks_flat[self.mask_qa_idx]
@@ -14622,8 +14636,8 @@ if __name__ == '__main__':
         header.setStyleSheet("font-size: 14px; padding: 5px;")
         grid_main_layout.addWidget(header)
 
-        hint = QLabel("Double-click = accept (smaller approved, larger rejected). "
-                      "Single-click = open for paint/erase editing.")
+        hint = QLabel("Double-click = accept this size (smaller approved, larger rejected). "
+                      "Right-click = reject this size and larger. R = reject all.")
         hint.setStyleSheet("color: gray; padding-bottom: 8px;")
         hint.setWordWrap(True)
         grid_main_layout.addWidget(hint)
@@ -14780,9 +14794,9 @@ if __name__ == '__main__':
             thumb_label._qa_soma_key = soma_key
             thumb_label._qa_mask_items = mask_items
             thumb_label._qa_img_name = img_name
-            # Double-click = accept; single-click = open for paint/erase
+            # Double-click = accept this size; right-click = reject this size
             thumb_label.mouseDoubleClickEvent = lambda event, lbl=thumb_label: self._on_grid_thumb_double_click(lbl)
-            thumb_label.mousePressEvent = lambda event, lbl=thumb_label: self._on_grid_thumb_click(event, lbl)
+            thumb_label.mousePressEvent = lambda event, lbl=thumb_label: self._on_grid_thumb_right_click(event, lbl)
 
             thumb_widget_layout.addWidget(thumb_label)
 
@@ -14811,6 +14825,15 @@ if __name__ == '__main__':
 
         nav_layout.addStretch()
 
+        reject_all_btn = QPushButton("Reject All Masks")
+        reject_all_btn.setStyleSheet("QPushButton { color: #F44336; font-weight: bold; }")
+        reject_all_btn.setToolTip("Reject every mask for this cell and move to next")
+        reject_all_btn.clicked.connect(lambda: self._qa_grid_reject_all(soma_key, mask_items))
+        reject_all_btn.setFixedWidth(140)
+        nav_layout.addWidget(reject_all_btn)
+
+        nav_layout.addStretch()
+
         skip_btn = QPushButton("Skip →")
         skip_btn.clicked.connect(self._qa_grid_skip)
         skip_btn.setToolTip("Skip this soma (you'll be reminded at the end)")
@@ -14834,9 +14857,41 @@ if __name__ == '__main__':
         self.original_label.info_text_right = os.path.splitext(img_name)[0]
         self.original_label._update_display()
 
-    def _on_grid_thumb_click(self, event, thumb_label):
-        """Single-click in grid: no action (use double-click to accept)."""
-        pass
+    def _on_grid_thumb_right_click(self, event, thumb_label):
+        """Right-click in grid: reject this mask and all larger."""
+        if event.button() != Qt.RightButton:
+            return
+
+        clicked_md = thumb_label._qa_mask_data
+        soma_key = thumb_label._qa_soma_key
+        mask_items = thumb_label._qa_mask_items
+        img_name = soma_key[0]
+
+        size_key = 'volume_um3' if self.mode_3d else 'target_area_um2'
+        clicked_size = clicked_md.get(size_key, 0)
+
+        rejected_count = 0
+        approved_count = 0
+        for fi, md in mask_items:
+            target_size = md.get(size_key, 0)
+            if target_size >= clicked_size:
+                if md.get('approved') is not True:
+                    md['approved'] = False
+                    rejected_count += 1
+                    self._qa_user_rejected_count += 1
+                    self._delete_rejected_mask_tiff(img_name, md)
+            else:
+                if md.get('approved') is None:
+                    md['approved'] = True
+                    approved_count += 1
+                    self._qa_approved_count += 1
+
+        unit = 'µm³' if self.mode_3d else 'µm²'
+        self.log(f"✗ {soma_key[1]}: rejected {int(clicked_size)} {unit} and larger "
+                 f"({rejected_count} rejected, {approved_count} smaller approved)")
+
+        self._qa_skipped_somas.discard(soma_key)
+        self._show_qa_grid()
 
     def _on_grid_thumb_double_click(self, thumb_label):
         """Handle double-click on a grid thumbnail: accept this mask size."""
@@ -14872,6 +14927,23 @@ if __name__ == '__main__':
         self.log(f"✓ {soma_id}: accepted {int(clicked_size)} {unit} "
                  f"({approved_count} approved, {rejected_count} rejected)")
 
+        self._qa_grid_next()
+
+    def _qa_grid_reject_all(self, soma_key, mask_items):
+        """Reject ALL masks for this soma and advance."""
+        img_name = soma_key[0]
+        size_key = 'volume_um3' if self.mode_3d else 'target_area_um2'
+        rejected_count = 0
+
+        for fi, md in mask_items:
+            if md.get('approved') is not False:
+                md['approved'] = False
+                rejected_count += 1
+                self._qa_user_rejected_count += 1
+                self._delete_rejected_mask_tiff(img_name, md)
+
+        self._qa_skipped_somas.discard(soma_key)
+        self.log(f"✗ {soma_key[1]}: rejected all {rejected_count} masks")
         self._qa_grid_next()
 
     def _qa_grid_skip(self):
