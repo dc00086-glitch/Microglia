@@ -14701,23 +14701,24 @@ if __name__ == '__main__':
             crop_bg = crop_bg.astype(np.uint8)
             crop_bg_rgb = np.stack([crop_bg, crop_bg, crop_bg], axis=-1)
 
-        # Dynamic thumbnail size based on mask count
+        # Dynamic thumbnail size: fill available width
         n_masks = len(mask_items)
-        if n_masks <= 3:
+        available_width = self.qa_grid_scroll.viewport().width() - 40
+        if available_width < 200:
+            available_width = 800
+
+        # Try single row first, fall back to 2 rows if thumbs get too small
+        spacing = 10
+        thumb_size = max(100, (available_width - spacing * n_masks) // max(n_masks, 1))
+        if thumb_size >= 140:
             n_cols = n_masks
-            thumb_size = 300
-        elif n_masks <= 5:
-            n_cols = n_masks
-            thumb_size = 240
-        elif n_masks <= 8:
-            n_cols = n_masks
-            thumb_size = 180
-        elif n_masks <= 12:
-            n_cols = 6
-            thumb_size = 160
         else:
-            n_cols = 8
-            thumb_size = 130
+            # Two rows
+            n_cols = max(1, (n_masks + 1) // 2)
+            thumb_size = max(100, (available_width - spacing * n_cols) // max(n_cols, 1))
+
+        # Cap at a reasonable max
+        thumb_size = min(thumb_size, 500)
 
         # Wrapping grid layout for 16+ masks
         from PyQt5.QtWidgets import QGridLayout
