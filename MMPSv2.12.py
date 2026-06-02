@@ -14769,9 +14769,10 @@ if __name__ == '__main__':
 
             # Create clickable thumbnail
             thumb_widget = QWidget()
+            thumb_widget.setFixedWidth(thumb_size + 4)
             thumb_widget_layout = QVBoxLayout(thumb_widget)
-            thumb_widget_layout.setContentsMargins(2, 2, 2, 2)
-            thumb_widget_layout.setSpacing(2)
+            thumb_widget_layout.setContentsMargins(0, 0, 0, 0)
+            thumb_widget_layout.setSpacing(1)
 
             thumb_label = QLabel()
             thumb_label.setPixmap(pixmap)
@@ -14800,23 +14801,26 @@ if __name__ == '__main__':
             thumb_widget_layout.addWidget(thumb_label)
 
             # Target area (bottom-left) and actual area (bottom-right)
-            unit = 'µm³' if self.mode_3d else 'µm²'
             actual_area = 0
             if mask is not None:
                 img_px = self._get_pixel_size(img_name)
                 actual_area = int(np.count_nonzero(mask) * (img_px ** 2))
 
-            area_row = QHBoxLayout()
-            area_row.setContentsMargins(0, 0, 0, 0)
+            area_container = QWidget()
+            area_container.setFixedWidth(thumb_size)
+            area_row = QHBoxLayout(area_container)
+            area_row.setContentsMargins(2, 0, 2, 0)
+            area_row.setSpacing(0)
             target_lbl = QLabel(f"T:{int(target_area)}")
             target_lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: #4CAF50;")
-            target_lbl.setAlignment(Qt.AlignLeft)
+            target_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             area_row.addWidget(target_lbl)
+            area_row.addStretch()
             actual_lbl = QLabel(f"A:{actual_area}")
             actual_lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: #2196F3;")
-            actual_lbl.setAlignment(Qt.AlignRight)
+            actual_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             area_row.addWidget(actual_lbl)
-            thumb_widget_layout.addLayout(area_row)
+            thumb_widget_layout.addWidget(area_container)
 
             thumb_grid.addWidget(thumb_widget, row, col)
 
