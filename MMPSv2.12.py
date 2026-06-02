@@ -9129,6 +9129,11 @@ if __name__ == '__main__':
 
     def _refresh_color_display(self):
         """Refresh the display with current channel settings"""
+        # If in grid QA mode, refresh the grid
+        if getattr(self, '_qa_use_grid', False) and self.mask_qa_active:
+            self._show_qa_grid(allow_reviewed=True)
+            return
+
         if not self.current_image_name or self.current_image_name not in self.images:
             return
 
@@ -15054,8 +15059,14 @@ if __name__ == '__main__':
                 crop_color = np.stack([crop_color, crop_color, crop_color], axis=-1)
             elif crop_color.shape[2] == 4:
                 crop_color = crop_color[:, :, :3]
+            # Apply channel visibility toggle
+            for ch_idx in range(min(3, crop_color.shape[2])):
+                if not self.display_channels.get(ch_idx, True):
+                    crop_color[:, :, ch_idx] = 0
             crop_color = crop_color.astype(np.float64)
             for ch in range(crop_color.shape[2]):
+                if not self.display_channels.get(ch, True):
+                    continue
                 ch_data = crop_color[:, :, ch]
                 ch_min, ch_max = ch_data.min(), ch_data.max()
                 if ch_max > ch_min:
