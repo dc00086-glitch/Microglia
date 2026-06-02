@@ -10453,7 +10453,12 @@ if __name__ == '__main__':
         )
 
     def _snap_to_brightest(self, coords):
-        """Snap coords to the brightest pixel within 5 µm radius."""
+        """Snap coords to the brightest signal pixel within 5 µm radius.
+
+        If a multi-channel image is available and a DAPI channel has been set,
+        prefers pixels that have BOTH signal AND DAPI. Falls back to brightest
+        signal-only if no DAPI+signal pixel exists nearby.
+        """
         if not self.current_image_name:
             return coords
         img_data = self.images[self.current_image_name]
@@ -10471,16 +10476,44 @@ if __name__ == '__main__':
         r_max = min(h, row + radius_px + 1)
         c_min = max(0, col - radius_px)
         c_max = min(w, col + radius_px + 1)
-        best_val = -1
-        best_r, best_c = row, col
+
+        # Check if we have a DAPI channel available
+        dapi = None
+        dapi_ch = getattr(self, '_dapi_channel', None)
+        if dapi_ch is not None:
+            color_img = img_data.get('color_image')
+            if color_img is not None and color_img.ndim == 3 and dapi_ch < color_img.shape[2]:
+                dapi = color_img[:, :, dapi_ch].astype(np.float64)
+                # Otsu threshold for DAPI presence
+                d_norm = dapi.copy()
+                dmin, dmax = d_norm.min(), d_norm.max()
+                if dmax > dmin:
+                    d_norm = (d_norm - dmin) / (dmax - dmin) * 255
+                _, dapi_binary = cv2.threshold(d_norm.astype(np.uint8), 0, 255,
+                                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # First pass: find brightest signal pixel that also has DAPI
+        best_both_val = -1
+        best_both_r, best_both_c = row, col
+        best_signal_val = -1
+        best_signal_r, best_signal_c = row, col
+
         for r in range(r_min, r_max):
             for c in range(c_min, c_max):
                 if (r - row) ** 2 + (c - col) ** 2 <= radius_px ** 2:
                     val = float(gray[r, c])
-                    if val > best_val:
-                        best_val = val
-                        best_r, best_c = r, c
-        return (best_r, best_c)
+                    if val > best_signal_val:
+                        best_signal_val = val
+                        best_signal_r, best_signal_c = r, c
+                    if dapi is not None and dapi_binary[r, c] > 0:
+                        if val > best_both_val:
+                            best_both_val = val
+                            best_both_r, best_both_c = r, c
+
+        # Prefer signal+DAPI pixel; fall back to brightest signal only
+        if best_both_val > 0:
+            return (best_both_r, best_both_c)
+        return (best_signal_r, best_signal_c)
 
     def add_soma(self, coords):
         if not self.current_image_name:
