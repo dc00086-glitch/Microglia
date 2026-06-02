@@ -4704,6 +4704,16 @@ print("=" * 60)
         wrapper_basename = os.path.basename(wrapper_path)
         module_line = f"\n{module_load}" if module_load else ""
 
+        # Extract just the module load commands for the merge job
+        # (merge only needs Python, not Java/Fiji/PATH exports)
+        merge_modules = []
+        if module_load:
+            for part in module_load.split('&&'):
+                part = part.strip()
+                if part.startswith('module load'):
+                    merge_modules.append(part)
+        merge_module_line = ' && '.join(merge_modules) if merge_modules else module_load
+
         script = f'''#!/bin/bash
 # =============================================================================
 # MMPS ImageJ Cluster Analysis - SLURM Array Job Launcher
@@ -4827,7 +4837,7 @@ MERGE_JOB_ID=$(sbatch --parsable \\
     --dependency=afterok:$ARRAY_JOB_ID \\
     --output=mmps_imagej_merge_%j.out \\
     --error=mmps_imagej_merge_%j.err \\
-    --wrap="{module_line} && command -v python3 > /dev/null 2>&1 || {{ echo 'ERROR: python3 not found after module load. Check your module load command.'; exit 1; }} && python3 \\"$SCRIPT_DIR/merge_results.py\\" \\"$MMPS_OUTPUT_DIR\\""
+    --wrap="{merge_module_line} && python3 \\"$SCRIPT_DIR/merge_results.py\\" \\"$MMPS_OUTPUT_DIR\\""
 )
 
 echo "Submitted merge job:  $MERGE_JOB_ID (runs after array completes)"
@@ -5576,6 +5586,15 @@ if __name__ == "__main__":
     def _build_spread_slurm_script(self, partition, wall_time, mem, cpus, job_name, module_load):
         """Build the SLURM array job submission script for spread analysis."""
         module_line = f"\n{module_load}" if module_load else ""
+
+        # Extract just the module load commands for the merge job
+        merge_modules = []
+        if module_load:
+            for part in module_load.split('&&'):
+                part = part.strip()
+                if part.startswith('module load'):
+                    merge_modules.append(part)
+        merge_module_line = ' && '.join(merge_modules) if merge_modules else module_load
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
         script = f'''#!/bin/bash
@@ -5660,7 +5679,7 @@ MERGE_JOB_ID=$(sbatch --parsable \\
     --dependency=afterok:$ARRAY_JOB_ID \\
     --output=mmps_spread_merge_%j.out \\
     --error=mmps_spread_merge_%j.err \\
-    --wrap="{module_line} && command -v python3 > /dev/null 2>&1 || {{ echo 'ERROR: python3 not found after module load.'; exit 1; }} && python3 \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\" --merge-only"
+    --wrap="{merge_module_line} && python3 \\"$SCRIPT_DIR/mmps_spread_analysis.py\\" \\"$MMPS_OUTPUT_DIR\\" --merge-only"
 )
 
 echo "Submitted merge job:  $MERGE_JOB_ID (runs after array completes)"
