@@ -14649,31 +14649,29 @@ if __name__ == '__main__':
         else:
             cy, cx = img_h // 2, img_w // 2
 
-        # Find the extent of the largest mask to determine crop size
-        largest_mask = None
+        # Load largest mask and compute crop region centered on soma
+        # Ensure ALL masks are loaded first so none are missing from thumbnails
         for fi, md in mask_items:
             if md.get('mask') is None:
                 self._reload_mask_from_disk(md, img_name)
-            if md.get('mask') is not None:
-                largest_mask = md['mask']
+
+        # Find extent needed from the largest mask
+        crop_radius = 100
+        for fi, md in mask_items:
+            mask = md.get('mask')
+            if mask is not None:
+                mask_coords = np.argwhere(mask > 0)
+                if len(mask_coords) > 0:
+                    # Max distance from soma centroid to any mask pixel
+                    dr = max(abs(mask_coords[:, 0].max() - cy), abs(mask_coords[:, 0].min() - cy))
+                    dc = max(abs(mask_coords[:, 1].max() - cx), abs(mask_coords[:, 1].min() - cx))
+                    crop_radius = max(crop_radius, int(max(dr, dc) * 1.3))
                 break
 
-        if largest_mask is not None:
-            mask_coords = np.argwhere(largest_mask > 0)
-            if len(mask_coords) > 0:
-                r_min, c_min = mask_coords.min(axis=0)
-                r_max, c_max = mask_coords.max(axis=0)
-                pad = max(30, (r_max - r_min) // 4, (c_max - c_min) // 4)
-                crop_r1 = max(0, r_min - pad)
-                crop_r2 = min(img_h, r_max + pad)
-                crop_c1 = max(0, c_min - pad)
-                crop_c2 = min(img_w, c_max + pad)
-            else:
-                crop_r1, crop_r2 = max(0, cy - 100), min(img_h, cy + 100)
-                crop_c1, crop_c2 = max(0, cx - 100), min(img_w, cx + 100)
-        else:
-            crop_r1, crop_r2 = max(0, cy - 100), min(img_h, cy + 100)
-            crop_c1, crop_c2 = max(0, cx - 100), min(img_w, cx + 100)
+        crop_r1 = max(0, cy - crop_radius)
+        crop_r2 = min(img_h, cy + crop_radius)
+        crop_c1 = max(0, cx - crop_radius)
+        crop_c2 = min(img_w, cx + crop_radius)
 
         # Build crop background — color or grayscale based on toggle
         use_color = self.show_color_view and 'color_image' in img_data
