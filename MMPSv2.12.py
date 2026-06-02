@@ -14799,16 +14799,24 @@ if __name__ == '__main__':
 
             thumb_widget_layout.addWidget(thumb_label)
 
+            # Target area (bottom-left) and actual area (bottom-right)
             unit = 'µm³' if self.mode_3d else 'µm²'
-            status_str = ""
-            if approved is True:
-                status_str = " ✓"
-            elif approved is False:
-                status_str = " ✗"
-            area_label = QLabel(f"{int(target_area)} {unit}{status_str}")
-            area_label.setAlignment(Qt.AlignCenter)
-            area_label.setStyleSheet("font-size: 11px; font-weight: bold;")
-            thumb_widget_layout.addWidget(area_label)
+            actual_area = 0
+            if mask is not None:
+                img_px = self._get_pixel_size(img_name)
+                actual_area = int(np.count_nonzero(mask) * (img_px ** 2))
+
+            area_row = QHBoxLayout()
+            area_row.setContentsMargins(0, 0, 0, 0)
+            target_lbl = QLabel(f"T:{int(target_area)}")
+            target_lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: #4CAF50;")
+            target_lbl.setAlignment(Qt.AlignLeft)
+            area_row.addWidget(target_lbl)
+            actual_lbl = QLabel(f"A:{actual_area}")
+            actual_lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: #2196F3;")
+            actual_lbl.setAlignment(Qt.AlignRight)
+            area_row.addWidget(actual_lbl)
+            thumb_widget_layout.addLayout(area_row)
 
             thumb_grid.addWidget(thumb_widget, row, col)
 
