@@ -1331,7 +1331,7 @@ class MorphologyCalculationThread(QThread):
                 if self.masks_dir:
                     img_basename = os.path.splitext(img_name)[0]
                     soma_id = mask_data['soma_id']
-                    area_um2 = mask_data.get('target_area_um2', 0)
+                    area_um2 = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
                     mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
                     mask_path = os.path.join(self.masks_dir, mask_filename)
                     if os.path.exists(mask_path):
@@ -1371,7 +1371,7 @@ class MorphologyCalculationThread(QThread):
                 if mask_data.get('mask') is None and self.masks_dir:
                     img_basename = os.path.splitext(img_name)[0]
                     soma_id = mask_data['soma_id']
-                    area_um2 = mask_data.get('target_area_um2', 0)
+                    area_um2 = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
                     mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
                     mask_path = os.path.join(self.masks_dir, mask_filename)
                     if os.path.exists(mask_path):
@@ -5943,13 +5943,13 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             return
         current_img = flat_data['image_name']
         current_soma_id = current_mask_data.get('soma_id', '')
-        current_area = current_mask_data.get('target_area_um2', 0)
+        current_area = current_mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
 
         soma_key = (current_img, current_soma_id)
         for idx in self._qa_soma_mask_index.get(soma_key, []):
             other_flat = self.all_masks_flat[idx]
             other_mask_data = other_flat['mask_data']
-            if other_mask_data.get('target_area_um2', 0) >= current_area:
+            if other_mask_data.get('target_area_um2', mask_data.get('area_um2', 0)) >= current_area:
                 continue
             other_mask = other_mask_data.get('mask')
             if other_mask is None:
@@ -13976,7 +13976,7 @@ if __name__ == '__main__':
             return
         img_basename = os.path.splitext(img_name)[0]
         soma_id = mask_data['soma_id']
-        area_um2 = mask_data.get('target_area_um2', 0)
+        area_um2 = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
         mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
         mask_path = os.path.join(self.masks_dir, mask_filename)
         if os.path.exists(mask_path):
@@ -13999,7 +13999,9 @@ if __name__ == '__main__':
 
         img_basename = os.path.splitext(img_name)[0]
         soma_id = mask_data['soma_id']
-        area_um2 = mask_data.get('target_area_um2', 0)
+        area_um2 = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
+
+        # Try exact filename first
         mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
         mask_path = os.path.join(self.masks_dir, mask_filename)
 
@@ -14010,6 +14012,38 @@ if __name__ == '__main__':
                 return True
             except Exception as e:
                 self.log(f"   ⚠️ Could not reload mask {mask_filename}: {e}")
+
+        # Try rounding to nearest int (handles float precision issues)
+        alt_area = int(round(float(area_um2)))
+        if alt_area != int(area_um2):
+            alt_filename = f"{img_basename}_{soma_id}_area{alt_area}_mask.tif"
+            alt_path = os.path.join(self.masks_dir, alt_filename)
+            if os.path.exists(alt_path):
+                try:
+                    mask_arr = safe_tiff_read(alt_path)
+                    mask_data['mask'] = (mask_arr > 0).astype(np.uint8)
+                    return True
+                except Exception:
+                    pass
+
+        # Fallback: search for any mask file matching this soma
+        prefix = f"{img_basename}_{soma_id}_area"
+        try:
+            for f in os.listdir(self.masks_dir):
+                if f.startswith(prefix) and f.endswith('_mask.tif'):
+                    try:
+                        # Extract area from filename and check if close
+                        file_area = int(f[len(prefix):-len('_mask.tif')])
+                        if abs(file_area - int(round(float(area_um2)))) <= 1:
+                            mask_path = os.path.join(self.masks_dir, f)
+                            mask_arr = safe_tiff_read(mask_path)
+                            mask_data['mask'] = (mask_arr > 0).astype(np.uint8)
+                            return True
+                    except (ValueError, Exception):
+                        continue
+        except OSError:
+            pass
+
         return False
 
     def _ensure_processed_loaded(self, img_name):
@@ -14098,8 +14132,8 @@ if __name__ == '__main__':
             # Reload mask from disk if it was evicted from memory
             if mask_data.get('mask') is None:
                 if not self._reload_mask_from_disk(mask_data, img_name):
-                    self.log(f"Cannot display mask - file not found on disk")
-                    return
+                    area_val = mask_data.get('target_area_um2', mask_data.get('area_um2', '?'))
+                    self.log(f"⚠️ Mask file not found: {os.path.splitext(img_name)[0]}_{mask_data.get('soma_id', '')}_{area_val}")
 
             if processed_img.ndim > 2:
                 processed_img = ensure_grayscale(processed_img)
@@ -14131,7 +14165,7 @@ if __name__ == '__main__':
             self.mask_label.set_image(pixmap, centroids=soma_centroid, mask_overlay=mask_data['mask'])
 
             # Show mask size and image name on original image panel
-            target_area = mask_data.get('target_area_um2', 0)
+            target_area = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
             self.original_label.info_text = f"{int(target_area)} µm²"
             self.original_label.info_text_right = os.path.splitext(img_name)[0]
             self.original_label._update_display()
@@ -14157,7 +14191,7 @@ if __name__ == '__main__':
             f"Mask {self.mask_qa_idx + 1 - auto_rejected}/{masks_needing_review} | "
             f"Reviewed: {reviewed}/{masks_needing_review} | "
             f"{img_name} | {mask_data.get('soma_id', '')} | "
-            f"Area: {mask_data.get('target_area_um2', 0)} um^2 | {status_text}"
+            f"Area: {mask_data.get('target_area_um2', mask_data.get('area_um2', 0))} um^2 | {status_text}"
         )
 
         self.mask_qa_progress_bar.setValue(reviewed)
@@ -14251,7 +14285,7 @@ if __name__ == '__main__':
             size_key = 'volume_um3'
             size_unit = 'um^3'
         else:
-            current_size = mask_data.get('target_area_um2', 0)
+            current_size = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
             size_key = 'target_area_um2'
             size_unit = 'um^2'
 
@@ -14346,7 +14380,7 @@ if __name__ == '__main__':
                     size_val = mask_data.get('volume_um3', 0)
                     cl_key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_vol{size_val}"
                 else:
-                    size_val = mask_data.get('target_area_um2', 0)
+                    size_val = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
                     cl_key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{size_val}"
                 self._qa_checklist_dirty[cl_key] = 1
 
@@ -14383,7 +14417,7 @@ if __name__ == '__main__':
         mask_data = flat_data['mask_data']
         img_name = flat_data['image_name']
         soma_id = mask_data['soma_id']
-        area_um2 = mask_data.get('target_area_um2', 0)
+        area_um2 = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
 
         # Create unique filename with area to distinguish different masks for same soma
         img_basename = os.path.splitext(img_name)[0]
@@ -14454,7 +14488,7 @@ if __name__ == '__main__':
                 continue
 
             soma_id = mask_data['soma_id']
-            area_um2 = mask_data.get('target_area_um2', 0)
+            area_um2 = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
             mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
             mask_path = os.path.join(self.masks_dir, mask_filename)
 
@@ -14597,7 +14631,7 @@ if __name__ == '__main__':
             self._qa_user_rejected_count += 1
 
         if not self.mode_3d:
-            self.log(f"Rejected: {mask_data.get('soma_id', '')} ({mask_data.get('target_area_um2', 0)} um^2)")
+            self.log(f"Rejected: {mask_data.get('soma_id', '')} ({mask_data.get('target_area_um2', mask_data.get('area_um2', 0))} um^2)")
         else:
             vol = mask_data.get('volume_um3', 0)
             self.log(f"Rejected: {mask_data.get('soma_id', '')} ({vol} um^3)")
@@ -14606,7 +14640,7 @@ if __name__ == '__main__':
         if self.mode_3d:
             key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_vol{mask_data.get('volume_um3', 0)}"
         else:
-            key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{mask_data.get('target_area_um2', 0)}"
+            key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{mask_data.get('target_area_um2', mask_data.get('area_um2', 0))}"
         self._qa_checklist_dirty[key] = 1
 
         # Show next mask FIRST so UI feels instant
@@ -15081,6 +15115,14 @@ if __name__ == '__main__':
                     mask_u8 = (mask_crop > 0).astype(np.uint8) * 255
                     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     cv2.drawContours(bg_rgb, contours, -1, (0, 255, 0), 2)
+                else:
+                    # Mask loaded but empty in this crop region
+                    cv2.putText(bg_rgb, "EMPTY", (5, 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+            else:
+                # Mask file not found on disk
+                cv2.putText(bg_rgb, "NO MASK", (5, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
             # Draw soma centroid marker
             if soma_centroid:
@@ -16602,7 +16644,7 @@ cat("============================================\\n")
                 # Draw cell label
                 if include_labels:
                     soma_id = mask_data.get('soma_id', '')
-                    area = mask_data.get('target_area_um2', 0)
+                    area = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
                     label = f"{soma_id} ({int(area)})"
                     coords = np.argwhere(mask > 0)
                     if len(coords) > 0:
