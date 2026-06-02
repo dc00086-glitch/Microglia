@@ -9176,6 +9176,8 @@ if __name__ == '__main__':
         # During soma picking, use the dedicated refresh to preserve picking state
         if self.processed_label.soma_mode:
             self._load_image_for_soma_picking()
+        elif getattr(self, '_qa_use_grid', False) and self.mask_qa_active:
+            self._show_qa_grid()
         else:
             self.update_display()
 
@@ -14492,8 +14494,18 @@ if __name__ == '__main__':
         if processed_img.ndim > 2:
             processed_img = ensure_grayscale(processed_img)
 
-        # Get soma centroid for cropping
+        # Ensure color image is loaded for color toggle
         img_data = self.images.get(img_name, {})
+        if 'color_image' not in img_data and 'raw_path' in img_data:
+            try:
+                raw_img = load_tiff_image(img_data['raw_path'])
+                if raw_img is not None and raw_img.ndim == 3:
+                    img_data['color_image'] = raw_img.copy()
+                    img_data['num_channels'] = raw_img.shape[2]
+            except Exception:
+                pass
+
+        # Get soma centroid for cropping
         soma_idx = self.all_masks_flat[flat_indices[0]]['mask_data'].get('soma_idx', 0)
         soma_centroid = None
         if soma_idx < len(img_data.get('somas', [])):
@@ -14565,12 +14577,33 @@ if __name__ == '__main__':
             crop_r1, crop_r2 = max(0, cy - 100), min(img_h, cy + 100)
             crop_c1, crop_c2 = max(0, cx - 100), min(img_w, cx + 100)
 
-        # Normalize processed image crop for display
-        crop_bg = processed_img[crop_r1:crop_r2, crop_c1:crop_c2].astype(np.float64)
-        cmin, cmax = crop_bg.min(), crop_bg.max()
-        if cmax > cmin:
-            crop_bg = (crop_bg - cmin) / (cmax - cmin) * 255
-        crop_bg = crop_bg.astype(np.uint8)
+        # Build crop background — color or grayscale based on toggle
+        use_color = self.show_color_view and 'color_image' in img_data
+        if use_color:
+            proc_color = self._build_processed_color_image(img_data)
+            if proc_color is not None:
+                color_src = proc_color
+            else:
+                color_src = img_data['color_image']
+            crop_color = color_src[crop_r1:crop_r2, crop_c1:crop_c2].copy()
+            if crop_color.ndim == 2:
+                crop_color = np.stack([crop_color, crop_color, crop_color], axis=-1)
+            elif crop_color.shape[2] == 4:
+                crop_color = crop_color[:, :, :3]
+            crop_color = crop_color.astype(np.float64)
+            for ch in range(crop_color.shape[2]):
+                ch_data = crop_color[:, :, ch]
+                ch_min, ch_max = ch_data.min(), ch_data.max()
+                if ch_max > ch_min:
+                    crop_color[:, :, ch] = (ch_data - ch_min) / (ch_max - ch_min) * 255
+            crop_bg_rgb = crop_color.astype(np.uint8)
+        else:
+            crop_bg = processed_img[crop_r1:crop_r2, crop_c1:crop_c2].astype(np.float64)
+            cmin, cmax = crop_bg.min(), crop_bg.max()
+            if cmax > cmin:
+                crop_bg = (crop_bg - cmin) / (cmax - cmin) * 255
+            crop_bg = crop_bg.astype(np.uint8)
+            crop_bg_rgb = np.stack([crop_bg, crop_bg, crop_bg], axis=-1)
 
         # Dynamic thumbnail size based on mask count
         n_masks = len(mask_items)
@@ -14604,7 +14637,7 @@ if __name__ == '__main__':
             approved = md.get('approved')
 
             # Build thumbnail: grayscale background + green mask outline
-            bg_rgb = np.stack([crop_bg, crop_bg, crop_bg], axis=-1).copy()
+            bg_rgb = crop_bg_rgb.copy()
 
             mask = md.get('mask')
             if mask is None:
