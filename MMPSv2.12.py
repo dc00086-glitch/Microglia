@@ -10745,11 +10745,17 @@ if __name__ == '__main__':
         auto_btn.setStyleSheet("border: 2px solid #4CAF50; font-weight: bold;")
         layout.addWidget(auto_btn)
 
+        dapi_btn = QPushButton("DAPI-Seeded - Grow from nucleus on signal channel")
+        dapi_btn.clicked.connect(lambda: dialog.done(3))
+        dapi_btn.setStyleSheet("border: 2px solid #2196F3; font-weight: bold;")
+        dapi_btn.setToolTip("Use DAPI nuclear stain as seed, grow on Iba1 channel.\n"
+                            "Competitive growth prevents overlap between somas.")
+        layout.addWidget(dapi_btn)
+
         # Auto settings — method is locked to Hybrid, only sensitivity adjustable
         from PyQt5.QtWidgets import QDoubleSpinBox
         settings_layout = QHBoxLayout()
-        settings_layout.addWidget(QLabel("Method: Hybrid"))
-        settings_layout.addWidget(QLabel("Sens:"))
+        settings_layout.addWidget(QLabel("Auto sens:"))
         sens_spin = QDoubleSpinBox()
         sens_spin.setRange(0.01, 90.0)
         sens_spin.setDecimals(2)
@@ -10758,11 +10764,60 @@ if __name__ == '__main__':
         settings_layout.addWidget(sens_spin)
         layout.addLayout(settings_layout)
 
+        # DAPI settings
+        layout.addWidget(QLabel("<b>DAPI-Seeded settings:</b>"))
+        dapi_settings = QFormLayout()
+
+        # Detect available channels
+        n_ch = 3
+        sample_img = None
+        for iname, idata in self.images.items():
+            if 'color_image' in idata and idata['color_image'] is not None:
+                n_ch = min(idata['color_image'].shape[2], 3) if idata['color_image'].ndim == 3 else 1
+                break
+
+        dapi_ch_combo = QComboBox()
+        for i in range(n_ch):
+            ch_name = self.channel_names.get(i, '')
+            label_str = f"Channel {i + 1}"
+            if ch_name:
+                label_str += f" ({ch_name})"
+            dapi_ch_combo.addItem(label_str, i)
+        dapi_ch_combo.setCurrentIndex(min(2, n_ch - 1))
+        dapi_settings.addRow("DAPI channel:", dapi_ch_combo)
+
+        signal_ch_combo = QComboBox()
+        for i in range(n_ch):
+            ch_name = self.channel_names.get(i, '')
+            label_str = f"Channel {i + 1}"
+            if ch_name:
+                label_str += f" ({ch_name})"
+            signal_ch_combo.addItem(label_str, i)
+        signal_ch_combo.setCurrentIndex(0)
+        dapi_settings.addRow("Signal channel (Iba1):", signal_ch_combo)
+
+        dapi_intensity_spin = QSpinBox()
+        dapi_intensity_spin.setRange(5, 80)
+        dapi_intensity_spin.setValue(30)
+        dapi_intensity_spin.setSuffix("%")
+        dapi_intensity_spin.setToolTip("Stop growing when signal drops below this % of soma peak intensity")
+        dapi_settings.addRow("Growth intensity floor:", dapi_intensity_spin)
+
+        dapi_max_area_spin = QSpinBox()
+        dapi_max_area_spin.setRange(50, 2000)
+        dapi_max_area_spin.setValue(400)
+        dapi_max_area_spin.setSuffix(" µm²")
+        dapi_max_area_spin.setToolTip("Maximum soma area to prevent growth into processes")
+        dapi_settings.addRow("Max soma area:", dapi_max_area_spin)
+
+        layout.addLayout(dapi_settings)
+
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(lambda: dialog.done(0))
         layout.addWidget(cancel_btn)
 
         dialog.setLayout(layout)
+        dialog.setMinimumWidth(400)
         result = dialog.exec_()
 
         if result == 0:
@@ -10770,6 +10825,10 @@ if __name__ == '__main__':
 
         self.auto_outline_method.setCurrentIndex(4)  # Always Hybrid
         self._auto_outline_sensitivity_value = sens_spin.value()
+        self._dapi_channel = dapi_ch_combo.currentData()
+        self._signal_channel = signal_ch_combo.currentData()
+        self._dapi_intensity_floor = dapi_intensity_spin.value()
+        self._dapi_max_soma_area = dapi_max_area_spin.value()
 
         self.batch_mode = True
         self.polygon_points = []
@@ -10814,6 +10873,12 @@ if __name__ == '__main__':
         if result == 1:
             # Manual mode
             self._start_manual_outlining()
+        elif result == 3:
+            # DAPI-seeded mode — skip polygon mode, run directly
+            self.batch_mode = False
+            self.processed_label.polygon_mode = False
+            self.outline_controls_widget.setVisible(False)
+            self._run_dapi_seeded_outlining()
         else:
             # Auto mode - outline all, then review
             self._run_auto_outline_all()
@@ -10904,6 +10969,264 @@ if __name__ == '__main__':
                 return
 
         self._start_review_mode()
+
+    def _run_dapi_seeded_outlining(self):
+        """Outline all somas using DAPI-seeded competitive growth on the signal channel."""
+        import heapq
+
+        dapi_ch = self._dapi_channel
+        signal_ch = self._signal_channel
+        intensity_floor_pct = self._dapi_intensity_floor
+        max_soma_area_um2 = self._dapi_max_soma_area
+
+        self.log("=" * 50)
+        self.log("DAPI-SEEDED COMPETITIVE SOMA OUTLINING")
+        self.log(f"DAPI channel: {dapi_ch + 1} | Signal channel: {signal_ch + 1}")
+        self.log(f"Intensity floor: {intensity_floor_pct}% | Max soma area: {max_soma_area_um2} µm²")
+        self.log("=" * 50)
+
+        self.progress_bar.setVisible(True)
+        self.progress_status_label.setVisible(True)
+
+        # Group somas by image for competitive growth
+        by_image = {}
+        for qi, (img_name, soma_idx) in enumerate(self.outlining_queue):
+            if self._soma_has_outline(img_name, soma_idx):
+                continue
+            if img_name not in by_image:
+                by_image[img_name] = []
+            by_image[img_name].append((qi, soma_idx))
+
+        total_somas = sum(len(v) for v in by_image.values())
+        completed = 0
+
+        for img_name, soma_list in by_image.items():
+            img_data = self.images[img_name]
+            self.progress_status_label.setText(f"DAPI outlining: {img_name}")
+            QApplication.processEvents()
+
+            # Load color image for channel extraction
+            if 'color_image' not in img_data or img_data['color_image'] is None:
+                try:
+                    raw_img = load_tiff_image(img_data['raw_path'])
+                    if raw_img is not None and raw_img.ndim == 3:
+                        img_data['color_image'] = raw_img.copy()
+                except Exception:
+                    self.log(f"  Cannot load color image for {img_name}")
+                    continue
+
+            color_img = img_data.get('color_image')
+            if color_img is None or color_img.ndim != 3:
+                self.log(f"  Skipping {img_name}: no multi-channel image")
+                continue
+
+            n_ch = color_img.shape[2]
+            if dapi_ch >= n_ch or signal_ch >= n_ch:
+                self.log(f"  Skipping {img_name}: not enough channels")
+                continue
+
+            # Extract channels
+            dapi_img = color_img[:, :, dapi_ch].astype(np.float64)
+            signal_img = color_img[:, :, signal_ch].astype(np.float64)
+
+            # Use processed signal channel if available
+            if img_data.get('processed') is not None and signal_ch == self.grayscale_channel:
+                signal_img = img_data['processed'].astype(np.float64)
+
+            h, w = signal_img.shape[:2]
+            pixel_size = self._get_pixel_size(img_name)
+            max_soma_px = int(max_soma_area_um2 / (pixel_size ** 2))
+
+            # Threshold DAPI to find nuclei — Otsu per-image
+            dapi_norm = dapi_img.copy()
+            dmin, dmax = dapi_norm.min(), dapi_norm.max()
+            if dmax > dmin:
+                dapi_norm = (dapi_norm - dmin) / (dmax - dmin) * 255
+            dapi_u8 = dapi_norm.astype(np.uint8)
+            otsu_thresh, dapi_binary = cv2.threshold(dapi_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # Competitive growth: all somas grow simultaneously on the signal channel
+            owner_map = np.full((h, w), -1, dtype=np.int32)
+            visited = np.zeros((h, w), dtype=bool)
+            growth_orders = {}  # soma_idx -> [(r, c), ...]
+            soma_seed_counts = {}
+            heap = []
+
+            # Seed each soma from its DAPI nuclear region
+            for qi, soma_idx in soma_list:
+                soma = img_data['somas'][soma_idx]
+                cy, cx = int(soma[0]), int(soma[1])
+                cy = max(0, min(h - 1, cy))
+                cx = max(0, min(w - 1, cx))
+                si = soma_idx
+
+                growth_orders[si] = []
+                soma_seed_counts[si] = 0
+
+                # Flood-fill DAPI from centroid to find this soma's nucleus
+                nucleus_mask = np.zeros((h, w), dtype=bool)
+                nuc_queue = [(cy, cx)]
+                if dapi_binary[cy, cx] > 0:
+                    nucleus_mask[cy, cx] = True
+                    while nuc_queue:
+                        nr, nc = nuc_queue.pop(0)
+                        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                            rr, cc = nr + dr, nc + dc
+                            if (0 <= rr < h and 0 <= cc < w
+                                    and not nucleus_mask[rr, cc]
+                                    and dapi_binary[rr, cc] > 0):
+                                dist_sq = (rr - cy) ** 2 + (cc - cx) ** 2
+                                if dist_sq < (max_soma_px * 2):
+                                    nucleus_mask[rr, cc] = True
+                                    nuc_queue.append((rr, cc))
+
+                # Seed from nucleus pixels (or centroid if no DAPI signal)
+                nuc_pixels = np.argwhere(nucleus_mask)
+                if len(nuc_pixels) > 0:
+                    for nr, nc in nuc_pixels:
+                        if not visited[nr, nc]:
+                            visited[nr, nc] = True
+                            owner_map[nr, nc] = si
+                            growth_orders[si].append((nr, nc))
+                            soma_seed_counts[si] += 1
+                    # Push boundary neighbors into heap
+                    for nr, nc in nuc_pixels:
+                        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                            rr, cc = nr + dr, nc + dc
+                            if 0 <= rr < h and 0 <= cc < w and not visited[rr, cc]:
+                                if signal_img[rr, cc] > 0:
+                                    visited[rr, cc] = True
+                                    owner_map[rr, cc] = si
+                                    heapq.heappush(heap, (-signal_img[rr, cc], rr, cc, si))
+                else:
+                    # No DAPI signal at centroid — seed from centroid pixel
+                    if not visited[cy, cx]:
+                        visited[cy, cx] = True
+                        owner_map[cy, cx] = si
+                        growth_orders[si].append((cy, cx))
+                        soma_seed_counts[si] = 1
+                        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                            rr, cc = cy + dr, cx + dc
+                            if 0 <= rr < h and 0 <= cc < w and not visited[rr, cc]:
+                                if signal_img[rr, cc] > 0:
+                                    visited[rr, cc] = True
+                                    owner_map[rr, cc] = si
+                                    heapq.heappush(heap, (-signal_img[rr, cc], rr, cc, si))
+
+            # Compute per-soma intensity floor from seed region
+            soma_floors = {}
+            for si in growth_orders:
+                if growth_orders[si]:
+                    seed_intensities = [signal_img[r, c] for r, c in growth_orders[si]]
+                    peak = max(seed_intensities) if seed_intensities else 0
+                    soma_floors[si] = peak * (intensity_floor_pct / 100.0)
+                else:
+                    soma_floors[si] = 0
+
+            # Competitive growth on signal channel
+            soma_done = {si: False for si in growth_orders}
+            while heap:
+                neg_intensity, r, c, si = heapq.heappop(heap)
+
+                if owner_map[r, c] != si:
+                    continue
+                if len(growth_orders[si]) >= max_soma_px:
+                    soma_done[si] = True
+                    if all(soma_done.values()):
+                        break
+                    continue
+
+                # Intensity floor check: don't grow below the floor
+                if signal_img[r, c] < soma_floors.get(si, 0):
+                    continue
+
+                growth_orders[si].append((r, c))
+
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    rr, cc = r + dr, c + dc
+                    if 0 <= rr < h and 0 <= cc < w and not visited[rr, cc]:
+                        # Must have signal on the channel of interest
+                        if signal_img[rr, cc] > 0 and signal_img[rr, cc] >= soma_floors.get(si, 0):
+                            visited[rr, cc] = True
+                            owner_map[rr, cc] = si
+                            heapq.heappush(heap, (-signal_img[rr, cc], rr, cc, si))
+
+            # Convert growth regions to outlines
+            for qi, soma_idx in soma_list:
+                si = soma_idx
+                go = growth_orders.get(si, [])
+                if len(go) < 10:
+                    self.log(f"  {img_data['soma_ids'][soma_idx]}: too few pixels ({len(go)}), skipping")
+                    completed += 1
+                    continue
+
+                # Build binary mask from growth order
+                soma_mask = np.zeros((h, w), dtype=np.uint8)
+                for r, c in go:
+                    soma_mask[r, c] = 1
+
+                # Smooth: morphological close + open to clean edges
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                soma_mask = cv2.morphologyEx(soma_mask, cv2.MORPH_CLOSE, kernel)
+                soma_mask = cv2.morphologyEx(soma_mask, cv2.MORPH_OPEN, kernel)
+
+                # Extract contour as polygon points
+                contours, _ = cv2.findContours(soma_mask * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not contours:
+                    self.log(f"  {img_data['soma_ids'][soma_idx]}: no contour found")
+                    completed += 1
+                    continue
+
+                contour = max(contours, key=cv2.contourArea)
+                epsilon = 0.01 * cv2.arcLength(contour, True)
+                approx = cv2.approxPolyDP(contour, epsilon, True)
+
+                if len(approx) < 3:
+                    completed += 1
+                    continue
+
+                polygon_points = [(int(pt[0][1]), int(pt[0][0])) for pt in approx]
+
+                soma_id = img_data['soma_ids'][soma_idx]
+                soma_area_um2 = np.sum(soma_mask) * (pixel_size ** 2)
+
+                img_data['soma_outlines'].append({
+                    'soma_idx': soma_idx,
+                    'soma_id': soma_id,
+                    'centroid': img_data['somas'][soma_idx],
+                    'outline': soma_mask,
+                    'polygon_points': polygon_points,
+                    'soma_area_um2': soma_area_um2,
+                })
+
+                self._export_soma_outline(img_name, soma_id, soma_mask,
+                                          self._get_pixel_size_xy(img_name), soma_area_um2)
+
+                nuc_count = soma_seed_counts.get(si, 0)
+                self.log(f"  {soma_id}: nucleus={nuc_count}px, soma={len(go)}px, "
+                         f"area={soma_area_um2:.1f} µm²")
+
+                completed += 1
+                self.progress_bar.setValue(int(completed / max(total_somas, 1) * 100))
+                QApplication.processEvents()
+
+            img_data['status'] = 'outlined'
+            self._update_file_list_item(img_name)
+
+        self.progress_bar.setVisible(False)
+        self.progress_status_label.setVisible(False)
+
+        outlined = sum(1 for in_, si in self.outlining_queue if self._soma_has_outline(in_, si))
+        self.log("=" * 50)
+        self.log(f"✓ DAPI-seeded outlining complete: {outlined}/{len(self.outlining_queue)} somas")
+        self.log("=" * 50)
+
+        self.batch_generate_masks_btn.setEnabled(True)
+        self._auto_save()
+        QMessageBox.information(self, "Complete",
+            f"DAPI-seeded outlining complete!\n\n"
+            f"Outlined: {outlined}/{len(self.outlining_queue)} somas\n\n"
+            f"Ready to generate masks.")
 
     def _start_review_mode(self):
         """Start reviewing auto-outlined somas one by one"""
