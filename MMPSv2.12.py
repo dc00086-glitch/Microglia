@@ -11265,6 +11265,16 @@ if __name__ == '__main__':
     def _start_review_mode(self):
         """Start reviewing auto-outlined somas one by one"""
         self.review_mode = True
+        self.batch_mode = True
+        self.processed_label.polygon_mode = True
+        self.processed_label.soma_mode = False
+        self.processed_label.point_edit_mode = False
+        self.processed_label.selected_point_idx = None
+        self.processed_label.dragging_point = False
+
+        self.outline_controls_widget.setVisible(True)
+        self.outline_sens_display.setValue(self._auto_outline_sensitivity_value)
+        self.redo_outline_btn.setEnabled(False)
 
         self.z_key_held = False
         for label in [self.processed_label, self.original_label, self.preview_label, self.mask_label]:
