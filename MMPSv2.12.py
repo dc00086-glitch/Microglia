@@ -3170,10 +3170,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
             "QPushButton { padding: 4px 10px; }")
         zoom_layout.addWidget(self.paint_erase_btn)
 
-        # Clear All Masks + Undo QA + Approve All — next to Redo, only visible during QA
+        # Clear All Masks + Undo QA + Approve All + Switch Mode — visible during QA
         zoom_layout.addWidget(self.clear_masks_btn)
         zoom_layout.addWidget(self.undo_qa_btn)
         zoom_layout.addWidget(self.approve_all_btn)
+
+        self.qa_switch_mode_btn = QPushButton("Switch to Single View")
+        self.qa_switch_mode_btn.clicked.connect(self._toggle_qa_mode)
+        self.qa_switch_mode_btn.setVisible(False)
+        self.qa_switch_mode_btn.setToolTip("Switch between Grid View (fast) and Single Mask View (paint/erase)")
+        self.qa_switch_mode_btn.setStyleSheet("QPushButton { padding: 4px 10px; }")
+        zoom_layout.addWidget(self.qa_switch_mode_btn)
 
         self.zoom_level_label = QLabel("1.0x")
         self.zoom_level_label.setFixedWidth(50)
@@ -13499,6 +13506,13 @@ if __name__ == '__main__':
         self.paint_brush_spin.setVisible(not self._qa_use_grid)
         self.paint_erase_btn.setVisible(not self._qa_use_grid)
 
+        # Switch mode button
+        self.qa_switch_mode_btn.setVisible(True)
+        if self._qa_use_grid:
+            self.qa_switch_mode_btn.setText("Switch to Single View")
+        else:
+            self.qa_switch_mode_btn.setText("Switch to Grid View")
+
         self._qa_grid_soma_idx = 0
         self._qa_skipped_somas = set()
         self._qa_grid_edit_return = False
@@ -14340,6 +14354,7 @@ if __name__ == '__main__':
             self.clear_masks_btn.setVisible(False)
             self.clear_masks_btn.setEnabled(False)
             self.undo_qa_btn.setVisible(False)
+            self.qa_switch_mode_btn.setVisible(False)
             self.mask_qa_progress_bar.setVisible(False)
             self.original_label.info_text = None
             self.original_label.info_text_right = None
@@ -14460,6 +14475,75 @@ if __name__ == '__main__':
     # ----------------------------------------------------------------
     # GRID QA VIEW
     # ----------------------------------------------------------------
+
+    def _toggle_qa_mode(self):
+        """Switch between Grid View and Single Mask View during QA."""
+        if not self.mask_qa_active:
+            return
+
+        self._qa_use_grid = not self._qa_use_grid
+
+        if self._qa_use_grid:
+            # Switch to grid
+            self.qa_switch_mode_btn.setText("Switch to Single View")
+            self.paint_fill_btn.setVisible(False)
+            self.paint_fill_btn.setChecked(False)
+            self.paint_brush_spin.setVisible(False)
+            self.paint_erase_btn.setVisible(False)
+            self.paint_erase_btn.setChecked(False)
+            self.mask_label.setVisible(False)
+            self.qa_grid_scroll.setVisible(True)
+
+            # Find which soma the current mask belongs to
+            if self.mask_qa_idx < len(self.all_masks_flat):
+                flat = self.all_masks_flat[self.mask_qa_idx]
+                soma_key = (flat['image_name'], flat['mask_data'].get('soma_id', ''))
+                if soma_key in self._qa_soma_order_index:
+                    self._qa_grid_soma_idx = self._qa_soma_order_index[soma_key]
+
+            # Update progress bar to soma count
+            total_somas = len(self._qa_soma_order)
+            reviewed_somas = sum(
+                1 for sk in self._qa_soma_order
+                if all(self.all_masks_flat[fi]['mask_data'].get('approved') is not None
+                       for fi in self._qa_soma_mask_index.get(sk, []))
+            )
+            self.mask_qa_progress_bar.setFormat("%v / %m somas reviewed")
+            self.mask_qa_progress_bar.setMaximum(total_somas)
+            self.mask_qa_progress_bar.setValue(reviewed_somas)
+
+            self._show_qa_grid()
+            self.log("Switched to Grid View")
+        else:
+            # Switch to single mask
+            self.qa_switch_mode_btn.setText("Switch to Grid View")
+            self.paint_fill_btn.setVisible(True)
+            self.paint_brush_spin.setVisible(True)
+            self.paint_erase_btn.setVisible(True)
+            self.qa_grid_scroll.setVisible(False)
+            self.mask_label.setVisible(True)
+
+            # Find first unreviewed mask to show
+            found = False
+            for idx in range(len(self.all_masks_flat)):
+                md = self.all_masks_flat[idx]['mask_data']
+                if md.get('approved') is None and not md.get('duplicate'):
+                    self.mask_qa_idx = idx
+                    found = True
+                    break
+            if not found:
+                self.mask_qa_idx = max(0, len(self.all_masks_flat) - 1)
+
+            # Update progress bar to mask count
+            auto_rejected = self._qa_auto_rejected_count
+            masks_needing_review = len(self.all_masks_flat) - auto_rejected
+            reviewed = self._qa_approved_count + self._qa_user_rejected_count
+            self.mask_qa_progress_bar.setFormat("%v / %m masks reviewed")
+            self.mask_qa_progress_bar.setMaximum(masks_needing_review)
+            self.mask_qa_progress_bar.setValue(reviewed)
+
+            self._show_current_mask()
+            self.log("Switched to Single Mask View (Paint/Erase available)")
 
     def _show_qa_grid(self):
         """Show a grid of mask thumbnails for the current soma."""
