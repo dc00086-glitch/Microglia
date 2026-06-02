@@ -2510,7 +2510,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
                 # Restart current outline
                 self.restart_polygon()
                 return
-            elif key == Qt.Key_Delete:
+            elif key == Qt.Key_Delete or key == Qt.Key_D:
                 self.skip_delete_current_soma()
                 return
             elif key == Qt.Key_Return or key == Qt.Key_Enter:
@@ -2918,11 +2918,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.accept_outline_btn.setToolTip("Accept outline and move to next soma")
         outline_btn_layout.addWidget(self.accept_outline_btn)
 
-        self.skip_soma_btn = QPushButton("Skip (Del)")
+        self.skip_soma_btn = QPushButton("Skip (D)")
         self.skip_soma_btn.clicked.connect(self.skip_delete_current_soma)
         self.skip_soma_btn.setEnabled(False)
         self.skip_soma_btn.setStyleSheet("border: 2px solid #f44336;")
-        self.skip_soma_btn.setToolTip("Delete this soma and skip to next (Del key)")
+        self.skip_soma_btn.setToolTip("Delete this soma and skip to next (D or Del key)")
         outline_btn_layout.addWidget(self.skip_soma_btn)
         outline_controls_layout.addLayout(outline_btn_layout)
 
