@@ -10874,10 +10874,7 @@ if __name__ == '__main__':
             # Manual mode
             self._start_manual_outlining()
         elif result == 3:
-            # DAPI-seeded mode — skip polygon mode, run directly
-            self.batch_mode = False
-            self.processed_label.polygon_mode = False
-            self.outline_controls_widget.setVisible(False)
+            # DAPI-seeded mode — generate outlines, then review
             self._run_dapi_seeded_outlining()
         else:
             # Auto mode - outline all, then review
@@ -11187,46 +11184,27 @@ if __name__ == '__main__':
 
                 polygon_points = [(int(pt[0][1]), int(pt[0][0])) for pt in approx]
 
-                soma_id = img_data['soma_ids'][soma_idx]
-                soma_area_um2 = np.sum(soma_mask) * (pixel_size ** 2)
-
-                img_data['soma_outlines'].append({
-                    'soma_idx': soma_idx,
-                    'soma_id': soma_id,
-                    'centroid': img_data['somas'][soma_idx],
-                    'outline': soma_mask,
-                    'polygon_points': polygon_points,
-                    'soma_area_um2': soma_area_um2,
-                })
-
-                self._export_soma_outline(img_name, soma_id, soma_mask,
-                                          self._get_pixel_size_xy(img_name), soma_area_um2)
+                # Store for review (don't save yet)
+                self.auto_outlined_points[qi] = polygon_points
 
                 nuc_count = soma_seed_counts.get(si, 0)
-                self.log(f"  {soma_id}: nucleus={nuc_count}px, soma={len(go)}px, "
-                         f"area={soma_area_um2:.1f} µm²")
+                soma_area_um2 = np.sum(soma_mask) * (pixel_size ** 2)
+                self.log(f"  {img_data['soma_ids'][soma_idx]}: nucleus={nuc_count}px, "
+                         f"soma={len(go)}px, area={soma_area_um2:.1f} µm²")
 
                 completed += 1
                 self.progress_bar.setValue(int(completed / max(total_somas, 1) * 100))
                 QApplication.processEvents()
 
-            img_data['status'] = 'outlined'
-            self._update_file_list_item(img_name)
-
         self.progress_bar.setVisible(False)
         self.progress_status_label.setVisible(False)
 
-        outlined = sum(1 for in_, si in self.outlining_queue if self._soma_has_outline(in_, si))
-        self.log("=" * 50)
-        self.log(f"✓ DAPI-seeded outlining complete: {outlined}/{len(self.outlining_queue)} somas")
-        self.log("=" * 50)
+        success_count = len(self.auto_outlined_points)
+        fail_count = total_somas - success_count
+        self.log(f"DAPI-seeded: {success_count} outlined, {fail_count} failed")
 
-        self.batch_generate_masks_btn.setEnabled(True)
-        self._auto_save()
-        QMessageBox.information(self, "Complete",
-            f"DAPI-seeded outlining complete!\n\n"
-            f"Outlined: {outlined}/{len(self.outlining_queue)} somas\n\n"
-            f"Ready to generate masks.")
+        # Enter review mode so user can check/edit each outline
+        self._start_review_mode()
 
     def _start_review_mode(self):
         """Start reviewing auto-outlined somas one by one"""
