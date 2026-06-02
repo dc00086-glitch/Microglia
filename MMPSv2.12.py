@@ -14927,7 +14927,7 @@ if __name__ == '__main__':
             self._show_current_mask()
             self.log("Switched to Single Mask View (Paint/Erase available)")
 
-    def _show_qa_grid(self):
+    def _show_qa_grid(self, allow_reviewed=False):
         """Show a grid of mask thumbnails for the current soma."""
         if self._qa_grid_soma_idx >= len(self._qa_soma_order):
             self._handle_grid_qa_end()
@@ -14937,12 +14937,12 @@ if __name__ == '__main__':
         img_name, soma_id = soma_key
         flat_indices = self._qa_soma_mask_index.get(soma_key, [])
 
-        # Skip somas where all masks are already reviewed (but not skipped ones)
+        # Skip somas where all masks are already reviewed (unless going back)
         non_dup_indices = [fi for fi in flat_indices
                           if not self.all_masks_flat[fi]['mask_data'].get('duplicate')]
         all_reviewed = all(self.all_masks_flat[fi]['mask_data'].get('approved') is not None
                           for fi in non_dup_indices)
-        if all_reviewed and soma_key not in self._qa_skipped_somas:
+        if all_reviewed and not allow_reviewed and soma_key not in self._qa_skipped_somas:
             if self._qa_grid_soma_idx < len(self._qa_soma_order) - 1:
                 self._qa_grid_soma_idx += 1
                 self._show_qa_grid()
@@ -15366,7 +15366,7 @@ if __name__ == '__main__':
         """Go back to the previous soma in the grid."""
         if self._qa_grid_soma_idx > 0:
             self._qa_grid_soma_idx -= 1
-            self._show_qa_grid()
+            self._show_qa_grid(allow_reviewed=True)
 
     def _handle_grid_qa_end(self):
         """Handle reaching the end of the grid — remind about skipped somas."""
