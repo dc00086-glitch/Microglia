@@ -16072,67 +16072,77 @@ if __name__ == '__main__':
         soma centroid in the same image, converted to µm using the pixel size.
         Adds 'nearest_neighbor_um' to each result dict.
         """
-        # Group results by image and collect soma positions
+        # Group results by image, deduplicate by soma_id
         by_image = {}
         for i, result in enumerate(all_results):
             img_name = result.get('image_name', '')
+            if img_name not in by_image:
+                by_image[img_name] = {'result_indices': [], 'somas': {}}
+            by_image[img_name]['result_indices'].append(i)
             soma_id = result.get('soma_id', '')
             soma_idx = result.get('soma_idx', 0)
-            if img_name not in by_image:
-                by_image[img_name] = []
-            by_image[img_name].append((i, soma_id, soma_idx))
+            if soma_id not in by_image[img_name]['somas']:
+                by_image[img_name]['somas'][soma_id] = soma_idx
 
         computed = 0
-        for img_name_base, cells in by_image.items():
+        for img_name_base, img_info in by_image.items():
             # Find the full image name to get soma coordinates
             img_data = None
+            full_img_name = None
             for full_name, data in self.images.items():
                 if os.path.splitext(full_name)[0] == img_name_base:
                     img_data = data
+                    full_img_name = full_name
                     break
 
-            if img_data is None or len(cells) < 2:
-                for idx, _, _ in cells:
+            unique_somas = img_info['somas']
+
+            if img_data is None or len(unique_somas) < 2:
+                for idx in img_info['result_indices']:
                     all_results[idx]['nearest_neighbor_um'] = 0.0
                 continue
 
-            px_x, px_y = self._get_pixel_size_xy(
-                next((fn for fn in self.images if os.path.splitext(fn)[0] == img_name_base), None))
+            px_x, px_y = self._get_pixel_size_xy(full_img_name)
 
-            # Build coordinate array for all somas in this image
-            coords = []
-            result_indices = []
-            for idx, soma_id, soma_idx in cells:
+            # Build coordinate array for unique somas only
+            soma_coords = {}
+            for soma_id, soma_idx in unique_somas.items():
                 if soma_idx < len(img_data.get('somas', [])):
                     soma = img_data['somas'][soma_idx]
-                    coords.append((float(soma[0]), float(soma[1])))
-                    result_indices.append(idx)
-                else:
-                    all_results[idx]['nearest_neighbor_um'] = 0.0
+                    soma_coords[soma_id] = (float(soma[0]), float(soma[1]))
 
-            if len(coords) < 2:
-                for idx in result_indices:
+            if len(soma_coords) < 2:
+                for idx in img_info['result_indices']:
                     all_results[idx]['nearest_neighbor_um'] = 0.0
                 continue
 
-            coords_arr = np.array(coords)
+            # Compute nearest neighbor for each unique soma
+            soma_nnd = {}
+            soma_ids_list = list(soma_coords.keys())
+            coords_list = [soma_coords[sid] for sid in soma_ids_list]
 
-            for j, idx in enumerate(result_indices):
-                row_j, col_j = coords_arr[j]
+            for j, sid_j in enumerate(soma_ids_list):
+                row_j, col_j = coords_list[j]
                 min_dist = float('inf')
-                for k in range(len(coords_arr)):
+                for k, sid_k in enumerate(soma_ids_list):
                     if k == j:
                         continue
-                    row_k, col_k = coords_arr[k]
+                    row_k, col_k = coords_list[k]
                     dy = (row_j - row_k) * px_y
                     dx = (col_j - col_k) * px_x
                     dist = math.sqrt(dx * dx + dy * dy)
                     if dist < min_dist:
                         min_dist = dist
-                all_results[idx]['nearest_neighbor_um'] = round(min_dist, 2)
-                computed += 1
+                soma_nnd[sid_j] = round(min_dist, 2)
 
-        self.log(f"✓ Nearest neighbor distances computed for {computed} cells")
+            # Assign to ALL result rows (every mask size gets the same NND)
+            for idx in img_info['result_indices']:
+                soma_id = all_results[idx].get('soma_id', '')
+                all_results[idx]['nearest_neighbor_um'] = soma_nnd.get(soma_id, 0.0)
+                if soma_id in soma_nnd:
+                    computed += 1
+
+        self.log(f"✓ Nearest neighbor distances computed for {computed} result rows")
 
     # ----------------------------------------------------------------
     # EXPORT: R SCRIPT GENERATOR
