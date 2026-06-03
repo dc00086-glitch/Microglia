@@ -12575,6 +12575,9 @@ if __name__ == '__main__':
                             m_key = f"{img_name}_{m['soma_id']}_area{m['target_area_um2']}"
                             self._update_checklist_row(img_cl_path, 0, m_key, 1, 1)
 
+                # Reject masks that touch the image border (while still in memory)
+                self._reject_border_masks_for_image(img_name, img_data['masks'])
+
                 # Export ALL generated masks to disk immediately so they
                 # survive save/load even before QA approval
                 if self.masks_dir and os.path.isdir(self.masks_dir):
@@ -13734,76 +13737,58 @@ if __name__ == '__main__':
                 self.log(f"  Could not reload {fname}: {e}")
         return False
 
-    def _reject_border_touching_masks(self):
-        """Auto-reject masks that touch the image border.
+    def _reject_border_masks_for_image(self, img_name, masks):
+        """Auto-reject masks that touch the image border for one image.
 
-        Returns dict of {soma_key: n_rejected} for cells where ALL masks
-        were border-rejected, so the user can be notified.
+        Called during mask generation while masks are still in memory.
         """
-        border_rejected_count = 0
-        fully_rejected_cells = {}  # soma_key -> n_rejected
+        border_rejected = 0
+        by_soma = {}  # soma_id -> list of mask_datas
 
-        for flat_data in self.all_masks_flat:
-            md = flat_data['mask_data']
-            if md.get('approved') is not None or md.get('duplicate'):
+        for md in masks:
+            if md.get('duplicate'):
                 continue
-
-            img_name = flat_data['image_name']
             mask = md.get('mask')
-            # Only check masks already in memory — don't load from disk
-            # (loading thousands of TIFFs would hang the UI)
             if mask is None:
                 continue
 
+            soma_id = md.get('soma_id', '')
+            if soma_id not in by_soma:
+                by_soma[soma_id] = []
+            by_soma[soma_id].append(md)
+
             h, w = mask.shape
             touches_border = (
-                np.any(mask[0, :] > 0) or    # top row
-                np.any(mask[-1, :] > 0) or   # bottom row
-                np.any(mask[:, 0] > 0) or    # left column
-                np.any(mask[:, -1] > 0)      # right column
+                np.any(mask[0, :] > 0) or
+                np.any(mask[-1, :] > 0) or
+                np.any(mask[:, 0] > 0) or
+                np.any(mask[:, -1] > 0)
             )
             if touches_border:
                 md['approved'] = False
                 md['border_rejected'] = True
-                border_rejected_count += 1
-                self._qa_user_rejected_count += 1
-                self._delete_rejected_mask_tiff(img_name, md)
+                border_rejected += 1
 
-        if border_rejected_count == 0:
-            return {}
+        if border_rejected == 0:
+            return
 
-        self.log(f"⚠️ Auto-rejected {border_rejected_count} masks touching the image border")
+        self.log(f"  ⚠️ {border_rejected} masks touch the image border (auto-rejected)")
 
-        # Check which cells had ALL their masks rejected
-        for soma_key, flat_indices in self._qa_soma_mask_index.items():
-            non_dup = [fi for fi in flat_indices
-                       if not self.all_masks_flat[fi]['mask_data'].get('duplicate')]
-            all_rejected = all(
-                self.all_masks_flat[fi]['mask_data'].get('approved') is False
-                for fi in non_dup
-            )
-            border_any = any(
-                self.all_masks_flat[fi]['mask_data'].get('border_rejected')
-                for fi in non_dup
-            )
-            if all_rejected and border_any:
-                fully_rejected_cells[soma_key] = len(non_dup)
+        # Check for cells where ALL masks were rejected
+        fully_rejected = []
+        for soma_id, soma_masks in by_soma.items():
+            if all(m.get('approved') is False for m in soma_masks):
+                if any(m.get('border_rejected') for m in soma_masks):
+                    fully_rejected.append(soma_id)
 
-        if fully_rejected_cells:
-            cell_list = [f"  {sk[1]} ({os.path.splitext(sk[0])[0]})"
-                         for sk in fully_rejected_cells]
-            msg = (f"{len(fully_rejected_cells)} cell(s) had ALL masks rejected "
-                   f"because they touch the image border:\n\n"
-                   + "\n".join(cell_list[:20])
-                   + ("\n  ..." if len(cell_list) > 20 else "")
-                   + "\n\nThese cells are likely at the edge of the image "
-                   "and don't have complete morphology.")
-            QMessageBox.warning(self, "Border-Touching Cells Rejected", msg)
-            self.log(f"  {len(fully_rejected_cells)} cells fully rejected (all masks touch border)")
-            for sk in fully_rejected_cells:
-                self.log(f"    {sk[1]} ({os.path.splitext(sk[0])[0]})")
-
-        return fully_rejected_cells
+        if fully_rejected:
+            cell_list = "\n".join(f"  {sid}" for sid in fully_rejected[:20])
+            extra = f"\n  ...and {len(fully_rejected) - 20} more" if len(fully_rejected) > 20 else ""
+            QMessageBox.warning(self, "Border-Touching Cells",
+                f"{len(fully_rejected)} cell(s) in {os.path.splitext(img_name)[0]} had ALL masks "
+                f"rejected (touching image border):\n\n{cell_list}{extra}")
+            for sid in fully_rejected:
+                self.log(f"    {sid}: all masks touch border")
 
     def start_batch_qa(self):
         # Flatten all masks from all images
@@ -13895,9 +13880,6 @@ if __name__ == '__main__':
                 passed = 1 if md.get('approved') is True else 0
                 cl_rows.append([key, str(passed)])
             self._write_checklist(qa_cl_path, cl_rows, ['Mask', 'Passed QA'])
-
-        # Auto-reject masks that touch the image border
-        border_rejected = self._reject_border_touching_masks()
 
         # Ask user which QA mode to use
         mode_dialog = QDialog(self)
