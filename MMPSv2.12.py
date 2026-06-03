@@ -5961,13 +5961,13 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             return
         current_img = flat_data['image_name']
         current_soma_id = current_mask_data.get('soma_id', '')
-        current_area = current_mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
+        current_area = current_mask_data.get('target_area_um2', current_mask_data.get('area_um2', 0))
 
         soma_key = (current_img, current_soma_id)
         for idx in self._qa_soma_mask_index.get(soma_key, []):
             other_flat = self.all_masks_flat[idx]
             other_mask_data = other_flat['mask_data']
-            if other_mask_data.get('target_area_um2', mask_data.get('area_um2', 0)) >= current_area:
+            if other_mask_data.get('target_area_um2', other_mask_data.get('area_um2', 0)) >= current_area:
                 continue
             other_mask = other_mask_data.get('mask')
             if other_mask is None:
@@ -13734,6 +13734,78 @@ if __name__ == '__main__':
                 self.log(f"  Could not reload {fname}: {e}")
         return False
 
+    def _reject_border_touching_masks(self):
+        """Auto-reject masks that touch the image border.
+
+        Returns dict of {soma_key: n_rejected} for cells where ALL masks
+        were border-rejected, so the user can be notified.
+        """
+        border_rejected_count = 0
+        fully_rejected_cells = {}  # soma_key -> n_rejected
+
+        for flat_data in self.all_masks_flat:
+            md = flat_data['mask_data']
+            if md.get('approved') is not None or md.get('duplicate'):
+                continue
+
+            img_name = flat_data['image_name']
+            mask = md.get('mask')
+            if mask is None:
+                self._reload_mask_from_disk(md, img_name)
+                mask = md.get('mask')
+            if mask is None:
+                continue
+
+            h, w = mask.shape
+            touches_border = (
+                np.any(mask[0, :] > 0) or    # top row
+                np.any(mask[-1, :] > 0) or   # bottom row
+                np.any(mask[:, 0] > 0) or    # left column
+                np.any(mask[:, -1] > 0)      # right column
+            )
+            if touches_border:
+                md['approved'] = False
+                md['border_rejected'] = True
+                border_rejected_count += 1
+                self._qa_user_rejected_count += 1
+                self._delete_rejected_mask_tiff(img_name, md)
+
+        if border_rejected_count == 0:
+            return {}
+
+        self.log(f"⚠️ Auto-rejected {border_rejected_count} masks touching the image border")
+
+        # Check which cells had ALL their masks rejected
+        for soma_key, flat_indices in self._qa_soma_mask_index.items():
+            non_dup = [fi for fi in flat_indices
+                       if not self.all_masks_flat[fi]['mask_data'].get('duplicate')]
+            all_rejected = all(
+                self.all_masks_flat[fi]['mask_data'].get('approved') is False
+                for fi in non_dup
+            )
+            border_any = any(
+                self.all_masks_flat[fi]['mask_data'].get('border_rejected')
+                for fi in non_dup
+            )
+            if all_rejected and border_any:
+                fully_rejected_cells[soma_key] = len(non_dup)
+
+        if fully_rejected_cells:
+            cell_list = [f"  {sk[1]} ({os.path.splitext(sk[0])[0]})"
+                         for sk in fully_rejected_cells]
+            msg = (f"{len(fully_rejected_cells)} cell(s) had ALL masks rejected "
+                   f"because they touch the image border:\n\n"
+                   + "\n".join(cell_list[:20])
+                   + ("\n  ..." if len(cell_list) > 20 else "")
+                   + "\n\nThese cells are likely at the edge of the image "
+                   "and don't have complete morphology.")
+            QMessageBox.warning(self, "Border-Touching Cells Rejected", msg)
+            self.log(f"  {len(fully_rejected_cells)} cells fully rejected (all masks touch border)")
+            for sk in fully_rejected_cells:
+                self.log(f"    {sk[1]} ({os.path.splitext(sk[0])[0]})")
+
+        return fully_rejected_cells
+
     def start_batch_qa(self):
         # Flatten all masks from all images
         self.all_masks_flat = []
@@ -13824,6 +13896,9 @@ if __name__ == '__main__':
                 passed = 1 if md.get('approved') is True else 0
                 cl_rows.append([key, str(passed)])
             self._write_checklist(qa_cl_path, cl_rows, ['Mask', 'Passed QA'])
+
+        # Auto-reject masks that touch the image border
+        border_rejected = self._reject_border_touching_masks()
 
         # Ask user which QA mode to use
         mode_dialog = QDialog(self)
