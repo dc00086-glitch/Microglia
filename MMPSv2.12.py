@@ -16556,77 +16556,84 @@ cat("============================================\\n")
 
     def _export_figure_composites(self):
         """Export publication-ready composite images with mask outlines, scale bar, and labels."""
-        if not self.images or not self.masks_dir:
-            QMessageBox.warning(self, "Warning",
-                "Load images and generate masks before exporting composites.")
+        if not self.images:
+            QMessageBox.warning(self, "Warning", "Load images first.")
             return
 
-        # Check for approved masks
         has_approved = any(
             m.get('approved') for d in self.images.values() for m in d.get('masks', [])
         )
-        if not has_approved:
-            QMessageBox.warning(self, "Warning", "No approved masks found. Complete QA first.")
-            return
 
         # Settings dialog
         dialog = QDialog(self)
         dialog.setWindowTitle("Export Figure Composites")
         dialog.setModal(True)
-        dialog.setMinimumWidth(450)
+        dialog.setMinimumWidth(480)
         layout = QVBoxLayout()
 
-        layout.addWidget(QLabel("<b>Export publication-ready composite images</b>"))
-        layout.addWidget(QLabel("Each image gets: processed image + mask outline + scale bar + cell label"))
+        layout.addWidget(QLabel("<b>Export publication-ready images</b>"))
 
-        # Options
         form = QFormLayout()
-
         from PyQt5.QtWidgets import QDoubleSpinBox
 
-        # Scale bar
+        # What to export
+        layout.addWidget(QLabel("<b>Export options:</b>"))
+        export_composite_check = QCheckBox("Color composite (all channels merged)")
+        export_composite_check.setChecked(True)
+        form.addRow("", export_composite_check)
+
+        export_channels_check = QCheckBox("Individual channels (one image per channel)")
+        export_channels_check.setChecked(True)
+        form.addRow("", export_channels_check)
+
+        export_processed_check = QCheckBox("Processed image (grayscale)")
+        export_processed_check.setChecked(True)
+        form.addRow("", export_processed_check)
+
+        export_masks_check = QCheckBox("Mask outlines on images")
+        export_masks_check.setChecked(has_approved)
+        export_masks_check.setEnabled(has_approved)
+        if not has_approved:
+            export_masks_check.setToolTip("No approved masks — complete QA first to enable")
+        form.addRow("", export_masks_check)
+
+        layout.addLayout(form)
+
+        # Mask settings
+        form2 = QFormLayout()
         scale_bar_check = QCheckBox("Include scale bar")
         scale_bar_check.setChecked(True)
-        form.addRow("", scale_bar_check)
+        form2.addRow("", scale_bar_check)
 
         scale_bar_um = QDoubleSpinBox()
         scale_bar_um.setRange(1, 1000)
         scale_bar_um.setValue(50)
         scale_bar_um.setSuffix(" µm")
-        form.addRow("Scale bar length:", scale_bar_um)
+        form2.addRow("Scale bar length:", scale_bar_um)
 
-        # Outline color
         outline_color_combo = QComboBox()
         outline_color_combo.addItems(["Green", "Red", "Yellow", "Cyan", "White", "Magenta"])
-        form.addRow("Mask outline color:", outline_color_combo)
+        form2.addRow("Mask outline color:", outline_color_combo)
 
         outline_width = QSpinBox()
         outline_width.setRange(1, 5)
         outline_width.setValue(2)
         outline_width.setSuffix(" px")
-        form.addRow("Outline width:", outline_width)
+        form2.addRow("Outline width:", outline_width)
 
-        # Label
         label_check = QCheckBox("Include cell labels")
         label_check.setChecked(True)
-        form.addRow("", label_check)
+        form2.addRow("", label_check)
 
-        # Which masks
         mask_choice = QComboBox()
         mask_choice.addItems(["Largest approved only", "All approved"])
-        form.addRow("Masks to show:", mask_choice)
+        form2.addRow("Masks to show:", mask_choice)
 
-        # Format
         format_combo = QComboBox()
-        format_combo.addItems(["PNG (300 DPI)", "TIFF (300 DPI)", "SVG"])
-        form.addRow("Output format:", format_combo)
+        format_combo.addItems(["PNG (300 DPI)", "TIFF (300 DPI)"])
+        form2.addRow("Output format:", format_combo)
 
-        # Background
-        bg_combo = QComboBox()
-        bg_combo.addItems(["Grayscale (processed)", "Color (if available)"])
-        form.addRow("Background image:", bg_combo)
-
-        layout.addLayout(form)
+        layout.addLayout(form2)
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -16640,13 +16647,16 @@ cat("============================================\\n")
         export_btn.clicked.connect(dialog.accept)
         btn_layout.addWidget(export_btn)
         layout.addLayout(btn_layout)
-
         dialog.setLayout(layout)
 
         if dialog.exec_() != QDialog.Accepted:
             return
 
         # Get settings
+        do_composite = export_composite_check.isChecked()
+        do_channels = export_channels_check.isChecked()
+        do_processed = export_processed_check.isChecked()
+        do_masks = export_masks_check.isChecked() and has_approved
         include_scale_bar = scale_bar_check.isChecked()
         scale_bar_length = scale_bar_um.value()
         color_names = {"Green": (0, 255, 0), "Red": (255, 0, 0), "Yellow": (255, 255, 0),
@@ -16655,78 +16665,52 @@ cat("============================================\\n")
         o_width = outline_width.value()
         include_labels = label_check.isChecked()
         largest_only = mask_choice.currentIndex() == 0
-        fmt = ["png", "tif", "svg"][format_combo.currentIndex()]
-        use_color_bg = bg_combo.currentIndex() == 1
+        fmt = ["png", "tif"][format_combo.currentIndex()]
+        ext = fmt if fmt == "png" else "tif"
 
-        # Ask output folder
-        out_dir = QFileDialog.getExistingDirectory(self, "Select Folder for Composites")
+        out_dir = QFileDialog.getExistingDirectory(self, "Select Folder for Export")
         if not out_dir:
             return
         composite_dir = os.path.join(out_dir, "Figure Composites")
         os.makedirs(composite_dir, exist_ok=True)
 
         self.log("=" * 50)
-        self.log("Exporting figure composites...")
+        self.log("Exporting figure images...")
 
         exported = 0
-        pixel_size = self._get_pixel_size()
+        from PIL import Image as PILImage
 
-        for img_name, img_data in self.images.items():
-            if not img_data['selected']:
-                continue
+        def _normalize_channel(ch):
+            ch = ch.astype(np.float64)
+            cmin, cmax = ch.min(), ch.max()
+            if cmax > cmin:
+                ch = (ch - cmin) / (cmax - cmin) * 255
+            return ch.astype(np.uint8)
 
-            approved_masks = [m for m in img_data.get('masks', [])
-                              if m.get('approved') and not m.get('duplicate')]
-            if not approved_masks:
-                continue
+        def _add_scale_bar(img_rgb, px_size):
+            h, w = img_rgb.shape[:2]
+            bar_px = int(scale_bar_length / px_size)
+            bar_height = max(4, h // 100)
+            margin = 20
+            x1 = w - margin - bar_px
+            y1 = h - margin - bar_height
+            cv2.rectangle(img_rgb, (x1, y1), (x1 + bar_px, y1 + bar_height), (255, 255, 255), -1)
+            bar_label = f"{int(scale_bar_length)} um"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            (tw, th), _ = cv2.getTextSize(bar_label, font, 0.5, 1)
+            cv2.putText(img_rgb, bar_label, (x1 + (bar_px - tw) // 2, y1 - 5),
+                        font, 0.5, (255, 255, 255), 1)
 
-            # Get background image
-            if use_color_bg and 'color_image' in img_data:
-                bg = img_data['color_image'].copy()
-                if bg.ndim == 2:
-                    bg = np.stack([bg, bg, bg], axis=-1)
+        def _add_name(img_rgb, name):
+            cv2.putText(img_rgb, name, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        def _save_image(img_rgb, path):
+            if fmt == "png":
+                PILImage.fromarray(img_rgb).save(path, dpi=(300, 300))
             else:
-                proc = self._ensure_processed_loaded(img_name)
-                if proc is None:
-                    self.log(f"  Skipping {img_name}: no processed image")
-                    continue
-                if proc.ndim == 2:
-                    # Normalize to 0-255
-                    p = proc.astype(np.float64)
-                    pmin, pmax = p.min(), p.max()
-                    if pmax > pmin:
-                        p = (p - pmin) / (pmax - pmin) * 255
-                    bg = np.stack([p, p, p], axis=-1).astype(np.uint8)
-                else:
-                    bg = proc.copy()
+                tifffile.imwrite(path, img_rgb, resolution=(300/25.4, 300/25.4), metadata={'unit': 'mm'})
 
-            if bg.dtype != np.uint8:
-                bg_f = bg.astype(np.float64)
-                bmin, bmax = bg_f.min(), bg_f.max()
-                if bmax > bmin:
-                    bg_f = (bg_f - bmin) / (bmax - bmin) * 255
-                bg = bg_f.astype(np.uint8)
-
-            h, w = bg.shape[:2]
-            if bg.ndim == 2:
-                bg = np.stack([bg, bg, bg], axis=-1)
-
-            img_pixel_size = self._get_pixel_size(img_name)
-
-            if largest_only:
-                # Group by soma, keep only largest
-                by_soma = {}
-                for m in approved_masks:
-                    sid = m.get('soma_id', '')
-                    area = m.get('target_area_um2', 0)
-                    if sid not in by_soma or area > by_soma[sid].get('target_area_um2', 0):
-                        by_soma[sid] = m
-                masks_to_draw = list(by_soma.values())
-            else:
-                masks_to_draw = approved_masks
-
-            # Draw mask outlines
-            composite = bg.copy()
+        def _draw_masks_on(img_rgb, masks_to_draw, img_name_str, w):
             for mask_data in masks_to_draw:
                 mask = mask_data.get('mask')
                 if mask is None:
@@ -16734,83 +16718,131 @@ cat("============================================\\n")
                     mask = mask_data.get('mask')
                 if mask is None:
                     continue
-
-                # Find contours of the mask
                 mask_u8 = (mask > 0).astype(np.uint8) * 255
                 contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(composite, contours, -1, outline_rgb, o_width)
-
-                # Draw cell label
+                cv2.drawContours(img_rgb, contours, -1, outline_rgb, o_width)
                 if include_labels:
                     soma_id = mask_data.get('soma_id', '')
                     area = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
                     label = f"{soma_id} ({int(area)})"
                     coords = np.argwhere(mask > 0)
                     if len(coords) > 0:
-                        cy = int(np.min(coords[:, 0])) - 8
+                        cy = max(15, int(np.min(coords[:, 0])) - 8)
                         cx = int(np.mean(coords[:, 1]))
-                        cy = max(15, cy)
                         font = cv2.FONT_HERSHEY_SIMPLEX
-                        font_scale = 0.4
-                        thickness = 1
-                        (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+                        (tw, th), _ = cv2.getTextSize(label, font, 0.4, 1)
                         tx = max(0, min(w - tw, cx - tw // 2))
-                        cv2.rectangle(composite, (tx - 1, cy - th - 2), (tx + tw + 1, cy + 2), (0, 0, 0), -1)
-                        cv2.putText(composite, label, (tx, cy), font, font_scale, (255, 255, 255), thickness)
+                        cv2.rectangle(img_rgb, (tx-1, cy-th-2), (tx+tw+1, cy+2), (0,0,0), -1)
+                        cv2.putText(img_rgb, label, (tx, cy), font, 0.4, (255,255,255), 1)
 
-            # Draw scale bar
-            if include_scale_bar:
-                bar_px = int(scale_bar_length / img_pixel_size)
-                bar_height = max(4, h // 100)
-                margin = 20
-                x1 = w - margin - bar_px
-                y1 = h - margin - bar_height
-                cv2.rectangle(composite, (x1, y1), (x1 + bar_px, y1 + bar_height), (255, 255, 255), -1)
-                bar_label = f"{int(scale_bar_length)} µm"
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.5
-                (tw, th), _ = cv2.getTextSize(bar_label, font, font_scale, 1)
-                tx = x1 + (bar_px - tw) // 2
-                ty = y1 - 5
-                cv2.putText(composite, bar_label, (tx, ty), font, font_scale, (255, 255, 255), 1)
+        for img_name, img_data in self.images.items():
+            if not img_data['selected']:
+                continue
 
-            # Draw image name
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            img_label = os.path.splitext(img_name)[0]
-            cv2.putText(composite, img_label, (10, 25), font, 0.6, (255, 255, 255), 1)
-
-            # Save
             img_basename = os.path.splitext(img_name)[0]
-            if fmt == "png":
-                out_path = os.path.join(composite_dir, f"{img_basename}_composite.png")
-                from PIL import Image as PILImage
-                pil_img = PILImage.fromarray(composite)
-                pil_img.save(out_path, dpi=(300, 300))
-            elif fmt == "tif":
-                out_path = os.path.join(composite_dir, f"{img_basename}_composite.tif")
-                tifffile.imwrite(out_path, composite,
-                                 resolution=(300 / 25.4, 300 / 25.4),
-                                 metadata={'unit': 'mm'})
-            else:
-                out_path = os.path.join(composite_dir, f"{img_basename}_composite.png")
-                from PIL import Image as PILImage
-                pil_img = PILImage.fromarray(composite)
-                pil_img.save(out_path, dpi=(300, 300))
+            img_pixel_size = self._get_pixel_size(img_name)
 
-            # Free mask arrays after drawing
-            for mask_data in masks_to_draw:
-                mask_data['mask'] = None
+            # Load color image
+            color_img = img_data.get('color_image')
+            if color_img is None and 'raw_path' in img_data:
+                try:
+                    raw = load_tiff_image(img_data['raw_path'])
+                    if raw is not None and raw.ndim == 3:
+                        color_img = raw.copy()
+                        img_data['color_image'] = color_img
+                except Exception:
+                    pass
 
-            exported += 1
-            self.log(f"  Exported: {os.path.basename(out_path)}")
+            # Get masks for this image
+            masks_to_draw = []
+            if do_masks:
+                approved = [m for m in img_data.get('masks', [])
+                            if m.get('approved') and not m.get('duplicate')]
+                if largest_only:
+                    by_soma = {}
+                    for m in approved:
+                        sid = m.get('soma_id', '')
+                        area = m.get('target_area_um2', m.get('area_um2', 0))
+                        if sid not in by_soma or area > by_soma[sid].get('target_area_um2', by_soma[sid].get('area_um2', 0)):
+                            by_soma[sid] = m
+                    masks_to_draw = list(by_soma.values())
+                else:
+                    masks_to_draw = approved
 
-        self.log(f"Exported {exported} composites to: {composite_dir}")
+            img_exported = False
+
+            # --- Export individual channels ---
+            if do_channels and color_img is not None and color_img.ndim == 3:
+                n_ch = min(color_img.shape[2], 3)
+                channel_colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255)]  # G, R, B
+                for ch_idx in range(n_ch):
+                    ch_name = self.channel_names.get(ch_idx, f'Ch{ch_idx+1}')
+                    if not ch_name:
+                        ch_name = f'Ch{ch_idx+1}'
+                    ch_data = _normalize_channel(color_img[:, :, ch_idx])
+                    # Create pseudo-color: map grayscale to channel color
+                    h, w = ch_data.shape
+                    ch_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+                    cr, cg, cb = channel_colors[ch_idx]
+                    ch_rgb[:, :, 0] = (ch_data.astype(np.float32) * cr / 255).astype(np.uint8)
+                    ch_rgb[:, :, 1] = (ch_data.astype(np.float32) * cg / 255).astype(np.uint8)
+                    ch_rgb[:, :, 2] = (ch_data.astype(np.float32) * cb / 255).astype(np.uint8)
+                    if do_masks and masks_to_draw:
+                        _draw_masks_on(ch_rgb, masks_to_draw, img_name, w)
+                    if include_scale_bar:
+                        _add_scale_bar(ch_rgb, img_pixel_size)
+                    _add_name(ch_rgb, f"{img_basename} - {ch_name}")
+                    _save_image(ch_rgb, os.path.join(composite_dir, f"{img_basename}_{ch_name}.{ext}"))
+                    img_exported = True
+
+            # --- Export color composite ---
+            if do_composite and color_img is not None and color_img.ndim == 3:
+                n_ch = min(color_img.shape[2], 3)
+                h, w = color_img.shape[:2]
+                comp_rgb = np.zeros((h, w, 3), dtype=np.float32)
+                for ch_idx in range(n_ch):
+                    ch_norm = _normalize_channel(color_img[:, :, ch_idx]).astype(np.float32)
+                    comp_rgb[:, :, ch_idx] = ch_norm
+                comp_rgb = np.clip(comp_rgb, 0, 255).astype(np.uint8)
+                if do_masks and masks_to_draw:
+                    _draw_masks_on(comp_rgb, masks_to_draw, img_name, w)
+                if include_scale_bar:
+                    _add_scale_bar(comp_rgb, img_pixel_size)
+                _add_name(comp_rgb, f"{img_basename} - Composite")
+                _save_image(comp_rgb, os.path.join(composite_dir, f"{img_basename}_composite.{ext}"))
+                img_exported = True
+
+            # --- Export processed grayscale ---
+            if do_processed:
+                proc = self._ensure_processed_loaded(img_name)
+                if proc is not None:
+                    if proc.ndim > 2:
+                        proc = ensure_grayscale(proc)
+                    proc_norm = _normalize_channel(proc)
+                    h, w = proc_norm.shape
+                    proc_rgb = np.stack([proc_norm, proc_norm, proc_norm], axis=-1)
+                    if do_masks and masks_to_draw:
+                        _draw_masks_on(proc_rgb, masks_to_draw, img_name, w)
+                    if include_scale_bar:
+                        _add_scale_bar(proc_rgb, img_pixel_size)
+                    _add_name(proc_rgb, f"{img_basename} - Processed")
+                    _save_image(proc_rgb, os.path.join(composite_dir, f"{img_basename}_processed.{ext}"))
+                    img_exported = True
+
+            # Free mask arrays
+            for md in masks_to_draw:
+                md['mask'] = None
+
+            if img_exported:
+                exported += 1
+                self.log(f"  Exported: {img_basename}")
+
+        self.log(f"Exported {exported} images to: {composite_dir}")
         self.log("=" * 50)
 
         QMessageBox.information(self, "Export Complete",
-            f"Exported {exported} composite images to:\n{composite_dir}\n\n"
-            f"Format: {fmt.upper()}, 300 DPI\n"
-            f"Scale bar: {scale_bar_length} µm" if include_scale_bar else "")
+            f"Exported {exported} images to:\n{composite_dir}\n\n"
+            f"Format: {fmt.upper()}, 300 DPI")
 
     # ----------------------------------------------------------------
     # 3D MORPHOLOGY CALCULATION
