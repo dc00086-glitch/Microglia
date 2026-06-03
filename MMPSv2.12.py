@@ -13750,9 +13750,8 @@ if __name__ == '__main__':
 
             img_name = flat_data['image_name']
             mask = md.get('mask')
-            if mask is None:
-                self._reload_mask_from_disk(md, img_name)
-                mask = md.get('mask')
+            # Only check masks already in memory — don't load from disk
+            # (loading thousands of TIFFs would hang the UI)
             if mask is None:
                 continue
 
@@ -15263,10 +15262,10 @@ if __name__ == '__main__':
 
             # Create clickable thumbnail
             thumb_widget = QWidget()
-            thumb_widget.setFixedWidth(thumb_size + 4)
+            thumb_widget.setFixedWidth(thumb_size)
             thumb_widget_layout = QVBoxLayout(thumb_widget)
             thumb_widget_layout.setContentsMargins(0, 0, 0, 0)
-            thumb_widget_layout.setSpacing(1)
+            thumb_widget_layout.setSpacing(0)
 
             thumb_label = QLabel()
             thumb_label.setPixmap(pixmap)
