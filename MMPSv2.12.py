@@ -8868,26 +8868,34 @@ if __name__ == '__main__':
             skel_lookup = _build_ij_lookup(skeleton_data) if skeleton_data else {}
             fractal_lookup = _build_ij_lookup(fractal_data) if fractal_data else {}
 
+            # Build soma-level lookups: (img, soma_id) -> data_dict
+            # ImageJ only analyzes the largest mask, so we need to match by
+            # soma regardless of which target area the morphology row has
+            def _build_soma_lookup(ij_lookup):
+                soma_lookup = {}
+                for (img, sid, area), data in ij_lookup.items():
+                    key = (img, sid)
+                    if key not in soma_lookup:
+                        soma_lookup[key] = data
+                return soma_lookup
+
+            sholl_soma = _build_soma_lookup(sholl_lookup) if sholl_lookup else {}
+            skel_soma = _build_soma_lookup(skel_lookup) if skel_lookup else {}
+            fractal_soma = _build_soma_lookup(fractal_lookup) if fractal_lookup else {}
+
             for row in morphology_rows:
                 img_name = row.get('image_name', '')
                 soma_id = row.get('soma_id', '')
-                morph_area_str = row.get('target_area_um2', '')
-                try:
-                    morph_area = int(float(morph_area_str)) if morph_area_str else None
-                except (ValueError, TypeError):
-                    morph_area = None
-
-                key = (img_name, soma_id, morph_area)
-                key_no_area = (img_name, soma_id, None)
+                soma_key = (img_name, soma_id)
 
                 for lookup, counter_name in [
-                    (sholl_lookup, 'sholl'),
-                    (skel_lookup, 'skeleton'),
-                    (fractal_lookup, 'fractal'),
+                    (sholl_soma, 'sholl'),
+                    (skel_soma, 'skeleton'),
+                    (fractal_soma, 'fractal'),
                 ]:
                     if not lookup:
                         continue
-                    match_data = lookup.get(key) or lookup.get(key_no_area)
+                    match_data = lookup.get(soma_key)
                     if match_data:
                         row.update(match_data)
                         if counter_name == 'sholl':
