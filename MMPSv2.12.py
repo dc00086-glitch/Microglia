@@ -15108,24 +15108,28 @@ if __name__ == '__main__':
             crop_bg = crop_bg.astype(np.uint8)
             crop_bg_rgb = np.stack([crop_bg, crop_bg, crop_bg], axis=-1)
 
-        # Dynamic thumbnail size: fill available width
+        # Dynamic thumbnail size: always use 2 rows, fill available space
         n_masks = len(mask_items)
-        available_width = self.qa_grid_scroll.viewport().width() - 40
+        spacing = 6
+        available_width = self.qa_grid_scroll.viewport().width() - 30
+        available_height = self.qa_grid_scroll.viewport().height() - 120
         if available_width < 200:
             available_width = 800
+        if available_height < 200:
+            available_height = 500
 
-        # Try single row first, fall back to 2 rows if thumbs get too small
-        spacing = 10
-        thumb_size = max(100, (available_width - spacing * n_masks) // max(n_masks, 1))
-        if thumb_size >= 140:
+        # Always 2 rows for up to 16 masks
+        n_cols = max(1, (n_masks + 1) // 2)
+        if n_masks <= 2:
             n_cols = n_masks
-        else:
-            # Two rows
-            n_cols = max(1, (n_masks + 1) // 2)
-            thumb_size = max(100, (available_width - spacing * n_cols) // max(n_cols, 1))
 
-        # Cap at a reasonable max
-        thumb_size = min(thumb_size, 500)
+        # Size to fill width
+        thumb_w = max(80, (available_width - spacing * (n_cols + 1)) // max(n_cols, 1))
+        # Size to fill height (2 rows + labels)
+        n_rows = max(1, (n_masks + n_cols - 1) // n_cols)
+        thumb_h = max(80, (available_height - spacing * (n_rows + 1) - 20 * n_rows) // max(n_rows, 1))
+        # Use the smaller of width/height to keep square
+        thumb_size = min(thumb_w, thumb_h, 500)
 
         # Wrapping grid layout for 16+ masks
         from PyQt5.QtWidgets import QGridLayout
