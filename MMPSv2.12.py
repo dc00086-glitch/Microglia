@@ -15668,6 +15668,9 @@ if __name__ == '__main__':
 
         self._save_batch_results(all_results)
 
+        # Classify morphotypes and show stacked bar graph
+        self._classify_and_show_morphotypes(all_results)
+
         for img_name, img_data in self.images.items():
             if img_data['selected'] and img_data['status'] == 'qa_complete':
                 img_data['status'] = 'analyzed'
@@ -16132,6 +16135,213 @@ if __name__ == '__main__':
 
         self.log(f"✓ Nearest neighbor distances computed for {computed} result rows "
                  f"({len(by_image)} images)")
+
+    # ----------------------------------------------------------------
+    # MORPHOTYPE CLASSIFICATION + STACKED BAR DISPLAY
+    # ----------------------------------------------------------------
+
+    def _classify_and_show_morphotypes(self, all_results):
+        """Classify cells into morphotypes and display a stacked bar chart.
+
+        Phenotypes: Ramified (SCR<=0.35), Reactive (SCR>0.35),
+        Amoeboid (SCR>0.50 + roundness>0.45), Rod (roundness<0.15 + ecc>0.85).
+        """
+        if not all_results:
+            return
+
+        # Classification thresholds
+        amoeboid_scr = 0.50
+        amoeboid_rnd = 0.45
+        reactive_scr = 0.35
+        rod_rnd = 0.15
+        rod_ecc = 0.85
+
+        phenotype_levels = ['Ramified', 'Reactive', 'Amoeboid', 'Rod']
+
+        # Classify each cell (largest mask only — already filtered by this point)
+        for r in all_results:
+            soma = r.get('soma_area', 0)
+            mask = r.get('mask_area', 0)
+            rnd = r.get('roundness', 0)
+            ecc = r.get('eccentricity', 0)
+
+            scr = soma / mask if mask > 0 else 0
+
+            if scr > amoeboid_scr and rnd > amoeboid_rnd:
+                r['phenotype'] = 'Amoeboid'
+            elif rnd < rod_rnd and ecc > rod_ecc:
+                r['phenotype'] = 'Rod'
+            elif scr > reactive_scr:
+                r['phenotype'] = 'Reactive'
+            else:
+                r['phenotype'] = 'Ramified'
+
+            r['soma_cell_ratio'] = round(scr, 4)
+
+        # Count phenotypes per treatment group
+        by_treatment = {}
+        for r in all_results:
+            trt = r.get('treatment', 'Unknown')
+            ph = r.get('phenotype', 'Ramified')
+            if trt not in by_treatment:
+                by_treatment[trt] = {p: 0 for p in phenotype_levels}
+                by_treatment[trt]['_total'] = 0
+            by_treatment[trt][ph] = by_treatment[trt].get(ph, 0) + 1
+            by_treatment[trt]['_total'] += 1
+
+        if not by_treatment:
+            return
+
+        # Log results
+        self.log("")
+        self.log("=" * 50)
+        self.log("MORPHOTYPE CLASSIFICATION")
+        self.log(f"Amoeboid: SCR>{amoeboid_scr} + roundness>{amoeboid_rnd}")
+        self.log(f"Rod: roundness<{rod_rnd} + eccentricity>{rod_ecc}")
+        self.log(f"Reactive: SCR>{reactive_scr}")
+        self.log("Ramified: all other cells")
+        self.log("=" * 50)
+
+        header = f"{'':15s}"
+        for trt in sorted(by_treatment.keys()):
+            header += f"  {trt:>12s}"
+        self.log(header)
+
+        for ph in phenotype_levels:
+            row = f"  {ph:13s}"
+            for trt in sorted(by_treatment.keys()):
+                n = by_treatment[trt].get(ph, 0)
+                total = by_treatment[trt]['_total']
+                pct = (n / total * 100) if total > 0 else 0
+                row += f"  {n:4d} ({pct:5.1f}%)"
+            self.log(row)
+
+        # Build and show stacked bar chart
+        try:
+            self._show_morphotype_bar_chart(by_treatment, phenotype_levels)
+        except Exception as e:
+            self.log(f"Could not display morphotype chart: {e}")
+
+    def _show_morphotype_bar_chart(self, by_treatment, phenotype_levels):
+        """Display a stacked bar chart of morphotype composition per treatment."""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel
+        from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QFont
+        from PyQt5.QtCore import Qt
+
+        treatments = sorted(by_treatment.keys())
+        n_groups = len(treatments)
+        if n_groups == 0:
+            return
+
+        colors = {
+            'Ramified':  (100, 181, 246),   # blue
+            'Reactive':  (255, 183, 77),    # orange
+            'Amoeboid':  (171, 71, 188),    # purple
+            'Rod':       (129, 199, 132),   # green
+        }
+
+        # Chart dimensions
+        chart_w = max(400, n_groups * 120 + 100)
+        chart_h = 450
+        bar_w = 60
+        margin_left = 60
+        margin_top = 60
+        margin_bottom = 80
+        plot_h = chart_h - margin_top - margin_bottom
+        spacing = (chart_w - margin_left - 40) // max(n_groups, 1)
+
+        img = QImage(chart_w, chart_h, QImage.Format_RGB888)
+        img.fill(QColor(255, 255, 255))
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Title
+        font_title = QFont()
+        font_title.setBold(True)
+        font_title.setPointSize(14)
+        painter.setFont(font_title)
+        painter.setPen(QColor(0, 0, 0))
+        painter.drawText(0, 0, chart_w, margin_top - 10, Qt.AlignCenter, "Microglia Phenotype Composition")
+
+        # Y axis
+        font_axis = QFont()
+        font_axis.setPointSize(9)
+        painter.setFont(font_axis)
+        for tick in range(0, 101, 25):
+            y = margin_top + plot_h - int(tick / 100 * plot_h)
+            painter.setPen(QColor(180, 180, 180))
+            painter.drawLine(margin_left, y, chart_w - 20, y)
+            painter.setPen(QColor(0, 0, 0))
+            painter.drawText(5, y - 8, margin_left - 10, 16, Qt.AlignRight | Qt.AlignVCenter, f"{tick}%")
+
+        # Y axis label
+        painter.save()
+        painter.translate(15, margin_top + plot_h // 2)
+        painter.rotate(-90)
+        font_ylabel = QFont()
+        font_ylabel.setBold(True)
+        font_ylabel.setPointSize(10)
+        painter.setFont(font_ylabel)
+        painter.drawText(-plot_h // 2, 0, plot_h, 20, Qt.AlignCenter, "% of Cells")
+        painter.restore()
+
+        # Bars
+        for i, trt in enumerate(treatments):
+            total = by_treatment[trt]['_total']
+            if total == 0:
+                continue
+            x = margin_left + i * spacing + (spacing - bar_w) // 2
+            y_cursor = margin_top + plot_h  # bottom of bar
+
+            # Draw segments bottom to top: Rod, Amoeboid, Reactive, Ramified
+            for ph in reversed(phenotype_levels):
+                n = by_treatment[trt].get(ph, 0)
+                pct = n / total * 100
+                seg_h = int(pct / 100 * plot_h)
+                if seg_h < 1 and n > 0:
+                    seg_h = 1
+
+                cr, cg, cb = colors.get(ph, (200, 200, 200))
+                painter.setBrush(QColor(cr, cg, cb, 220))
+                painter.setPen(QColor(255, 255, 255))
+                painter.drawRect(x, y_cursor - seg_h, bar_w, seg_h)
+                y_cursor -= seg_h
+
+            # Treatment label
+            painter.setPen(QColor(0, 0, 0))
+            font_label = QFont()
+            font_label.setPointSize(9)
+            font_label.setBold(True)
+            painter.setFont(font_label)
+            painter.drawText(x, margin_top + plot_h + 5, bar_w, 20, Qt.AlignCenter, trt)
+
+        # Legend
+        legend_y = margin_top + plot_h + 35
+        legend_x = margin_left
+        font_legend = QFont()
+        font_legend.setPointSize(8)
+        painter.setFont(font_legend)
+        for ph in phenotype_levels:
+            cr, cg, cb = colors.get(ph, (200, 200, 200))
+            painter.setBrush(QColor(cr, cg, cb, 220))
+            painter.setPen(QColor(0, 0, 0))
+            painter.drawRect(legend_x, legend_y, 12, 12)
+            painter.drawText(legend_x + 16, legend_y, 80, 14, Qt.AlignLeft | Qt.AlignVCenter, ph)
+            legend_x += 90
+
+        painter.end()
+
+        # Show in a dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Morphotype Classification")
+        dialog.setMinimumSize(chart_w + 20, chart_h + 40)
+        layout = QVBoxLayout()
+        label = QLabel()
+        label.setPixmap(QPixmap.fromImage(img))
+        label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(label)
+        dialog.setLayout(layout)
+        dialog.exec_()
 
     # ----------------------------------------------------------------
     # EXPORT: R SCRIPT GENERATOR
