@@ -31,13 +31,14 @@ from skimage.morphology import skeletonize
 def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                            min_bulb_diameter_um=1.5, soma_mask=None,
                            soma_area_um2=None, soma_margin=1.3,
-                           soma_dilation_px=3):
+                           soma_dilation_px=3, baseline_percentile=25,
+                           min_branch_px=5):
     """Identical logic to MMPSv2.12.py — kept standalone for easy testing.
 
-    When the real ``soma_mask`` is supplied the exact soma footprint (dilated) is
-    excluded; otherwise the soma is estimated as the thickest point of the
-    distance transform. Returns ``soma_region`` / ``soma_center`` / ``exclusion_px``
-    so the overlay can show what was excluded.
+    Swellings are detected along each branch, relative to that branch's own
+    baseline width. The soma is removed first (real ``soma_mask`` footprint, else
+    a circular estimate). Returns ``soma_region`` / ``soma_center`` /
+    ``exclusion_px`` so the overlay can show what was excluded.
     """
     result = {'num_bulbous_endings': 0, 'mean_bulb_diameter_um': 0.0,
               'beading_index': 0.0, 'bulb_coords': [],
@@ -53,14 +54,6 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         return result
     radius = ndimage.distance_transform_edt(binary)
 
-    skel_rows, skel_cols = np.nonzero(skeleton)
-    skel_u8 = skeleton.astype(np.uint8)
-    neighbor_count = ndimage.convolve(
-        skel_u8, np.ones((3, 3), dtype=np.uint8),
-        mode='constant', cval=0) - skel_u8
-    endpoints = skeleton & (neighbor_count == 1)
-    ep_rows, ep_cols = np.nonzero(endpoints)
-
     use_real_soma = (soma_mask is not None
                      and np.shape(soma_mask) == binary.shape
                      and np.any(soma_mask))
@@ -69,8 +62,6 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         if soma_dilation_px and soma_dilation_px > 0:
             soma_region = ndimage.binary_dilation(
                 soma_region, iterations=int(soma_dilation_px))
-        ep_in_soma = soma_region[ep_rows, ep_cols]
-        skel_in_soma = soma_region[skel_rows, skel_cols]
         result['soma_region'] = soma_region
         result['used_real_soma'] = True
     else:
@@ -80,41 +71,63 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         else:
             soma_radius_px = float(radius[soma_center])
         exclusion_px = soma_radius_px * soma_margin
-        ep_in_soma = np.hypot(ep_rows - soma_center[0],
-                              ep_cols - soma_center[1]) <= exclusion_px
-        skel_in_soma = np.hypot(skel_rows - soma_center[0],
-                                skel_cols - soma_center[1]) <= exclusion_px
+        rr, cc = np.indices(binary.shape)
+        soma_region = (np.hypot(rr - soma_center[0],
+                                cc - soma_center[1]) <= exclusion_px)
         result['soma_center'] = (int(soma_center[0]), int(soma_center[1]))
         result['exclusion_px'] = float(exclusion_px)
 
-    keep = ~ep_in_soma
-    ep_rows, ep_cols = ep_rows[keep], ep_cols[keep]
-    n_endpoints = int(ep_rows.size)
-    if n_endpoints == 0:
+    skeleton = skeleton & ~soma_region
+    if not np.any(skeleton):
         return result
 
-    process = ~skel_in_soma
-    if int(np.count_nonzero(process)) >= 5:
-        median_radius = float(np.median(radius[skel_rows[process], skel_cols[process]]))
-    else:
-        median_radius = float(np.median(radius[skeleton]))
-    if median_radius <= 0:
+    struct = np.ones((3, 3), dtype=int)
+    skel_u8 = skeleton.astype(np.uint8)
+    neighbor_count = ndimage.convolve(
+        skel_u8, np.ones((3, 3), dtype=np.uint8),
+        mode='constant', cval=0) - skel_u8
+    junctions = skeleton & (neighbor_count >= 3)
+    branches = skeleton & ~junctions
+    labeled, n_labels = ndimage.label(branches, structure=struct)
+    if n_labels == 0:
         return result
 
     min_bulb_radius_px = (min_bulb_diameter_um / pixel_size) / 2.0
-    ep_radii = radius[ep_rows, ep_cols]
-    is_bulb = (ep_radii >= swelling_ratio * median_radius) & \
-              (ep_radii >= min_bulb_radius_px)
+    swelling = np.zeros(binary.shape, dtype=bool)
+    n_branches = 0
+    for lab in range(1, n_labels + 1):
+        idx = (labeled == lab)
+        if int(np.count_nonzero(idx)) < min_branch_px:
+            continue
+        n_branches += 1
+        branch_radii = radius[idx]
+        baseline = float(np.percentile(branch_radii, baseline_percentile))
+        if baseline <= 0:
+            baseline = max(float(branch_radii.min()), 1.0)
+        threshold = max(swelling_ratio * baseline, min_bulb_radius_px)
+        swelling |= (idx & (radius >= threshold))
 
-    n_bulbs = int(np.count_nonzero(is_bulb))
-    result['num_bulbous_endings'] = n_bulbs
-    result['beading_index'] = round(n_bulbs / n_endpoints, 4)
-    if n_bulbs > 0:
-        bulb_diam_um = 2.0 * ep_radii[is_bulb] * pixel_size
-        result['mean_bulb_diameter_um'] = round(float(np.mean(bulb_diam_um)), 4)
-        result['bulb_coords'] = list(zip(ep_rows[is_bulb].tolist(),
-                                         ep_cols[is_bulb].tolist(),
-                                         (2.0 * ep_radii[is_bulb]).tolist()))
+    if not np.any(swelling) or n_branches == 0:
+        return result
+
+    bulb_labeled, n_bulbs = ndimage.label(swelling, structure=struct)
+    if n_bulbs == 0:
+        return result
+
+    coords = []
+    diameters = []
+    for b in range(1, n_bulbs + 1):
+        bidx = (bulb_labeled == b)
+        peak = np.unravel_index(int(np.argmax(np.where(bidx, radius, 0))),
+                                radius.shape)
+        diam_px = 2.0 * float(radius[peak])
+        diameters.append(diam_px * pixel_size)
+        coords.append((int(peak[0]), int(peak[1]), diam_px))
+
+    result['num_bulbous_endings'] = int(n_bulbs)
+    result['mean_bulb_diameter_um'] = round(float(np.mean(diameters)), 4)
+    result['beading_index'] = round(n_bulbs / n_branches, 4)
+    result['bulb_coords'] = coords
     return result
 
 
@@ -179,7 +192,9 @@ def run_one(path, args, overlay_dir=None):
                                  args.swelling_ratio, args.min_bulb_diameter,
                                  soma_mask=soma_mask,
                                  soma_margin=args.soma_margin,
-                                 soma_dilation_px=args.soma_dilation)
+                                 soma_dilation_px=args.soma_dilation,
+                                 baseline_percentile=args.baseline_percentile,
+                                 min_branch_px=args.min_branch_px)
     name = os.path.basename(path)
     soma_tag = "real-soma" if res.get('used_real_soma') else "est-soma "
     print(f"{name:40s}  [{soma_tag}]  bulbs={res['num_bulbous_endings']:3d}  "
@@ -204,6 +219,10 @@ def main():
                     help="circular soma exclusion factor (only when no soma mask found)")
     ap.add_argument("--soma-dilation", type=int, default=3,
                     help="pixels to dilate the real soma mask before excluding")
+    ap.add_argument("--baseline-percentile", type=float, default=25,
+                    help="percentile of each branch's radius used as its shaft width")
+    ap.add_argument("--min-branch-px", type=int, default=5,
+                    help="ignore skeleton branches shorter than this many pixels")
     ap.add_argument("--no-soma", action="store_true",
                     help="ignore soma TIFFs and use the circular estimate")
     ap.add_argument("--overlay", action="store_true",
