@@ -29,10 +29,17 @@ from skimage.morphology import skeletonize
 
 
 def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
-                           min_bulb_diameter_um=1.5):
-    """Identical logic to MMPSv2.12.py — kept standalone for easy testing."""
+                           min_bulb_diameter_um=1.5, soma_area_um2=None,
+                           soma_margin=1.3):
+    """Identical logic to MMPSv2.12.py — kept standalone for easy testing.
+
+    The soma (thickest point of the distance transform) is excluded so its
+    internal skeleton endpoints are not mistaken for bulbs. ``soma_center`` and
+    ``exclusion_px`` are returned so the overlay can show the excluded zone.
+    """
     result = {'num_bulbous_endings': 0, 'mean_bulb_diameter_um': 0.0,
-              'beading_index': 0.0, 'bulb_coords': []}
+              'beading_index': 0.0, 'bulb_coords': [],
+              'soma_center': None, 'exclusion_px': 0.0}
 
     binary = (mask > 0)
     if not np.any(binary):
@@ -43,6 +50,16 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         return result
     radius = ndimage.distance_transform_edt(binary)
 
+    # Locate and size the soma, then build an exclusion zone around it.
+    soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
+    if soma_area_um2 and soma_area_um2 > 0:
+        soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
+    else:
+        soma_radius_px = float(radius[soma_center])
+    exclusion_px = soma_radius_px * soma_margin
+    result['soma_center'] = (int(soma_center[0]), int(soma_center[1]))
+    result['exclusion_px'] = float(exclusion_px)
+
     skel_u8 = skeleton.astype(np.uint8)
     neighbor_count = ndimage.convolve(
         skel_u8, np.ones((3, 3), dtype=np.uint8),
@@ -50,11 +67,20 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     endpoints = skeleton & (neighbor_count == 1)
 
     ep_rows, ep_cols = np.nonzero(endpoints)
+    ep_dist = np.hypot(ep_rows - soma_center[0], ep_cols - soma_center[1])
+    keep = ep_dist > exclusion_px
+    ep_rows, ep_cols = ep_rows[keep], ep_cols[keep]
     n_endpoints = int(ep_rows.size)
     if n_endpoints == 0:
         return result
 
-    median_radius = float(np.median(radius[skeleton]))
+    skel_rows, skel_cols = np.nonzero(skeleton)
+    skel_dist = np.hypot(skel_rows - soma_center[0], skel_cols - soma_center[1])
+    process = skel_dist > exclusion_px
+    if int(np.count_nonzero(process)) >= 5:
+        median_radius = float(np.median(radius[skel_rows[process], skel_cols[process]]))
+    else:
+        median_radius = float(np.median(radius[skeleton]))
     if median_radius <= 0:
         return result
 
@@ -83,6 +109,12 @@ def save_overlay(mask, res, out_path):
 
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.imshow(mask > 0, cmap='gray')
+    # Soma exclusion zone (everything inside is ignored for bulb detection).
+    if res.get('soma_center') and res.get('exclusion_px'):
+        sr, sc = res['soma_center']
+        ax.add_patch(plt.Circle((sc, sr), res['exclusion_px'],
+                                color='deepskyblue', fill=False,
+                                linewidth=1.5, linestyle='--'))
     for r, c, diam_px in res['bulb_coords']:
         ax.add_patch(plt.Circle((c, r), max(diam_px, 6),
                                 color='red', fill=False, linewidth=2))

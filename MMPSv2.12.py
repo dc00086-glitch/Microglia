@@ -375,13 +375,22 @@ def _grow_masks_for_soma(args):
 
 
 def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
-                            min_bulb_diameter_um=1.5):
+                            min_bulb_diameter_um=1.5, soma_area_um2=None,
+                            soma_margin=1.3):
     """Detect bulbous (spheroidal) swellings at the tips of microglial processes.
 
     A skeleton endpoint counts as a bulbous ending when its local process radius
     (read from the Euclidean distance transform) is BOTH:
-      - at least ``swelling_ratio`` times the cell's median process radius, and
+      - at least ``swelling_ratio`` times the cell's median *process* radius, and
       - at least ``min_bulb_diameter_um`` microns in diameter.
+
+    The soma is excluded first: an irregular soma skeletonizes into short internal
+    branches whose endpoints carry the soma's large radius and would otherwise be
+    mistaken for giant bulbs. We locate the soma as the thickest point of the
+    distance transform and drop any endpoint within ``soma_margin`` x the soma
+    radius of it; the baseline process width is also measured from non-soma
+    skeleton only. When the soma area is known it sets the soma radius directly,
+    otherwise the largest inscribed radius is used.
 
     Spheroidal terminal swellings are a hallmark of dystrophic microglia. The
     diameter-versus-local-width criterion mirrors automated axonal-beading
@@ -389,8 +398,8 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     dystrophy scoring rather than treated as fixed constants.
 
     Returns a dict with ``num_bulbous_endings``, ``mean_bulb_diameter_um`` and
-    ``beading_index`` (bulbs / total endpoints), plus ``bulb_coords`` — a list of
-    (row, col) pixel positions for an optional QA overlay.
+    ``beading_index`` (bulbs / process endpoints), plus ``bulb_coords`` — a list
+    of (row, col) pixel positions for an optional QA overlay.
     """
     from skimage.morphology import skeletonize
 
@@ -411,6 +420,15 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         return result
     radius = ndimage.distance_transform_edt(binary)
 
+    # Locate the soma: the single thickest point of the cell. Its radius is the
+    # largest inscribed circle, or is derived from the known soma area.
+    soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
+    if soma_area_um2 and soma_area_um2 > 0:
+        soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
+    else:
+        soma_radius_px = float(radius[soma_center])
+    exclusion_px = soma_radius_px * soma_margin
+
     # Endpoints: skeleton pixels with exactly one skeleton neighbor.
     skel_u8 = skeleton.astype(np.uint8)
     neighbor_count = ndimage.convolve(
@@ -419,13 +437,23 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     endpoints = skeleton & (neighbor_count == 1)
 
     ep_rows, ep_cols = np.nonzero(endpoints)
+    # Keep only endpoints outside the soma — true process tips.
+    ep_dist = np.hypot(ep_rows - soma_center[0], ep_cols - soma_center[1])
+    keep = ep_dist > exclusion_px
+    ep_rows, ep_cols = ep_rows[keep], ep_cols[keep]
     n_endpoints = int(ep_rows.size)
     if n_endpoints == 0:
         return result
 
-    # Baseline process radius: median over the skeleton. The median is robust to
-    # the few high-radius pixels the soma contributes to the skeleton.
-    median_radius = float(np.median(radius[skeleton]))
+    # Baseline process radius: median over non-soma skeleton pixels, so the soma
+    # does not inflate the reference width. Median is robust to local spikes.
+    skel_rows, skel_cols = np.nonzero(skeleton)
+    skel_dist = np.hypot(skel_rows - soma_center[0], skel_cols - soma_center[1])
+    process = skel_dist > exclusion_px
+    if int(np.count_nonzero(process)) >= 5:
+        median_radius = float(np.median(radius[skel_rows[process], skel_cols[process]]))
+    else:
+        median_radius = float(np.median(radius[skeleton]))
     if median_radius <= 0:
         return result
 
@@ -522,7 +550,7 @@ def _compute_morphology_single(args):
         params['minor_axis_um'] = 0
 
     # Bulbous (spheroidal) terminal swellings — dystrophic microglia marker.
-    bulb = _detect_bulbous_endings(mask, pixel_size)
+    bulb = _detect_bulbous_endings(mask, pixel_size, soma_area_um2=soma_area_um2)
     params['num_bulbous_endings'] = bulb['num_bulbous_endings']
     params['mean_bulb_diameter_um'] = bulb['mean_bulb_diameter_um']
     params['beading_index'] = bulb['beading_index']
@@ -1247,7 +1275,8 @@ class MorphologyCalculator:
             params.update(self._calculate_polarity(coords, centroid))
 
             # Bulbous (spheroidal) terminal swellings — dystrophic marker.
-            bulb = _detect_bulbous_endings(mask, self.pixel_size)
+            bulb = _detect_bulbous_endings(mask, self.pixel_size,
+                                           soma_area_um2=soma_area_um2)
             params['num_bulbous_endings'] = bulb['num_bulbous_endings']
             params['mean_bulb_diameter_um'] = bulb['mean_bulb_diameter_um']
             params['beading_index'] = bulb['beading_index']
@@ -5417,12 +5446,15 @@ def get_soma_area(somas_dir, image_name, soma_id, pixel_size):
 
 
 def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
-                           min_bulb_diameter_um=1.5):
+                           min_bulb_diameter_um=1.5, soma_area_um2=None,
+                           soma_margin=1.3):
     """Detect bulbous (spheroidal) terminal swellings on microglial processes.
 
     A skeleton endpoint is bulbous when its local process radius (from the
     distance transform) is both >= swelling_ratio x the median process radius
-    and >= min_bulb_diameter_um in diameter. Hallmark of dystrophic microglia.
+    and >= min_bulb_diameter_um in diameter. The soma (thickest point) is
+    excluded first so its internal skeleton endpoints are not counted as bulbs.
+    Hallmark of dystrophic microglia.
     """
     from skimage.morphology import skeletonize
     from scipy import ndimage
@@ -5439,6 +5471,13 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         return out
     radius = ndimage.distance_transform_edt(binary)
 
+    soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
+    if soma_area_um2 and soma_area_um2 > 0:
+        soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
+    else:
+        soma_radius_px = float(radius[soma_center])
+    exclusion_px = soma_radius_px * soma_margin
+
     skel_u8 = skeleton.astype(np.uint8)
     neighbor_count = ndimage.convolve(
         skel_u8, np.ones((3, 3), dtype=np.uint8),
@@ -5446,11 +5485,20 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     endpoints = skeleton & (neighbor_count == 1)
 
     ep_rows, ep_cols = np.nonzero(endpoints)
+    ep_dist = np.hypot(ep_rows - soma_center[0], ep_cols - soma_center[1])
+    keep = ep_dist > exclusion_px
+    ep_rows, ep_cols = ep_rows[keep], ep_cols[keep]
     n_endpoints = int(ep_rows.size)
     if n_endpoints == 0:
         return out
 
-    median_radius = float(np.median(radius[skeleton]))
+    skel_rows, skel_cols = np.nonzero(skeleton)
+    skel_dist = np.hypot(skel_rows - soma_center[0], skel_cols - soma_center[1])
+    process = skel_dist > exclusion_px
+    if int(np.count_nonzero(process)) >= 5:
+        median_radius = float(np.median(radius[skel_rows[process], skel_cols[process]]))
+    else:
+        median_radius = float(np.median(radius[skeleton]))
     if median_radius <= 0:
         return out
 
@@ -5542,7 +5590,7 @@ def compute_metrics(mask_path, pixel_size, soma_area_um2=None):
         params['minor_axis_um'] = 0
 
     # Bulbous (spheroidal) terminal swellings — dystrophic microglia marker.
-    bulb = detect_bulbous_endings(mask, pixel_size)
+    bulb = detect_bulbous_endings(mask, pixel_size, soma_area_um2=soma_area_um2)
     params['num_bulbous_endings'] = bulb['num_bulbous_endings']
     params['mean_bulb_diameter_um'] = bulb['mean_bulb_diameter_um']
     params['beading_index'] = bulb['beading_index']
