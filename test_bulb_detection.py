@@ -28,17 +28,73 @@ from scipy import ndimage
 from skimage.morphology import skeletonize
 
 
+def order_branch_pixels(pixels):
+    """Order a simple-path skeleton branch end-to-end."""
+    ps = set(pixels)
+    nbrs = dict()
+    for p in pixels:
+        r, c = p
+        adj = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                q = (r + dr, c + dc)
+                if q in ps:
+                    adj.append(q)
+        nbrs[p] = adj
+    ends = [p for p in pixels if len(nbrs[p]) == 1]
+    start = ends[0] if ends else pixels[0]
+    order = [start]
+    visited = set()
+    visited.add(start)
+    cur = start
+    while True:
+        nxt = None
+        for q in nbrs[cur]:
+            if q not in visited:
+                nxt = q
+                break
+        if nxt is None:
+            break
+        visited.add(nxt)
+        order.append(nxt)
+        cur = nxt
+    return order
+
+
+def terminal_bulb(profile, ratio, floor):
+    """Bulb at a process tip: peak before the nearest neck >= ratio x neck."""
+    R = np.asarray(profile, dtype=float)
+    n = R.size
+    if n < 2:
+        return None
+    neck = None
+    for i in range(1, n - 1):
+        if R[i] <= R[i - 1] and R[i] <= R[i + 1]:
+            neck = i
+            break
+    if neck is None:
+        neck = n - 1
+    peak_idx = int(np.argmax(R[:neck + 1]))
+    peak = R[peak_idx]
+    if peak >= floor and peak >= ratio * R[neck] and peak_idx < neck:
+        return peak_idx
+    return None
+
+
 def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                            min_bulb_diameter_um=1.5, soma_mask=None,
                            soma_area_um2=None, soma_margin=1.3,
-                           soma_dilation_px=3, baseline_percentile=25,
-                           min_branch_px=5):
+                           soma_dilation_px=3, min_branch_px=5):
     """Identical logic to MMPSv2.12.py — kept standalone for easy testing.
 
-    Swellings are detected along each branch, relative to that branch's own
-    baseline width. The soma is removed first (real ``soma_mask`` footprint, else
-    a circular estimate). Returns ``soma_region`` / ``soma_center`` /
-    ``exclusion_px`` so the overlay can show what was excluded.
+    Counts only TERMINAL end-bulbs: at each true process tip the branch radius is
+    walked inward to the nearest neck, and the tip is a bulb when the peak before
+    that neck is >= ``swelling_ratio`` x the neck and clears the floor. Interior
+    beads are ignored. The soma is removed first (real ``soma_mask`` footprint,
+    else a circular estimate). Returns ``soma_region`` / ``soma_center`` /
+    ``exclusion_px`` for the overlay.
     """
     result = {'num_bulbous_endings': 0, 'mean_bulb_diameter_um': 0.0,
               'beading_index': 0.0, 'bulb_coords': [],
@@ -86,6 +142,7 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     neighbor_count = ndimage.convolve(
         skel_u8, np.ones((3, 3), dtype=np.uint8),
         mode='constant', cval=0) - skel_u8
+    is_tip = skeleton & (neighbor_count == 1)
     junctions = skeleton & (neighbor_count >= 3)
     branches = skeleton & ~junctions
     labeled, n_labels = ndimage.label(branches, structure=struct)
@@ -93,40 +150,31 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         return result
 
     min_bulb_radius_px = (min_bulb_diameter_um / pixel_size) / 2.0
-    swelling = np.zeros(binary.shape, dtype=bool)
-    n_branches = 0
+    bulb_pixels = {}
+    n_tips = 0
     for lab in range(1, n_labels + 1):
-        idx = (labeled == lab)
-        if int(np.count_nonzero(idx)) < min_branch_px:
+        pix = np.argwhere(labeled == lab)
+        if pix.shape[0] < min_branch_px:
             continue
-        n_branches += 1
-        branch_radii = radius[idx]
-        baseline = float(np.percentile(branch_radii, baseline_percentile))
-        if baseline <= 0:
-            baseline = max(float(branch_radii.min()), 1.0)
-        threshold = max(swelling_ratio * baseline, min_bulb_radius_px)
-        swelling |= (idx & (radius >= threshold))
+        order = order_branch_pixels([tuple(p) for p in pix])
+        for end in (order, order[::-1]):
+            if not bool(is_tip[end[0]]):
+                continue
+            n_tips += 1
+            bi = terminal_bulb([radius[p] for p in end],
+                               swelling_ratio, min_bulb_radius_px)
+            if bi is not None:
+                peak = end[bi]
+                bulb_pixels[(int(peak[0]), int(peak[1]))] = float(radius[peak])
 
-    if not np.any(swelling) or n_branches == 0:
+    if not bulb_pixels or n_tips == 0:
         return result
 
-    bulb_labeled, n_bulbs = ndimage.label(swelling, structure=struct)
-    if n_bulbs == 0:
-        return result
-
-    coords = []
-    diameters = []
-    for b in range(1, n_bulbs + 1):
-        bidx = (bulb_labeled == b)
-        peak = np.unravel_index(int(np.argmax(np.where(bidx, radius, 0))),
-                                radius.shape)
-        diam_px = 2.0 * float(radius[peak])
-        diameters.append(diam_px * pixel_size)
-        coords.append((int(peak[0]), int(peak[1]), diam_px))
-
-    result['num_bulbous_endings'] = int(n_bulbs)
+    coords = [(r, c, 2.0 * rad) for (r, c), rad in bulb_pixels.items()]
+    diameters = [2.0 * rad * pixel_size for rad in bulb_pixels.values()]
+    result['num_bulbous_endings'] = len(coords)
     result['mean_bulb_diameter_um'] = round(float(np.mean(diameters)), 4)
-    result['beading_index'] = round(n_bulbs / n_branches, 4)
+    result['beading_index'] = round(len(coords) / n_tips, 4)
     result['bulb_coords'] = coords
     return result
 
@@ -193,7 +241,6 @@ def run_one(path, args, overlay_dir=None):
                                  soma_mask=soma_mask,
                                  soma_margin=args.soma_margin,
                                  soma_dilation_px=args.soma_dilation,
-                                 baseline_percentile=args.baseline_percentile,
                                  min_branch_px=args.min_branch_px)
     name = os.path.basename(path)
     soma_tag = "real-soma" if res.get('used_real_soma') else "est-soma "
@@ -219,8 +266,6 @@ def main():
                     help="circular soma exclusion factor (only when no soma mask found)")
     ap.add_argument("--soma-dilation", type=int, default=3,
                     help="pixels to dilate the real soma mask before excluding")
-    ap.add_argument("--baseline-percentile", type=float, default=25,
-                    help="percentile of each branch's radius used as its shaft width")
     ap.add_argument("--min-branch-px", type=int, default=5,
                     help="ignore skeleton branches shorter than this many pixels")
     ap.add_argument("--no-soma", action="store_true",

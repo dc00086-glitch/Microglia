@@ -374,40 +374,103 @@ def _grow_masks_for_soma(args):
     return masks
 
 
+def _order_branch_pixels(pixels):
+    """Order the pixels of a simple-path skeleton branch end-to-end.
+
+    ``pixels`` is a list of (row, col). Returns them walked from one tip to the
+    other so their radius profile can be read as a 1-D signal.
+    """
+    ps = set(pixels)
+    nbrs = dict()
+    for p in pixels:
+        r, c = p
+        adj = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                q = (r + dr, c + dc)
+                if q in ps:
+                    adj.append(q)
+        nbrs[p] = adj
+    ends = [p for p in pixels if len(nbrs[p]) == 1]
+    start = ends[0] if ends else pixels[0]
+    order = [start]
+    visited = set()
+    visited.add(start)
+    cur = start
+    while True:
+        nxt = None
+        for q in nbrs[cur]:
+            if q not in visited:
+                nxt = q
+                break
+        if nxt is None:
+            break
+        visited.add(nxt)
+        order.append(nxt)
+        cur = nxt
+    return order
+
+
+def _terminal_bulb(profile, ratio, floor):
+    """Test whether a process tip carries a bulbous swelling.
+
+    ``profile`` is the branch's radius read from the TIP inward. Walking inward,
+    we find the nearest constriction (first local minimum = the neck). The tip is
+    a bulb when the peak radius before that neck is at least ``ratio`` times the
+    neck radius and clears the absolute ``floor``. This catches only the swelling
+    at the very end of a process (the ATP-sensor end-bulb), not beads further
+    along the branch — those would lie beyond the neck and are ignored.
+
+    Returns the index (into ``profile``) of the bulb's peak, or None.
+    """
+    R = np.asarray(profile, dtype=float)
+    n = R.size
+    if n < 2:
+        return None
+    neck = None
+    for i in range(1, n - 1):
+        if R[i] <= R[i - 1] and R[i] <= R[i + 1]:
+            neck = i
+            break
+    if neck is None:
+        neck = n - 1
+    peak_idx = int(np.argmax(R[:neck + 1]))
+    peak = R[peak_idx]
+    if peak >= floor and peak >= ratio * R[neck] and peak_idx < neck:
+        return peak_idx
+    return None
+
+
 def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                             min_bulb_diameter_um=1.5, soma_mask=None,
                             soma_area_um2=None, soma_margin=1.3,
-                            soma_dilation_px=3, baseline_percentile=25,
-                            min_branch_px=5):
-    """Detect bulbous (spheroidal) swellings along microglial processes.
+                            soma_dilation_px=3, min_branch_px=5):
+    """Detect bulbous swellings at the TERMINAL tips of microglial processes.
 
-    A swelling is judged relative to the *branch it sits on*, not the whole cell.
-    The skeleton is split into individual branch segments (cut at junctions), and
-    on each branch a pixel is part of a swelling when its local radius (from the
-    Euclidean distance transform) is BOTH:
-      - at least ``swelling_ratio`` times that branch's own baseline radius
-        (the ``baseline_percentile`` percentile of the branch's radius profile —
-        its thin shaft), and
-      - at least ``min_bulb_diameter_um`` microns in diameter.
-    Contiguous swelling pixels are grouped into discrete bulbs; each bulb's
-    diameter is taken at its thickest point. Bulbs are found anywhere along a
-    branch (beads-on-a-string), not only at the tip.
+    These terminal end-bulbs are the ATP-sensor structures; they sit only at the
+    free ends of processes, not along the branch. The skeleton is split into
+    branches, and at each true process tip the branch's radius is walked inward
+    to the nearest constriction (neck). The tip counts as a bulb when the peak
+    radius before that neck is at least ``swelling_ratio`` times the neck radius
+    and clears ``min_bulb_diameter_um``. Interior beads and the thick base of a
+    tapering process are not counted.
 
-    The soma is removed from the skeleton first so its blob is never counted.
-    When the actual ``soma_mask`` is supplied (the pipeline's saved soma outline,
-    same shape as ``mask``) its footprint, dilated by ``soma_dilation_px``, is
-    excluded; otherwise the soma is estimated as the thickest point of the
-    distance transform with radius from ``soma_area_um2`` (or the largest
-    inscribed circle) and dropped within ``soma_margin`` x that radius.
+    The soma is removed from the skeleton first. When the actual ``soma_mask`` is
+    supplied (the pipeline's saved soma outline, same shape as ``mask``) its
+    footprint, dilated by ``soma_dilation_px``, is excluded; otherwise the soma
+    is estimated as the thickest point of the distance transform, with radius
+    from ``soma_area_um2`` (or the largest inscribed circle), excluded within
+    ``soma_margin`` x that radius.
 
-    Beaded/spheroidal swellings are a hallmark of dystrophic microglia. The
-    swelling-versus-branch-width criterion mirrors automated axonal-beading
-    methods; thresholds are meant to be tuned against blinded manual dystrophy
-    scoring rather than treated as fixed constants.
+    Terminal end-bulbs are a hallmark of dystrophic microglia. The
+    peak-versus-neck criterion mirrors automated axonal-swelling methods;
+    thresholds are meant to be tuned against blinded manual scoring.
 
-    Returns a dict with ``num_bulbous_endings`` (discrete swellings),
-    ``mean_bulb_diameter_um`` and ``beading_index`` (swellings per branch), plus
-    ``bulb_coords`` — (row, col) of each swelling's peak for an optional overlay.
+    Returns a dict with ``num_bulbous_endings`` (terminal bulbs),
+    ``mean_bulb_diameter_um`` and ``beading_index`` (bulbs per process tip), plus
+    ``bulb_coords`` — (row, col) of each bulb's peak for an optional overlay.
     """
     from skimage.morphology import skeletonize
 
@@ -452,54 +515,46 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         return result
 
     # Split the skeleton into individual branches by cutting at junctions
-    # (skeleton pixels with 3+ neighbors).
+    # (skeleton pixels with 3+ neighbors). Track true tips (degree-1 endpoints).
     struct = np.ones((3, 3), dtype=int)
     skel_u8 = skeleton.astype(np.uint8)
     neighbor_count = ndimage.convolve(
         skel_u8, np.ones((3, 3), dtype=np.uint8),
         mode='constant', cval=0) - skel_u8
+    is_tip = skeleton & (neighbor_count == 1)
     junctions = skeleton & (neighbor_count >= 3)
     branches = skeleton & ~junctions
     labeled, n_labels = ndimage.label(branches, structure=struct)
     if n_labels == 0:
         return result
 
-    # For each branch, flag pixels swollen relative to that branch's own shaft.
     min_bulb_radius_px = (min_bulb_diameter_um / pixel_size) / 2.0
-    swelling = np.zeros(binary.shape, dtype=bool)
-    n_branches = 0
+    bulb_pixels = {}  # (row, col) -> peak radius, dedup tips shared between scans
+    n_tips = 0
     for lab in range(1, n_labels + 1):
-        idx = (labeled == lab)
-        if int(np.count_nonzero(idx)) < min_branch_px:
+        pix = np.argwhere(labeled == lab)
+        if pix.shape[0] < min_branch_px:
             continue  # skip tiny skeleton spurs / noise
-        n_branches += 1
-        branch_radii = radius[idx]
-        baseline = float(np.percentile(branch_radii, baseline_percentile))
-        if baseline <= 0:
-            baseline = max(float(branch_radii.min()), 1.0)
-        threshold = max(swelling_ratio * baseline, min_bulb_radius_px)
-        swelling |= (idx & (radius >= threshold))
+        order = _order_branch_pixels([tuple(p) for p in pix])
+        # Test each end that is a true process tip, reading the profile inward.
+        for end in (order, order[::-1]):
+            if not bool(is_tip[end[0]]):
+                continue
+            n_tips += 1
+            bi = _terminal_bulb([radius[p] for p in end],
+                                swelling_ratio, min_bulb_radius_px)
+            if bi is not None:
+                peak = end[bi]
+                bulb_pixels[(int(peak[0]), int(peak[1]))] = float(radius[peak])
 
-    if not np.any(swelling) or n_branches == 0:
+    if not bulb_pixels or n_tips == 0:
         return result
 
-    # Group contiguous swollen pixels into discrete bulbs; size each at its peak.
-    bulb_labeled, n_bulbs = ndimage.label(swelling, structure=struct)
-    if n_bulbs == 0:
-        return result
-
-    coords = []
-    diameters = []
-    for b in range(1, n_bulbs + 1):
-        bidx = (bulb_labeled == b)
-        peak = np.unravel_index(int(np.argmax(np.where(bidx, radius, 0))),
-                                radius.shape)
-        diameters.append(2.0 * float(radius[peak]) * pixel_size)
-        coords.append((int(peak[0]), int(peak[1])))
-
-    result['num_bulbous_endings'] = int(n_bulbs)
+    coords = list(bulb_pixels.keys())
+    diameters = [2.0 * r * pixel_size for r in bulb_pixels.values()]
+    result['num_bulbous_endings'] = len(coords)
     result['mean_bulb_diameter_um'] = round(float(np.mean(diameters)), 4)
-    result['beading_index'] = round(n_bulbs / n_branches, 4)
+    result['beading_index'] = round(len(coords) / n_tips, 4)
     result['bulb_coords'] = coords
     return result
 
@@ -5517,19 +5572,72 @@ def get_soma_mask(somas_dir, image_name, soma_id):
     return None
 
 
+def order_branch_pixels(pixels):
+    """Order a simple-path skeleton branch end-to-end."""
+    ps = set(pixels)
+    nbrs = dict()
+    for p in pixels:
+        r, c = p
+        adj = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                q = (r + dr, c + dc)
+                if q in ps:
+                    adj.append(q)
+        nbrs[p] = adj
+    ends = [p for p in pixels if len(nbrs[p]) == 1]
+    start = ends[0] if ends else pixels[0]
+    order = [start]
+    visited = set()
+    visited.add(start)
+    cur = start
+    while True:
+        nxt = None
+        for q in nbrs[cur]:
+            if q not in visited:
+                nxt = q
+                break
+        if nxt is None:
+            break
+        visited.add(nxt)
+        order.append(nxt)
+        cur = nxt
+    return order
+
+
+def terminal_bulb(profile, ratio, floor):
+    """Bulb at a process tip: peak before the nearest neck >= ratio x neck."""
+    R = np.asarray(profile, dtype=float)
+    n = R.size
+    if n < 2:
+        return None
+    neck = None
+    for i in range(1, n - 1):
+        if R[i] <= R[i - 1] and R[i] <= R[i + 1]:
+            neck = i
+            break
+    if neck is None:
+        neck = n - 1
+    peak_idx = int(np.argmax(R[:neck + 1]))
+    peak = R[peak_idx]
+    if peak >= floor and peak >= ratio * R[neck] and peak_idx < neck:
+        return peak_idx
+    return None
+
+
 def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                            min_bulb_diameter_um=1.5, soma_mask=None,
                            soma_area_um2=None, soma_margin=1.3,
-                           soma_dilation_px=3, baseline_percentile=25,
-                           min_branch_px=5):
-    """Detect bulbous swellings along microglial processes, relative to branch.
+                           soma_dilation_px=3, min_branch_px=5):
+    """Detect bulbous swellings at the TERMINAL tips of microglial processes.
 
-    The skeleton is split into branches (cut at junctions). On each branch a
-    pixel is part of a swelling when its radius is both >= swelling_ratio x that
-    branch's own baseline radius (baseline_percentile of the branch profile) and
-    >= min_bulb_diameter_um in diameter. Contiguous swollen pixels form discrete
-    bulbs, found anywhere along a branch. The soma is removed from the skeleton
-    first (real soma_mask footprint dilated, else a circular estimate).
+    The terminal end-bulbs (ATP-sensor structures) sit only at the free ends of
+    processes. At each true tip the branch radius is walked inward to the nearest
+    neck; the tip is a bulb when the peak before that neck is >= swelling_ratio x
+    the neck radius and clears min_bulb_diameter_um. Interior beads are ignored.
+    The soma is removed first (real soma_mask footprint dilated, else estimate).
     """
     from skimage.morphology import skeletonize
     from scipy import ndimage
@@ -5573,6 +5681,7 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     neighbor_count = ndimage.convolve(
         skel_u8, np.ones((3, 3), dtype=np.uint8),
         mode='constant', cval=0) - skel_u8
+    is_tip = skeleton & (neighbor_count == 1)
     junctions = skeleton & (neighbor_count >= 3)
     branches = skeleton & ~junctions
     labeled, n_labels = ndimage.label(branches, structure=struct)
@@ -5580,37 +5689,30 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         return out
 
     min_bulb_radius_px = (min_bulb_diameter_um / pixel_size) / 2.0
-    swelling = np.zeros(binary.shape, dtype=bool)
-    n_branches = 0
+    bulb_pixels = dict()
+    n_tips = 0
     for lab in range(1, n_labels + 1):
-        idx = (labeled == lab)
-        if int(np.count_nonzero(idx)) < min_branch_px:
+        pix = np.argwhere(labeled == lab)
+        if pix.shape[0] < min_branch_px:
             continue
-        n_branches += 1
-        branch_radii = radius[idx]
-        baseline = float(np.percentile(branch_radii, baseline_percentile))
-        if baseline <= 0:
-            baseline = max(float(branch_radii.min()), 1.0)
-        threshold = max(swelling_ratio * baseline, min_bulb_radius_px)
-        swelling |= (idx & (radius >= threshold))
+        order = order_branch_pixels([tuple(p) for p in pix])
+        for end in (order, order[::-1]):
+            if not bool(is_tip[end[0]]):
+                continue
+            n_tips += 1
+            bi = terminal_bulb([radius[p] for p in end],
+                               swelling_ratio, min_bulb_radius_px)
+            if bi is not None:
+                peak = end[bi]
+                bulb_pixels[(int(peak[0]), int(peak[1]))] = float(radius[peak])
 
-    if not np.any(swelling) or n_branches == 0:
+    if not bulb_pixels or n_tips == 0:
         return out
 
-    bulb_labeled, n_bulbs = ndimage.label(swelling, structure=struct)
-    if n_bulbs == 0:
-        return out
-
-    diameters = []
-    for b in range(1, n_bulbs + 1):
-        bidx = (bulb_labeled == b)
-        peak = np.unravel_index(int(np.argmax(np.where(bidx, radius, 0))),
-                                radius.shape)
-        diameters.append(2.0 * float(radius[peak]) * pixel_size)
-
-    out['num_bulbous_endings'] = int(n_bulbs)
+    diameters = [2.0 * r * pixel_size for r in bulb_pixels.values()]
+    out['num_bulbous_endings'] = len(bulb_pixels)
     out['mean_bulb_diameter_um'] = round(float(np.mean(diameters)), 4)
-    out['beading_index'] = round(n_bulbs / n_branches, 4)
+    out['beading_index'] = round(len(bulb_pixels) / n_tips, 4)
     return out
 
 
