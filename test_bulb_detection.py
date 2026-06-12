@@ -29,17 +29,20 @@ from skimage.morphology import skeletonize
 
 
 def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
-                           min_bulb_diameter_um=1.5, soma_area_um2=None,
-                           soma_margin=1.3):
+                           min_bulb_diameter_um=1.5, soma_mask=None,
+                           soma_area_um2=None, soma_margin=1.3,
+                           soma_dilation_px=3):
     """Identical logic to MMPSv2.12.py — kept standalone for easy testing.
 
-    The soma (thickest point of the distance transform) is excluded so its
-    internal skeleton endpoints are not mistaken for bulbs. ``soma_center`` and
-    ``exclusion_px`` are returned so the overlay can show the excluded zone.
+    When the real ``soma_mask`` is supplied the exact soma footprint (dilated) is
+    excluded; otherwise the soma is estimated as the thickest point of the
+    distance transform. Returns ``soma_region`` / ``soma_center`` / ``exclusion_px``
+    so the overlay can show what was excluded.
     """
     result = {'num_bulbous_endings': 0, 'mean_bulb_diameter_um': 0.0,
               'beading_index': 0.0, 'bulb_coords': [],
-              'soma_center': None, 'exclusion_px': 0.0}
+              'soma_region': None, 'soma_center': None, 'exclusion_px': 0.0,
+              'used_real_soma': False}
 
     binary = (mask > 0)
     if not np.any(binary):
@@ -50,33 +53,47 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         return result
     radius = ndimage.distance_transform_edt(binary)
 
-    # Locate and size the soma, then build an exclusion zone around it.
-    soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
-    if soma_area_um2 and soma_area_um2 > 0:
-        soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
-    else:
-        soma_radius_px = float(radius[soma_center])
-    exclusion_px = soma_radius_px * soma_margin
-    result['soma_center'] = (int(soma_center[0]), int(soma_center[1]))
-    result['exclusion_px'] = float(exclusion_px)
-
+    skel_rows, skel_cols = np.nonzero(skeleton)
     skel_u8 = skeleton.astype(np.uint8)
     neighbor_count = ndimage.convolve(
         skel_u8, np.ones((3, 3), dtype=np.uint8),
         mode='constant', cval=0) - skel_u8
     endpoints = skeleton & (neighbor_count == 1)
-
     ep_rows, ep_cols = np.nonzero(endpoints)
-    ep_dist = np.hypot(ep_rows - soma_center[0], ep_cols - soma_center[1])
-    keep = ep_dist > exclusion_px
+
+    use_real_soma = (soma_mask is not None
+                     and np.shape(soma_mask) == binary.shape
+                     and np.any(soma_mask))
+    if use_real_soma:
+        soma_region = (np.asarray(soma_mask) > 0)
+        if soma_dilation_px and soma_dilation_px > 0:
+            soma_region = ndimage.binary_dilation(
+                soma_region, iterations=int(soma_dilation_px))
+        ep_in_soma = soma_region[ep_rows, ep_cols]
+        skel_in_soma = soma_region[skel_rows, skel_cols]
+        result['soma_region'] = soma_region
+        result['used_real_soma'] = True
+    else:
+        soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
+        if soma_area_um2 and soma_area_um2 > 0:
+            soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
+        else:
+            soma_radius_px = float(radius[soma_center])
+        exclusion_px = soma_radius_px * soma_margin
+        ep_in_soma = np.hypot(ep_rows - soma_center[0],
+                              ep_cols - soma_center[1]) <= exclusion_px
+        skel_in_soma = np.hypot(skel_rows - soma_center[0],
+                                skel_cols - soma_center[1]) <= exclusion_px
+        result['soma_center'] = (int(soma_center[0]), int(soma_center[1]))
+        result['exclusion_px'] = float(exclusion_px)
+
+    keep = ~ep_in_soma
     ep_rows, ep_cols = ep_rows[keep], ep_cols[keep]
     n_endpoints = int(ep_rows.size)
     if n_endpoints == 0:
         return result
 
-    skel_rows, skel_cols = np.nonzero(skeleton)
-    skel_dist = np.hypot(skel_rows - soma_center[0], skel_cols - soma_center[1])
-    process = skel_dist > exclusion_px
+    process = ~skel_in_soma
     if int(np.count_nonzero(process)) >= 5:
         median_radius = float(np.median(radius[skel_rows[process], skel_cols[process]]))
     else:
@@ -101,6 +118,30 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     return result
 
 
+def find_soma_mask(mask_path):
+    """Find the soma TIFF matching a cell mask and return it as a binary array.
+
+    Mask:  <img>_<soma_id>_area<NNN>_mask.tif
+    Soma:  <img>_<soma_id>_soma.tif  (in a sibling ``somas/`` folder or alongside)
+    """
+    import re
+    name = os.path.basename(mask_path)
+    m = re.match(r'^(.+?)_(soma_\d+_\d+)_area\d+_mask\.tif{1,2}$', name, re.I)
+    if not m:
+        return None
+    img, soma_id = m.group(1), m.group(2)
+    soma_name = f"{img}_{soma_id}_soma.tif"
+    mask_dir = os.path.dirname(os.path.abspath(mask_path))
+    for cand in [
+        os.path.join(os.path.dirname(mask_dir), "somas", soma_name),  # ../somas/
+        os.path.join(mask_dir, "somas", soma_name),                    # ./somas/
+        os.path.join(mask_dir, soma_name),                             # alongside
+    ]:
+        if os.path.exists(cand):
+            return (tifffile.imread(cand) > 0)
+    return None
+
+
 def save_overlay(mask, res, out_path):
     """Save a PNG of the mask with each detected bulb circled in red."""
     import matplotlib
@@ -109,8 +150,11 @@ def save_overlay(mask, res, out_path):
 
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.imshow(mask > 0, cmap='gray')
-    # Soma exclusion zone (everything inside is ignored for bulb detection).
-    if res.get('soma_center') and res.get('exclusion_px'):
+    # Show the excluded soma region: real outline (blue) or circular estimate.
+    if res.get('soma_region') is not None:
+        ax.contour(res['soma_region'], levels=[0.5],
+                   colors='deepskyblue', linewidths=1.5)
+    elif res.get('soma_center') and res.get('exclusion_px'):
         sr, sc = res['soma_center']
         ax.add_patch(plt.Circle((sc, sr), res['exclusion_px'],
                                 color='deepskyblue', fill=False,
@@ -119,9 +163,10 @@ def save_overlay(mask, res, out_path):
         ax.add_patch(plt.Circle((c, r), max(diam_px, 6),
                                 color='red', fill=False, linewidth=2))
         ax.plot(c, r, 'r+', markersize=8)
+    soma_tag = "real soma" if res.get('used_real_soma') else "est. soma"
     ax.set_title(f"bulbs={res['num_bulbous_endings']}  "
                  f"beading_index={res['beading_index']}  "
-                 f"mean_diam={res['mean_bulb_diameter_um']}um")
+                 f"mean_diam={res['mean_bulb_diameter_um']}um  [{soma_tag}]")
     ax.axis('off')
     fig.savefig(out_path, dpi=120, bbox_inches='tight')
     plt.close(fig)
@@ -129,10 +174,15 @@ def save_overlay(mask, res, out_path):
 
 def run_one(path, args, overlay_dir=None):
     mask = tifffile.imread(path)
+    soma_mask = None if args.no_soma else find_soma_mask(path)
     res = detect_bulbous_endings(mask, args.pixel_size,
-                                 args.swelling_ratio, args.min_bulb_diameter)
+                                 args.swelling_ratio, args.min_bulb_diameter,
+                                 soma_mask=soma_mask,
+                                 soma_margin=args.soma_margin,
+                                 soma_dilation_px=args.soma_dilation)
     name = os.path.basename(path)
-    print(f"{name:40s}  bulbs={res['num_bulbous_endings']:3d}  "
+    soma_tag = "real-soma" if res.get('used_real_soma') else "est-soma "
+    print(f"{name:40s}  [{soma_tag}]  bulbs={res['num_bulbous_endings']:3d}  "
           f"beading_index={res['beading_index']:.3f}  "
           f"mean_diam_um={res['mean_bulb_diameter_um']:.3f}")
     if overlay_dir:
@@ -150,6 +200,12 @@ def main():
     ap.add_argument("--swelling-ratio", type=float, default=1.75)
     ap.add_argument("--min-bulb-diameter", type=float, default=1.5,
                     help="minimum bulb diameter in microns")
+    ap.add_argument("--soma-margin", type=float, default=1.3,
+                    help="circular soma exclusion factor (only when no soma mask found)")
+    ap.add_argument("--soma-dilation", type=int, default=3,
+                    help="pixels to dilate the real soma mask before excluding")
+    ap.add_argument("--no-soma", action="store_true",
+                    help="ignore soma TIFFs and use the circular estimate")
     ap.add_argument("--overlay", action="store_true",
                     help="save overlay PNGs marking detected bulbs")
     args = ap.parse_args()

@@ -375,8 +375,9 @@ def _grow_masks_for_soma(args):
 
 
 def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
-                            min_bulb_diameter_um=1.5, soma_area_um2=None,
-                            soma_margin=1.3):
+                            min_bulb_diameter_um=1.5, soma_mask=None,
+                            soma_area_um2=None, soma_margin=1.3,
+                            soma_dilation_px=3):
     """Detect bulbous (spheroidal) swellings at the tips of microglial processes.
 
     A skeleton endpoint counts as a bulbous ending when its local process radius
@@ -386,11 +387,14 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
 
     The soma is excluded first: an irregular soma skeletonizes into short internal
     branches whose endpoints carry the soma's large radius and would otherwise be
-    mistaken for giant bulbs. We locate the soma as the thickest point of the
-    distance transform and drop any endpoint within ``soma_margin`` x the soma
-    radius of it; the baseline process width is also measured from non-soma
-    skeleton only. When the soma area is known it sets the soma radius directly,
-    otherwise the largest inscribed radius is used.
+    mistaken for giant bulbs. When the actual ``soma_mask`` is supplied (the
+    pipeline's saved soma outline, same shape as ``mask``) it is used directly —
+    endpoints inside the soma footprint (dilated by ``soma_dilation_px``) are
+    dropped, and the baseline process width is measured from non-soma skeleton
+    only. Without a soma mask we fall back to a circular estimate: the soma is the
+    thickest point of the distance transform and its radius comes from
+    ``soma_area_um2`` (or the largest inscribed circle), excluding endpoints
+    within ``soma_margin`` x that radius.
 
     Spheroidal terminal swellings are a hallmark of dystrophic microglia. The
     diameter-versus-local-width criterion mirrors automated axonal-beading
@@ -420,14 +424,7 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         return result
     radius = ndimage.distance_transform_edt(binary)
 
-    # Locate the soma: the single thickest point of the cell. Its radius is the
-    # largest inscribed circle, or is derived from the known soma area.
-    soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
-    if soma_area_um2 and soma_area_um2 > 0:
-        soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
-    else:
-        soma_radius_px = float(radius[soma_center])
-    exclusion_px = soma_radius_px * soma_margin
+    skel_rows, skel_cols = np.nonzero(skeleton)
 
     # Endpoints: skeleton pixels with exactly one skeleton neighbor.
     skel_u8 = skeleton.astype(np.uint8)
@@ -435,11 +432,34 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         skel_u8, np.ones((3, 3), dtype=np.uint8),
         mode='constant', cval=0) - skel_u8
     endpoints = skeleton & (neighbor_count == 1)
-
     ep_rows, ep_cols = np.nonzero(endpoints)
+
+    # Decide which skeleton pixels / endpoints fall in the soma.
+    use_real_soma = (soma_mask is not None
+                     and np.shape(soma_mask) == binary.shape
+                     and np.any(soma_mask))
+    if use_real_soma:
+        soma_region = (np.asarray(soma_mask) > 0)
+        if soma_dilation_px and soma_dilation_px > 0:
+            soma_region = ndimage.binary_dilation(
+                soma_region, iterations=int(soma_dilation_px))
+        ep_in_soma = soma_region[ep_rows, ep_cols]
+        skel_in_soma = soma_region[skel_rows, skel_cols]
+    else:
+        # Circular fallback when no soma outline is available.
+        soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
+        if soma_area_um2 and soma_area_um2 > 0:
+            soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
+        else:
+            soma_radius_px = float(radius[soma_center])
+        exclusion_px = soma_radius_px * soma_margin
+        ep_in_soma = np.hypot(ep_rows - soma_center[0],
+                              ep_cols - soma_center[1]) <= exclusion_px
+        skel_in_soma = np.hypot(skel_rows - soma_center[0],
+                                skel_cols - soma_center[1]) <= exclusion_px
+
     # Keep only endpoints outside the soma — true process tips.
-    ep_dist = np.hypot(ep_rows - soma_center[0], ep_cols - soma_center[1])
-    keep = ep_dist > exclusion_px
+    keep = ~ep_in_soma
     ep_rows, ep_cols = ep_rows[keep], ep_cols[keep]
     n_endpoints = int(ep_rows.size)
     if n_endpoints == 0:
@@ -447,9 +467,7 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
 
     # Baseline process radius: median over non-soma skeleton pixels, so the soma
     # does not inflate the reference width. Median is robust to local spikes.
-    skel_rows, skel_cols = np.nonzero(skeleton)
-    skel_dist = np.hypot(skel_rows - soma_center[0], skel_cols - soma_center[1])
-    process = skel_dist > exclusion_px
+    process = ~skel_in_soma
     if int(np.count_nonzero(process)) >= 5:
         median_radius = float(np.median(radius[skel_rows[process], skel_cols[process]]))
     else:
@@ -1223,15 +1241,17 @@ class MorphologyCalculator:
         self.pixel_size = pixel_size_um
         # Note: use_imagej parameter kept for backwards compatibility but not used
 
-    def calculate_all_parameters(self, cell_mask, soma_centroid, soma_area_um2=None):
+    def calculate_all_parameters(self, cell_mask, soma_centroid, soma_area_um2=None,
+                                 soma_mask=None):
         """Calculate ONLY simple parameters - Sholl, Fractal, Hull, Skeleton done in ImageJ"""
         params = {}
-      
-        params.update(self._calculate_simple_descriptors(cell_mask, soma_area_um2))
+
+        params.update(self._calculate_simple_descriptors(cell_mask, soma_area_um2,
+                                                         soma_mask))
 
         return params
 
-    def _calculate_simple_descriptors(self, mask, soma_area_um2=None):
+    def _calculate_simple_descriptors(self, mask, soma_area_um2=None, soma_mask=None):
         params = {}
         props = measure.regionprops(mask.astype(int))[0] if np.any(mask) else None
         if props:
@@ -1276,6 +1296,7 @@ class MorphologyCalculator:
 
             # Bulbous (spheroidal) terminal swellings — dystrophic marker.
             bulb = _detect_bulbous_endings(mask, self.pixel_size,
+                                           soma_mask=soma_mask,
                                            soma_area_um2=soma_area_um2)
             params['num_bulbous_endings'] = bulb['num_bulbous_endings']
             params['mean_bulb_diameter_um'] = bulb['mean_bulb_diameter_um']
@@ -1463,6 +1484,8 @@ class MorphologyCalculationThread(QThread):
 
             # Process remaining masks serially (in-memory)
             calculator_cache = {}
+            soma_mask_cache = {}
+            somas_dir = os.path.join(self.output_dir, "somas") if self.output_dir else None
             for i in serial_indices:
                 flat_data = self.approved_masks[i]
                 mask_data = flat_data['mask_data']
@@ -1508,7 +1531,26 @@ class MorphologyCalculationThread(QThread):
                 if cache_key not in calculator_cache:
                     calculator_cache[cache_key] = MorphologyCalculator(processed_img, ps_for_calc, use_imagej=self.use_imagej)
                 calculator = calculator_cache[cache_key]
-                params = calculator.calculate_all_parameters(mask_data['mask'], soma_centroid, soma_area_um2)
+
+                # Real soma outline (full-image, pixel-aligned with the mask) so
+                # bulb detection excludes the exact soma rather than estimating it.
+                soma_mask_arr = None
+                if somas_dir:
+                    img_basename = os.path.splitext(img_name)[0]
+                    soma_key = (img_basename, mask_data['soma_id'])
+                    if soma_key not in soma_mask_cache:
+                        soma_path = os.path.join(
+                            somas_dir, f"{img_basename}_{mask_data['soma_id']}_soma.tif")
+                        try:
+                            soma_mask_cache[soma_key] = (
+                                (safe_tiff_read(soma_path) > 0)
+                                if os.path.exists(soma_path) else None)
+                        except Exception:
+                            soma_mask_cache[soma_key] = None
+                    soma_mask_arr = soma_mask_cache[soma_key]
+
+                params = calculator.calculate_all_parameters(
+                    mask_data['mask'], soma_centroid, soma_area_um2, soma_mask_arr)
 
                 meta = task_metadata[i]
                 params['image_name'] = meta[0]
@@ -5445,16 +5487,35 @@ def get_soma_area(somas_dir, image_name, soma_id, pixel_size):
     return None
 
 
+def get_soma_mask(somas_dir, image_name, soma_id):
+    """Load the soma outline TIFF as a binary mask (for bulb detection)."""
+    if not somas_dir or not os.path.isdir(somas_dir):
+        return None
+    candidates = [
+        f"{{image_name}}_{{soma_id}}_soma.tif",
+        f"{{image_name}}_{{soma_id}}.tif",
+    ]
+    for c in candidates:
+        path = os.path.join(somas_dir, c)
+        if os.path.exists(path):
+            return (tifffile.imread(path) > 0)
+    for f in os.listdir(somas_dir):
+        if soma_id in f and f.endswith(".tif"):
+            return (tifffile.imread(os.path.join(somas_dir, f)) > 0)
+    return None
+
+
 def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
-                           min_bulb_diameter_um=1.5, soma_area_um2=None,
-                           soma_margin=1.3):
+                           min_bulb_diameter_um=1.5, soma_mask=None,
+                           soma_area_um2=None, soma_margin=1.3,
+                           soma_dilation_px=3):
     """Detect bulbous (spheroidal) terminal swellings on microglial processes.
 
     A skeleton endpoint is bulbous when its local process radius (from the
     distance transform) is both >= swelling_ratio x the median process radius
-    and >= min_bulb_diameter_um in diameter. The soma (thickest point) is
-    excluded first so its internal skeleton endpoints are not counted as bulbs.
-    Hallmark of dystrophic microglia.
+    and >= min_bulb_diameter_um in diameter. The soma is excluded first: when the
+    actual soma_mask is supplied its footprint (dilated) is removed; otherwise the
+    soma is estimated as the thickest point. Hallmark of dystrophic microglia.
     """
     from skimage.morphology import skeletonize
     from scipy import ndimage
@@ -5471,30 +5532,43 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         return out
     radius = ndimage.distance_transform_edt(binary)
 
-    soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
-    if soma_area_um2 and soma_area_um2 > 0:
-        soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
-    else:
-        soma_radius_px = float(radius[soma_center])
-    exclusion_px = soma_radius_px * soma_margin
-
+    skel_rows, skel_cols = np.nonzero(skeleton)
     skel_u8 = skeleton.astype(np.uint8)
     neighbor_count = ndimage.convolve(
         skel_u8, np.ones((3, 3), dtype=np.uint8),
         mode='constant', cval=0) - skel_u8
     endpoints = skeleton & (neighbor_count == 1)
-
     ep_rows, ep_cols = np.nonzero(endpoints)
-    ep_dist = np.hypot(ep_rows - soma_center[0], ep_cols - soma_center[1])
-    keep = ep_dist > exclusion_px
+
+    use_real_soma = (soma_mask is not None
+                     and np.shape(soma_mask) == binary.shape
+                     and np.any(soma_mask))
+    if use_real_soma:
+        soma_region = (np.asarray(soma_mask) > 0)
+        if soma_dilation_px and soma_dilation_px > 0:
+            soma_region = ndimage.binary_dilation(
+                soma_region, iterations=int(soma_dilation_px))
+        ep_in_soma = soma_region[ep_rows, ep_cols]
+        skel_in_soma = soma_region[skel_rows, skel_cols]
+    else:
+        soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
+        if soma_area_um2 and soma_area_um2 > 0:
+            soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
+        else:
+            soma_radius_px = float(radius[soma_center])
+        exclusion_px = soma_radius_px * soma_margin
+        ep_in_soma = np.hypot(ep_rows - soma_center[0],
+                              ep_cols - soma_center[1]) <= exclusion_px
+        skel_in_soma = np.hypot(skel_rows - soma_center[0],
+                                skel_cols - soma_center[1]) <= exclusion_px
+
+    keep = ~ep_in_soma
     ep_rows, ep_cols = ep_rows[keep], ep_cols[keep]
     n_endpoints = int(ep_rows.size)
     if n_endpoints == 0:
         return out
 
-    skel_rows, skel_cols = np.nonzero(skeleton)
-    skel_dist = np.hypot(skel_rows - soma_center[0], skel_cols - soma_center[1])
-    process = skel_dist > exclusion_px
+    process = ~skel_in_soma
     if int(np.count_nonzero(process)) >= 5:
         median_radius = float(np.median(radius[skel_rows[process], skel_cols[process]]))
     else:
@@ -5516,7 +5590,7 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     return out
 
 
-def compute_metrics(mask_path, pixel_size, soma_area_um2=None):
+def compute_metrics(mask_path, pixel_size, soma_area_um2=None, soma_mask=None):
     """Load a mask TIFF and compute all morphology metrics."""
     mask = tifffile.imread(mask_path)
     mask = (mask > 0).astype(np.uint8)
@@ -5590,7 +5664,8 @@ def compute_metrics(mask_path, pixel_size, soma_area_um2=None):
         params['minor_axis_um'] = 0
 
     # Bulbous (spheroidal) terminal swellings — dystrophic microglia marker.
-    bulb = detect_bulbous_endings(mask, pixel_size, soma_area_um2=soma_area_um2)
+    bulb = detect_bulbous_endings(mask, pixel_size, soma_mask=soma_mask,
+                                  soma_area_um2=soma_area_um2)
     params['num_bulbous_endings'] = bulb['num_bulbous_endings']
     params['mean_bulb_diameter_um'] = bulb['mean_bulb_diameter_um']
     params['beading_index'] = bulb['beading_index']
@@ -5627,10 +5702,11 @@ def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir, meta
     for filename, soma_id, area in mask_files:
         mask_path = os.path.join(masks_dir, filename)
         soma_area = get_soma_area(somas_dir, image_name, soma_id, pixel_size)
+        soma_mask = get_soma_mask(somas_dir, image_name, soma_id)
         aid, treat, sidx = get_meta_ids(metadata, image_name, soma_id)
 
         try:
-            metrics = compute_metrics(mask_path, pixel_size, soma_area)
+            metrics = compute_metrics(mask_path, pixel_size, soma_area, soma_mask)
         except Exception as e:
             print(f"  ERROR: {{filename}}: {{e}}")
             continue
