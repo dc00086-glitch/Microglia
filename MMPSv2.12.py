@@ -446,7 +446,8 @@ def _terminal_bulb(profile, ratio, floor):
 def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                             min_bulb_diameter_um=1.5, soma_mask=None,
                             soma_area_um2=None, soma_margin=1.3,
-                            soma_dilation_px=3, min_branch_px=5):
+                            soma_dilation_px=3, min_branch_px=5,
+                            min_tip_dist_factor=1.5):
     """Detect bulbous swellings at the TERMINAL tips of microglial processes.
 
     These terminal end-bulbs are the ATP-sensor structures; they sit only at the
@@ -507,7 +508,11 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                      and np.shape(soma_mask) == binary.shape
                      and np.any(soma_mask))
     if use_real_soma:
-        soma_region = (np.asarray(soma_mask) > 0)
+        soma_bin = (np.asarray(soma_mask) > 0)
+        srows, scols = np.nonzero(soma_bin)
+        soma_center = (float(srows.mean()), float(scols.mean()))
+        soma_radius_px = np.sqrt(srows.size / np.pi)
+        soma_region = soma_bin
         if soma_dilation_px and soma_dilation_px > 0:
             soma_region = ndimage.binary_dilation(
                 soma_region, iterations=int(soma_dilation_px))
@@ -525,6 +530,12 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     is_tip = is_tip & skeleton  # keep only tips that survive soma removal
     if not np.any(skeleton):
         return result
+
+    # A real terminal bulb sits out on a process, not in the perinuclear region.
+    # Require each bulb to be at least this many soma-radii from the soma center
+    # (using the soma's own size as the ruler), which removes the thick residue
+    # left when the soma mask is smaller than the cell body.
+    min_tip_dist_px = min_tip_dist_factor * soma_radius_px
 
     # Split the soma-removed skeleton into individual branches by cutting at
     # junctions (skeleton pixels with 3+ neighbors).
@@ -556,7 +567,9 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                                 swelling_ratio, min_bulb_radius_px)
             if bi is not None:
                 peak = end[bi]
-                bulb_pixels[(int(peak[0]), int(peak[1]))] = float(radius[peak])
+                dist = np.hypot(peak[0] - soma_center[0], peak[1] - soma_center[1])
+                if dist >= min_tip_dist_px:
+                    bulb_pixels[(int(peak[0]), int(peak[1]))] = float(radius[peak])
 
     if not bulb_pixels or n_tips == 0:
         return result
@@ -5641,7 +5654,8 @@ def terminal_bulb(profile, ratio, floor):
 def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                            min_bulb_diameter_um=1.5, soma_mask=None,
                            soma_area_um2=None, soma_margin=1.3,
-                           soma_dilation_px=3, min_branch_px=5):
+                           soma_dilation_px=3, min_branch_px=5,
+                           min_tip_dist_factor=1.5):
     """Detect bulbous swellings at the TERMINAL tips of microglial processes.
 
     The terminal end-bulbs (ATP-sensor structures) sit only at the free ends of
@@ -5677,7 +5691,11 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                      and np.shape(soma_mask) == binary.shape
                      and np.any(soma_mask))
     if use_real_soma:
-        soma_region = (np.asarray(soma_mask) > 0)
+        soma_bin = (np.asarray(soma_mask) > 0)
+        srows, scols = np.nonzero(soma_bin)
+        soma_center = (float(srows.mean()), float(scols.mean()))
+        soma_radius_px = np.sqrt(srows.size / np.pi)
+        soma_region = soma_bin
         if soma_dilation_px and soma_dilation_px > 0:
             soma_region = ndimage.binary_dilation(
                 soma_region, iterations=int(soma_dilation_px))
@@ -5695,6 +5713,7 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     is_tip = is_tip & skeleton
     if not np.any(skeleton):
         return out
+    min_tip_dist_px = min_tip_dist_factor * soma_radius_px
 
     struct = np.ones((3, 3), dtype=int)
     skel_u8 = skeleton.astype(np.uint8)
@@ -5723,7 +5742,9 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                                swelling_ratio, min_bulb_radius_px)
             if bi is not None:
                 peak = end[bi]
-                bulb_pixels[(int(peak[0]), int(peak[1]))] = float(radius[peak])
+                dist = np.hypot(peak[0] - soma_center[0], peak[1] - soma_center[1])
+                if dist >= min_tip_dist_px:
+                    bulb_pixels[(int(peak[0]), int(peak[1]))] = float(radius[peak])
 
     if not bulb_pixels or n_tips == 0:
         return out

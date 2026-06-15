@@ -86,7 +86,8 @@ def terminal_bulb(profile, ratio, floor):
 def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                            min_bulb_diameter_um=1.5, soma_mask=None,
                            soma_area_um2=None, soma_margin=1.3,
-                           soma_dilation_px=3, min_branch_px=5):
+                           soma_dilation_px=3, min_branch_px=5,
+                           min_tip_dist_factor=1.5):
     """Identical logic to MMPSv2.12.py — kept standalone for easy testing.
 
     Counts only TERMINAL end-bulbs: at each true process tip the branch radius is
@@ -121,7 +122,11 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                      and np.shape(soma_mask) == binary.shape
                      and np.any(soma_mask))
     if use_real_soma:
-        soma_region = (np.asarray(soma_mask) > 0)
+        soma_bin = (np.asarray(soma_mask) > 0)
+        srows, scols = np.nonzero(soma_bin)
+        soma_center = (float(srows.mean()), float(scols.mean()))
+        soma_radius_px = np.sqrt(srows.size / np.pi)
+        soma_region = soma_bin
         if soma_dilation_px and soma_dilation_px > 0:
             soma_region = ndimage.binary_dilation(
                 soma_region, iterations=int(soma_dilation_px))
@@ -144,6 +149,7 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     is_tip = is_tip & skeleton
     if not np.any(skeleton):
         return result
+    min_tip_dist_px = min_tip_dist_factor * soma_radius_px
 
     struct = np.ones((3, 3), dtype=int)
     skel_u8 = skeleton.astype(np.uint8)
@@ -172,7 +178,9 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
                                swelling_ratio, min_bulb_radius_px)
             if bi is not None:
                 peak = end[bi]
-                bulb_pixels[(int(peak[0]), int(peak[1]))] = float(radius[peak])
+                dist = np.hypot(peak[0] - soma_center[0], peak[1] - soma_center[1])
+                if dist >= min_tip_dist_px:
+                    bulb_pixels[(int(peak[0]), int(peak[1]))] = float(radius[peak])
 
     if not bulb_pixels or n_tips == 0:
         return result
@@ -248,7 +256,8 @@ def run_one(path, args, overlay_dir=None):
                                  soma_mask=soma_mask,
                                  soma_margin=args.soma_margin,
                                  soma_dilation_px=args.soma_dilation,
-                                 min_branch_px=args.min_branch_px)
+                                 min_branch_px=args.min_branch_px,
+                                 min_tip_dist_factor=args.min_tip_dist_factor)
     name = os.path.basename(path)
     soma_tag = "real-soma" if res.get('used_real_soma') else "est-soma "
     print(f"{name:40s}  [{soma_tag}]  bulbs={res['num_bulbous_endings']:3d}  "
@@ -275,6 +284,8 @@ def main():
                     help="pixels to dilate the real soma mask before excluding")
     ap.add_argument("--min-branch-px", type=int, default=5,
                     help="ignore skeleton branches shorter than this many pixels")
+    ap.add_argument("--min-tip-dist-factor", type=float, default=1.5,
+                    help="bulb must be at least this many soma-radii from the soma center")
     ap.add_argument("--no-soma", action="store_true",
                     help="ignore soma TIFFs and use the circular estimate")
     ap.add_argument("--overlay", action="store_true",
