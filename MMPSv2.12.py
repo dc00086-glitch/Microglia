@@ -444,7 +444,7 @@ def _terminal_bulb(profile, ratio, floor):
 
 
 def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
-                            min_bulb_diameter_um=1.5, soma_mask=None,
+                            min_bulb_diameter_um=1.0, soma_mask=None,
                             soma_area_um2=None, soma_margin=1.3,
                             soma_dilation_px=3, min_branch_px=5,
                             min_tip_dist_factor=1.5):
@@ -5652,7 +5652,7 @@ def terminal_bulb(profile, ratio, floor):
 
 
 def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
-                           min_bulb_diameter_um=1.5, soma_mask=None,
+                           min_bulb_diameter_um=1.0, soma_mask=None,
                            soma_area_um2=None, soma_margin=1.3,
                            soma_dilation_px=3, min_branch_px=5,
                            min_tip_dist_factor=1.5):

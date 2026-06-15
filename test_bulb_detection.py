@@ -15,7 +15,7 @@ Usage:
 
     # tune the thresholds
     python3 test_bulb_detection.py mask.tif --pixel-size 0.5 \
-        --swelling-ratio 1.75 --min-bulb-diameter 1.5 --overlay
+        --swelling-ratio 1.75 --min-bulb-diameter 1.0 --overlay
 """
 
 import os
@@ -84,7 +84,7 @@ def terminal_bulb(profile, ratio, floor):
 
 
 def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
-                           min_bulb_diameter_um=1.5, soma_mask=None,
+                           min_bulb_diameter_um=1.0, soma_mask=None,
                            soma_area_um2=None, soma_margin=1.3,
                            soma_dilation_px=3, min_branch_px=5,
                            min_tip_dist_factor=1.5):
@@ -276,8 +276,8 @@ def main():
     ap.add_argument("--pixel-size", type=float, required=True,
                     help="microns per pixel")
     ap.add_argument("--swelling-ratio", type=float, default=1.75)
-    ap.add_argument("--min-bulb-diameter", type=float, default=1.5,
-                    help="minimum bulb diameter in microns")
+    ap.add_argument("--min-bulb-diameter", type=float, default=1.0,
+                    help="minimum bulb diameter in microns (size floor; ratio test gives specificity)")
     ap.add_argument("--soma-margin", type=float, default=1.3,
                     help="circular soma exclusion factor (only when no soma mask found)")
     ap.add_argument("--soma-dilation", type=int, default=3,
