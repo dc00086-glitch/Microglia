@@ -374,11 +374,38 @@ def _grow_masks_for_soma(args):
     return masks
 
 
+def _branch_extends_past(touching, proc_labeled, proc_sizes, ring, blob_center,
+                         soma_center, distal_min_len_px, distal_cos):
+    """True if a process leaves the blob on the far side from the soma.
+
+    For each thin-process branch touching the blob, the vector from the blob
+    centre to where it attaches is compared with the direction toward the soma.
+    A branch whose attachment points *away* from the soma (cosine below
+    ``distal_cos``) and is at least ``distal_min_len_px`` long means the process
+    continues past the bulb — so it is not a clean terminal bulb.
+    """
+    cy, cx = blob_center
+    v_s = np.array([soma_center[0] - cy, soma_center[1] - cx], dtype=float)
+    ns = np.linalg.norm(v_s) + 1e-9
+    for t in touching:
+        if proc_sizes[t] < distal_min_len_px:
+            continue
+        ty, tx = np.nonzero((proc_labeled == t) & ring)
+        if ty.size == 0:
+            continue
+        v_t = np.array([ty.mean() - cy, tx.mean() - cx], dtype=float)
+        cos = float(v_t @ v_s / (np.linalg.norm(v_t) * ns + 1e-9))
+        if cos < distal_cos:
+            return True
+    return False
+
+
 def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
                             soma_mask=None, soma_area_um2=None, soma_margin=1.3,
                             open_radius_px=None, soma_dilation_px=3,
                             min_tip_dist_factor=1.5, min_conn_len_px=10,
-                            max_connections=1):
+                            max_connections=1, distal_min_len_px=4,
+                            distal_cos=-0.2):
     """Detect bulbous terminal swellings (ATP-sensor end-bulbs) on microglia.
 
     A bulb is a rounded terminal lobe: a blob connected to the rest of the cell
@@ -498,6 +525,11 @@ def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
         n_conn = sum(1 for t in touching if proc_sizes[t] >= min_conn_len_px)
         if n_conn > max_connections:
             continue  # junction, not a terminal bulb
+        # A bulb is terminal: the connecting process must not continue PAST it.
+        # Reject if any process leaves the blob on the far side from the soma.
+        if _branch_extends_past(touching, proc_labeled, proc_sizes, ring,
+                                (cy, cx), soma_center, distal_min_len_px, distal_cos):
+            continue
         peak = np.unravel_index(int(np.argmax(np.where(comp, radius, 0))),
                                 radius.shape)
         coords.append((int(peak[0]), int(peak[1])))
@@ -5540,7 +5572,8 @@ def detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
                            soma_mask=None, soma_area_um2=None, soma_margin=1.3,
                            open_radius_px=None, soma_dilation_px=3,
                            min_tip_dist_factor=1.5, min_conn_len_px=10,
-                           max_connections=1):
+                           max_connections=1, distal_min_len_px=4,
+                           distal_cos=-0.2):
     """Detect bulbous terminal swellings (ATP-sensor end-bulbs) on microglia.
 
     A bulb is a rounded terminal lobe connected to the cell by exactly one thin
@@ -5627,6 +5660,22 @@ def detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
         touching = set(np.unique(proc_labeled[ring & proc_skel])) - {{0}}
         n_conn = sum(1 for t in touching if proc_sizes[t] >= min_conn_len_px)
         if n_conn > max_connections:
+            continue
+        # Reject if a process extends PAST the bulb (far side from the soma).
+        v_s = np.array([soma_center[0] - cy, soma_center[1] - cx], dtype=float)
+        ns = np.linalg.norm(v_s) + 1e-9
+        extends_past = False
+        for t in touching:
+            if proc_sizes[t] < distal_min_len_px:
+                continue
+            ty, tx = np.nonzero((proc_labeled == t) & ring)
+            if ty.size == 0:
+                continue
+            v_t = np.array([ty.mean() - cy, tx.mean() - cx], dtype=float)
+            if float(v_t @ v_s / (np.linalg.norm(v_t) * ns + 1e-9)) < distal_cos:
+                extends_past = True
+                break
+        if extends_past:
             continue
         diameters.append(2.0 * blob_radius * pixel_size)
 

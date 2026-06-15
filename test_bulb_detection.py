@@ -32,7 +32,8 @@ def detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
                            soma_mask=None, soma_area_um2=None, soma_margin=1.3,
                            open_radius_px=None, soma_dilation_px=3,
                            min_tip_dist_factor=1.5, min_conn_len_px=10,
-                           max_connections=1):
+                           max_connections=1, distal_min_len_px=4,
+                           distal_cos=-0.2):
     """Identical logic to MMPSv2.12.py — kept standalone for easy testing.
 
     A bulb is a rounded terminal lobe: a blob (isolated by morphological opening,
@@ -120,6 +121,22 @@ def detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
         touching = set(np.unique(proc_labeled[ring & proc_skel])) - {0}
         n_conn = sum(1 for t in touching if proc_sizes[t] >= min_conn_len_px)
         if n_conn > max_connections:
+            continue
+        # Reject if a process extends PAST the bulb (far side from the soma).
+        v_s = np.array([soma_center[0] - cy, soma_center[1] - cx], dtype=float)
+        ns = np.linalg.norm(v_s) + 1e-9
+        extends_past = False
+        for t in touching:
+            if proc_sizes[t] < distal_min_len_px:
+                continue
+            ty, tx = np.nonzero((proc_labeled == t) & ring)
+            if ty.size == 0:
+                continue
+            v_t = np.array([ty.mean() - cy, tx.mean() - cx], dtype=float)
+            if float(v_t @ v_s / (np.linalg.norm(v_t) * ns + 1e-9)) < distal_cos:
+                extends_past = True
+                break
+        if extends_past:
             continue
         peak = np.unravel_index(int(np.argmax(np.where(comp, radius, 0))),
                                 radius.shape)
