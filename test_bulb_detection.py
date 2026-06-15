@@ -110,6 +110,13 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         return result
     radius = ndimage.distance_transform_edt(binary)
 
+    # True tips = degree-1 endpoints of the FULL skeleton (before soma removal).
+    full_u8 = skeleton.astype(np.uint8)
+    full_neighbors = ndimage.convolve(
+        full_u8, np.ones((3, 3), dtype=np.uint8),
+        mode='constant', cval=0) - full_u8
+    is_tip = skeleton & (full_neighbors == 1)
+
     use_real_soma = (soma_mask is not None
                      and np.shape(soma_mask) == binary.shape
                      and np.any(soma_mask))
@@ -134,6 +141,7 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         result['exclusion_px'] = float(exclusion_px)
 
     skeleton = skeleton & ~soma_region
+    is_tip = is_tip & skeleton
     if not np.any(skeleton):
         return result
 
@@ -142,7 +150,6 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     neighbor_count = ndimage.convolve(
         skel_u8, np.ones((3, 3), dtype=np.uint8),
         mode='constant', cval=0) - skel_u8
-    is_tip = skeleton & (neighbor_count == 1)
     junctions = skeleton & (neighbor_count >= 3)
     branches = skeleton & ~junctions
     labeled, n_labels = ndimage.label(branches, structure=struct)
