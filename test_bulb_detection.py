@@ -295,13 +295,19 @@ def main():
     overlay_dir = "bulb_overlays" if args.overlay else None
 
     if os.path.isdir(args.path):
+        # Skip hidden / macOS AppleDouble (._*) sidecar files, not just by name
+        # but only keep real *_mask.tif files.
         masks = sorted(f for f in os.listdir(args.path)
-                       if f.lower().endswith((".tif", ".tiff")))
+                       if f.lower().endswith((".tif", ".tiff"))
+                       and not f.startswith("."))
         if not masks:
             print("No .tif files found in folder.")
             sys.exit(1)
         for f in masks:
-            run_one(os.path.join(args.path, f), args, overlay_dir)
+            try:
+                run_one(os.path.join(args.path, f), args, overlay_dir)
+            except Exception as e:
+                print(f"  SKIP {f}: {e}")
     else:
         run_one(args.path, args, overlay_dir)
 

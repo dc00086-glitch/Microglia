@@ -5514,6 +5514,9 @@ MASK_RE = re.compile(r'^(.+?)_(soma_\\d+_\\d+)_area(\\d+)_mask\\.tif$')
 
 def parse_mask_filename(filename):
     """Extract image_name, soma_id, area from a mask filename."""
+    # Ignore hidden / macOS AppleDouble (._*) sidecar files.
+    if filename.startswith("."):
+        return None, None, None
     m = MASK_RE.match(filename)
     if m:
         return m.group(1), m.group(2), int(m.group(3))
@@ -5568,7 +5571,7 @@ def get_soma_area(somas_dir, image_name, soma_id, pixel_size):
                 return np.sum(soma) * (pixel_size ** 2)
             return None
     for f in os.listdir(somas_dir):
-        if soma_id in f and f.endswith(".tif"):
+        if soma_id in f and f.endswith(".tif") and not f.startswith("."):
             path = os.path.join(somas_dir, f)
             soma = tifffile.imread(path)
             soma = (soma > 0).astype(np.uint8)
@@ -5591,7 +5594,7 @@ def get_soma_mask(somas_dir, image_name, soma_id):
         if os.path.exists(path):
             return (tifffile.imread(path) > 0)
     for f in os.listdir(somas_dir):
-        if soma_id in f and f.endswith(".tif"):
+        if soma_id in f and f.endswith(".tif") and not f.startswith("."):
             return (tifffile.imread(os.path.join(somas_dir, f)) > 0)
     return None
 
