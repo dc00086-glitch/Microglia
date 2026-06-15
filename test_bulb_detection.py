@@ -30,7 +30,7 @@ from skimage.morphology import skeletonize
 
 def detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
                            soma_mask=None, soma_area_um2=None, soma_margin=1.3,
-                           open_radius_px=4, soma_dilation_px=3,
+                           open_radius_px=None, soma_dilation_px=3,
                            min_tip_dist_factor=1.5, min_conn_len_px=10,
                            max_connections=1):
     """Identical logic to MMPSv2.12.py — kept standalone for easy testing.
@@ -77,6 +77,12 @@ def detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
         soma_region = (np.hypot(rr - soma_center[0],
                                 cc - soma_center[1]) <= soma_radius_px * soma_margin)
     result['soma_region'] = soma_region
+
+    if open_radius_px is None:
+        proc_dt = radius[skel & ~soma_region]
+        thin_half = float(np.percentile(proc_dt, 25)) if proc_dt.size else 2.0
+        ceiling = max(3, int((min_bulb_diameter_um / pixel_size) / 2.0) - 1)
+        open_radius_px = int(min(max(round(thin_half + 2), 3), ceiling))
 
     opened = opening(binary, disk(int(open_radius_px)))
     labeled, n_labels = ndimage.label(opened, structure=struct)
@@ -220,8 +226,8 @@ def main():
                     help="microns per pixel")
     ap.add_argument("--min-bulb-diameter", type=float, default=1.4,
                     help="minimum bulb diameter in microns (size floor)")
-    ap.add_argument("--open-radius", type=int, default=4,
-                    help="opening disk radius in px (just above thin-process width)")
+    ap.add_argument("--open-radius", type=int, default=None,
+                    help="opening disk radius in px; omit for auto (sized to this cell's process width)")
     ap.add_argument("--soma-margin", type=float, default=1.3,
                     help="circular soma exclusion factor (only when no soma mask found)")
     ap.add_argument("--soma-dilation", type=int, default=3,

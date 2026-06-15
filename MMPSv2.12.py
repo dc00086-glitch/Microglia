@@ -376,7 +376,7 @@ def _grow_masks_for_soma(args):
 
 def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
                             soma_mask=None, soma_area_um2=None, soma_margin=1.3,
-                            open_radius_px=4, soma_dilation_px=3,
+                            open_radius_px=None, soma_dilation_px=3,
                             min_tip_dist_factor=1.5, min_conn_len_px=10,
                             max_connections=1):
     """Detect bulbous terminal swellings (ATP-sensor end-bulbs) on microglia.
@@ -386,8 +386,11 @@ def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
     endpoint-based detection fails; instead we isolate blobs morphologically.
 
     Steps:
-      1. Morphological opening with a disk of ``open_radius_px`` removes the thin
-         processes, leaving the soma/body and the rounded lobes as components.
+      1. Morphological opening with a disk removes the thin processes, leaving the
+         soma/body and the rounded lobes as components. The disk radius adapts to
+         the cell: when ``open_radius_px`` is None it is sized just above this
+         cell's own process half-width (so thick-branched cells get a larger disk
+         and thin-branched cells a smaller one); pass a number to force a radius.
       2. Drop the component containing the soma/body.
       3. Keep blobs whose diameter (2 x max distance-transform radius) is at least
          ``min_bulb_diameter_um`` and that lie at least ``min_tip_dist_factor``
@@ -441,6 +444,15 @@ def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
         rr, cc = np.indices(binary.shape)
         soma_region = (np.hypot(rr - soma_center[0],
                                 cc - soma_center[1]) <= soma_radius_px * soma_margin)
+
+    # Size the opening disk. If not forced, set it just above this cell's own
+    # process half-width (25th percentile of thickness along the non-soma
+    # skeleton), capped below the bulb size floor so qualifying lobes survive.
+    if open_radius_px is None:
+        proc_dt = radius[skeleton & ~soma_region]
+        thin_half = float(np.percentile(proc_dt, 25)) if proc_dt.size else 2.0
+        ceiling = max(3, int((min_bulb_diameter_um / pixel_size) / 2.0) - 1)
+        open_radius_px = int(min(max(round(thin_half + 2), 3), ceiling))
 
     # Isolate rounded blobs (soma/body + lobes) by removing thin processes.
     opened = opening(binary, disk(int(open_radius_px)))
@@ -5526,7 +5538,7 @@ def get_soma_mask(somas_dir, image_name, soma_id):
 
 def detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
                            soma_mask=None, soma_area_um2=None, soma_margin=1.3,
-                           open_radius_px=4, soma_dilation_px=3,
+                           open_radius_px=None, soma_dilation_px=3,
                            min_tip_dist_factor=1.5, min_conn_len_px=10,
                            max_connections=1):
     """Detect bulbous terminal swellings (ATP-sensor end-bulbs) on microglia.
@@ -5573,6 +5585,12 @@ def detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
         rr, cc = np.indices(binary.shape)
         soma_region = (np.hypot(rr - soma_center[0],
                                 cc - soma_center[1]) <= soma_radius_px * soma_margin)
+
+    if open_radius_px is None:
+        proc_dt = radius[skeleton & ~soma_region]
+        thin_half = float(np.percentile(proc_dt, 25)) if proc_dt.size else 2.0
+        ceiling = max(3, int((min_bulb_diameter_um / pixel_size) / 2.0) - 1)
+        open_radius_px = int(min(max(round(thin_half + 2), 3), ceiling))
 
     opened = opening(binary, disk(int(open_radius_px)))
     labeled, n_labels = ndimage.label(opened, structure=struct)
