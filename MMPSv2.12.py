@@ -374,106 +374,35 @@ def _grow_masks_for_soma(args):
     return masks
 
 
-def _order_branch_pixels(pixels):
-    """Order the pixels of a simple-path skeleton branch end-to-end.
+def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
+                            soma_mask=None, soma_area_um2=None, soma_margin=1.3,
+                            open_radius_px=4, soma_dilation_px=3,
+                            min_tip_dist_factor=1.5, min_conn_len_px=10,
+                            max_connections=1):
+    """Detect bulbous terminal swellings (ATP-sensor end-bulbs) on microglia.
 
-    ``pixels`` is a list of (row, col). Returns them walked from one tip to the
-    other so their radius profile can be read as a 1-D signal.
+    A bulb is a rounded terminal lobe: a blob connected to the rest of the cell
+    by exactly one thin process. The skeleton branches *inside* these lobes, so
+    endpoint-based detection fails; instead we isolate blobs morphologically.
+
+    Steps:
+      1. Morphological opening with a disk of ``open_radius_px`` removes the thin
+         processes, leaving the soma/body and the rounded lobes as components.
+      2. Drop the component containing the soma/body.
+      3. Keep blobs whose diameter (2 x max distance-transform radius) is at least
+         ``min_bulb_diameter_um`` and that lie at least ``min_tip_dist_factor``
+         soma-radii from the soma centre.
+      4. Terminal test: count the thin-process skeleton branches (length
+         >= ``min_conn_len_px``) that touch the blob; keep it only if that count
+         is <= ``max_connections`` (1). A junction has two or more, so it is
+         rejected. The opening itself enforces the thin-neck requirement (a thick
+         stub straight off the body stays attached and is excluded with it).
+
+    Returns a dict with ``num_bulbous_endings``, ``mean_bulb_diameter_um`` and
+    ``beading_index`` (bulbs per process tip), plus ``bulb_coords`` — (row, col)
+    of each bulb centre for an optional overlay.
     """
-    ps = set(pixels)
-    nbrs = dict()
-    for p in pixels:
-        r, c = p
-        adj = []
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                q = (r + dr, c + dc)
-                if q in ps:
-                    adj.append(q)
-        nbrs[p] = adj
-    ends = [p for p in pixels if len(nbrs[p]) == 1]
-    start = ends[0] if ends else pixels[0]
-    order = [start]
-    visited = set()
-    visited.add(start)
-    cur = start
-    while True:
-        nxt = None
-        for q in nbrs[cur]:
-            if q not in visited:
-                nxt = q
-                break
-        if nxt is None:
-            break
-        visited.add(nxt)
-        order.append(nxt)
-        cur = nxt
-    return order
-
-
-def _terminal_bulb(profile, ratio, floor):
-    """Test whether a process tip carries a bulbous swelling.
-
-    ``profile`` is the branch's radius read from the TIP inward. Walking inward,
-    we find the nearest constriction (first local minimum = the neck). The tip is
-    a bulb when the peak radius before that neck is at least ``ratio`` times the
-    neck radius and clears the absolute ``floor``. This catches only the swelling
-    at the very end of a process (the ATP-sensor end-bulb), not beads further
-    along the branch — those would lie beyond the neck and are ignored.
-
-    Returns the index (into ``profile``) of the bulb's peak, or None.
-    """
-    R = np.asarray(profile, dtype=float)
-    n = R.size
-    if n < 2:
-        return None
-    neck = None
-    for i in range(1, n - 1):
-        if R[i] <= R[i - 1] and R[i] <= R[i + 1]:
-            neck = i
-            break
-    if neck is None:
-        neck = n - 1
-    peak_idx = int(np.argmax(R[:neck + 1]))
-    peak = R[peak_idx]
-    if peak >= floor and peak >= ratio * R[neck] and peak_idx < neck:
-        return peak_idx
-    return None
-
-
-def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
-                            min_bulb_diameter_um=1.0, soma_mask=None,
-                            soma_area_um2=None, soma_margin=1.3,
-                            soma_dilation_px=3, min_branch_px=5,
-                            min_tip_dist_factor=1.5):
-    """Detect bulbous swellings at the TERMINAL tips of microglial processes.
-
-    These terminal end-bulbs are the ATP-sensor structures; they sit only at the
-    free ends of processes, not along the branch. The skeleton is split into
-    branches, and at each true process tip the branch's radius is walked inward
-    to the nearest constriction (neck). The tip counts as a bulb when the peak
-    radius before that neck is at least ``swelling_ratio`` times the neck radius
-    and clears ``min_bulb_diameter_um``. Interior beads and the thick base of a
-    tapering process are not counted.
-
-    The soma is removed from the skeleton first. When the actual ``soma_mask`` is
-    supplied (the pipeline's saved soma outline, same shape as ``mask``) its
-    footprint, dilated by ``soma_dilation_px``, is excluded; otherwise the soma
-    is estimated as the thickest point of the distance transform, with radius
-    from ``soma_area_um2`` (or the largest inscribed circle), excluded within
-    ``soma_margin`` x that radius.
-
-    Terminal end-bulbs are a hallmark of dystrophic microglia. The
-    peak-versus-neck criterion mirrors automated axonal-swelling methods;
-    thresholds are meant to be tuned against blinded manual scoring.
-
-    Returns a dict with ``num_bulbous_endings`` (terminal bulbs),
-    ``mean_bulb_diameter_um`` and ``beading_index`` (bulbs per process tip), plus
-    ``bulb_coords`` — (row, col) of each bulb's peak for an optional overlay.
-    """
-    from skimage.morphology import skeletonize
+    from skimage.morphology import skeletonize, opening, disk
 
     result = {
         'num_bulbous_endings': 0,
@@ -486,24 +415,11 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     if not np.any(binary):
         return result
 
-    # Centerline of the cell, and local half-thickness (radius) at every pixel.
-    skeleton = skeletonize(binary)
-    if not np.any(skeleton):
-        return result
     radius = ndimage.distance_transform_edt(binary)
+    skeleton = skeletonize(binary)
+    struct = np.ones((3, 3), dtype=int)
 
-    # True process tips are degree-1 endpoints of the FULL skeleton (computed
-    # before the soma is removed). This is essential: if tips were taken after
-    # soma removal, every place a process is severed from the soma would become a
-    # fake "tip" right at the soma — and since processes are thick there and
-    # narrow outward, the peak-vs-neck test would fire all around the soma.
-    full_u8 = skeleton.astype(np.uint8)
-    full_neighbors = ndimage.convolve(
-        full_u8, np.ones((3, 3), dtype=np.uint8),
-        mode='constant', cval=0) - full_u8
-    is_tip = skeleton & (full_neighbors == 1)
-
-    # Remove the soma from the skeleton so its blob is never measured.
+    # Locate the soma (centre + radius) for the body exclusion and distance gate.
     use_real_soma = (soma_mask is not None
                      and np.shape(soma_mask) == binary.shape
                      and np.any(soma_mask))
@@ -514,71 +430,80 @@ def _detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         soma_radius_px = np.sqrt(srows.size / np.pi)
         soma_region = soma_bin
         if soma_dilation_px and soma_dilation_px > 0:
-            soma_region = ndimage.binary_dilation(
-                soma_region, iterations=int(soma_dilation_px))
+            soma_region = ndimage.binary_dilation(soma_region,
+                                                  iterations=int(soma_dilation_px))
     else:
         soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
         if soma_area_um2 and soma_area_um2 > 0:
             soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
         else:
             soma_radius_px = float(radius[soma_center])
-        exclusion_px = soma_radius_px * soma_margin
         rr, cc = np.indices(binary.shape)
         soma_region = (np.hypot(rr - soma_center[0],
-                                cc - soma_center[1]) <= exclusion_px)
-    skeleton = skeleton & ~soma_region
-    is_tip = is_tip & skeleton  # keep only tips that survive soma removal
-    if not np.any(skeleton):
-        return result
+                                cc - soma_center[1]) <= soma_radius_px * soma_margin)
 
-    # A real terminal bulb sits out on a process, not in the perinuclear region.
-    # Require each bulb to be at least this many soma-radii from the soma center
-    # (using the soma's own size as the ruler), which removes the thick residue
-    # left when the soma mask is smaller than the cell body.
-    min_tip_dist_px = min_tip_dist_factor * soma_radius_px
-
-    # Split the soma-removed skeleton into individual branches by cutting at
-    # junctions (skeleton pixels with 3+ neighbors).
-    struct = np.ones((3, 3), dtype=int)
-    skel_u8 = skeleton.astype(np.uint8)
-    neighbor_count = ndimage.convolve(
-        skel_u8, np.ones((3, 3), dtype=np.uint8),
-        mode='constant', cval=0) - skel_u8
-    junctions = skeleton & (neighbor_count >= 3)
-    branches = skeleton & ~junctions
-    labeled, n_labels = ndimage.label(branches, structure=struct)
+    # Isolate rounded blobs (soma/body + lobes) by removing thin processes.
+    opened = opening(binary, disk(int(open_radius_px)))
+    labeled, n_labels = ndimage.label(opened, structure=struct)
     if n_labels == 0:
         return result
 
-    min_bulb_radius_px = (min_bulb_diameter_um / pixel_size) / 2.0
-    bulb_pixels = {}  # (row, col) -> peak radius, dedup tips shared between scans
-    n_tips = 0
-    for lab in range(1, n_labels + 1):
-        pix = np.argwhere(labeled == lab)
-        if pix.shape[0] < min_branch_px:
-            continue  # skip tiny skeleton spurs / noise
-        order = _order_branch_pixels([tuple(p) for p in pix])
-        # Test each end that is a true process tip, reading the profile inward.
-        for end in (order, order[::-1]):
-            if not bool(is_tip[end[0]]):
-                continue
-            n_tips += 1
-            bi = _terminal_bulb([radius[p] for p in end],
-                                swelling_ratio, min_bulb_radius_px)
-            if bi is not None:
-                peak = end[bi]
-                dist = np.hypot(peak[0] - soma_center[0], peak[1] - soma_center[1])
-                if dist >= min_tip_dist_px:
-                    bulb_pixels[(int(peak[0]), int(peak[1]))] = float(radius[peak])
+    # The soma/body is the component at the soma centre (or the one most
+    # overlapping the soma region).
+    sc = (int(round(soma_center[0])), int(round(soma_center[1])))
+    soma_label = labeled[sc] if (0 <= sc[0] < labeled.shape[0]
+                                 and 0 <= sc[1] < labeled.shape[1]) else 0
+    if soma_label == 0:
+        overlap = labeled[soma_region]
+        overlap = overlap[overlap > 0]
+        if overlap.size:
+            soma_label = int(np.bincount(overlap).argmax())
 
-    if not bulb_pixels or n_tips == 0:
+    # Thin-process skeleton (blobs removed) — used to count real connections.
+    proc_skel = skeleton & ~opened
+    proc_labeled, _ = ndimage.label(proc_skel, structure=struct)
+    proc_sizes = np.bincount(proc_labeled.ravel())
+
+    min_bulb_radius_px = (min_bulb_diameter_um / pixel_size) / 2.0
+    min_tip_dist_px = min_tip_dist_factor * soma_radius_px
+
+    coords = []
+    diameters = []
+    for lab in range(1, n_labels + 1):
+        if lab == soma_label:
+            continue
+        comp = (labeled == lab)
+        blob_radius = float(radius[comp].max())
+        if blob_radius < min_bulb_radius_px:
+            continue
+        ys, xs = np.nonzero(comp)
+        cy, cx = ys.mean(), xs.mean()
+        if np.hypot(cy - soma_center[0], cx - soma_center[1]) < min_tip_dist_px:
+            continue
+        # Count substantial thin-process branches touching the blob.
+        ring = ndimage.binary_dilation(comp, iterations=2)
+        touching = set(np.unique(proc_labeled[ring & proc_skel])) - {0}
+        n_conn = sum(1 for t in touching if proc_sizes[t] >= min_conn_len_px)
+        if n_conn > max_connections:
+            continue  # junction, not a terminal bulb
+        peak = np.unravel_index(int(np.argmax(np.where(comp, radius, 0))),
+                                radius.shape)
+        coords.append((int(peak[0]), int(peak[1])))
+        diameters.append(2.0 * blob_radius * pixel_size)
+
+    if not coords:
         return result
 
-    coords = list(bulb_pixels.keys())
-    diameters = [2.0 * r * pixel_size for r in bulb_pixels.values()]
+    # Beading index: bulbs per process tip (degree-1 skeleton endpoints, non-soma).
+    skel_nosoma = skeleton & ~soma_region
+    su = skel_nosoma.astype(np.uint8)
+    nbr = ndimage.convolve(su, np.ones((3, 3), dtype=np.uint8),
+                           mode='constant', cval=0) - su
+    n_tips = int(np.count_nonzero(skel_nosoma & (nbr == 1)))
+
     result['num_bulbous_endings'] = len(coords)
     result['mean_bulb_diameter_um'] = round(float(np.mean(diameters)), 4)
-    result['beading_index'] = round(len(coords) / n_tips, 4)
+    result['beading_index'] = round(len(coords) / n_tips, 4) if n_tips else 0.0
     result['bulb_coords'] = coords
     return result
 
@@ -5599,75 +5524,21 @@ def get_soma_mask(somas_dir, image_name, soma_id):
     return None
 
 
-def order_branch_pixels(pixels):
-    """Order a simple-path skeleton branch end-to-end."""
-    ps = set(pixels)
-    nbrs = dict()
-    for p in pixels:
-        r, c = p
-        adj = []
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                q = (r + dr, c + dc)
-                if q in ps:
-                    adj.append(q)
-        nbrs[p] = adj
-    ends = [p for p in pixels if len(nbrs[p]) == 1]
-    start = ends[0] if ends else pixels[0]
-    order = [start]
-    visited = set()
-    visited.add(start)
-    cur = start
-    while True:
-        nxt = None
-        for q in nbrs[cur]:
-            if q not in visited:
-                nxt = q
-                break
-        if nxt is None:
-            break
-        visited.add(nxt)
-        order.append(nxt)
-        cur = nxt
-    return order
+def detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
+                           soma_mask=None, soma_area_um2=None, soma_margin=1.3,
+                           open_radius_px=4, soma_dilation_px=3,
+                           min_tip_dist_factor=1.5, min_conn_len_px=10,
+                           max_connections=1):
+    """Detect bulbous terminal swellings (ATP-sensor end-bulbs) on microglia.
 
-
-def terminal_bulb(profile, ratio, floor):
-    """Bulb at a process tip: peak before the nearest neck >= ratio x neck."""
-    R = np.asarray(profile, dtype=float)
-    n = R.size
-    if n < 2:
-        return None
-    neck = None
-    for i in range(1, n - 1):
-        if R[i] <= R[i - 1] and R[i] <= R[i + 1]:
-            neck = i
-            break
-    if neck is None:
-        neck = n - 1
-    peak_idx = int(np.argmax(R[:neck + 1]))
-    peak = R[peak_idx]
-    if peak >= floor and peak >= ratio * R[neck] and peak_idx < neck:
-        return peak_idx
-    return None
-
-
-def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
-                           min_bulb_diameter_um=1.0, soma_mask=None,
-                           soma_area_um2=None, soma_margin=1.3,
-                           soma_dilation_px=3, min_branch_px=5,
-                           min_tip_dist_factor=1.5):
-    """Detect bulbous swellings at the TERMINAL tips of microglial processes.
-
-    The terminal end-bulbs (ATP-sensor structures) sit only at the free ends of
-    processes. At each true tip the branch radius is walked inward to the nearest
-    neck; the tip is a bulb when the peak before that neck is >= swelling_ratio x
-    the neck radius and clears min_bulb_diameter_um. Interior beads are ignored.
-    The soma is removed first (real soma_mask footprint dilated, else estimate).
+    A bulb is a rounded terminal lobe connected to the cell by exactly one thin
+    process. Opening with a disk of open_radius_px removes thin processes leaving
+    blobs; the soma/body component is dropped; remaining blobs are kept if their
+    diameter >= min_bulb_diameter_um, they lie >= min_tip_dist_factor soma-radii
+    from the soma, and at most max_connections thin-process branches (length
+    >= min_conn_len_px) touch them (junctions have more and are rejected).
     """
-    from skimage.morphology import skeletonize
+    from skimage.morphology import skeletonize, opening, disk
     from scipy import ndimage
 
     out = {{'num_bulbous_endings': 0, 'mean_bulb_diameter_um': 0.0,
@@ -5677,18 +5548,9 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
     if not np.any(binary):
         return out
 
-    skeleton = skeletonize(binary)
-    if not np.any(skeleton):
-        return out
     radius = ndimage.distance_transform_edt(binary)
-
-    # True tips = degree-1 endpoints of the FULL skeleton (before soma removal),
-    # so process-to-soma junctions are never treated as tips.
-    full_u8 = skeleton.astype(np.uint8)
-    full_neighbors = ndimage.convolve(
-        full_u8, np.ones((3, 3), dtype=np.uint8),
-        mode='constant', cval=0) - full_u8
-    is_tip = skeleton & (full_neighbors == 1)
+    skeleton = skeletonize(binary)
+    struct = np.ones((3, 3), dtype=int)
 
     use_real_soma = (soma_mask is not None
                      and np.shape(soma_mask) == binary.shape
@@ -5700,62 +5562,68 @@ def detect_bulbous_endings(mask, pixel_size, swelling_ratio=1.75,
         soma_radius_px = np.sqrt(srows.size / np.pi)
         soma_region = soma_bin
         if soma_dilation_px and soma_dilation_px > 0:
-            soma_region = ndimage.binary_dilation(
-                soma_region, iterations=int(soma_dilation_px))
+            soma_region = ndimage.binary_dilation(soma_region,
+                                                  iterations=int(soma_dilation_px))
     else:
         soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
         if soma_area_um2 and soma_area_um2 > 0:
             soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
         else:
             soma_radius_px = float(radius[soma_center])
-        exclusion_px = soma_radius_px * soma_margin
         rr, cc = np.indices(binary.shape)
         soma_region = (np.hypot(rr - soma_center[0],
-                                cc - soma_center[1]) <= exclusion_px)
-    skeleton = skeleton & ~soma_region
-    is_tip = is_tip & skeleton
-    if not np.any(skeleton):
-        return out
-    min_tip_dist_px = min_tip_dist_factor * soma_radius_px
+                                cc - soma_center[1]) <= soma_radius_px * soma_margin)
 
-    struct = np.ones((3, 3), dtype=int)
-    skel_u8 = skeleton.astype(np.uint8)
-    neighbor_count = ndimage.convolve(
-        skel_u8, np.ones((3, 3), dtype=np.uint8),
-        mode='constant', cval=0) - skel_u8
-    junctions = skeleton & (neighbor_count >= 3)
-    branches = skeleton & ~junctions
-    labeled, n_labels = ndimage.label(branches, structure=struct)
+    opened = opening(binary, disk(int(open_radius_px)))
+    labeled, n_labels = ndimage.label(opened, structure=struct)
     if n_labels == 0:
         return out
 
-    min_bulb_radius_px = (min_bulb_diameter_um / pixel_size) / 2.0
-    bulb_pixels = dict()
-    n_tips = 0
-    for lab in range(1, n_labels + 1):
-        pix = np.argwhere(labeled == lab)
-        if pix.shape[0] < min_branch_px:
-            continue
-        order = order_branch_pixels([tuple(p) for p in pix])
-        for end in (order, order[::-1]):
-            if not bool(is_tip[end[0]]):
-                continue
-            n_tips += 1
-            bi = terminal_bulb([radius[p] for p in end],
-                               swelling_ratio, min_bulb_radius_px)
-            if bi is not None:
-                peak = end[bi]
-                dist = np.hypot(peak[0] - soma_center[0], peak[1] - soma_center[1])
-                if dist >= min_tip_dist_px:
-                    bulb_pixels[(int(peak[0]), int(peak[1]))] = float(radius[peak])
+    sc = (int(round(soma_center[0])), int(round(soma_center[1])))
+    soma_label = labeled[sc] if (0 <= sc[0] < labeled.shape[0]
+                                 and 0 <= sc[1] < labeled.shape[1]) else 0
+    if soma_label == 0:
+        overlap = labeled[soma_region]; overlap = overlap[overlap > 0]
+        if overlap.size:
+            soma_label = int(np.bincount(overlap).argmax())
 
-    if not bulb_pixels or n_tips == 0:
+    proc_skel = skeleton & ~opened
+    proc_labeled, _ = ndimage.label(proc_skel, structure=struct)
+    proc_sizes = np.bincount(proc_labeled.ravel())
+
+    min_bulb_radius_px = (min_bulb_diameter_um / pixel_size) / 2.0
+    min_tip_dist_px = min_tip_dist_factor * soma_radius_px
+
+    diameters = []
+    for lab in range(1, n_labels + 1):
+        if lab == soma_label:
+            continue
+        comp = (labeled == lab)
+        blob_radius = float(radius[comp].max())
+        if blob_radius < min_bulb_radius_px:
+            continue
+        ys, xs = np.nonzero(comp); cy, cx = ys.mean(), xs.mean()
+        if np.hypot(cy - soma_center[0], cx - soma_center[1]) < min_tip_dist_px:
+            continue
+        ring = ndimage.binary_dilation(comp, iterations=2)
+        touching = set(np.unique(proc_labeled[ring & proc_skel])) - {{0}}
+        n_conn = sum(1 for t in touching if proc_sizes[t] >= min_conn_len_px)
+        if n_conn > max_connections:
+            continue
+        diameters.append(2.0 * blob_radius * pixel_size)
+
+    if not diameters:
         return out
 
-    diameters = [2.0 * r * pixel_size for r in bulb_pixels.values()]
-    out['num_bulbous_endings'] = len(bulb_pixels)
+    skel_nosoma = skeleton & ~soma_region
+    su = skel_nosoma.astype(np.uint8)
+    nbr = ndimage.convolve(su, np.ones((3, 3), dtype=np.uint8),
+                           mode='constant', cval=0) - su
+    n_tips = int(np.count_nonzero(skel_nosoma & (nbr == 1)))
+
+    out['num_bulbous_endings'] = len(diameters)
     out['mean_bulb_diameter_um'] = round(float(np.mean(diameters)), 4)
-    out['beading_index'] = round(len(bulb_pixels) / n_tips, 4)
+    out['beading_index'] = round(len(diameters) / n_tips, 4) if n_tips else 0.0
     return out
 
 
