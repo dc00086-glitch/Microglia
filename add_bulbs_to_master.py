@@ -23,7 +23,8 @@ USAGE
   1) Edit the CONFIG block below (paths + how your master sheet identifies cells).
   2) Install deps:
          python3 -m pip install numpy scipy scikit-image tifffile
-         python3 -m pip install pandas openpyxl     # only needed for the merge
+         # CSV master sheets need nothing more. Only an Excel (.xlsx) master
+         # needs:  python3 -m pip install pandas openpyxl
   3) Run:
          python3 add_bulbs_to_master.py
 ------------------------------------------------------------------------------
@@ -298,91 +299,135 @@ def process_group(group):
 BULB_COLS = ['num_bulbous_endings', 'mean_bulb_diameter_um', 'beading_index']
 
 
-def merge_into_master(rows):
-    """Write a copy of the master sheet with bulb columns added (non-destructive)."""
-    try:
-        import pandas as pd
-    except ImportError:
-        print("\npandas not installed -> skipping master merge "
-              "(use the bulb_results CSV, or: pip install pandas openpyxl).")
-        return
+def _norm(v):
+    return str(v).strip()
 
-    ext = os.path.splitext(MASTER_SHEET)[1].lower()
-    master = pd.read_excel(MASTER_SHEET) if ext in (".xlsx", ".xls") \
-        else pd.read_csv(MASTER_SHEET)
 
-    def find_col(explicit, candidates):
-        if explicit:
-            return explicit
-        lower = {c.lower(): c for c in master.columns}
-        for cand in candidates:
-            if cand in lower:
-                return lower[cand]
-        return None
+def _norm_img(v):
+    """Normalize an image name: strip whitespace and a trailing .tif/.tiff (the
+    IC sheet stores the full filename with extension; masks do not)."""
+    s = str(v).strip()
+    low = s.lower()
+    if low.endswith('.tiff'):
+        return s[:-5]
+    if low.endswith('.tif'):
+        return s[:-4]
+    return s
 
-    img_col = find_col(MASTER_IMAGE_COL, ['image_name', 'image', 'imagename'])
-    soma_col = find_col(MASTER_SOMA_COL, ['soma_id', 'soma', 'somaid'])
-    # Only match on a timepoint column if explicitly configured — never auto-grab
-    # 'Day' (it holds "Sham"/blank or numeric days, not the 1d/3d folder names).
-    grp_col = find_col(MASTER_GROUP_COL, []) if MASTER_GROUP_COL else None
-    if img_col is None or soma_col is None:
-        print(f"\nCould not find image/soma columns in master "
-              f"(have: {list(master.columns)}). Set MASTER_IMAGE_COL / "
-              f"MASTER_SOMA_COL in CONFIG. Wrote bulb CSV only.")
-        return
 
-    # Build lookup keyed by (timepoint?, image_name, soma_id).
-    def norm(v):
-        return str(v).strip()
+def _pick_col(columns, explicit, candidates):
+    if explicit:
+        return explicit
+    lower = {c.lower(): c for c in columns}
+    for cand in candidates:
+        if cand in lower:
+            return lower[cand]
+    return None
 
-    def norm_img(v):
-        """Normalize an image name: strip whitespace and a trailing .tif/.tiff
-        (the IC sheet stores the full filename with extension; masks don't)."""
-        s = str(v).strip()
-        low = s.lower()
-        if low.endswith('.tiff'):
-            s = s[:-5]
-        elif low.endswith('.tif'):
-            s = s[:-4]
-        return s
 
+def _build_lut(rows, use_group):
     lut = {}
     for r in rows:
-        if grp_col is not None:
-            key = (norm(r['timepoint']), norm_img(r['image_name']), norm(r['soma_id']))
+        if use_group:
+            key = (_norm(r['timepoint']), _norm_img(r['image_name']), _norm(r['soma_id']))
         else:
-            key = (norm_img(r['image_name']), norm(r['soma_id']))
+            key = (_norm_img(r['image_name']), _norm(r['soma_id']))
         lut[key] = r
+    return lut
 
+
+def merge_into_master(rows):
+    """Write a copy of the master sheet with bulb columns added (non-destructive).
+
+    CSV masters are handled with the standard library (no pandas needed). Excel
+    masters require pandas + openpyxl.
+    """
+    ext = os.path.splitext(MASTER_SHEET)[1].lower()
+    out = MASTER_OUT or (os.path.splitext(MASTER_SHEET)[0] + "_with_bulbs" + ext)
+
+    if ext in (".xlsx", ".xls"):
+        _merge_excel(rows, out)
+    else:
+        _merge_csv(rows, out)
+
+
+def _merge_csv(rows, out):
+    with open(MASTER_SHEET, 'r', newline='') as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        master_rows = list(reader)
+
+    img_col = _pick_col(fieldnames, MASTER_IMAGE_COL, ['image_name', 'image', 'imagename'])
+    soma_col = _pick_col(fieldnames, MASTER_SOMA_COL, ['soma_id', 'soma', 'somaid'])
+    grp_col = _pick_col(fieldnames, MASTER_GROUP_COL, []) if MASTER_GROUP_COL else None
+    if img_col is None or soma_col is None:
+        print(f"\nCould not find image/soma columns in master (have: {fieldnames}). "
+              f"Set MASTER_IMAGE_COL / MASTER_SOMA_COL in CONFIG. Wrote bulb CSV only.")
+        return
+
+    lut = _build_lut(rows, grp_col is not None)
     matched = 0
-    out_cols = {c: [] for c in BULB_COLS}
-    for _, mr in master.iterrows():
+    for mr in master_rows:
         if grp_col is not None:
-            key = (norm(mr[grp_col]), norm_img(mr[img_col]), norm(mr[soma_col]))
+            key = (_norm(mr[grp_col]), _norm_img(mr[img_col]), _norm(mr[soma_col]))
         else:
-            key = (norm_img(mr[img_col]), norm(mr[soma_col]))
+            key = (_norm_img(mr[img_col]), _norm(mr[soma_col]))
         hit = lut.get(key)
         if hit:
             matched += 1
         for c in BULB_COLS:
-            out_cols[c].append(hit[c] if hit else np.nan)
+            mr[c] = hit[c] if hit else ""
+
+    out_fields = fieldnames + [c for c in BULB_COLS if c not in fieldnames]
+    with open(out, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=out_fields, extrasaction='ignore')
+        w.writeheader()
+        w.writerows(master_rows)
+    _report(matched, len(master_rows), grp_col, img_col, soma_col, out)
+
+
+def _merge_excel(rows, out):
+    try:
+        import pandas as pd
+    except ImportError:
+        print("\nExcel master needs pandas -> pip install pandas openpyxl "
+              "(or save the master as .csv, which needs no extra packages).")
+        return
+    master = pd.read_excel(MASTER_SHEET)
+    cols = list(master.columns)
+    img_col = _pick_col(cols, MASTER_IMAGE_COL, ['image_name', 'image', 'imagename'])
+    soma_col = _pick_col(cols, MASTER_SOMA_COL, ['soma_id', 'soma', 'somaid'])
+    grp_col = _pick_col(cols, MASTER_GROUP_COL, []) if MASTER_GROUP_COL else None
+    if img_col is None or soma_col is None:
+        print(f"\nCould not find image/soma columns in master (have: {cols}). "
+              f"Set MASTER_IMAGE_COL / MASTER_SOMA_COL in CONFIG. Wrote bulb CSV only.")
+        return
+    lut = _build_lut(rows, grp_col is not None)
+    matched = 0
+    out_cols = {c: [] for c in BULB_COLS}
+    for _, mr in master.iterrows():
+        if grp_col is not None:
+            key = (_norm(mr[grp_col]), _norm_img(mr[img_col]), _norm(mr[soma_col]))
+        else:
+            key = (_norm_img(mr[img_col]), _norm(mr[soma_col]))
+        hit = lut.get(key)
+        if hit:
+            matched += 1
+        for c in BULB_COLS:
+            out_cols[c].append(hit[c] if hit else "")
     for c in BULB_COLS:
         master[c] = out_cols[c]
+    master.to_excel(out, index=False)
+    _report(matched, len(master), grp_col, img_col, soma_col, out)
 
-    out = MASTER_OUT
-    if out is None:
-        stem, e = os.path.splitext(MASTER_SHEET)
-        out = f"{stem}_with_bulbs{e}"
-    if out.lower().endswith((".xlsx", ".xls")):
-        master.to_excel(out, index=False)
-    else:
-        master.to_csv(out, index=False)
-    print(f"\nMerged bulb columns into {matched}/{len(master)} master rows "
+
+def _report(matched, total, grp_col, img_col, soma_col, out):
+    print(f"\nMerged bulb columns into {matched}/{total} master rows "
           f"(matched on {'timepoint+' if grp_col else ''}{img_col}+{soma_col}).")
     print(f"Wrote: {out}   (original master untouched)")
     if matched == 0:
         print("  WARNING: 0 rows matched — check that the master's image/soma "
-              "values match the mask filenames (and the timepoint column).")
+              "values match the mask filenames.")
 
 
 def main():
