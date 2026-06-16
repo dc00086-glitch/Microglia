@@ -59,16 +59,19 @@ PIXEL_SIZE = None
 PIXEL_SIZE_FALLBACK = 0.104
 
 # ---- Master sheet merge (set MASTER_SHEET = None to skip and only get the CSV) ----
-MASTER_SHEET = None          # e.g. "/Users/dc00086/Desktop/master.xlsx" or ".csv"
+# This is pre-filled for the CORTEX run. For the INTERNAL CAPSULE sheet, point
+# BASE_DIR at that region's mask folders and set MASTER_SHEET to:
+#   ".../All Internal Capsule Morphology Data/Merged_All_Timepoints_IC_Morphology_Clean.csv"
+MASTER_SHEET = "/Volumes/Expansion/CCI Young Rat NL1 Study Data/Raw Data/TREM2 IBA1 Cortex CCI 63x/Master Sheet Cortex_FIXED.csv"
 MASTER_OUT = None            # output path; None = "<master stem>_with_bulbs.<ext>"
 
-# Which master-sheet columns identify a cell, so bulb rows can be matched to it.
-# The script matches on (image_name, soma_id) and, if available, timepoint.
-# Set the names to match YOUR sheet's headers (case-insensitive). Leave as-is to
-# auto-detect common names.
-MASTER_IMAGE_COL = None      # e.g. "image_name"  (None = auto-detect)
-MASTER_SOMA_COL = None       # e.g. "soma_id"     (None = auto-detect)
-MASTER_GROUP_COL = None      # e.g. "timepoint"   (None = match on image+soma only)
+# Which master-sheet columns identify a cell. Matching is on image_name + soma_id
+# (globally unique), with the .tif extension auto-stripped from image_name (the IC
+# sheet stores it). Timepoint is NOT used for matching (the Day column is
+# "Sham"/numeric, not the folder names). Leave None to auto-detect image/soma.
+MASTER_IMAGE_COL = None      # auto-detects "image_name"
+MASTER_SOMA_COL = None       # auto-detects "soma_id"
+MASTER_GROUP_COL = None      # leave None (match on image+soma only)
 
 # ---- Detector parameters (defaults match the validated MMPS detector) ----
 MIN_BULB_DIAMETER_UM = 1.4
@@ -319,7 +322,9 @@ def merge_into_master(rows):
 
     img_col = find_col(MASTER_IMAGE_COL, ['image_name', 'image', 'imagename'])
     soma_col = find_col(MASTER_SOMA_COL, ['soma_id', 'soma', 'somaid'])
-    grp_col = find_col(MASTER_GROUP_COL, ['timepoint', 'group', 'time', 'day'])
+    # Only match on a timepoint column if explicitly configured — never auto-grab
+    # 'Day' (it holds "Sham"/blank or numeric days, not the 1d/3d folder names).
+    grp_col = find_col(MASTER_GROUP_COL, []) if MASTER_GROUP_COL else None
     if img_col is None or soma_col is None:
         print(f"\nCould not find image/soma columns in master "
               f"(have: {list(master.columns)}). Set MASTER_IMAGE_COL / "
@@ -330,21 +335,32 @@ def merge_into_master(rows):
     def norm(v):
         return str(v).strip()
 
+    def norm_img(v):
+        """Normalize an image name: strip whitespace and a trailing .tif/.tiff
+        (the IC sheet stores the full filename with extension; masks don't)."""
+        s = str(v).strip()
+        low = s.lower()
+        if low.endswith('.tiff'):
+            s = s[:-5]
+        elif low.endswith('.tif'):
+            s = s[:-4]
+        return s
+
     lut = {}
     for r in rows:
         if grp_col is not None:
-            key = (norm(r['timepoint']), norm(r['image_name']), norm(r['soma_id']))
+            key = (norm(r['timepoint']), norm_img(r['image_name']), norm(r['soma_id']))
         else:
-            key = (norm(r['image_name']), norm(r['soma_id']))
+            key = (norm_img(r['image_name']), norm(r['soma_id']))
         lut[key] = r
 
     matched = 0
     out_cols = {c: [] for c in BULB_COLS}
     for _, mr in master.iterrows():
         if grp_col is not None:
-            key = (norm(mr[grp_col]), norm(mr[img_col]), norm(mr[soma_col]))
+            key = (norm(mr[grp_col]), norm_img(mr[img_col]), norm(mr[soma_col]))
         else:
-            key = (norm(mr[img_col]), norm(mr[soma_col]))
+            key = (norm_img(mr[img_col]), norm(mr[soma_col]))
         hit = lut.get(key)
         if hit:
             matched += 1
