@@ -1,5 +1,5 @@
 /* Offline cache so the app works on the home screen with no connection. */
-const CACHE = 'bj-trainer-v3';
+const CACHE = 'bj-trainer-v4';
 const ASSETS = [
   './',
   'index.html',

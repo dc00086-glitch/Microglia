@@ -94,6 +94,7 @@ h2 { font-size: 17px; margin: 20px 0 8px; color: var(--ink); }
 .tag-badge.p { background: rgba(102,189,115,.3); color: #9be8ad; }
 .tag-badge.z { background: rgba(160,170,165,.25); color: #d4dad7; }
 .tag-badge.n { background: rgba(219,77,69,.3); color: #ffaba6; }
+.run-sub { font-size: 12px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; }
 .count-eq { font-variant-numeric: tabular-nums; font-size: 15px; color: var(--ink); line-height: 1.8; word-spacing: 2px; max-width: 100%; }
 
 .hand { display: flex; gap: 6px; justify-content: center; margin: 6px 0; }

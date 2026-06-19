@@ -592,14 +592,17 @@ Drill the tags and running/true count in the **Count** tab.` },
   let rcPhase = 'idle', rcSeq = [], rcIdx = 0, rcLen = 20, rcDecks = 1, rcGuessR = 0, rcGuessT = 0, rcShowMath = true;
   function signStr(n) { return n > 0 ? '+' + n : n < 0 ? '−' + Math.abs(n) : '0'; }
   function tagBadge(v) { return el('span', 'tag-badge ' + (v > 0 ? 'p' : v < 0 ? 'n' : 'z'), tagStr(v)); }
-  // A row of cards, each with its Hi-Lo tag underneath.
+  // A row of cards, each with its Hi-Lo tag and the running total after it.
   function countTape(cards) {
     const wrap = el('div', 'tape');
+    let run = 0;
     cards.forEach(c => {
+      run += c.rank.hiLo;
       const it = el('div', 'tape-item');
       const cc = cardEl(c); cc.classList.add('sm');
       it.appendChild(cc);
       it.appendChild(tagBadge(c.rank.hiLo));
+      it.appendChild(el('span', 'run-sub', signStr(run)));
       wrap.appendChild(it);
     });
     return wrap;
@@ -670,6 +673,7 @@ Drill the tags and running/true count in the **Count** tab.` },
       box.appendChild(resultRow('True count', rcGuessT, rcTrue()));
       box.appendChild(el('p', 'hint', `True count = running (${rcSeen()}) ÷ decks remaining (${rcDecksRem().toFixed(2)}) = ${rcTrueRaw().toFixed(2)} → rounds to ${rcTrue()}.`));
       box.appendChild(el('h2', null, 'How the count was built'));
+      box.appendChild(el('p', 'hint', 'Each card shows its tag (green/grey/red) and the running total after it.'));
       box.appendChild(countTape(rcSeq.slice(0, rcIdx)));
       box.appendChild(countEquation(rcSeq.slice(0, rcIdx)));
       const nr = el('button', 'btn', 'New Round'); nr.onclick = () => { rcPhase = 'idle'; renderCount(); };
@@ -689,7 +693,7 @@ Drill the tags and running/true count in the **Count** tab.` },
   function resultRow(label, guess, actual) {
     const ok = guess === actual;
     const r = el('div', 'res ' + (ok ? 'ok' : 'no'));
-    r.innerHTML = `<span>${ok ? '✓' : '✗'} ${label}</span><span class="mono">you ${guess} · actual ${actual}</span>`;
+    r.innerHTML = `<span>${ok ? '✓' : '✗'} ${label}</span><span class="mono">your ${signStr(guess)} · correct ${signStr(actual)}</span>`;
     return r;
   }
 
