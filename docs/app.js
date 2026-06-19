@@ -589,7 +589,27 @@ Drill the tags and running/true count in the **Count** tab.` },
   function tagStr(v) { return v > 0 ? '+1' : v < 0 ? '−1' : '0'; }
 
   // running drill
-  let rcPhase = 'idle', rcSeq = [], rcIdx = 0, rcLen = 20, rcDecks = 1, rcGuessR = 0, rcGuessT = 0;
+  let rcPhase = 'idle', rcSeq = [], rcIdx = 0, rcLen = 20, rcDecks = 1, rcGuessR = 0, rcGuessT = 0, rcShowMath = true;
+  function signStr(n) { return n > 0 ? '+' + n : n < 0 ? '−' + Math.abs(n) : '0'; }
+  function tagBadge(v) { return el('span', 'tag-badge ' + (v > 0 ? 'p' : v < 0 ? 'n' : 'z'), tagStr(v)); }
+  // A row of cards, each with its Hi-Lo tag underneath.
+  function countTape(cards) {
+    const wrap = el('div', 'tape');
+    cards.forEach(c => {
+      const it = el('div', 'tape-item');
+      const cc = cardEl(c); cc.classList.add('sm');
+      it.appendChild(cc);
+      it.appendChild(tagBadge(c.rank.hiLo));
+      wrap.appendChild(it);
+    });
+    return wrap;
+  }
+  // The arithmetic line: "+1  +1  −1  0  …  =  +N"
+  function countEquation(cards) {
+    const parts = cards.map(c => tagStr(c.rank.hiLo));
+    const sum = cards.reduce((a, c) => a + c.rank.hiLo, 0);
+    return el('div', 'count-eq', parts.join('  ') + '  =  ' + signStr(sum));
+  }
   function rcSeen() { return rcSeq.slice(0, rcIdx).reduce((a, c) => a + c.rank.hiLo, 0); }
   function rcDecksRem() { return Math.max(0.25, (rcDecks * 52 - rcIdx) / 52); }
   function rcTrueRaw() { return rcSeen() / rcDecksRem(); }
@@ -612,13 +632,28 @@ Drill the tags and running/true count in the **Count** tab.` },
       plus.onclick = () => { rcLen = Math.min(rcDecks * 52, rcLen + 5); lbl.textContent = 'Cards: ' + rcLen; };
       stepRow.append(minus, lbl, plus);
       box.appendChild(stepRow);
+      const mathToggle = el('label', 'toggle');
+      mathToggle.appendChild(el('span', null, 'Show the +1/−1 math as I flip (learn mode)'));
+      const sw = el('span', 'switch' + (rcShowMath ? ' on' : ''));
+      sw.appendChild(el('span', 'knob')); mathToggle.appendChild(sw);
+      mathToggle.onclick = () => { rcShowMath = !rcShowMath; renderCount(); };
+      box.appendChild(mathToggle);
       const start = el('button', 'btn', 'Start Round');
       start.onclick = () => { rcSeq = buildShoe(rcDecks).slice(0, Math.min(rcLen, rcDecks * 52)); rcIdx = 0; rcGuessR = 0; rcGuessT = 0; rcPhase = 'dealing'; renderCount(); };
       box.appendChild(start);
     } else if (rcPhase === 'dealing') {
       box.appendChild(el('p', 'hint', `Card ${rcIdx} of ${rcSeq.length}`));
-      if (rcIdx > 0) { const b = cardEl(rcSeq[rcIdx - 1]); b.classList.add('big'); box.appendChild(b); }
-      else box.appendChild(el('div', 'placeholder', 'Tap Next'));
+      if (rcIdx > 0) {
+        const cur = rcSeq[rcIdx - 1];
+        const b = cardEl(cur); b.classList.add('big'); box.appendChild(b);
+        if (rcShowMath) {
+          box.appendChild(el('div', 'cur-tag', `${cur.rank.label} → ${tagStr(cur.rank.hiLo)}`));
+          box.appendChild(el('div', 'count-total', 'Running count: ' + signStr(rcSeen())));
+          box.appendChild(countTape(rcSeq.slice(0, rcIdx)));
+        }
+      } else {
+        box.appendChild(el('div', 'placeholder', 'Tap Next'));
+      }
       const nb = el('button', 'btn', rcIdx < rcSeq.length ? 'Next Card' : 'Done — Enter Count');
       nb.onclick = () => { if (rcIdx < rcSeq.length) rcIdx++; else rcPhase = 'answering'; renderCount(); };
       box.appendChild(nb);
@@ -634,6 +669,9 @@ Drill the tags and running/true count in the **Count** tab.` },
       box.appendChild(resultRow('Running count', rcGuessR, rcSeen()));
       box.appendChild(resultRow('True count', rcGuessT, rcTrue()));
       box.appendChild(el('p', 'hint', `True count = running (${rcSeen()}) ÷ decks remaining (${rcDecksRem().toFixed(2)}) = ${rcTrueRaw().toFixed(2)} → rounds to ${rcTrue()}.`));
+      box.appendChild(el('h2', null, 'How the count was built'));
+      box.appendChild(countTape(rcSeq.slice(0, rcIdx)));
+      box.appendChild(countEquation(rcSeq.slice(0, rcIdx)));
       const nr = el('button', 'btn', 'New Round'); nr.onclick = () => { rcPhase = 'idle'; renderCount(); };
       box.appendChild(nr);
     }
