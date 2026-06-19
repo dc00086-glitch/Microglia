@@ -435,18 +435,39 @@ Drill the tags and running/true count in the **Count** tab.` },
   }
 
   // ---- Trainer ----
-  let tShoe = [], tPlayer = [], tDealer = null, tAnswered = false;
+  let tPlayer = [], tDealer = null, tAnswered = false;
+
+  // Weighted scenario generator so every decision type (pairs/splits, soft
+  // hands, surrenders) shows up often — pure random deals mostly boring hard
+  // totals and pairs only ~13% of the time.
+  const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+  const ranksWhere = fn => RANKS.filter(fn);
+  const ACE = RANKS.find(r => r.key === 'A');
+  function dealScenario() {
+    const dealer = card(pick(RANKS), pick(SUITS));
+    const r = Math.random();
+    let player;
+    if (r < 0.32) {                       // a pair → split is on the table
+      const rk = pick(RANKS);
+      player = [card(rk, SUITS[0]), card(rk, SUITS[1])];
+    } else if (r < 0.57) {                // soft hand (A + 2..9)
+      const other = pick(ranksWhere(x => x.pip >= 2 && x.pip <= 9));
+      player = [card(ACE, SUITS[0]), card(other, SUITS[1])];
+    } else {                              // hard, non-pair
+      let a, b;
+      do { a = pick(ranksWhere(x => x.key !== 'A')); b = pick(ranksWhere(x => x.key !== 'A')); }
+      while (a.pip === b.pip);
+      player = [card(a, SUITS[0]), card(b, SUITS[1])];
+    }
+    return { player, dealer };
+  }
   function trainerDeal() {
-    if (tShoe.length < 15) tShoe = buildShoe(rules.decks);
-    do {
-      tPlayer = [tShoe.pop(), tShoe.pop()];
-      tDealer = tShoe.pop();
-    } while (handIsBlackjack(tPlayer));
+    const s = dealScenario();
+    tPlayer = s.player; tDealer = s.dealer;
     tAnswered = false;
     renderTrainer();
   }
   function renderTrainer() {
-    if (!tDealer) { tShoe = buildShoe(rules.decks); }
     if (!tPlayer.length) { trainerDeal(); return; }
     const root = el('div', 'screen');
     root.appendChild(el('h1', null, 'Trainer'));
@@ -568,23 +589,31 @@ Drill the tags and running/true count in the **Count** tab.` },
   function tagStr(v) { return v > 0 ? '+1' : v < 0 ? '−1' : '0'; }
 
   // running drill
-  let rcPhase = 'idle', rcSeq = [], rcIdx = 0, rcLen = 15, rcGuessR = 0, rcGuessT = 0;
+  let rcPhase = 'idle', rcSeq = [], rcIdx = 0, rcLen = 20, rcDecks = 1, rcGuessR = 0, rcGuessT = 0;
   function rcSeen() { return rcSeq.slice(0, rcIdx).reduce((a, c) => a + c.rank.hiLo, 0); }
-  function rcDecksRem() { return Math.max(0.5, (rules.decks * 52 - rcIdx) / 52); }
-  function rcTrue() { return Math.round(rcSeen() / rcDecksRem()); }
+  function rcDecksRem() { return Math.max(0.25, (rcDecks * 52 - rcIdx) / 52); }
+  function rcTrueRaw() { return rcSeen() / rcDecksRem(); }
+  function rcTrue() { return Math.round(rcTrueRaw()); }
   function runningDrill() {
     const box = el('div', 'center');
     if (rcPhase === 'idle') {
-      box.appendChild(el('p', 'hint', 'Flip through cards one at a time, keep a running count in your head, then enter the running count and true count.'));
+      box.appendChild(el('p', 'hint', 'Flip through cards one at a time, keep a running count in your head, then enter the running count and true count. Start with 1 deck (running count ≈ true count), then add decks to practice the true-count division.'));
+      const deckRow = el('div', 'stepper');
+      const dm = el('button', 'btn small', '−'); const dp = el('button', 'btn small', '+');
+      const dlbl = el('span', 'step-lbl', 'Decks in shoe: ' + rcDecks);
+      dm.onclick = () => { rcDecks = Math.max(1, rcDecks - 1); rcLen = Math.min(rcLen, rcDecks * 52); dlbl.textContent = 'Decks in shoe: ' + rcDecks; };
+      dp.onclick = () => { rcDecks = Math.min(8, rcDecks + 1); dlbl.textContent = 'Decks in shoe: ' + rcDecks; };
+      deckRow.append(dm, dlbl, dp);
+      box.appendChild(deckRow);
       const stepRow = el('div', 'stepper');
       const minus = el('button', 'btn small', '−'); const plus = el('button', 'btn small', '+');
       const lbl = el('span', 'step-lbl', 'Cards: ' + rcLen);
       minus.onclick = () => { rcLen = Math.max(5, rcLen - 5); lbl.textContent = 'Cards: ' + rcLen; };
-      plus.onclick = () => { rcLen = Math.min(52, rcLen + 5); lbl.textContent = 'Cards: ' + rcLen; };
+      plus.onclick = () => { rcLen = Math.min(rcDecks * 52, rcLen + 5); lbl.textContent = 'Cards: ' + rcLen; };
       stepRow.append(minus, lbl, plus);
       box.appendChild(stepRow);
       const start = el('button', 'btn', 'Start Round');
-      start.onclick = () => { rcSeq = buildShoe(rules.decks).slice(0, rcLen); rcIdx = 0; rcGuessR = 0; rcGuessT = 0; rcPhase = 'dealing'; renderCount(); };
+      start.onclick = () => { rcSeq = buildShoe(rcDecks).slice(0, Math.min(rcLen, rcDecks * 52)); rcIdx = 0; rcGuessR = 0; rcGuessT = 0; rcPhase = 'dealing'; renderCount(); };
       box.appendChild(start);
     } else if (rcPhase === 'dealing') {
       box.appendChild(el('p', 'hint', `Card ${rcIdx} of ${rcSeq.length}`));
@@ -604,7 +633,7 @@ Drill the tags and running/true count in the **Count** tab.` },
     } else { // revealed
       box.appendChild(resultRow('Running count', rcGuessR, rcSeen()));
       box.appendChild(resultRow('True count', rcGuessT, rcTrue()));
-      box.appendChild(el('p', 'hint', `True count = running (${rcSeen()}) ÷ decks remaining (${rcDecksRem().toFixed(1)}).`));
+      box.appendChild(el('p', 'hint', `True count = running (${rcSeen()}) ÷ decks remaining (${rcDecksRem().toFixed(2)}) = ${rcTrueRaw().toFixed(2)} → rounds to ${rcTrue()}.`));
       const nr = el('button', 'btn', 'New Round'); nr.onclick = () => { rcPhase = 'idle'; renderCount(); };
       box.appendChild(nr);
     }
@@ -690,6 +719,12 @@ Drill the tags and running/true count in the **Count** tab.` },
   function selectTab(id) {
     document.querySelectorAll('#tabbar .tab').forEach(b => b.classList.toggle('on', b.dataset.id === id));
     TABS.find(t => t.id === id).render();
+  }
+
+  // ---------- test hook (no effect in the browser) ----------
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { RANKS, buildShoe, handTotal, handIsPair, handDescribe,
+      recommendation, hardMove, softMove, pairMove, dealScenario };
   }
 
   // ---------- boot ----------
