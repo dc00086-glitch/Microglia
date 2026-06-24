@@ -88,15 +88,20 @@ echo "======================================"
 
 if [ -d "dist/MMPS62426.app" ]; then
     APP_SIZE=$(du -sh "dist/MMPS62426.app" | cut -f1)
+
+    # Zip the .app for upload as a GitHub release asset
+    ZIP_NAME="MMPS62426-mac.zip"
+    rm -f "dist/$ZIP_NAME"
+    ( cd dist && zip -r -q -y "$ZIP_NAME" MMPS62426.app )
+    ZIP_SIZE=$(du -sh "dist/$ZIP_NAME" | cut -f1)
+
     echo "  BUILD SUCCESSFUL"
     echo ""
-    echo "  App:  dist/MMPS62426.app  ($APP_SIZE)"
+    echo "  App:  dist/MMPS62426.app   ($APP_SIZE)"
+    echo "  Zip:  dist/$ZIP_NAME  ($ZIP_SIZE)  <- upload this to the GitHub release"
     echo ""
     echo "  To run:  open dist/MMPS62426.app"
     echo "  To install: drag dist/MMPS62426.app to /Applications"
-    echo ""
-    echo "  To share it as a release download, zip it first:"
-    echo "    cd dist && zip -r -y MMPS62426-mac.zip MMPS62426.app"
     echo ""
     echo "  NOTE: On first launch macOS may block it."
     echo "  Fix: System Settings > Privacy & Security > Open Anyway"
