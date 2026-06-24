@@ -1,0 +1,110 @@
+#!/bin/bash
+# ============================================================================
+# Build MMPS62426 as a macOS .app bundle using PyInstaller
+#
+# Prerequisites:
+#   pip install pyinstaller PyQt5 numpy scipy scikit-image opencv-python-headless \
+#               tifffile Pillow matplotlib
+#
+# Usage:
+#   cd /path/to/Microglia
+#   bash build_MMPS62426.sh
+#
+# Output:
+#   dist/MMPS62426.app    — double-click to run
+# ============================================================================
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+echo "======================================"
+echo "  Building MMPS62426.app"
+echo "======================================"
+
+# Check for required files
+if [ ! -f "MMPS62426.py" ]; then
+    echo "ERROR: MMPS62426.py not found in current directory"
+    echo "  Run this script from the directory containing it"
+    exit 1
+fi
+
+# Look for icon
+ICON=""
+for candidate in \
+    "$HOME/Desktop/MMPS.icns" \
+    "$HOME/MMPS.icns" \
+    "$HOME/Downloads/MMPS.icns" \
+    "./MMPS.icns"; do
+    if [ -f "$candidate" ]; then
+        ICON="$candidate"
+        echo "Found icon: $ICON"
+        break
+    fi
+done
+
+if [ -z "$ICON" ]; then
+    echo "WARNING: MMPS.icns not found. Building without custom icon."
+    echo "  Place MMPS.icns in this directory or on your Desktop to include it."
+fi
+
+# Check PyInstaller is installed
+if ! command -v pyinstaller &> /dev/null; then
+    echo "PyInstaller not found. Installing..."
+    pip install pyinstaller
+fi
+
+# Check key dependencies are installed
+echo "Checking dependencies..."
+python3 -c "
+import PyQt5, numpy, scipy, skimage, cv2, tifffile, PIL, matplotlib
+print('All dependencies found')
+" || {
+    echo ""
+    echo "Missing dependencies. Install with:"
+    echo "  pip install PyQt5 numpy scipy scikit-image opencv-python-headless tifffile Pillow matplotlib"
+    exit 1
+}
+
+# Copy icon to build directory if found elsewhere
+if [ -n "$ICON" ] && [ ! -f "MMPS.icns" ]; then
+    cp "$ICON" ./MMPS.icns
+    echo "Copied icon to build directory"
+fi
+
+# Clean previous builds
+rm -rf build/MMPS62426 dist/MMPS62426 dist/MMPS62426.app
+
+echo ""
+echo "Running PyInstaller..."
+echo ""
+
+# Build using the spec file
+pyinstaller MMPS62426.spec --noconfirm
+
+echo ""
+echo "======================================"
+
+if [ -d "dist/MMPS62426.app" ]; then
+    APP_SIZE=$(du -sh "dist/MMPS62426.app" | cut -f1)
+    echo "  BUILD SUCCESSFUL"
+    echo ""
+    echo "  App:  dist/MMPS62426.app  ($APP_SIZE)"
+    echo ""
+    echo "  To run:  open dist/MMPS62426.app"
+    echo "  To install: drag dist/MMPS62426.app to /Applications"
+    echo ""
+    echo "  To share it as a release download, zip it first:"
+    echo "    cd dist && zip -r -y MMPS62426-mac.zip MMPS62426.app"
+    echo ""
+    echo "  NOTE: On first launch macOS may block it."
+    echo "  Fix: System Settings > Privacy & Security > Open Anyway"
+    echo "  Or:  Right-click the app > Open"
+    echo "======================================"
+else
+    echo "  BUILD FAILED"
+    echo "  Check the output above for errors"
+    echo "======================================"
+    exit 1
+fi
