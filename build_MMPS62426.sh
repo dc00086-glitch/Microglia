@@ -49,10 +49,10 @@ if [ -z "$ICON" ]; then
     echo "  Place MMPS.icns in this directory or on your Desktop to include it."
 fi
 
-# Check PyInstaller is installed
-if ! command -v pyinstaller &> /dev/null; then
+# Check PyInstaller is installed (invoked as a module so PATH doesn't matter)
+if ! python3 -c "import PyInstaller" &> /dev/null; then
     echo "PyInstaller not found. Installing..."
-    pip install pyinstaller
+    python3 -m pip install pyinstaller
 fi
 
 # Check key dependencies are installed
@@ -63,7 +63,7 @@ print('All dependencies found')
 " || {
     echo ""
     echo "Missing dependencies. Install with:"
-    echo "  pip install PyQt5 numpy scipy scikit-image opencv-python-headless tifffile Pillow matplotlib"
+    echo "  python3 -m pip install PyQt5 numpy scipy scikit-image opencv-python-headless tifffile Pillow matplotlib"
     exit 1
 }
 
@@ -80,8 +80,8 @@ echo ""
 echo "Running PyInstaller..."
 echo ""
 
-# Build using the spec file
-pyinstaller MMPS62426.spec --noconfirm
+# Build using the spec file (invoked as a module so PATH doesn't matter)
+python3 -m PyInstaller MMPS62426.spec --noconfirm
 
 echo ""
 echo "======================================"
