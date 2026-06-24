@@ -14,16 +14,25 @@ block_cipher = None
 
 # Paths — adjust if your files are elsewhere
 SCRIPT = 'MMPS62426.py'
-ICON = os.path.expanduser('~/Desktop/MMPS.icns')
+
+# Resolve the app icon from the first location that exists. Drop MMPS.icns in
+# the project folder (or on your Desktop / in Downloads) to give the app its icon.
+ICON = None
+for _cand in (
+    'MMPS.icns',
+    os.path.expanduser('~/Desktop/MMPS.icns'),
+    os.path.expanduser('~/Downloads/MMPS.icns'),
+):
+    if os.path.isfile(_cand):
+        ICON = _cand
+        break
 
 # Collect extra data files to bundle alongside the executable
 datas = []
 
 # Bundle the icon file so it can be found at runtime
-if os.path.isfile(ICON):
+if ICON:
     datas.append((ICON, '.'))
-elif os.path.isfile('MMPS.icns'):
-    datas.append(('MMPS.icns', '.'))
 
 a = Analysis(
     [SCRIPT],
@@ -97,7 +106,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=ICON if os.path.isfile(ICON) else None,
+    icon=ICON,
 )
 
 coll = COLLECT(
@@ -115,7 +124,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='MMPS62426.app',
-    icon=ICON if os.path.isfile(ICON) else None,
+    icon=ICON,
     bundle_identifier='com.mmps.microgliaanalysis',
     info_plist={
         'CFBundleName': 'MMPS',
