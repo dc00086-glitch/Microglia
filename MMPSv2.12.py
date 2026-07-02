@@ -8447,9 +8447,10 @@ if __name__ == '__main__':
 
                 # One row per soma, using that soma's largest approved mask.
                 dist_um = ndimage.distance_transform_edt(~(vessel_mask > 0)) * ps
+                img_base = os.path.splitext(img_name)[0]
                 by_soma = {}
                 for m in masks:
-                    if m.get('approved') is False or m.get('mask') is None:
+                    if m.get('approved') is False:
                         continue
                     sid = m.get('soma_id')
                     if sid is None:
@@ -8457,11 +8458,27 @@ if __name__ == '__main__':
                     if (sid not in by_soma or m.get('target_area_um2', 0)
                             > by_soma[sid].get('target_area_um2', 0)):
                         by_soma[sid] = m
+
+                soma_masks = {}  # sid -> mask array (loaded from disk if freed)
                 for sid, m in by_soma.items():
+                    mk = m.get('mask')
+                    if mk is None and self.masks_dir:
+                        area = int(m.get('target_area_um2',
+                                         m.get('area_um2', 0)) or 0)
+                        mpath = os.path.join(
+                            self.masks_dir,
+                            f"{img_base}_{sid}_area{area}_mask.tif")
+                        if os.path.exists(mpath):
+                            try:
+                                mk = (safe_tiff_read(mpath) > 0).astype(np.uint8)
+                            except Exception:
+                                mk = None
+                    if mk is None:
+                        continue
+                    soma_masks[sid] = mk
                     exp = _microglia_leakage_exposure(
-                        m['mask'], vessel_mask, tracers, ps, dist_um=dist_um)
-                    crow = {'image_name': os.path.splitext(img_name)[0],
-                            'soma_id': sid}
+                        mk, vessel_mask, tracers, ps, dist_um=dist_um)
+                    crow = {'image_name': img_base, 'soma_id': sid}
                     crow.update(exp)
                     cell_rows.append(crow)
 
@@ -8471,10 +8488,9 @@ if __name__ == '__main__':
                         ov_dir = os.path.join(out_dir, 'bbb_overlays')
                         os.makedirs(ov_dir, exist_ok=True)
                         _save_bbb_overlay(
-                            os.path.join(ov_dir,
-                                         os.path.splitext(img_name)[0] + '_bbb.png'),
+                            os.path.join(ov_dir, img_base + '_bbb.png'),
                             vessel_mask, tracers,
-                            cell_masks=[m['mask'] for m in by_soma.values()])
+                            cell_masks=list(soma_masks.values()))
                     except Exception as e:
                         self.log(f"BBB: overlay failed for {img_name}: {e}")
                 n_imgs += 1
