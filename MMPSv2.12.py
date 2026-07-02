@@ -796,6 +796,30 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     return m
 
 
+_DEFAULT_SOMA_RADIUS_UM = 6.0
+
+
+def _soma_footprint_mask(shape, centroid, pixel_size_um,
+                         radius_um=_DEFAULT_SOMA_RADIUS_UM):
+    """Small disk around a soma centroid, used as a leakage-sampling footprint
+    when a microglia has no generated mask or traced outline. ``centroid`` is
+    (row, col); in 3D it may be (z, row, col) — the trailing two are used.
+    Returns a uint8 mask the same H×W as ``shape``."""
+    h, w = shape[:2]
+    coords = list(centroid)
+    if len(coords) < 2:
+        return np.zeros((h, w), dtype=np.uint8)
+    cy = int(round(coords[-2]))
+    cx = int(round(coords[-1]))
+    if not (0 <= cy < h and 0 <= cx < w):
+        cy = min(max(cy, 0), h - 1)
+        cx = min(max(cx, 0), w - 1)
+    r = max(1, int(round(radius_um / max(pixel_size_um, 1e-6))))
+    yy, xx = np.ogrid[:h, :w]
+    m = (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
+    return m.astype(np.uint8)
+
+
 def _load_bbb_image(path):
     """Load a multi-channel image as (H, W, C) for BBB analysis. Delegates to the
     shared channel-preserving loader and guarantees a trailing channel axis."""
@@ -8390,8 +8414,10 @@ if __name__ == '__main__':
                             if channels.get(n, -1) >= 0]
         vessel_rows, cell_rows, n_imgs = [], [], 0
 
-        # Only images that have masks are processed — drive a progress bar over them.
-        targets = [(nm, dat) for nm, dat in self.images.items() if dat.get('masks')]
+        # Process every image that has microglia defined — by generated mask OR
+        # by picked soma (so every microglia gets a leakage row, mask or not).
+        targets = [(nm, dat) for nm, dat in self.images.items()
+                   if dat.get('masks') or dat.get('somas')]
         from PyQt5.QtWidgets import QProgressDialog
         progress = QProgressDialog("Running BBB analysis…", "Cancel", 0,
                                    max(len(targets), 1), self)
@@ -8408,8 +8434,6 @@ if __name__ == '__main__':
             progress.setValue(_k)
             QApplication.processEvents()
             masks = idata.get('masks') or []
-            if not masks:
-                continue
             # Load all channels from the raw file via tifffile (preserves the
             # far-red / 4th+ channels PIL would collapse); fall back to cache.
             color = None
@@ -8445,9 +8469,11 @@ if __name__ == '__main__':
                         row['%s_%s' % (tname, k)] = v
                 vessel_rows.append(row)
 
-                # One row per soma, using that soma's largest approved mask.
+                # One row per microglia — EVERY picked soma, mask or not.
                 dist_um = ndimage.distance_transform_edt(~(vessel_mask > 0)) * ps
                 img_base = os.path.splitext(img_name)[0]
+
+                # Largest approved mask per soma_id (best footprint when present).
                 by_soma = {}
                 for m in masks:
                     if m.get('approved') is False:
@@ -8459,26 +8485,75 @@ if __name__ == '__main__':
                             > by_soma[sid].get('target_area_um2', 0)):
                         by_soma[sid] = m
 
-                soma_masks = {}  # sid -> mask array (loaded from disk if freed)
-                for sid, m in by_soma.items():
-                    mk = m.get('mask')
-                    if mk is None and self.masks_dir:
-                        area = int(m.get('target_area_um2',
-                                         m.get('area_um2', 0)) or 0)
-                        mpath = os.path.join(
-                            self.masks_dir,
-                            f"{img_base}_{sid}_area{area}_mask.tif")
-                        if os.path.exists(mpath):
-                            try:
-                                mk = (safe_tiff_read(mpath) > 0).astype(np.uint8)
-                            except Exception:
-                                mk = None
+                # Traced soma outlines, keyed by soma_id (second-best footprint).
+                outline_by_sid = {}
+                for o in (idata.get('soma_outlines') or []):
+                    osid = o.get('soma_id')
+                    if osid and len(o.get('polygon_points') or []) >= 3:
+                        outline_by_sid[osid] = o
+
+                # Full soma roster: pair every centroid with its soma_id.
+                somas = idata.get('somas') or []
+                soma_ids = idata.get('soma_ids') or []
+                roster = []  # (sid, centroid)
+                for i, sid in enumerate(soma_ids):
+                    cen = somas[i] if i < len(somas) else None
+                    roster.append((sid, cen))
+                # Include any mask/outline soma_ids not in the roster (defensive).
+                known = {sid for sid, _ in roster}
+                for sid in list(by_soma) + list(outline_by_sid):
+                    if sid not in known:
+                        roster.append((sid, None))
+                        known.add(sid)
+
+                shape = vessel_mask.shape
+                soma_masks = {}  # sid -> footprint mask actually used
+                for sid, cen in roster:
+                    if sid is None:
+                        continue
+                    mk = None
+                    source = None
+                    # 1) generated mask (memory, then disk if freed)
+                    m = by_soma.get(sid)
+                    if m is not None:
+                        mk = m.get('mask')
+                        if mk is None and self.masks_dir:
+                            area = int(m.get('target_area_um2',
+                                             m.get('area_um2', 0)) or 0)
+                            mpath = os.path.join(
+                                self.masks_dir,
+                                f"{img_base}_{sid}_area{area}_mask.tif")
+                            if os.path.exists(mpath):
+                                try:
+                                    mk = (safe_tiff_read(mpath) > 0).astype(np.uint8)
+                                except Exception:
+                                    mk = None
+                        if mk is not None:
+                            source = 'mask'
+                    # 2) traced soma outline polygon
+                    if mk is None and sid in outline_by_sid:
+                        try:
+                            pmk = polygon_to_mask(
+                                outline_by_sid[sid]['polygon_points'], shape)
+                            if np.any(pmk):
+                                mk = pmk
+                                source = 'outline'
+                        except Exception:
+                            mk = None
+                    # 3) fallback: small disk around the soma centroid
+                    if mk is None and cen is not None:
+                        mk = _soma_footprint_mask(shape, cen, ps)
+                        if np.any(mk):
+                            source = 'soma_disk'
+                        else:
+                            mk = None
                     if mk is None:
                         continue
                     soma_masks[sid] = mk
                     exp = _microglia_leakage_exposure(
                         mk, vessel_mask, tracers, ps, dist_um=dist_um)
-                    crow = {'image_name': img_base, 'soma_id': sid}
+                    crow = {'image_name': img_base, 'soma_id': sid,
+                            'bbb_footprint': source}
                     crow.update(exp)
                     cell_rows.append(crow)
 
