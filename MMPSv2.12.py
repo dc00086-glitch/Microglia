@@ -8382,7 +8382,23 @@ if __name__ == '__main__':
                             if channels.get(n, -1) >= 0]
         vessel_rows, cell_rows, n_imgs = [], [], 0
 
-        for img_name, idata in self.images.items():
+        # Only images that have masks are processed — drive a progress bar over them.
+        targets = [(nm, dat) for nm, dat in self.images.items() if dat.get('masks')]
+        from PyQt5.QtWidgets import QProgressDialog
+        progress = QProgressDialog("Running BBB analysis…", "Cancel", 0,
+                                   max(len(targets), 1), self)
+        progress.setWindowTitle("BBB Analysis")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        for _k, (img_name, idata) in enumerate(targets):
+            if progress.wasCanceled():
+                break
+            progress.setLabelText(f"BBB: {img_name}  ({_k + 1}/{len(targets)})")
+            progress.setValue(_k)
+            QApplication.processEvents()
             masks = idata.get('masks') or []
             if not masks:
                 continue
@@ -8457,6 +8473,10 @@ if __name__ == '__main__':
             except Exception as e:
                 self.log(f"BBB: error on {img_name}: {e}")
 
+        progress.setLabelText("Writing results…")
+        progress.setValue(len(targets))
+        QApplication.processEvents()
+
         def _write(path, rows):
             keys = []
             for r in rows:
@@ -8494,6 +8514,7 @@ if __name__ == '__main__':
             merged_msg = ("no combined_morphology_results.csv yet; wrote "
                           "bbb_microglia_exposure.csv (run morphology first to "
                           "merge into the master)")
+        progress.close()
         self.log(f"BBB analysis complete: {n_imgs} images, {len(cell_rows)} microglia.")
         self.log(f"  {merged_msg}")
         self.log(f"  Vessel/leakage: bbb_vessel_leakage.csv; overlays: bbb_overlays/")
