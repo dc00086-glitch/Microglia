@@ -634,7 +634,13 @@ def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2)
     if img.max() <= 0 or not np.any(img > 0):
         return empty
 
-    thr = float(threshold_otsu(img[img > 0]))
+    pos = img[img > 0]
+    # Otsu needs a spread of values; if the foreground is (near-)constant, keep
+    # all of it instead of returning an empty mask.
+    if pos.size and pos.min() < pos.max():
+        thr = float(threshold_otsu(pos))
+    else:
+        thr = float(pos.min()) - 1.0 if pos.size else 0.0
     vessels = img > thr
     if close_radius_px > 0:
         vessels = ndimage.binary_closing(
@@ -2866,47 +2872,88 @@ class GrayscaleChannelDialog(QDialog):
 
 
 class BBBAnalysisDialog(QDialog):
-    """Assign channels (CD31 / dextran / albumin / IBA1) and run BBB analysis:
-    vessel segmentation, tracer extravasation/leakage, and per-microglia
-    tracer exposure. Non-destructive — reads the loaded images/masks and writes
-    new CSVs.
+    """Assign channels and run BBB analysis: CD31 vessel segmentation, tracer
+    extravasation/leakage, and per-microglia tracer exposure. The number of
+    tracers is user-settable (1..#channels) and each tracer is named by the user
+    (the name is used as the column prefix and overlay title). Non-destructive.
     """
     def __init__(self, parent, color_image=None, defaults=None):
         super().__init__(parent)
         self.setWindowTitle("Blood-Brain-Barrier Analysis")
         self.setModal(True)
-        from PyQt5.QtWidgets import QComboBox
+        from PyQt5.QtWidgets import QComboBox, QSpinBox, QLineEdit
         n = 4
         if color_image is not None and getattr(color_image, 'ndim', 0) == 3:
             n = color_image.shape[2]
         self.num_channels = max(n, 1)
         defaults = defaults or {}
 
+        def channel_combo(default, allow_none):
+            combo = QComboBox()
+            if allow_none:
+                combo.addItem("(none)", -1)
+            for i in range(self.num_channels):
+                combo.addItem(f"Channel {i + 1}", i)
+            valid = default if (default is not None and 0 <= default < self.num_channels) \
+                else (-1 if allow_none else 0)
+            idx = combo.findData(valid)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            return combo
+
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
             "<b>Assign channels</b> (leak tracers must be intravascular):"))
-        self.combos = {}
-        rows = [('cd31', 'CD31 (vessels):', 0),
-                ('dextran', 'Red dextran (tracer):', 1),
-                ('albumin', 'Far-red albumin (tracer):', 2),
-                ('iba1', 'IBA1 (microglia, optional):', 3)]
-        for key, label, dflt in rows:
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label))
-            combo = QComboBox()
-            combo.addItem("(none)", -1)
-            for i in range(self.num_channels):
-                combo.addItem(f"Channel {i + 1}", i)
-            want = defaults.get(key, dflt)
-            idx = combo.findData(want if want is not None and want < self.num_channels else -1)
-            combo.setCurrentIndex(idx if idx >= 0 else 0)
-            row.addWidget(combo)
-            layout.addLayout(row)
-            self.combos[key] = combo
 
-        note = QLabel("Runs on all loaded images that have masks. Writes\n"
-                      "bbb_vessel_leakage.csv and bbb_microglia_exposure.csv\n"
-                      "to the output folder.")
+        cd31_row = QHBoxLayout()
+        cd31_row.addWidget(QLabel("CD31 (vessels):"))
+        self.cd31_combo = channel_combo(defaults.get('cd31', 0), allow_none=False)
+        cd31_row.addWidget(self.cd31_combo)
+        layout.addLayout(cd31_row)
+
+        iba1_row = QHBoxLayout()
+        iba1_row.addWidget(QLabel("IBA1 (microglia, optional):"))
+        self.iba1_combo = channel_combo(defaults.get('iba1', -1), allow_none=True)
+        iba1_row.addWidget(self.iba1_combo)
+        layout.addLayout(iba1_row)
+
+        nt_row = QHBoxLayout()
+        nt_row.addWidget(QLabel("Number of tracers:"))
+        self.ntracer_spin = QSpinBox()
+        self.ntracer_spin.setRange(1, max(1, self.num_channels))
+        nt_row.addWidget(self.ntracer_spin)
+        layout.addLayout(nt_row)
+
+        default_tracers = defaults.get('tracers') or [
+            {'name': 'red_dextran', 'channel': 1 if self.num_channels > 1 else 0},
+            {'name': 'far_red_albumin', 'channel': 2 if self.num_channels > 2 else 0}]
+        self.tracer_rows = []
+        for i in range(max(1, self.num_channels)):
+            w = QWidget()
+            rl = QHBoxLayout(w)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.addWidget(QLabel(f"Tracer {i + 1} name:"))
+            name_edit = QLineEdit()
+            dt = default_tracers[i] if i < len(default_tracers) else {}
+            name_edit.setText(dt.get('name', f"tracer{i + 1}"))
+            name_edit.setPlaceholderText("e.g. red_dextran")
+            rl.addWidget(name_edit)
+            rl.addWidget(QLabel("channel:"))
+            combo = channel_combo(dt.get('channel', min(i + 1, self.num_channels - 1)),
+                                  allow_none=False)
+            rl.addWidget(combo)
+            layout.addWidget(w)
+            self.tracer_rows.append((w, name_edit, combo))
+
+        def _update_visible(nt):
+            for j, (row_w, _, _) in enumerate(self.tracer_rows):
+                row_w.setVisible(j < nt)
+        self.ntracer_spin.valueChanged.connect(_update_visible)
+        self.ntracer_spin.setValue(min(len(default_tracers), max(1, self.num_channels)) or 1)
+        _update_visible(self.ntracer_spin.value())
+
+        note = QLabel("Runs on all loaded images with masks. Saves leak overlays\n"
+                      "(bbb_overlays/) and folds per-cell exposure into the\n"
+                      "morphology master CSV.")
         note.setStyleSheet("color: gray;")
         layout.addWidget(note)
 
@@ -2921,7 +2968,18 @@ class BBBAnalysisDialog(QDialog):
         layout.addLayout(btns)
 
     def get_channels(self):
-        return {k: c.currentData() for k, c in self.combos.items()}
+        import re
+        tracers = []
+        for i in range(self.ntracer_spin.value()):
+            _, name_edit, combo = self.tracer_rows[i]
+            ch = combo.currentData()
+            if ch is None or ch < 0:
+                continue
+            name = re.sub(r'[^0-9A-Za-z]+', '_', name_edit.text().strip()).strip('_')
+            tracers.append({'name': name or f"tracer{i + 1}", 'channel': ch})
+        return {'cd31': self.cd31_combo.currentData(),
+                'iba1': self.iba1_combo.currentData(),
+                'tracers': tracers}
 
 
 class MicrogliaAnalysisGUI(QMainWindow):
@@ -2979,8 +3037,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Which channels to use for colocalization analysis
         self.coloc_channel_1 = 0  # First channel for colocalization
         self.coloc_channel_2 = 1  # Second channel for colocalization
-        # BBB analysis channel assignment (CD31/dextran/albumin/IBA1) by index
-        self.bbb_channels = {'cd31': 0, 'dextran': 1, 'albumin': 2, 'iba1': 3}
+        # BBB analysis channels: CD31, optional IBA1, and a user-defined list of
+        # named tracers (name is used as the CSV column prefix / overlay title).
+        self.bbb_channels = {
+            'cd31': 0, 'iba1': 3,
+            'tracers': [{'name': 'red_dextran', 'channel': 1},
+                        {'name': 'far_red_albumin', 'channel': 2}]}
         # Channel names (can be customized by user)
         self.channel_names = {0: '', 1: '', 2: ''}
         # Color/grayscale display toggle
@@ -8231,9 +8293,9 @@ if __name__ == '__main__':
         if dlg.exec_() != QDialog.Accepted:
             return
         ch = dlg.get_channels()
-        if ch.get('cd31', -1) < 0 or ch.get('dextran', -1) < 0:
+        if ch.get('cd31', -1) < 0 or not ch.get('tracers'):
             QMessageBox.warning(self, "BBB Analysis",
-                                "Assign at least CD31 and one tracer channel.")
+                                "Assign the CD31 channel and at least one tracer.")
             return
         self.bbb_channels = ch
         self.run_bbb_analysis(ch)
@@ -8246,8 +8308,13 @@ if __name__ == '__main__':
         out_dir = self.output_dir or os.getcwd()
         os.makedirs(out_dir, exist_ok=True)
         cd31_i = channels.get('cd31', -1)
-        dex_i = channels.get('dextran', -1)
-        alb_i = channels.get('albumin', -1)
+        # Named tracer list: [{'name': str, 'channel': int}, ...]. Back-compat:
+        # accept the old flat dextran/albumin keys too.
+        tracer_specs = channels.get('tracers')
+        if not tracer_specs:
+            tracer_specs = [{'name': n, 'channel': channels.get(n, -1)}
+                            for n in ('dextran', 'albumin')
+                            if channels.get(n, -1) >= 0]
         vessel_rows, cell_rows, n_imgs = [], [], 0
 
         for img_name, idata in self.images.items():
@@ -8276,16 +8343,15 @@ if __name__ == '__main__':
                 row = {'image_name': os.path.splitext(img_name)[0]}
                 row.update(vmetrics)
                 tracers = {}
-                if 0 <= dex_i < nch:
-                    dch = color[:, :, dex_i].astype(np.float64)
-                    tracers['dextran'] = dch
-                    for k, v in _quantify_leakage(vessel_mask, dch, ps).items():
-                        row['dextran_' + k] = v
-                if 0 <= alb_i < nch:
-                    ach = color[:, :, alb_i].astype(np.float64)
-                    tracers['albumin'] = ach
-                    for k, v in _quantify_leakage(vessel_mask, ach, ps).items():
-                        row['albumin_' + k] = v
+                for spec in tracer_specs:
+                    ti = spec.get('channel', -1)
+                    tname = spec.get('name') or 'tracer'
+                    if not (0 <= ti < nch):
+                        continue
+                    tch = color[:, :, ti].astype(np.float64)
+                    tracers[tname] = tch
+                    for k, v in _quantify_leakage(vessel_mask, tch, ps).items():
+                        row['%s_%s' % (tname, k)] = v
                 vessel_rows.append(row)
 
                 # One row per soma, using that soma's largest approved mask.
