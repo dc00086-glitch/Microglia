@@ -847,7 +847,7 @@ def _quantify_leakage(vessel_mask, tracer, pixel_size_um,
 
 
 def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
-                                dist_um=None, soma_mask=None):
+                                dist_um=None, soma_mask=None, cd31=None):
     """Per-microglia leakage exposure to join onto the morphology row.
 
     ``tracers`` is a dict name -> channel array. Returns distance to the nearest
@@ -859,6 +859,12 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     outline or a disk at the soma centroid) when provided, NOT the whole arbor,
     so a single long process touching a vessel doesn't make the cell body read
     as perivascular. Falls back to the cell footprint if no soma region is given.
+
+    Blood-vessel metrics for the cell (analogous to tracer exposure):
+      ``vessel_contact_fraction`` — fraction of the footprint overlapping the
+                                    segmented vessel mask (microglia–vessel contact).
+      ``cd31_exposure_mean``      — mean CD31 (vessel-marker) intensity within
+                                    the footprint, when the ``cd31`` channel is given.
     """
     m = {}
     vessel_mask = vessel_mask > 0
@@ -881,6 +887,13 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     for name, ch in tracers.items():
         m['%s_exposure_mean' % name] = round(
             float(np.asarray(ch, dtype=np.float64)[reg].mean()), 3)
+    # Blood-vessel metrics for this cell.
+    n_cell = int(cm.sum())
+    m['vessel_contact_fraction'] = (
+        round(float((cm & vessel_mask).sum()) / n_cell, 4) if n_cell else 0.0)
+    if cd31 is not None:
+        m['cd31_exposure_mean'] = round(
+            float(np.asarray(cd31, dtype=np.float64)[cm].mean()), 3)
     return m
 
 
@@ -8722,7 +8735,7 @@ if __name__ == '__main__':
                     soma_masks[sid] = mk
                     exp = _microglia_leakage_exposure(
                         mk, vessel_mask, tracers, ps, dist_um=dist_um,
-                        soma_mask=soma_region)
+                        soma_mask=soma_region, cd31=cd31)
                     crow = {'image_name': img_base, 'animal_id': animal_id,
                             'treatment': treatment, 'soma_id': sid,
                             'bbb_footprint': source}
