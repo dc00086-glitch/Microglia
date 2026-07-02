@@ -552,6 +552,132 @@ def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
     return result
 
 
+# ============================================================================
+# BLOOD-BRAIN-BARRIER (BBB) ANALYSIS ENGINE
+# Vessel segmentation (CD31), tracer extravasation/leakage (intravascular
+# dextran / far-red albumin), and per-microglia leakage exposure. Pure
+# functions so the in-app BBB mode (and any script) can call them.
+# ============================================================================
+def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2):
+    """Segment the CD31 channel into a vessel mask and compute REAVER-style
+    vascular morphometrics.
+
+    Returns (vessel_mask, metrics_dict). Metrics: area fraction, length density
+    (skeleton length / area), branch-point density, mean diameter (from the
+    distance transform along the skeleton), and the Otsu threshold used.
+    """
+    from skimage.filters import threshold_otsu
+
+    img = np.asarray(cd31, dtype=np.float64)
+    empty = (np.zeros(img.shape, dtype=bool), {
+        'vessel_area_fraction': 0.0, 'vessel_length_density_um_per_um2': 0.0,
+        'vessel_branchpoint_density_per_mm2': 0.0, 'vessel_mean_diameter_um': 0.0,
+        'vessel_threshold': 0.0})
+    if img.max() <= 0 or not np.any(img > 0):
+        return empty
+
+    thr = float(threshold_otsu(img[img > 0]))
+    vessels = img > thr
+    if close_radius_px > 0:
+        vessels = ndimage.binary_closing(
+            vessels, structure=_disk_struct(close_radius_px))
+    # Drop tiny specks below the physical area floor.
+    min_px = max(int(min_object_um2 / (pixel_size_um ** 2)), 1)
+    lab, n = ndimage.label(vessels)
+    if n:
+        sizes = np.bincount(lab.ravel())
+        keep = np.where(sizes >= min_px)[0]
+        keep = keep[keep != 0]
+        vessels = np.isin(lab, keep)
+    if not np.any(vessels):
+        return empty
+
+    from skimage.morphology import skeletonize
+    area_um2 = vessels.size * (pixel_size_um ** 2)
+    skel = skeletonize(vessels)
+    skel_len_um = int(skel.sum()) * pixel_size_um
+    dt = ndimage.distance_transform_edt(vessels)
+    mean_diam_um = float(2 * dt[skel].mean() * pixel_size_um) if skel.any() else 0.0
+    su = skel.astype(np.uint8)
+    nbr = ndimage.convolve(su, np.ones((3, 3), np.uint8),
+                           mode='constant', cval=0) - su
+    n_branch = int(np.count_nonzero(skel & (nbr >= 3)))
+    metrics = {
+        'vessel_area_fraction': round(float(vessels.mean()), 4),
+        'vessel_length_density_um_per_um2': round(skel_len_um / area_um2, 6),
+        'vessel_branchpoint_density_per_mm2': round(n_branch / (area_um2 / 1e6), 2),
+        'vessel_mean_diameter_um': round(mean_diam_um, 3),
+        'vessel_threshold': round(thr, 2),
+    }
+    return vessels, metrics
+
+
+def _disk_struct(radius):
+    """A disk-shaped boolean structuring element of the given pixel radius."""
+    r = int(radius)
+    yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
+    return (yy * yy + xx * xx) <= r * r
+
+
+def _quantify_leakage(vessel_mask, tracer, pixel_size_um,
+                      ring_edges_um=(0, 10, 20, 40)):
+    """Extravasation of one intravascular tracer relative to the vessel mask.
+
+    Returns intravascular/extravascular mean intensity, the leakage index
+    (extravascular / intravascular), the extravascular-signal area fraction, and
+    a perivascular gradient (mean tracer intensity in distance rings out from the
+    vessel wall) — the cleanest extravasation readout.
+    """
+    t = np.asarray(tracer, dtype=np.float64)
+    vessel_mask = vessel_mask > 0
+    intra = t[vessel_mask]
+    extra = t[~vessel_mask]
+    intra_mean = float(intra.mean()) if intra.size else 0.0
+    extra_mean = float(extra.mean()) if extra.size else 0.0
+    # Extravascular signal footprint: parenchymal pixels brighter than the
+    # in-vessel median (i.e. tracer that has clearly left the lumen).
+    leak_thr = float(np.median(intra)) if intra.size else 0.0
+    extra_frac = float((extra > leak_thr).mean()) if extra.size else 0.0
+    m = {
+        'intravascular_mean': round(intra_mean, 3),
+        'extravascular_mean': round(extra_mean, 3),
+        'leakage_index': round(extra_mean / intra_mean, 4) if intra_mean > 0 else 0.0,
+        'extravascular_area_fraction': round(extra_frac, 4),
+    }
+    dist_um = ndimage.distance_transform_edt(~vessel_mask) * pixel_size_um
+    for i in range(len(ring_edges_um) - 1):
+        lo, hi = ring_edges_um[i], ring_edges_um[i + 1]
+        ring = (dist_um > lo) & (dist_um <= hi)
+        m['perivasc_%g_%gum_mean' % (lo, hi)] = (
+            round(float(t[ring].mean()), 3) if np.any(ring) else 0.0)
+    return m
+
+
+def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
+                                dist_um=None):
+    """Per-microglia leakage exposure to join onto the morphology row.
+
+    ``tracers`` is a dict name -> channel array. Returns distance to the nearest
+    vessel and, for each tracer, the mean extravascular intensity within the
+    cell (the tracer the cell is actually bathed in). ``dist_um`` (a precomputed
+    distance-to-vessel map) can be passed to avoid recomputing it per cell.
+    """
+    m = {}
+    vessel_mask = vessel_mask > 0
+    if dist_um is None:
+        dist_um = ndimage.distance_transform_edt(~vessel_mask) * pixel_size_um
+    cm = cell_mask > 0
+    if not np.any(cm):
+        return m
+    m['dist_to_vessel_um'] = round(float(dist_um[cm].min()), 3)
+    outside = cm & ~vessel_mask
+    reg = outside if np.any(outside) else cm
+    for name, ch in tracers.items():
+        m['%s_exposure_mean' % name] = round(
+            float(np.asarray(ch, dtype=np.float64)[reg].mean()), 3)
+    return m
+
+
 def _compute_morphology_single(args):
     """Standalone morphology computation for a single mask.
 
