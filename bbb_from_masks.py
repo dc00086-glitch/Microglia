@@ -187,6 +187,53 @@ def microglia_exposure(cell_mask, vessel_mask, tracers, ps, dist_um, soma_mask, 
 MASK_RE = re.compile(r'^(?P<base>.+)_(?P<sid>soma_(?P<r>\d+)_(?P<c>\d+))_area(?P<area>\d+)_mask\.tif+$', re.I)
 
 
+def merge_into_morphology(csv_path, cell_rows, bbb_cols):
+    """Add the BBB columns to combined_morphology_results.csv in place, matched
+    on image_name + soma_id + target_area_um2. Returns the number of rows matched
+    (or -1 if the CSV lacks the key columns)."""
+    def norm_img(s):
+        s = str(s).strip()
+        low = s.lower()
+        if low.endswith('.tiff'):
+            return s[:-5]
+        if low.endswith('.tif'):
+            return s[:-4]
+        return s
+
+    def norm_area(v):
+        try:
+            return int(round(float(v)))
+        except (TypeError, ValueError):
+            return None
+
+    with open(csv_path, newline='') as f:
+        reader = csv.DictReader(f)
+        fields = list(reader.fieldnames or [])
+        rows = list(reader)
+    for req in ('image_name', 'soma_id', 'target_area_um2'):
+        if req not in fields:
+            print(f"  merge skipped: '{req}' column not in {os.path.basename(csv_path)}")
+            return -1
+
+    lut = {(norm_img(r['image_name']), str(r['soma_id']).strip(),
+            norm_area(r.get('target_area_um2'))): r for r in cell_rows}
+    matched = 0
+    for r in rows:
+        key = (norm_img(r.get('image_name', '')), str(r.get('soma_id', '')).strip(),
+               norm_area(r.get('target_area_um2')))
+        hit = lut.get(key)
+        if hit:
+            matched += 1
+        for c in bbb_cols:
+            r[c] = hit.get(c, '') if hit else ''
+    out_fields = fields + [c for c in bbb_cols if c not in fields]
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=out_fields, extrasaction='ignore')
+        w.writeheader()
+        w.writerows(rows)
+    return matched
+
+
 def find_raw(base):
     for ext in ('.tif', '.tiff', '.TIF', '.TIFF'):
         p = os.path.join(RAW_DIR, base + ext)
@@ -252,7 +299,8 @@ def main():
                 continue
             sm = soma_disk(vessel_mask.shape, int(mm.group('r')), int(mm.group('c')), PIXEL_SIZE_UM)
             exp = microglia_exposure(mk, vessel_mask, tracers, PIXEL_SIZE_UM, dist_um, sm, cd31)
-            crow = {'image_name': base, 'soma_id': mm.group('sid')}
+            crow = {'image_name': base, 'soma_id': mm.group('sid'),
+                    'target_area_um2': int(mm.group('area'))}
             crow.update(exp)
             cell_rows.append(crow)
         print(f"  {base}: {len(masks)} microglia, vessel area fraction {vmetrics['vessel_area_fraction']}")
@@ -273,6 +321,22 @@ def main():
 
     write(os.path.join(OUT_DIR, 'bbb_microglia_from_masks.csv'), cell_rows)
     write(os.path.join(OUT_DIR, 'bbb_vessel_from_masks.csv'), vessel_rows)
+
+    # Merge the per-microglia BBB columns into the morphology master, matched on
+    # image_name + soma_id + target_area_um2.
+    master = os.path.join(OUT_DIR, 'combined_morphology_results.csv')
+    if cell_rows and os.path.exists(master):
+        identity = ('image_name', 'soma_id', 'target_area_um2')
+        bbb_cols = []
+        for r in cell_rows:
+            for k in r:
+                if k not in identity and k not in bbb_cols:
+                    bbb_cols.append(k)
+        matched = merge_into_morphology(master, cell_rows, bbb_cols)
+        if matched >= 0:
+            print(f"Merged BBB columns into {matched} rows of combined_morphology_results.csv")
+    elif cell_rows:
+        print("No combined_morphology_results.csv in OUT_DIR — wrote standalone CSV only.")
 
     if misses:
         raw_stems = sorted({
