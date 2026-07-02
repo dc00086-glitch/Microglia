@@ -742,6 +742,26 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     return m
 
 
+def _load_bbb_image(path):
+    """Load a multi-channel image as (H, W, C), preserving ALL channels and bit
+    depth. Uses tifffile, not PIL — PIL collapses a 4+ channel microscope TIFF to
+    8-bit RGBA (mangling e.g. a far-red channel), whereas the BBB analysis reads
+    each channel's raw intensity by index (independent of any display pseudocolor).
+    """
+    import tifffile
+    arr = np.squeeze(np.asarray(tifffile.imread(path)))
+    if arr.ndim == 4:            # e.g. (Z, C, H, W) — max-project the leading axis
+        arr = np.squeeze(arr.max(axis=0))
+    if arr.ndim == 2:
+        return arr[:, :, None]
+    if arr.ndim == 3:
+        ch = int(np.argmin(arr.shape))        # channel axis = the smallest
+        if arr.shape[ch] <= 8:
+            arr = np.moveaxis(arr, ch, -1)     # -> (H, W, C)
+        return arr
+    return arr
+
+
 def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None):
     """Save a figure showing each tracer as a heatmap with the vessel outline
     (cyan) and microglia outlines (lime) — so extravascular signal away from the
@@ -8272,15 +8292,19 @@ if __name__ == '__main__':
             if not name:
                 continue
             idata = self.images.get(name, {})
-            ci = idata.get('color_image')
+            ci = None
+            rp = idata.get('raw_path')
+            # Prefer the raw file via tifffile so ALL channels (incl. far-red)
+            # are exposed; fall back to any cached color image.
+            if rp and os.path.exists(rp):
+                try:
+                    raw = _load_bbb_image(rp)
+                    ci = raw if (raw is not None and raw.ndim == 3) else None
+                except Exception:
+                    ci = None
             if ci is None:
-                rp = idata.get('raw_path')
-                if rp and os.path.exists(rp):
-                    try:
-                        raw = load_tiff_image(rp)
-                        ci = raw if (raw is not None and raw.ndim == 3) else None
-                    except Exception:
-                        ci = None
+                cc = idata.get('color_image')
+                ci = cc if (cc is not None and getattr(cc, 'ndim', 0) == 3) else None
             if ci is not None and getattr(ci, 'ndim', 0) == 3:
                 color_img = ci
                 break
@@ -8321,15 +8345,19 @@ if __name__ == '__main__':
             masks = idata.get('masks') or []
             if not masks:
                 continue
-            color = idata.get('color_image')
-            if color is None:
-                rp = idata.get('raw_path')
-                if rp and os.path.exists(rp):
-                    try:
-                        color = load_tiff_image(rp)
-                    except Exception:
-                        color = None
+            # Load all channels from the raw file via tifffile (preserves the
+            # far-red / 4th+ channels PIL would collapse); fall back to cache.
+            color = None
+            rp = idata.get('raw_path')
+            if rp and os.path.exists(rp):
+                try:
+                    color = _load_bbb_image(rp)
+                except Exception:
+                    color = None
             if color is None or getattr(color, 'ndim', 0) != 3:
+                cc = idata.get('color_image')
+                color = cc if (cc is not None and getattr(cc, 'ndim', 0) == 3) else None
+            if color is None:
                 continue
             nch = color.shape[2]
             if not (0 <= cd31_i < nch):
