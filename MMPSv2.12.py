@@ -147,16 +147,23 @@ def ensure_grayscale(img):
     return img
 
 
-# Default display colors per channel index (R,G,B 0-255). The first three keep
-# the historical green / red / blue mapping; index 3 (far-red) is magenta.
-_CHANNEL_COLORS_DEFAULT = [
+# Default display colours per channel index (R,G,B 0-255). Two palettes to match
+# the historical behaviour exactly: 3- and 4-channel images rendered as identity
+# RGB (ch0->red, ch1->green, ch2->blue); other channel counts used a green/red/
+# blue mapping. Index 3 (far-red) and beyond get distinct colours so they show.
+_CHANNEL_COLORS_IDENTITY = [
+    (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 0, 255),
+    (0, 255, 255), (255, 255, 0), (255, 255, 255),
+]
+_CHANNEL_COLORS_SWAP = [
     (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 0, 255),
     (0, 255, 255), (255, 255, 0), (255, 255, 255),
 ]
 
 
-def _default_channel_color(i):
-    return _CHANNEL_COLORS_DEFAULT[i % len(_CHANNEL_COLORS_DEFAULT)]
+def _default_channel_color(i, nch=3):
+    palette = _CHANNEL_COLORS_IDENTITY if nch in (3, 4) else _CHANNEL_COLORS_SWAP
+    return palette[i % len(palette)]
 
 
 def extract_channel(img, channel_idx):
@@ -3069,9 +3076,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # INDEX (0,1,2,3,...) so any channel (incl. a 4th far-red) can be tuned;
         # legacy 'R'/'G'/'B' keys are migrated on session load.
         self.channel_brightness = {}
-        # Display color per channel index (R,G,B 0-255). Defaults keep the old
-        # green/red/blue look; index 3 (far-red) defaults to magenta.
-        self.channel_colors = {i: _default_channel_color(i) for i in range(7)}
+        # Per-channel display-colour OVERRIDES (index -> (R,G,B)). Empty by
+        # default; unset channels fall back to the count-dependent default so
+        # 3/4-channel images render as identity RGB exactly like before.
+        self.channel_colors = {}
         # Mask generation settings (defaults)
         self.use_min_intensity = True
         self.min_intensity_percent = 5
@@ -10034,10 +10042,10 @@ if __name__ == '__main__':
                 def paint(col):
                     btn.setStyleSheet(
                         f"background-color: rgb({col[0]},{col[1]},{col[2]}); border: 1px solid #888;")
-                paint(self.channel_colors.get(idx, _default_channel_color(idx)))
+                paint(self.channel_colors.get(idx) or _default_channel_color(idx, nch))
 
                 def pick():
-                    cur = self.channel_colors.get(idx, _default_channel_color(idx))
+                    cur = self.channel_colors.get(idx) or _default_channel_color(idx, nch)
                     chosen = QColorDialog.getColor(QColor(*cur), dialog,
                                                    f"Channel {idx + 1} colour")
                     if chosen.isValid():
@@ -10441,7 +10449,7 @@ if __name__ == '__main__':
             if b:
                 chan = chan + b * 1.5
             chan = np.clip(chan, 0, 255)
-            color = self.channel_colors.get(i, _default_channel_color(i))
+            color = self.channel_colors.get(i) or _default_channel_color(i, c)
             for k in range(3):
                 if color[k]:
                     out[:, :, k] += chan * (color[k] / 255.0)
