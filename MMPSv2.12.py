@@ -258,6 +258,30 @@ def _enforce_mask_subset_invariant(masks):
     return total_removed
 
 
+def _background_floor(roi):
+    """Absolute intensity gate just above the ROI background.
+
+    The region-growing floor needs a global minimum that stops growth from
+    spilling into dark background — but it must NOT scale with the soma (the
+    brightest object in the ROI). A soma-relative floor (``roi.max() * pct``)
+    cuts the dimmer, distal/tapering portions of BRIGHT processes: their tips
+    drop below a few-percent-of-soma and the mask stops partway along them.
+
+    This returns background + ~3σ, estimated robustly as
+    ``median + 3 * 1.4826 * MAD`` over the ROI (which is sized ~3× the cell
+    radius and is therefore dominated by background). Only true background and
+    its noise are excluded; real signal — however faint — is kept.
+    """
+    if roi is None or getattr(roi, 'size', 0) == 0:
+        return 0.0
+    finite = roi[np.isfinite(roi)]
+    if finite.size == 0:
+        return 0.0
+    bg = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - bg)))
+    return bg + 3.0 * 1.4826 * mad
+
+
 def _radial_intensity_floor(roi, cy, cx, radius_px=100, thickness=3):
     """Representative intensity on a ring ``radius_px`` from the soma centre.
 
@@ -300,13 +324,15 @@ def _growth_intensity_floor(roi, cy_roi, cx_roi, floor_mode,
         floor = min(otsu, radial) if radial > 0 else otsu
         return floor, None
 
-    # Default 'percent' mode (unchanged legacy behaviour).
+    # Default 'percent' mode. The per-pixel LOCAL floor (min_intensity_percent %
+    # of the local max) is the adaptive knob that scales with each region; the
+    # GLOBAL minimum is an absolute background gate, NOT a fraction of the soma —
+    # so bright processes stay followable to their faint tips (fixes the
+    # regression where roi.max()*pct cut the distal ends of bright branches).
     intensity_floor = 0.0
     intensity_floor_map = None
     if min_intensity_percent and min_intensity_percent > 0:
-        roi_max = roi.max()
-        if roi_max > 0:
-            intensity_floor = roi_max * (min_intensity_percent / 100.0)
+        intensity_floor = _background_floor(roi)
         if local_intensity_window and local_intensity_window > 0:
             local_max = ndimage.maximum_filter(roi, size=local_intensity_window)
             local_floor = local_max * (min_intensity_percent / 100.0)
@@ -7813,9 +7839,9 @@ def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
     intensity_floor = 0.0
     intensity_floor_map = None
     if use_min_intensity and min_intensity_percent > 0:
-        img_max = processed_img.max()
-        if img_max > 0:
-            intensity_floor = img_max * (min_intensity_percent / 100.0)
+        # Global minimum = absolute background gate (not soma-relative); local
+        # floor = pct of local max. Keeps bright processes followable to tips.
+        intensity_floor = _background_floor(processed_img.astype(np.float64))
         if local_intensity_window and local_intensity_window > 0:
             roi_f64 = processed_img.astype(np.float64)
             local_max = ndimage.maximum_filter(roi_f64, size=local_intensity_window)
@@ -8019,13 +8045,13 @@ def create_annulus_masks(centroid, area_list_um2, pixel_size_um, soma_idx, soma_
     intensity_floor = 0.0
     intensity_floor_map = None
     if use_min_intensity and min_intensity_percent > 0:
+        # Global minimum = absolute background gate (not soma-relative); local
+        # floor = pct of local max. Keeps bright processes followable to tips.
+        intensity_floor = _background_floor(roi)
         if local_intensity_window and local_intensity_window > 0:
             local_max = ndimage.maximum_filter(roi, size=local_intensity_window)
-            intensity_floor_map = local_max * (min_intensity_percent / 100.0)
-        else:
-            roi_max = roi.max()
-            if roi_max > 0:
-                intensity_floor = roi_max * (min_intensity_percent / 100.0)
+            local_floor = local_max * (min_intensity_percent / 100.0)
+            intensity_floor_map = np.maximum(local_floor, intensity_floor)
 
     territory_roi = None
     my_label = 0
@@ -14135,13 +14161,13 @@ if __name__ == '__main__':
         sorted_areas = sorted(area_list_um2, reverse=True)
         largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
 
-        # Compute intensity floor (local adaptive combined with global minimum)
+        # Intensity floor: global minimum = absolute background gate (not
+        # soma-relative); local floor = pct of local max. Keeps bright
+        # processes followable to their faint tips.
         intensity_floor = 0.0
         intensity_floor_map = None
         if self.use_min_intensity and self.min_intensity_percent > 0:
-            img_max = processed_img.max()
-            if img_max > 0:
-                intensity_floor = img_max * (self.min_intensity_percent / 100.0)
+            intensity_floor = _background_floor(processed_img.astype(np.float64))
             if self.local_intensity_window and self.local_intensity_window > 0:
                 roi_f64 = processed_img.astype(np.float64)
                 local_max = ndimage.maximum_filter(roi_f64, size=self.local_intensity_window)
