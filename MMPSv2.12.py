@@ -830,26 +830,51 @@ def _load_bbb_image(path):
 
 
 def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None):
-    """Save a figure showing each tracer as a heatmap with the vessel outline
-    (cyan) and microglia outlines (lime) — so extravascular signal away from the
-    vessels reads as leak."""
+    """Save, per tracer, a readable leak map.
+
+    Each panel shows one tracer's intensity as a heatmap WITH a colorbar (so the
+    amount of signal is readable, not just false color), the vessel lumen drawn
+    as a translucent cyan fill + outline (everything inside is intravascular),
+    and microglia as lime outlines. The takeaway: bright heatmap signal OUTSIDE
+    the cyan vessels is tracer that has leaked out of the blood into the tissue.
+    """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
 
     names = list(tracers.keys()) or ['tracer']
-    fig, axes = plt.subplots(1, len(names), figsize=(6 * len(names), 6),
+    vmask = vessel_mask > 0
+    vessel_rgba = (0.0, 0.85, 1.0, 0.35)  # translucent cyan
+    fig, axes = plt.subplots(1, len(names), figsize=(6.8 * len(names), 6.2),
                              squeeze=False)
     for ax, name in zip(axes[0], names):
         t = np.asarray(tracers.get(name), dtype=np.float64)
         vmax = float(np.percentile(t, 99)) if t.size else 1.0
-        ax.imshow(t, cmap='inferno', vmax=vmax if vmax > 0 else 1.0)
-        ax.contour(vessel_mask > 0, levels=[0.5], colors='cyan', linewidths=0.6)
+        im = ax.imshow(t, cmap='inferno', vmin=0.0,
+                       vmax=vmax if vmax > 0 else 1.0)
+        # Vessel lumen as a translucent fill so intra- vs extravascular is clear.
+        if np.any(vmask):
+            fill = np.zeros(vmask.shape + (4,), dtype=float)
+            fill[vmask] = vessel_rgba
+            ax.imshow(fill)
+            ax.contour(vmask, levels=[0.5], colors='cyan', linewidths=0.8)
         if cell_masks:
             for cm in cell_masks:
-                ax.contour(cm > 0, levels=[0.5], colors='lime', linewidths=0.5)
-        ax.set_title("%s — cyan=vessels, lime=microglia" % name)
+                ax.contour(cm > 0, levels=[0.5], colors='lime', linewidths=0.6)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('%s intensity (a.u.)' % name)
+        ax.set_title('%s — leak map' % name)
         ax.axis('off')
+        ax.legend(
+            handles=[
+                Patch(facecolor=vessel_rgba, edgecolor='cyan',
+                      label='vessel (intravascular)'),
+                Line2D([0], [0], color='lime', lw=2, label='microglia'),
+            ],
+            loc='lower right', fontsize=8, framealpha=0.75)
+    fig.suptitle('Bright signal OUTSIDE the cyan vessels = tracer leak', y=0.99)
     fig.tight_layout()
     fig.savefig(path, dpi=110, bbox_inches='tight')
     plt.close(fig)
@@ -8452,10 +8477,13 @@ if __name__ == '__main__':
             if not (0 <= cd31_i < nch):
                 continue
             ps = float(self._get_pixel_size(img_name))
+            animal_id = idata.get('animal_id', '')
+            treatment = idata.get('treatment', '')
             try:
                 cd31 = color[:, :, cd31_i].astype(np.float64)
                 vessel_mask, vmetrics = _segment_vessels(cd31, ps)
-                row = {'image_name': os.path.splitext(img_name)[0]}
+                row = {'image_name': os.path.splitext(img_name)[0],
+                       'animal_id': animal_id, 'treatment': treatment}
                 row.update(vmetrics)
                 tracers = {}
                 for spec in tracer_specs:
@@ -8552,7 +8580,8 @@ if __name__ == '__main__':
                     soma_masks[sid] = mk
                     exp = _microglia_leakage_exposure(
                         mk, vessel_mask, tracers, ps, dist_um=dist_um)
-                    crow = {'image_name': img_base, 'soma_id': sid,
+                    crow = {'image_name': img_base, 'animal_id': animal_id,
+                            'treatment': treatment, 'soma_id': sid,
                             'bbb_footprint': source}
                     crow.update(exp)
                     cell_rows.append(crow)
@@ -8593,10 +8622,13 @@ if __name__ == '__main__':
         # Fold the per-cell BBB columns into the morphology master CSV so
         # everything is in one file; keyed on image_name + soma_id. Fall back to
         # a standalone CSV if the morphology results aren't there yet.
+        # animal_id/treatment are identity columns already in the morphology
+        # master — keep them out of the merge so unmatched rows aren't wiped.
+        _skip_merge = ('image_name', 'soma_id', 'animal_id', 'treatment')
         bbb_cols, merged_msg = [], ""
         for r in cell_rows:
             for k in r:
-                if k not in ('image_name', 'soma_id') and k not in bbb_cols:
+                if k not in _skip_merge and k not in bbb_cols:
                     bbb_cols.append(k)
         master_csv = os.path.join(out_dir, 'combined_morphology_results.csv')
         if cell_rows and os.path.exists(master_csv):
