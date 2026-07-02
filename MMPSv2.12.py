@@ -16973,9 +16973,13 @@ if __name__ == '__main__':
             self.log("⚠️ Metadata entry cancelled - analysis aborted")
             return
 
+        # Predict each cell's morphology BEFORE saving so predicted_morphology
+        # and soma_cell_ratio are columns in the morphology CSV.
+        self._classify_morphotypes(all_results)
+
         self._save_batch_results(all_results)
 
-        # Classify morphotypes and show stacked bar graph
+        # Show the stacked bar graph (re-uses the same classification).
         self._classify_and_show_morphotypes(all_results)
 
         for img_name, img_data in self.images.items():
@@ -17447,49 +17451,52 @@ if __name__ == '__main__':
     # MORPHOTYPE CLASSIFICATION + STACKED BAR DISPLAY
     # ----------------------------------------------------------------
 
-    def _classify_and_show_morphotypes(self, all_results):
-        """Classify cells into morphotypes and display a stacked bar chart.
+    def _classify_morphotypes(self, results):
+        """Assign each cell a predicted morphology (mutates the result dicts).
 
-        Phenotypes: Ramified (SCR<=0.35), Reactive (SCR>0.35),
-        Amoeboid (SCR>0.50 + roundness>0.45), Rod (roundness<0.15 + ecc>0.85).
+        Sets ``result['predicted_morphology']`` (Ramified / Reactive / Amoeboid /
+        Rod) and ``result['soma_cell_ratio']`` so both land in the morphology
+        CSV. Called BEFORE the CSV is written. Rules (SCR = soma_area/mask_area):
+          Amoeboid  SCR>0.50 and roundness>0.45
+          Rod       roundness<0.15 and eccentricity>0.85
+          Reactive  SCR>0.35
+          Ramified  everything else
+        Returns the ordered phenotype list for the chart.
         """
-        if not all_results:
-            return
-
-        # Classification thresholds
-        amoeboid_scr = 0.50
-        amoeboid_rnd = 0.45
+        amoeboid_scr, amoeboid_rnd = 0.50, 0.45
         reactive_scr = 0.35
-        rod_rnd = 0.15
-        rod_ecc = 0.85
-
+        rod_rnd, rod_ecc = 0.15, 0.85
         phenotype_levels = ['Ramified', 'Reactive', 'Amoeboid', 'Rod']
-
-        # Classify each cell (largest mask only — already filtered by this point)
-        for r in all_results:
+        for r in results or []:
             soma = r.get('soma_area', 0)
             mask = r.get('mask_area', 0)
             rnd = r.get('roundness', 0)
             ecc = r.get('eccentricity', 0)
-
             scr = soma / mask if mask > 0 else 0
-
             if scr > amoeboid_scr and rnd > amoeboid_rnd:
-                r['phenotype'] = 'Amoeboid'
+                r['predicted_morphology'] = 'Amoeboid'
             elif rnd < rod_rnd and ecc > rod_ecc:
-                r['phenotype'] = 'Rod'
+                r['predicted_morphology'] = 'Rod'
             elif scr > reactive_scr:
-                r['phenotype'] = 'Reactive'
+                r['predicted_morphology'] = 'Reactive'
             else:
-                r['phenotype'] = 'Ramified'
-
+                r['predicted_morphology'] = 'Ramified'
             r['soma_cell_ratio'] = round(scr, 4)
+        return phenotype_levels
+
+    def _classify_and_show_morphotypes(self, all_results):
+        """Classify cells into morphotypes and display a stacked bar chart."""
+        if not all_results:
+            return
+
+        # Ensure predicted_morphology is assigned (idempotent — also run before save).
+        phenotype_levels = self._classify_morphotypes(all_results)
 
         # Count phenotypes per treatment group
         by_treatment = {}
         for r in all_results:
             trt = r.get('treatment', 'Unknown')
-            ph = r.get('phenotype', 'Ramified')
+            ph = r.get('predicted_morphology', 'Ramified')
             if trt not in by_treatment:
                 by_treatment[trt] = {p: 0 for p in phenotype_levels}
                 by_treatment[trt]['_total'] = 0
@@ -17503,9 +17510,9 @@ if __name__ == '__main__':
         self.log("")
         self.log("=" * 50)
         self.log("MORPHOTYPE CLASSIFICATION")
-        self.log(f"Amoeboid: SCR>{amoeboid_scr} + roundness>{amoeboid_rnd}")
-        self.log(f"Rod: roundness<{rod_rnd} + eccentricity>{rod_ecc}")
-        self.log(f"Reactive: SCR>{reactive_scr}")
+        self.log("Amoeboid: SCR>0.50 + roundness>0.45")
+        self.log("Rod: roundness<0.15 + eccentricity>0.85")
+        self.log("Reactive: SCR>0.35")
         self.log("Ramified: all other cells")
         self.log("=" * 50)
 
