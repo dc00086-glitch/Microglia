@@ -3164,7 +3164,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_segmentation_method = 'none'  # 'none', 'competitive', 'watershed'
         self.use_circular_constraint = False
         self.circular_buffer_um2 = 200  # extra area (µm²) beyond target for circular boundary
-        self.local_intensity_window = 51  # local adaptive window size (0 = global)
+        self.local_intensity_window = 0  # local adaptive window (0 = OFF; global background gate only)
         # Intensity-floor method for region growing: 'percent' (min-intensity %
         # of max, legacy) or 'otsu_radial' (min(Otsu, intensity at 100px ring)).
         self.mask_floor_mode = 'percent'
@@ -9237,7 +9237,7 @@ if __name__ == '__main__':
             self.mask_segmentation_method = session.get('mask_segmentation_method', 'none')
             self.use_circular_constraint = session.get('use_circular_constraint', False)
             self.circular_buffer_um2 = session.get('circular_buffer_um2', 200)
-            self.local_intensity_window = session.get('local_intensity_window', 51)
+            self.local_intensity_window = session.get('local_intensity_window', 0)
             self.mask_floor_mode = session.get('mask_floor_mode', 'percent')
             self.mask_smooth_enabled = session.get('mask_smooth_enabled', True)
             self.mask_smooth_gap_size = session.get('mask_smooth_gap_size', 4)
