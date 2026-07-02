@@ -2800,6 +2800,65 @@ class GrayscaleChannelDialog(QDialog):
         return ch1, ch2
 
 
+class BBBAnalysisDialog(QDialog):
+    """Assign channels (CD31 / dextran / albumin / IBA1) and run BBB analysis:
+    vessel segmentation, tracer extravasation/leakage, and per-microglia
+    tracer exposure. Non-destructive — reads the loaded images/masks and writes
+    new CSVs.
+    """
+    def __init__(self, parent, color_image=None, defaults=None):
+        super().__init__(parent)
+        self.setWindowTitle("Blood-Brain-Barrier Analysis")
+        self.setModal(True)
+        from PyQt5.QtWidgets import QComboBox
+        n = 4
+        if color_image is not None and getattr(color_image, 'ndim', 0) == 3:
+            n = color_image.shape[2]
+        self.num_channels = max(n, 1)
+        defaults = defaults or {}
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "<b>Assign channels</b> (leak tracers must be intravascular):"))
+        self.combos = {}
+        rows = [('cd31', 'CD31 (vessels):', 0),
+                ('dextran', 'Red dextran (tracer):', 1),
+                ('albumin', 'Far-red albumin (tracer):', 2),
+                ('iba1', 'IBA1 (microglia, optional):', 3)]
+        for key, label, dflt in rows:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            combo = QComboBox()
+            combo.addItem("(none)", -1)
+            for i in range(self.num_channels):
+                combo.addItem(f"Channel {i + 1}", i)
+            want = defaults.get(key, dflt)
+            idx = combo.findData(want if want is not None and want < self.num_channels else -1)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            row.addWidget(combo)
+            layout.addLayout(row)
+            self.combos[key] = combo
+
+        note = QLabel("Runs on all loaded images that have masks. Writes\n"
+                      "bbb_vessel_leakage.csv and bbb_microglia_exposure.csv\n"
+                      "to the output folder.")
+        note.setStyleSheet("color: gray;")
+        layout.addWidget(note)
+
+        btns = QHBoxLayout()
+        run_btn = QPushButton("Run BBB Analysis")
+        run_btn.setDefault(True)
+        run_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(run_btn)
+        btns.addWidget(cancel_btn)
+        layout.addLayout(btns)
+
+    def get_channels(self):
+        return {k: c.currentData() for k, c in self.combos.items()}
+
+
 class MicrogliaAnalysisGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2855,6 +2914,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Which channels to use for colocalization analysis
         self.coloc_channel_1 = 0  # First channel for colocalization
         self.coloc_channel_2 = 1  # Second channel for colocalization
+        # BBB analysis channel assignment (CD31/dextran/albumin/IBA1) by index
+        self.bbb_channels = {'cd31': 0, 'dextran': 1, 'albumin': 2, 'iba1': 3}
         # Channel names (can be customized by user)
         self.channel_names = {0: '', 1: '', 2: ''}
         # Color/grayscale display toggle
@@ -3018,6 +3079,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mode_3d_action.setChecked(False)
         self.mode_3d_action.setToolTip("Open the 3D Z-stack analysis window")
         self.mode_3d_action.triggered.connect(self._toggle_3d_mode)
+
+        self.bbb_action = mode_menu.addAction("BBB Analysis...")
+        self.bbb_action.setToolTip("Vessel segmentation, tracer leakage, and "
+                                   "per-microglia tracer exposure (multi-channel)")
+        self.bbb_action.triggered.connect(self._open_bbb_dialog)
 
         # Advanced menu
         advanced_menu = menu_bar.addMenu("Advanced")
@@ -8068,6 +8134,139 @@ if __name__ == '__main__':
         )
 
         return script
+
+    def _open_bbb_dialog(self):
+        """Open the BBB analysis dialog; run on accept."""
+        if not self.images:
+            QMessageBox.warning(self, "BBB Analysis", "Load images first.")
+            return
+        color_img = None
+        for name in ([self.current_image_name] + list(self.images)):
+            if not name:
+                continue
+            idata = self.images.get(name, {})
+            ci = idata.get('color_image')
+            if ci is None:
+                rp = idata.get('raw_path')
+                if rp and os.path.exists(rp):
+                    try:
+                        raw = load_tiff_image(rp)
+                        ci = raw if (raw is not None and raw.ndim == 3) else None
+                    except Exception:
+                        ci = None
+            if ci is not None and getattr(ci, 'ndim', 0) == 3:
+                color_img = ci
+                break
+        if color_img is None:
+            QMessageBox.warning(self, "BBB Analysis",
+                                "No multi-channel image found — BBB analysis needs "
+                                "a color/multi-channel image.")
+            return
+        dlg = BBBAnalysisDialog(self, color_image=color_img, defaults=self.bbb_channels)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        ch = dlg.get_channels()
+        if ch.get('cd31', -1) < 0 or ch.get('dextran', -1) < 0:
+            QMessageBox.warning(self, "BBB Analysis",
+                                "Assign at least CD31 and one tracer channel.")
+            return
+        self.bbb_channels = ch
+        self.run_bbb_analysis(ch)
+
+    def run_bbb_analysis(self, channels):
+        """Segment vessels, quantify tracer leakage, and per-microglia exposure
+        for every loaded image that has masks. Writes two CSVs to the output
+        folder; reads only, never modifies existing data."""
+        import csv as _csv
+        out_dir = self.output_dir or os.getcwd()
+        os.makedirs(out_dir, exist_ok=True)
+        cd31_i = channels.get('cd31', -1)
+        dex_i = channels.get('dextran', -1)
+        alb_i = channels.get('albumin', -1)
+        vessel_rows, cell_rows, n_imgs = [], [], 0
+
+        for img_name, idata in self.images.items():
+            masks = idata.get('masks') or []
+            if not masks:
+                continue
+            color = idata.get('color_image')
+            if color is None:
+                rp = idata.get('raw_path')
+                if rp and os.path.exists(rp):
+                    try:
+                        color = load_tiff_image(rp)
+                    except Exception:
+                        color = None
+            if color is None or getattr(color, 'ndim', 0) != 3:
+                continue
+            nch = color.shape[2]
+            if not (0 <= cd31_i < nch):
+                continue
+            ps = self.pixel_size_map.get(img_name, self.pixel_size)
+            if isinstance(ps, (list, tuple)):
+                ps = float(np.sqrt(ps[0] * ps[1]))
+            try:
+                cd31 = color[:, :, cd31_i].astype(np.float64)
+                vessel_mask, vmetrics = _segment_vessels(cd31, ps)
+                row = {'image_name': os.path.splitext(img_name)[0]}
+                row.update(vmetrics)
+                tracers = {}
+                if 0 <= dex_i < nch:
+                    dch = color[:, :, dex_i].astype(np.float64)
+                    tracers['dextran'] = dch
+                    for k, v in _quantify_leakage(vessel_mask, dch, ps).items():
+                        row['dextran_' + k] = v
+                if 0 <= alb_i < nch:
+                    ach = color[:, :, alb_i].astype(np.float64)
+                    tracers['albumin'] = ach
+                    for k, v in _quantify_leakage(vessel_mask, ach, ps).items():
+                        row['albumin_' + k] = v
+                vessel_rows.append(row)
+
+                # One row per soma, using that soma's largest approved mask.
+                dist_um = ndimage.distance_transform_edt(~(vessel_mask > 0)) * ps
+                by_soma = {}
+                for m in masks:
+                    if m.get('approved') is False or m.get('mask') is None:
+                        continue
+                    sid = m.get('soma_id')
+                    if sid is None:
+                        continue
+                    if (sid not in by_soma or m.get('target_area_um2', 0)
+                            > by_soma[sid].get('target_area_um2', 0)):
+                        by_soma[sid] = m
+                for sid, m in by_soma.items():
+                    exp = _microglia_leakage_exposure(
+                        m['mask'], vessel_mask, tracers, ps, dist_um=dist_um)
+                    crow = {'image_name': os.path.splitext(img_name)[0],
+                            'soma_id': sid}
+                    crow.update(exp)
+                    cell_rows.append(crow)
+                n_imgs += 1
+            except Exception as e:
+                self.log(f"BBB: error on {img_name}: {e}")
+
+        def _write(path, rows):
+            keys = []
+            for r in rows:
+                for k in r:
+                    if k not in keys:
+                        keys.append(k)
+            with open(path, 'w', newline='') as f:
+                w = _csv.DictWriter(f, fieldnames=keys, extrasaction='ignore')
+                w.writeheader()
+                w.writerows(rows)
+
+        if vessel_rows:
+            _write(os.path.join(out_dir, 'bbb_vessel_leakage.csv'), vessel_rows)
+        if cell_rows:
+            _write(os.path.join(out_dir, 'bbb_microglia_exposure.csv'), cell_rows)
+        self.log(f"BBB analysis complete: {n_imgs} images, {len(cell_rows)} microglia.")
+        self.log(f"  Wrote bbb_vessel_leakage.csv + bbb_microglia_exposure.csv to {out_dir}")
+        QMessageBox.information(
+            self, "BBB Analysis",
+            f"Done: {n_imgs} images, {len(cell_rows)} microglia.\n"
+            f"CSVs written to:\n{out_dir}")
 
     def _toggle_colocalization_mode(self, checked):
         """Toggle colocalization mode on/off from the Mode menu."""
