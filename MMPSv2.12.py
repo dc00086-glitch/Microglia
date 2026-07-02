@@ -13247,6 +13247,23 @@ if __name__ == '__main__':
         min_intensity_check.setToolTip("Exclude pixels below this intensity from masks")
         layout.addWidget(min_intensity_check)
 
+        # Intensity-floor method
+        floor_mode_layout2 = QHBoxLayout()
+        floor_mode_layout2.addWidget(QLabel("  Floor method:"))
+        floor_mode_combo = QComboBox()
+        floor_mode_combo.addItem("Min intensity % of max (default)", "percent")
+        floor_mode_combo.addItem("Otsu + 100px floor", "otsu_radial")
+        floor_mode_combo.setToolTip(
+            "Otsu + 100px floor: grow using the lower of the Otsu threshold and\n"
+            "the intensity on a ring 100px from the soma (more inclusive of faint\n"
+            "distal processes). 'Min intensity %' is the original method.")
+        _fmi = floor_mode_combo.findData(getattr(self, 'mask_floor_mode', 'percent'))
+        floor_mode_combo.setCurrentIndex(_fmi if _fmi >= 0 else 0)
+        floor_mode_combo.currentIndexChanged.connect(
+            lambda _i: setattr(self, 'mask_floor_mode', floor_mode_combo.currentData()))
+        floor_mode_layout2.addWidget(floor_mode_combo)
+        layout.addLayout(floor_mode_layout2)
+
         # Minimum intensity slider
         slider_layout = QHBoxLayout()
         slider_layout.addWidget(QLabel("  Min intensity:"))
@@ -14511,6 +14528,20 @@ if __name__ == '__main__':
         min_intensity_check = QCheckBox("Use minimum intensity threshold")
         min_intensity_check.setChecked(self.use_min_intensity)
         layout.addWidget(min_intensity_check)
+        floor_mode_layout3 = QHBoxLayout()
+        floor_mode_layout3.addWidget(QLabel("  Floor method:"))
+        floor_mode_combo3 = QComboBox()
+        floor_mode_combo3.addItem("Min intensity % of max (default)", "percent")
+        floor_mode_combo3.addItem("Otsu + 100px floor", "otsu_radial")
+        floor_mode_combo3.setToolTip(
+            "Otsu + 100px floor: grow using the lower of the Otsu threshold and\n"
+            "the intensity on a ring 100px from the soma. 'Min intensity %' is the original.")
+        _fmi3 = floor_mode_combo3.findData(getattr(self, 'mask_floor_mode', 'percent'))
+        floor_mode_combo3.setCurrentIndex(_fmi3 if _fmi3 >= 0 else 0)
+        floor_mode_combo3.currentIndexChanged.connect(
+            lambda _i: setattr(self, 'mask_floor_mode', floor_mode_combo3.currentData()))
+        floor_mode_layout3.addWidget(floor_mode_combo3)
+        layout.addLayout(floor_mode_layout3)
         slider_layout = QHBoxLayout()
         slider_layout.addWidget(QLabel("  Min intensity:"))
         min_intensity_slider = QSlider(Qt.Horizontal)
