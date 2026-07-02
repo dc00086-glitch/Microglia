@@ -847,13 +847,18 @@ def _quantify_leakage(vessel_mask, tracer, pixel_size_um,
 
 
 def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
-                                dist_um=None):
+                                dist_um=None, soma_mask=None):
     """Per-microglia leakage exposure to join onto the morphology row.
 
     ``tracers`` is a dict name -> channel array. Returns distance to the nearest
     vessel and, for each tracer, the mean extravascular intensity within the
     cell (the tracer the cell is actually bathed in). ``dist_um`` (a precomputed
     distance-to-vessel map) can be passed to avoid recomputing it per cell.
+
+    ``dist_to_vessel_um`` is measured from the SOMA (``soma_mask`` — the soma
+    outline or a disk at the soma centroid) when provided, NOT the whole arbor,
+    so a single long process touching a vessel doesn't make the cell body read
+    as perivascular. Falls back to the cell footprint if no soma region is given.
     """
     m = {}
     vessel_mask = vessel_mask > 0
@@ -862,7 +867,15 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     cm = cell_mask > 0
     if not np.any(cm):
         return m
-    m['dist_to_vessel_um'] = round(float(dist_um[cm].min()), 3)
+    # Distance basis: the soma region if available, else the whole footprint.
+    dist_region = None
+    if soma_mask is not None:
+        sm = soma_mask > 0
+        if np.any(sm):
+            dist_region = sm
+    if dist_region is None:
+        dist_region = cm
+    m['dist_to_vessel_um'] = round(float(dist_um[dist_region].min()), 3)
     outside = cm & ~vessel_mask
     reg = outside if np.any(outside) else cm
     for name, ch in tracers.items():
@@ -8690,9 +8703,26 @@ if __name__ == '__main__':
                             mk = None
                     if mk is None:
                         continue
+                    # Soma region for dist_to_vessel_um: the traced soma outline
+                    # if present, else a small disk at the soma centroid — so the
+                    # distance is measured from the cell body, not a process tip.
+                    soma_region = None
+                    if sid in outline_by_sid:
+                        try:
+                            sr = polygon_to_mask(
+                                outline_by_sid[sid]['polygon_points'], shape)
+                            if np.any(sr):
+                                soma_region = sr
+                        except Exception:
+                            soma_region = None
+                    if soma_region is None and cen is not None:
+                        sr = _soma_footprint_mask(shape, cen, ps)
+                        if np.any(sr):
+                            soma_region = sr
                     soma_masks[sid] = mk
                     exp = _microglia_leakage_exposure(
-                        mk, vessel_mask, tracers, ps, dist_um=dist_um)
+                        mk, vessel_mask, tracers, ps, dist_um=dist_um,
+                        soma_mask=soma_region)
                     crow = {'image_name': img_base, 'animal_id': animal_id,
                             'treatment': treatment, 'soma_id': sid,
                             'bbb_footprint': source}
