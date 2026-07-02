@@ -220,11 +220,11 @@ def main():
         print(f"No *_mask.tif files matched in {MASKS_DIR}")
         return
 
-    cell_rows, vessel_rows = [], []
+    cell_rows, vessel_rows, misses = [], [], []
     for base, masks in sorted(by_image.items()):
         raw = find_raw(base)
         if raw is None:
-            print(f"  ! no raw image for '{base}' in {RAW_DIR} — skipped")
+            misses.append(base)
             continue
         color = load_multichannel(raw)
         nch = color.shape[2]
@@ -273,6 +273,24 @@ def main():
 
     write(os.path.join(OUT_DIR, 'bbb_microglia_from_masks.csv'), cell_rows)
     write(os.path.join(OUT_DIR, 'bbb_vessel_from_masks.csv'), vessel_rows)
+
+    if misses:
+        raw_stems = sorted({
+            os.path.splitext(os.path.basename(p))[0]
+            for p in glob.glob(os.path.join(RAW_DIR, '*'))
+            if not os.path.basename(p).startswith('._')})
+        print("\n" + "=" * 68)
+        print(f"{len(misses)} image(s) had masks but NO matching raw file in RAW_DIR.")
+        print(f"  masks want:  {', '.join(misses[:8])}{' ...' if len(misses) > 8 else ''}")
+        print(f"  RAW_DIR   =  {RAW_DIR}")
+        print(f"  it holds:    {', '.join(raw_stems[:8]) or '(nothing)'}"
+              f"{' ...' if len(raw_stems) > 8 else ''}")
+        if any('_processed' in s for s in raw_stems) or 'Processed' in RAW_DIR:
+            print("\n  ⚠  RAW_DIR looks like your PROCESSED-images folder. Those are")
+            print("     single-channel (_processed.tif) and have no CD31/tracer channels.")
+            print("     Point RAW_DIR at the ORIGINAL MULTICHANNEL TIFFs you loaded into")
+            print("     MMPS (the files with all 3 channels: dextran + IBA1 + CD31).")
+        print("=" * 68)
 
 
 if __name__ == '__main__':
