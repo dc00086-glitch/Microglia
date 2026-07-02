@@ -45,6 +45,12 @@ TRACERS = [                    # (name, channel number) — one per injected tra
     ("dextran", 1),
 ]
 SOMA_RADIUS_UM = 6.0           # disk radius around the soma for the distance basis
+
+# Vessel segmentation: tubeness (Sato) enhances tube-like CD31 and suppresses
+# speckle before thresholding, giving cleaner vessels. Turn it on/off here.
+USE_TUBENESS        = False    # True = tubeness-enhanced vessels; False = plain Otsu
+TUBENESS_SIGMAS     = (1, 2, 3, 4, 6)   # vessel scales in pixels (Sato filter)
+SAVE_VESSEL_PREVIEW = True     # save a with/without-tubeness comparison PNG per image
 # ========================================================================
 
 
@@ -89,17 +95,26 @@ def _disk_struct(radius):
     return (yy * yy + xx * xx) <= r * r
 
 
-def segment_vessels(cd31, ps, min_object_um2=5.0, close_radius_px=2):
+def _vessel_binary(cd31, ps, use_tubeness=False, sigmas=TUBENESS_SIGMAS,
+                   min_object_um2=5.0, close_radius_px=2):
+    """Binary vessel mask from CD31. With ``use_tubeness`` the CD31 is first run
+    through a multi-scale Sato tubeness filter (bright ridges) and that response
+    is thresholded, which keeps tube-like vessels and drops speckle blobs."""
     img = np.asarray(cd31, dtype=np.float64)
-    empty = (np.zeros(img.shape, dtype=bool), {
-        'vessel_area_fraction': 0.0, 'vessel_length_density_um_per_um2': 0.0,
-        'vessel_branchpoint_density_per_mm2': 0.0, 'vessel_mean_diameter_um': 0.0,
-        'vessel_threshold': 0.0})
     if img.max() <= 0 or not np.any(img > 0):
-        return empty
-    pos = img[img > 0]
-    thr = float(threshold_otsu(pos)) if pos.min() < pos.max() else float(pos.min()) - 1.0
-    vessels = img > thr
+        return np.zeros(img.shape, dtype=bool), 0.0
+    if use_tubeness:
+        from skimage.filters import sato
+        mx = float(img.max())
+        base = np.nan_to_num(sato(img / mx, sigmas=sigmas, black_ridges=False))
+    else:
+        base = img
+    pos = base[base > 0]
+    if pos.size and pos.min() < pos.max():
+        thr = float(threshold_otsu(pos))
+    else:
+        thr = float(pos.min()) - 1.0 if pos.size else 0.0
+    vessels = base > thr
     if close_radius_px > 0:
         vessels = ndimage.binary_closing(vessels, structure=_disk_struct(close_radius_px))
     min_px = max(int(min_object_um2 / (ps ** 2)), 1)
@@ -109,8 +124,19 @@ def segment_vessels(cd31, ps, min_object_um2=5.0, close_radius_px=2):
         keep = np.where(sizes >= min_px)[0]
         keep = keep[keep != 0]
         vessels = np.isin(lab, keep)
+    return vessels, thr
+
+
+def segment_vessels(cd31, ps, min_object_um2=5.0, close_radius_px=2,
+                    use_tubeness=USE_TUBENESS, sigmas=TUBENESS_SIGMAS):
+    empty_metrics = {
+        'vessel_area_fraction': 0.0, 'vessel_length_density_um_per_um2': 0.0,
+        'vessel_branchpoint_density_per_mm2': 0.0, 'vessel_mean_diameter_um': 0.0,
+        'vessel_threshold': 0.0}
+    vessels, thr = _vessel_binary(cd31, ps, use_tubeness, sigmas,
+                                  min_object_um2, close_radius_px)
     if not np.any(vessels):
-        return empty
+        return np.zeros(np.asarray(cd31).shape, dtype=bool), empty_metrics
     area_um2 = vessels.size * (ps ** 2)
     skel = skeletonize(vessels)
     skel_len_um = int(skel.sum()) * ps
@@ -127,6 +153,31 @@ def segment_vessels(cd31, ps, min_object_um2=5.0, close_radius_px=2):
         'vessel_threshold': round(thr, 2),
     }
     return vessels, metrics
+
+
+def save_vessel_preview(path, cd31, ps, sigmas=TUBENESS_SIGMAS):
+    """Save a 2-panel PNG comparing the vessel mask WITHOUT tubeness (plain Otsu)
+    vs WITH tubeness (Sato), each as a cyan outline over the CD31 image, so you
+    can see the difference and decide whether to set USE_TUBENESS."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plain, _ = _vessel_binary(cd31, ps, use_tubeness=False)
+    tube, _ = _vessel_binary(cd31, ps, use_tubeness=True, sigmas=sigmas)
+    cd = np.asarray(cd31, dtype=np.float64)
+    vmax = float(np.percentile(cd, 99)) if cd.size else 1.0
+    fig, ax = plt.subplots(1, 2, figsize=(13, 6.2))
+    for a, mask, title in ((ax[0], plain, 'CD31 vessels — Otsu (no tubeness)'),
+                           (ax[1], tube, 'CD31 vessels — tubeness (Sato)')):
+        a.imshow(cd, cmap='gray', vmax=vmax if vmax > 0 else 1.0)
+        if np.any(mask):
+            a.contour(mask, levels=[0.5], colors='cyan', linewidths=0.6)
+        af = 100.0 * float(mask.mean())
+        a.set_title('%s\narea fraction %.2f%%' % (title, af))
+        a.axis('off')
+    fig.tight_layout()
+    fig.savefig(path, dpi=110, bbox_inches='tight')
+    plt.close(fig)
 
 
 def quantify_leakage(vessel_mask, tracer, ps, ring_edges_um=(0, 10, 20, 40)):
@@ -279,8 +330,18 @@ def main():
             print(f"  ! {base}: CD31 channel {CD31_CHANNEL} out of range ({nch} ch) — skipped")
             continue
         cd31 = color[:, :, cd31_idx]
-        vessel_mask, vmetrics = segment_vessels(cd31, PIXEL_SIZE_UM)
+        vessel_mask, vmetrics = segment_vessels(
+            cd31, PIXEL_SIZE_UM, use_tubeness=USE_TUBENESS, sigmas=TUBENESS_SIGMAS)
         dist_um = ndimage.distance_transform_edt(~(vessel_mask > 0)) * PIXEL_SIZE_UM
+
+        if SAVE_VESSEL_PREVIEW:
+            prev_dir = os.path.join(OUT_DIR, 'bbb_vessel_previews')
+            os.makedirs(prev_dir, exist_ok=True)
+            try:
+                save_vessel_preview(os.path.join(prev_dir, base + '_vessels.png'),
+                                    cd31, PIXEL_SIZE_UM, sigmas=TUBENESS_SIGMAS)
+            except Exception as e:
+                print(f"  ! vessel preview failed for {base}: {e}")
 
         tracers = {}
         vrow = {'image_name': base}

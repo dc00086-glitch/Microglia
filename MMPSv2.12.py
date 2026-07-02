@@ -745,36 +745,33 @@ def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
 # dextran / far-red albumin), and per-microglia leakage exposure. Pure
 # functions so the in-app BBB mode (and any script) can call them.
 # ============================================================================
-def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2):
-    """Segment the CD31 channel into a vessel mask and compute REAVER-style
-    vascular morphometrics.
+_VESSEL_TUBENESS_SIGMAS = (1, 2, 3, 4, 6)
 
-    Returns (vessel_mask, metrics_dict). Metrics: area fraction, length density
-    (skeleton length / area), branch-point density, mean diameter (from the
-    distance transform along the skeleton), and the Otsu threshold used.
-    """
+
+def _vessel_binary(cd31, pixel_size_um, use_tubeness=False,
+                   sigmas=_VESSEL_TUBENESS_SIGMAS,
+                   min_object_um2=5.0, close_radius_px=2):
+    """Binary CD31 vessel mask. With ``use_tubeness`` the CD31 is first passed
+    through a multi-scale Sato tubeness filter (bright ridges) and that response
+    is thresholded, keeping tube-like vessels and dropping speckle blobs."""
     from skimage.filters import threshold_otsu
-
     img = np.asarray(cd31, dtype=np.float64)
-    empty = (np.zeros(img.shape, dtype=bool), {
-        'vessel_area_fraction': 0.0, 'vessel_length_density_um_per_um2': 0.0,
-        'vessel_branchpoint_density_per_mm2': 0.0, 'vessel_mean_diameter_um': 0.0,
-        'vessel_threshold': 0.0})
     if img.max() <= 0 or not np.any(img > 0):
-        return empty
-
-    pos = img[img > 0]
-    # Otsu needs a spread of values; if the foreground is (near-)constant, keep
-    # all of it instead of returning an empty mask.
+        return np.zeros(img.shape, dtype=bool), 0.0
+    if use_tubeness:
+        from skimage.filters import sato
+        mx = float(img.max())
+        base = np.nan_to_num(sato(img / mx, sigmas=sigmas, black_ridges=False))
+    else:
+        base = img
+    pos = base[base > 0]
     if pos.size and pos.min() < pos.max():
         thr = float(threshold_otsu(pos))
     else:
         thr = float(pos.min()) - 1.0 if pos.size else 0.0
-    vessels = img > thr
+    vessels = base > thr
     if close_radius_px > 0:
-        vessels = ndimage.binary_closing(
-            vessels, structure=_disk_struct(close_radius_px))
-    # Drop tiny specks below the physical area floor.
+        vessels = ndimage.binary_closing(vessels, structure=_disk_struct(close_radius_px))
     min_px = max(int(min_object_um2 / (pixel_size_um ** 2)), 1)
     lab, n = ndimage.label(vessels)
     if n:
@@ -782,6 +779,26 @@ def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2)
         keep = np.where(sizes >= min_px)[0]
         keep = keep[keep != 0]
         vessels = np.isin(lab, keep)
+    return vessels, thr
+
+
+def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2,
+                     use_tubeness=False, sigmas=_VESSEL_TUBENESS_SIGMAS):
+    """Segment the CD31 channel into a vessel mask and compute REAVER-style
+    vascular morphometrics.
+
+    Returns (vessel_mask, metrics_dict). Metrics: area fraction, length density
+    (skeleton length / area), branch-point density, mean diameter (from the
+    distance transform along the skeleton), and the threshold used. Set
+    ``use_tubeness`` to enhance tube-like CD31 (Sato) before thresholding.
+    """
+    img = np.asarray(cd31, dtype=np.float64)
+    empty = (np.zeros(img.shape, dtype=bool), {
+        'vessel_area_fraction': 0.0, 'vessel_length_density_um_per_um2': 0.0,
+        'vessel_branchpoint_density_per_mm2': 0.0, 'vessel_mean_diameter_um': 0.0,
+        'vessel_threshold': 0.0})
+    vessels, thr = _vessel_binary(cd31, pixel_size_um, use_tubeness, sigmas,
+                                  min_object_um2, close_radius_px)
     if not np.any(vessels):
         return empty
 
@@ -976,6 +993,31 @@ def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None):
             ],
             loc='lower right', fontsize=8, framealpha=0.75)
     fig.suptitle('Bright signal OUTSIDE the cyan vessels = tracer leak', y=0.99)
+    fig.tight_layout()
+    fig.savefig(path, dpi=110, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _save_vessel_seg_preview(path, cd31, pixel_size_um,
+                             sigmas=_VESSEL_TUBENESS_SIGMAS):
+    """Save a 2-panel PNG comparing the CD31 vessel mask WITHOUT tubeness (plain
+    Otsu) vs WITH tubeness (Sato), each as a cyan outline over CD31, so the user
+    can see the difference and decide whether to enable tubeness."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plain, _ = _vessel_binary(cd31, pixel_size_um, use_tubeness=False)
+    tube, _ = _vessel_binary(cd31, pixel_size_um, use_tubeness=True, sigmas=sigmas)
+    cd = np.asarray(cd31, dtype=np.float64)
+    vmax = float(np.percentile(cd, 99)) if cd.size else 1.0
+    fig, ax = plt.subplots(1, 2, figsize=(13, 6.2))
+    for a, mask, title in ((ax[0], plain, 'CD31 vessels — Otsu (no tubeness)'),
+                           (ax[1], tube, 'CD31 vessels — tubeness (Sato)')):
+        a.imshow(cd, cmap='gray', vmax=vmax if vmax > 0 else 1.0)
+        if np.any(mask):
+            a.contour(mask, levels=[0.5], colors='cyan', linewidths=0.6)
+        a.set_title('%s\narea fraction %.2f%%' % (title, 100.0 * float(mask.mean())))
+        a.axis('off')
     fig.tight_layout()
     fig.savefig(path, dpi=110, bbox_inches='tight')
     plt.close(fig)
@@ -3171,9 +3213,15 @@ class BBBAnalysisDialog(QDialog):
         self.ntracer_spin.setValue(min(len(default_tracers), max(1, self.num_channels)) or 1)
         _update_visible(self.ntracer_spin.value())
 
+        self.tubeness_check = QCheckBox(
+            "Enhance vessels with tubeness (Sato) — cleaner vessels from noisy CD31")
+        self.tubeness_check.setChecked(False)
+        layout.addWidget(self.tubeness_check)
+
         note = QLabel("Runs on all loaded images with masks. Saves leak overlays\n"
-                      "(bbb_overlays/) and folds per-cell exposure into the\n"
-                      "morphology master CSV.")
+                      "(bbb_overlays/), an Otsu-vs-tubeness vessel comparison\n"
+                      "(bbb_vessel_previews/), and folds per-cell exposure into\n"
+                      "the morphology master CSV.")
         note.setStyleSheet("color: gray;")
         layout.addWidget(note)
 
@@ -3199,7 +3247,8 @@ class BBBAnalysisDialog(QDialog):
             tracers.append({'name': name or f"tracer{i + 1}", 'channel': ch})
         return {'cd31': self.cd31_combo.currentData(),
                 'iba1': self.iba1_combo.currentData(),
-                'tracers': tracers}
+                'tracers': tracers,
+                'use_tubeness': self.tubeness_check.isChecked()}
 
 
 class MicrogliaAnalysisGUI(QMainWindow):
@@ -8559,6 +8608,7 @@ if __name__ == '__main__':
                                 "Assign the CD31 channel and at least one tracer.")
             return
         self.bbb_channels = ch
+        self.bbb_use_tubeness = bool(ch.get('use_tubeness', False))
         self.run_bbb_analysis(ch)
 
     def run_bbb_analysis(self, channels):
@@ -8620,7 +8670,17 @@ if __name__ == '__main__':
             treatment = idata.get('treatment', '')
             try:
                 cd31 = color[:, :, cd31_i].astype(np.float64)
-                vessel_mask, vmetrics = _segment_vessels(cd31, ps)
+                use_tube = bool(getattr(self, 'bbb_use_tubeness', False))
+                vessel_mask, vmetrics = _segment_vessels(cd31, ps, use_tubeness=use_tube)
+                img_base = os.path.splitext(img_name)[0]
+                # Save an Otsu-vs-tubeness vessel comparison so the choice is visible.
+                try:
+                    prev_dir = os.path.join(out_dir, 'bbb_vessel_previews')
+                    os.makedirs(prev_dir, exist_ok=True)
+                    _save_vessel_seg_preview(
+                        os.path.join(prev_dir, img_base + '_vessels.png'), cd31, ps)
+                except Exception as e:
+                    self.log(f"BBB: vessel preview failed for {img_name}: {e}")
                 row = {'image_name': os.path.splitext(img_name)[0],
                        'animal_id': animal_id, 'treatment': treatment}
                 row.update(vmetrics)
@@ -8638,7 +8698,6 @@ if __name__ == '__main__':
 
                 # One row per microglia — EVERY picked soma, mask or not.
                 dist_um = ndimage.distance_transform_edt(~(vessel_mask > 0)) * ps
-                img_base = os.path.splitext(img_name)[0]
 
                 # Largest approved mask per soma_id (best footprint when present).
                 by_soma = {}
