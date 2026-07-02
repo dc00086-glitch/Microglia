@@ -3469,9 +3469,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
     def _create_left_panel(self):
         scroll = QScrollArea()
-        scroll.setFixedWidth(450)
+        scroll.setFixedWidth(540)
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # As-needed (not AlwaysOff) so a row wider than the panel scrolls into
+        # view instead of being clipped/hidden on high-DPI displays.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setFocusPolicy(Qt.NoFocus)  # Don't steal focus from child widgets
 
         panel = QWidget()
@@ -3652,7 +3654,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.branch_boost_slider.setPageStep(1)
         self.branch_boost_slider.setTickPosition(QSlider.TicksBelow)
         self.branch_boost_slider.setTickInterval(1)
-        self.branch_boost_slider.setMinimumWidth(160)
         branch_boost_layout.addWidget(self.branch_boost_slider)
         self.branch_boost_spin = QSpinBox()
         self.branch_boost_spin.setRange(0, 10)
@@ -3660,8 +3661,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.branch_boost_slider.valueChanged.connect(self.branch_boost_spin.setValue)
         self.branch_boost_spin.valueChanged.connect(self.branch_boost_slider.setValue)
         branch_boost_layout.addWidget(self.branch_boost_spin)
-        branch_boost_layout.addWidget(QLabel("(0=off, 3=gentle, 7+=strong)"))
-        branch_boost_layout.addStretch()
+        branch_boost_layout.addWidget(QLabel("(0–10)"))
         extra_layout.addLayout(branch_boost_layout)
 
         extra_processing_group.setLayout(extra_layout)
