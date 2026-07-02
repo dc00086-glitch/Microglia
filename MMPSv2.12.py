@@ -181,6 +181,48 @@ def extract_channel(img, channel_idx):
     return ensure_grayscale(img)
 
 
+def _branch_boost(img, amount, sigmas=(1, 2, 3)):
+    """Boost thin branch (neurite) signal to prevent a beaded / pseudodystrophic
+    look in the generated masks.
+
+    Faint, thin microglia processes often break into 'beads' where parts of a
+    process dip toward background; region growing then fragments them, which
+    reads as dystrophy that isn't real. This applies a multi-scale tubeness
+    (Sato) filter that responds to elongated, tube-like structures (processes)
+    but not to blobs (the soma) or flat background, and adds a scaled version of
+    that response back to the image. The dim gaps along a process are lifted
+    toward the brighter beads so it reads as continuous, while the background is
+    essentially untouched.
+
+    ``amount`` is the slider value (0 = off); internally ``amount / 100`` scales
+    how much of the normalised tubeness response is added back, in units of the
+    image's own max intensity. The original dtype (and its ceiling) is preserved.
+    """
+    if amount is None or amount <= 0:
+        return img
+    try:
+        from skimage.filters import sato
+    except Exception:
+        return img
+    dtype = img.dtype
+    f = np.asarray(img, dtype=np.float64)
+    mx = float(f.max())
+    if mx <= 0:
+        return img
+    resp = sato(f / mx, sigmas=sigmas, black_ridges=False)
+    resp = np.nan_to_num(resp, nan=0.0, posinf=0.0, neginf=0.0)
+    rmax = float(resp.max())
+    if rmax <= 0:
+        return img
+    resp /= rmax
+    boosted = f + (amount / 100.0) * resp * mx
+    if np.issubdtype(dtype, np.integer):
+        boosted = np.clip(boosted, 0, np.iinfo(dtype).max)
+    else:
+        boosted = np.clip(boosted, 0, None)
+    return boosted.astype(dtype)
+
+
 # ============================================================================
 # STANDALONE FUNCTIONS FOR MULTIPROCESSING
 # (must be module-level to be picklable by ProcessPoolExecutor)
@@ -2061,7 +2103,8 @@ class BackgroundRemovalThread(QThread):
 
     def _clean_single_channel(self, raw_img, ch_idx, radius, rb_enabled,
                                denoise_enabled, denoise_size,
-                               sharpen_enabled, sharpen_amount):
+                               sharpen_enabled, sharpen_amount,
+                               branch_boost_enabled=False, branch_boost_amount=0):
         """Apply the cleaning pipeline to one channel and return the result."""
         if raw_img.ndim == 3:
             # Extract channel WITHOUT normalization to preserve original
@@ -2087,6 +2130,9 @@ class BackgroundRemovalThread(QThread):
             sharpened = result_float + sharpen_amount * (result_float - blurred)
             result = np.clip(sharpened, 0, np.iinfo(img_dtype).max).astype(img_dtype)
 
+        if branch_boost_enabled and branch_boost_amount and branch_boost_amount > 0:
+            result = _branch_boost(result, branch_boost_amount)
+
         return result
 
     def run(self):
@@ -2094,7 +2140,8 @@ class BackgroundRemovalThread(QThread):
             total = len(self.image_data_list)
             for i, (
                     img_path, img_name, radius, rb_enabled, denoise_enabled, denoise_size,
-                    sharpen_enabled, sharpen_amount, process_channels) in enumerate(
+                    sharpen_enabled, sharpen_amount, branch_boost_enabled,
+                    branch_boost_amount, process_channels) in enumerate(
                 self.image_data_list):
                 try:
                     self.status_update.emit(f"Processing: {img_name}")
@@ -2112,7 +2159,8 @@ class BackgroundRemovalThread(QThread):
                     result = self._clean_single_channel(
                         raw_img, primary_ch, radius, rb_enabled,
                         denoise_enabled, denoise_size,
-                        sharpen_enabled, sharpen_amount)
+                        sharpen_enabled, sharpen_amount,
+                        branch_boost_enabled, branch_boost_amount)
 
                     name = os.path.splitext(img_name)[0]
                     out_path = os.path.join(self.output_dir, f"{name}_processed.tif")
@@ -2129,7 +2177,8 @@ class BackgroundRemovalThread(QThread):
                                 ch_result = self._clean_single_channel(
                                     raw_img, ch_idx, radius, rb_enabled,
                                     denoise_enabled, denoise_size,
-                                    sharpen_enabled, sharpen_amount)
+                                    sharpen_enabled, sharpen_amount,
+                                    branch_boost_enabled, branch_boost_amount)
                                 ch_path = os.path.join(
                                     self.output_dir,
                                     f"{name}_processed_ch{ch_idx + 1}.tif")
@@ -3580,6 +3629,29 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.sharpen_slider.valueChanged.connect(lambda v: self.sharpen_label.setText(f"{v / 10:.1f}"))
         sharpen_layout.addWidget(self.sharpen_label)
         extra_layout.addLayout(sharpen_layout)
+
+        # Branch Boost — enhance thin process signal (tubeness filter) so faint,
+        # beaded branches read as continuous instead of pseudodystrophic.
+        self.branch_boost_check = QCheckBox("Apply Branch Boost (enhance thin processes)")
+        self.branch_boost_check.setChecked(False)
+        extra_layout.addWidget(self.branch_boost_check)
+
+        branch_boost_layout = QHBoxLayout()
+        branch_boost_layout.addWidget(QLabel("  Boost amount:"))
+        self.branch_boost_slider = QSlider(Qt.Horizontal)
+        self.branch_boost_slider.setRange(0, 300)
+        self.branch_boost_slider.setSingleStep(10)
+        self.branch_boost_slider.setValue(50)
+        branch_boost_layout.addWidget(self.branch_boost_slider)
+        self.branch_boost_spin = QSpinBox()
+        self.branch_boost_spin.setRange(0, 300)
+        self.branch_boost_spin.setValue(50)
+        self.branch_boost_slider.valueChanged.connect(self.branch_boost_spin.setValue)
+        self.branch_boost_spin.valueChanged.connect(self.branch_boost_slider.setValue)
+        branch_boost_layout.addWidget(self.branch_boost_spin)
+        branch_boost_layout.addWidget(QLabel("(0=off, 50=gentle, 150+=strong)"))
+        branch_boost_layout.addStretch()
+        extra_layout.addLayout(branch_boost_layout)
 
         extra_processing_group.setLayout(extra_layout)
         param_layout.addWidget(extra_processing_group)
@@ -11028,6 +11100,9 @@ if __name__ == '__main__':
             sharpened = result_float + sharpen_amount * (result_float - blurred)
             result = np.clip(sharpened, 0, channel_img.max()).astype(result.dtype)
 
+        if self.branch_boost_check.isChecked() and self.branch_boost_slider.value() > 0:
+            result = _branch_boost(result, self.branch_boost_slider.value())
+
         # Store the preview (without adjustments)
         img_data['preview'] = result
         adjusted = self._apply_display_adjustments(result)
@@ -11041,6 +11116,8 @@ if __name__ == '__main__':
             steps.append(f"Denoise={self.denoise_spin.value()}")
         if self.sharpen_check.isChecked():
             steps.append(f"Sharpen={self.sharpen_slider.value() / 10:.1f}")
+        if self.branch_boost_check.isChecked() and self.branch_boost_slider.value() > 0:
+            steps.append(f"BranchBoost={self.branch_boost_slider.value()}")
         if len(steps) == 1:
             steps.append("no processing")
         self.log(f"Preview {self.current_image_name}: {', '.join(steps)}")
@@ -11194,6 +11271,8 @@ if __name__ == '__main__':
         denoise_size = self.denoise_spin.value()
         sharpen_enabled = self.sharpen_check.isChecked()
         sharpen_amount = self.sharpen_slider.value() / 10.0
+        branch_boost_enabled = self.branch_boost_check.isChecked()
+        branch_boost_amount = self.branch_boost_slider.value()
 
         channels_to_clean = self._get_channels_to_clean()
         process_channel = self.grayscale_channel
@@ -11210,6 +11289,8 @@ if __name__ == '__main__':
             steps.append(f"Denoise ({denoise_size})")
         if sharpen_enabled:
             steps.append(f"Sharpen ({sharpen_amount:.1f})")
+        if branch_boost_enabled and branch_boost_amount > 0:
+            steps.append(f"Branch Boost ({branch_boost_amount})")
         if len(steps) == 1:
             self.log(f"Processing Channel {process_channel + 1} only - no additional processing")
         else:
@@ -11219,6 +11300,7 @@ if __name__ == '__main__':
         for img_name, img_data in selected_images:
             process_list.append((img_data['raw_path'], img_name, radius, rb_enabled,
                                  denoise_enabled, denoise_size, sharpen_enabled, sharpen_amount,
+                                 branch_boost_enabled, branch_boost_amount,
                                  channels_to_clean))
         self.thread = BackgroundRemovalThread(process_list, self.processed_dir)
         self.thread.status_update.connect(self.log)
