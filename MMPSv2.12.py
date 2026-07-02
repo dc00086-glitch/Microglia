@@ -204,6 +204,62 @@ def _enforce_mask_subset_invariant(masks):
     return total_removed
 
 
+def _radial_intensity_floor(roi, cy, cx, radius_px=100, thickness=3):
+    """Representative intensity on a ring ``radius_px`` from the soma centre.
+
+    Uses the mean intensity on the ring (± ``thickness`` px) — the signal level
+    that far out from the soma. If the ROI is smaller than ``radius_px`` the
+    outermost available ring is used instead. Returns 0 if nothing is available.
+    """
+    h, w = roi.shape
+    yy, xx = np.ogrid[:h, :w]
+    dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    ring = (dist >= radius_px - thickness) & (dist <= radius_px + thickness)
+    if not np.any(ring):
+        rmax = float(dist.max())
+        ring = dist >= (rmax - thickness)
+    vals = roi[ring]
+    return float(vals.mean()) if vals.size else 0.0
+
+
+def _growth_intensity_floor(roi, cy_roi, cx_roi, floor_mode,
+                            min_intensity_percent, local_intensity_window,
+                            radius_px=100):
+    """Compute the region-growing intensity floor.
+
+    Returns ``(intensity_floor_scalar, intensity_floor_map)`` (the map is None
+    unless the local-adaptive percent mode is active).
+
+    ``floor_mode``:
+      'percent'      — original behaviour: min_intensity_percent % of the ROI
+                       max, plus an optional local-max-based per-pixel floor.
+      'otsu_radial'  — floor = min(Otsu threshold of the ROI, the intensity on a
+                       ring ``radius_px`` from the soma). The lower/more-inclusive
+                       of the two, so faint distal signal down to the 100px level
+                       is kept.
+    """
+    if floor_mode == 'otsu_radial':
+        from skimage.filters import threshold_otsu
+        pos = roi[roi > 0]
+        otsu = float(threshold_otsu(pos)) if pos.size else 0.0
+        radial = _radial_intensity_floor(roi, cy_roi, cx_roi, radius_px)
+        floor = min(otsu, radial) if radial > 0 else otsu
+        return floor, None
+
+    # Default 'percent' mode (unchanged legacy behaviour).
+    intensity_floor = 0.0
+    intensity_floor_map = None
+    if min_intensity_percent and min_intensity_percent > 0:
+        roi_max = roi.max()
+        if roi_max > 0:
+            intensity_floor = roi_max * (min_intensity_percent / 100.0)
+        if local_intensity_window and local_intensity_window > 0:
+            local_max = ndimage.maximum_filter(roi, size=local_intensity_window)
+            local_floor = local_max * (min_intensity_percent / 100.0)
+            intensity_floor_map = np.maximum(local_floor, intensity_floor)
+    return intensity_floor, intensity_floor_map
+
+
 def _grow_masks_for_soma(args):
     """Standalone region-growing mask generation for a single soma.
 
@@ -219,7 +275,9 @@ def _grow_masks_for_soma(args):
      territory_roi_data, my_territory_label,
      use_circular_constraint, circular_buffer_um2,
      use_min_intensity, min_intensity_percent, img_name,
-     local_intensity_window, smooth_enabled, smooth_gap_size) = args
+     local_intensity_window, smooth_enabled, smooth_gap_size) = args[:20]
+    # Optional trailing floor_mode ('percent' legacy default, or 'otsu_radial').
+    floor_mode = args[20] if len(args) > 20 else 'percent'
 
     y_min, y_max, x_min, x_max = roi_bounds
     roi = roi_data  # already float64
@@ -240,18 +298,18 @@ def _grow_masks_for_soma(args):
         max_radius_px = np.sqrt(constraint_area_px / np.pi)
         max_radius_px_sq = max_radius_px ** 2
 
-    # Intensity floor (local adaptive combined with global minimum)
+    # Intensity floor. 'otsu_radial' always applies; 'percent' only when the
+    # min-intensity toggle is on (preserves legacy behaviour exactly).
     intensity_floor = 0.0
     intensity_floor_map = None
-    if use_min_intensity and min_intensity_percent > 0:
-        roi_max = roi.max()
-        if roi_max > 0:
-            intensity_floor = roi_max * (min_intensity_percent / 100.0)
-        if local_intensity_window and local_intensity_window > 0:
-            local_max = ndimage.maximum_filter(roi, size=local_intensity_window)
-            local_floor = local_max * (min_intensity_percent / 100.0)
-            # Use whichever is stricter: global floor or local floor
-            intensity_floor_map = np.maximum(local_floor, intensity_floor)
+    if floor_mode == 'otsu_radial':
+        intensity_floor, intensity_floor_map = _growth_intensity_floor(
+            roi, cy_roi, cx_roi, 'otsu_radial',
+            min_intensity_percent, local_intensity_window)
+    elif use_min_intensity and min_intensity_percent > 0:
+        intensity_floor, intensity_floor_map = _growth_intensity_floor(
+            roi, cy_roi, cx_roi, 'percent',
+            min_intensity_percent, local_intensity_window)
 
     # Territory constraint
     territory_roi = territory_roi_data
@@ -2781,6 +2839,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.use_circular_constraint = False
         self.circular_buffer_um2 = 200  # extra area (µm²) beyond target for circular boundary
         self.local_intensity_window = 51  # local adaptive window size (0 = global)
+        # Intensity-floor method for region growing: 'percent' (min-intensity %
+        # of max, legacy) or 'otsu_radial' (min(Otsu, intensity at 100px ring)).
+        self.mask_floor_mode = 'percent'
+        self.mask_floor_radius_px = 100
         self.mask_smooth_enabled = True
         self.mask_smooth_gap_size = 4
         self.use_imagej = False
@@ -6814,6 +6876,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             'use_circular_constraint': self.use_circular_constraint,
             'circular_buffer_um2': self.circular_buffer_um2,
             'local_intensity_window': self.local_intensity_window,
+            'mask_floor_mode': self.mask_floor_mode,
             'mask_smooth_enabled': self.mask_smooth_enabled,
             'mask_smooth_gap_size': self.mask_smooth_gap_size,
             'coloc_channel_1': self.coloc_channel_1,
@@ -7092,6 +7155,21 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         min_intensity_check.setChecked(self.use_min_intensity)
         intensity_layout.addWidget(min_intensity_check)
 
+        # Intensity-floor method
+        floor_mode_layout = QHBoxLayout()
+        floor_mode_layout.addWidget(QLabel("Floor method:"))
+        floor_mode_combo = QComboBox()
+        floor_mode_combo.addItem("Min intensity % of max (default)", "percent")
+        floor_mode_combo.addItem("Otsu + 100px floor", "otsu_radial")
+        floor_mode_combo.setToolTip(
+            "Otsu + 100px floor: grow using the lower of the Otsu threshold and\n"
+            "the intensity on a ring 100px from the soma (more inclusive of faint\n"
+            "distal processes). 'Min intensity %' is the original method.")
+        _fm_idx = floor_mode_combo.findData(getattr(self, 'mask_floor_mode', 'percent'))
+        floor_mode_combo.setCurrentIndex(_fm_idx if _fm_idx >= 0 else 0)
+        floor_mode_layout.addWidget(floor_mode_combo)
+        intensity_layout.addLayout(floor_mode_layout)
+
         slider_layout = QHBoxLayout()
         slider_layout.addWidget(QLabel("Min intensity:"))
         min_intensity_slider = QSlider(Qt.Horizontal)
@@ -7221,6 +7299,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         use_min_intensity = min_intensity_check.isChecked()
         min_intensity_percent = min_intensity_slider.value()
         local_intensity_window = local_win_spin.value()
+        self.mask_floor_mode = floor_mode_combo.currentData()
         self.mask_smooth_enabled = smooth_check.isChecked()
         self.mask_smooth_gap_size = smooth_slider.value()
         mask_min_area = min_area_spin.value()
@@ -8547,6 +8626,7 @@ if __name__ == '__main__':
             self.use_circular_constraint = session.get('use_circular_constraint', False)
             self.circular_buffer_um2 = session.get('circular_buffer_um2', 200)
             self.local_intensity_window = session.get('local_intensity_window', 51)
+            self.mask_floor_mode = session.get('mask_floor_mode', 'percent')
             self.mask_smooth_enabled = session.get('mask_smooth_enabled', True)
             self.mask_smooth_gap_size = session.get('mask_smooth_gap_size', 4)
             self.coloc_channel_1 = session.get('coloc_channel_1', 0)
@@ -13059,7 +13139,8 @@ if __name__ == '__main__':
                             self.use_circular_constraint, self.circular_buffer_um2,
                             self.use_min_intensity, self.min_intensity_percent, img_name,
                             self.local_intensity_window,
-                            self.mask_smooth_enabled, self.mask_smooth_gap_size
+                            self.mask_smooth_enabled, self.mask_smooth_gap_size,
+                            getattr(self, 'mask_floor_mode', 'percent')
                         ))
 
                     # Run serially (desktops are not set up for parallel work)
@@ -13721,17 +13802,20 @@ if __name__ == '__main__':
             max_radius_px = np.sqrt(constraint_area_px / np.pi)
             max_radius_px_sq = max_radius_px ** 2
 
-        # Compute intensity floor (local adaptive combined with global minimum)
+        # Compute intensity floor. 'otsu_radial' always applies; 'percent' only
+        # when the min-intensity toggle is on (legacy behaviour preserved).
         intensity_floor = 0.0
         intensity_floor_map = None
-        if self.use_min_intensity and self.min_intensity_percent > 0:
-            roi_max = roi.max()
-            if roi_max > 0:
-                intensity_floor = roi_max * (self.min_intensity_percent / 100.0)
-            if self.local_intensity_window and self.local_intensity_window > 0:
-                local_max = ndimage.maximum_filter(roi, size=self.local_intensity_window)
-                local_floor = local_max * (self.min_intensity_percent / 100.0)
-                intensity_floor_map = np.maximum(local_floor, intensity_floor)
+        floor_mode = getattr(self, 'mask_floor_mode', 'percent')
+        if floor_mode == 'otsu_radial':
+            intensity_floor, intensity_floor_map = _growth_intensity_floor(
+                roi, cy_roi, cx_roi, 'otsu_radial',
+                self.min_intensity_percent, self.local_intensity_window,
+                getattr(self, 'mask_floor_radius_px', 100))
+        elif self.use_min_intensity and self.min_intensity_percent > 0:
+            intensity_floor, intensity_floor_map = _growth_intensity_floor(
+                roi, cy_roi, cx_roi, 'percent',
+                self.min_intensity_percent, self.local_intensity_window)
 
         # Build territory constraint ROI if watershed territory_map is provided
         territory_roi = None
