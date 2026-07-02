@@ -38,10 +38,11 @@ OUT_DIR    = "/Volumes/Expansion/.../Output"   # where the CSVs are written
 
 PIXEL_SIZE_UM = 0.316          # microns per pixel (match what you used in MMPS)
 
-CD31_CHANNEL  = 0              # 0-based channel index of CD31 (blood vessels)
-TRACERS = [                    # (name, 0-based channel index) — one per tracer
-    ("red_dextran",     1),
-    ("far_red_albumin", 2),
+# Channel numbers are 1-BASED, exactly as MMPS shows them (Channel 1, 2, 3...).
+# (IBA1/microglia channel isn't needed here — BBB only uses CD31 + tracers.)
+CD31_CHANNEL  = 3              # CD31 (blood vessels)
+TRACERS = [                    # (name, channel number) — one per injected tracer
+    ("dextran", 1),
 ]
 SOMA_RADIUS_UM = 6.0           # disk radius around the soma for the distance basis
 # ========================================================================
@@ -200,7 +201,9 @@ def find_raw(base):
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
-    tracer_specs = list(TRACERS)
+    # Convert 1-based channel numbers (as shown in MMPS) to 0-based array indices.
+    cd31_idx = CD31_CHANNEL - 1
+    tracer_specs = [(nm, ch - 1) for nm, ch in TRACERS]
 
     # Group masks by image base
     by_image = {}
@@ -225,10 +228,10 @@ def main():
             continue
         color = load_multichannel(raw)
         nch = color.shape[2]
-        if not (0 <= CD31_CHANNEL < nch):
+        if not (0 <= cd31_idx < nch):
             print(f"  ! {base}: CD31 channel {CD31_CHANNEL} out of range ({nch} ch) — skipped")
             continue
-        cd31 = color[:, :, CD31_CHANNEL]
+        cd31 = color[:, :, cd31_idx]
         vessel_mask, vmetrics = segment_vessels(cd31, PIXEL_SIZE_UM)
         dist_um = ndimage.distance_transform_edt(~(vessel_mask > 0)) * PIXEL_SIZE_UM
 
