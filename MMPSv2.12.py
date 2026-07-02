@@ -8403,9 +8403,7 @@ if __name__ == '__main__':
             nch = color.shape[2]
             if not (0 <= cd31_i < nch):
                 continue
-            ps = self.pixel_size_map.get(img_name, self.pixel_size)
-            if isinstance(ps, (list, tuple)):
-                ps = float(np.sqrt(ps[0] * ps[1]))
+            ps = float(self._get_pixel_size(img_name))
             try:
                 cd31 = color[:, :, cd31_i].astype(np.float64)
                 vessel_mask, vmetrics = _segment_vessels(cd31, ps)
