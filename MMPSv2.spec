@@ -46,6 +46,8 @@ a = Analysis(
         'skimage.measure',
         'skimage.segmentation',
         'skimage.filters',
+        'skimage.morphology',
+        'skimage.feature',
         'scipy',
         'scipy.ndimage',
         'scipy.stats',
