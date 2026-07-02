@@ -147,6 +147,18 @@ def ensure_grayscale(img):
     return img
 
 
+# Default display colors per channel index (R,G,B 0-255). The first three keep
+# the historical green / red / blue mapping; index 3 (far-red) is magenta.
+_CHANNEL_COLORS_DEFAULT = [
+    (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 0, 255),
+    (0, 255, 255), (255, 255, 0), (255, 255, 255),
+]
+
+
+def _default_channel_color(i):
+    return _CHANNEL_COLORS_DEFAULT[i % len(_CHANNEL_COLORS_DEFAULT)]
+
+
 def extract_channel(img, channel_idx):
     """Extract a single channel from a color image as grayscale"""
     if img is None:
@@ -3053,8 +3065,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.soma_mode = False  # Initialize soma_mode to prevent crashes
         self.brightness_value = 0
         self.contrast_value = 0
-        # Per-channel brightness for colocalization mode
-        self.channel_brightness = {'R': 0, 'G': 0, 'B': 0}
+        # Per-channel brightness for colocalization mode. Now keyed by channel
+        # INDEX (0,1,2,3,...) so any channel (incl. a 4th far-red) can be tuned;
+        # legacy 'R'/'G'/'B' keys are migrated on session load.
+        self.channel_brightness = {}
+        # Display color per channel index (R,G,B 0-255). Defaults keep the old
+        # green/red/blue look; index 3 (far-red) defaults to magenta.
+        self.channel_colors = {i: _default_channel_color(i) for i in range(7)}
         # Mask generation settings (defaults)
         self.use_min_intensity = True
         self.min_intensity_percent = 5
@@ -9972,73 +9989,69 @@ if __name__ == '__main__':
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
-        # Per-channel brightness in colocalization mode
+        # Per-channel display colour + brightness in colocalization mode. One row
+        # per channel (including a 4th far-red), each with a colour swatch that
+        # opens a colour picker and a brightness slider.
         channel_sliders = {}
         if self.colocalization_mode:
-            channel_group = QGroupBox("Channel Brightness")
+            from PyQt5.QtWidgets import QColorDialog
+            from PyQt5.QtGui import QColor
+
+            nch = 3
+            idata = self.images.get(self.current_image_name, {})
+            ci = idata.get('color_image')
+            if ci is not None and getattr(ci, 'ndim', 0) == 3:
+                nch = ci.shape[2]
+            elif idata.get('num_channels'):
+                nch = idata['num_channels']
+
+            channel_group = QGroupBox("Channel colour + brightness")
             channel_layout = QVBoxLayout()
 
-            # Green channel
-            green_layout = QHBoxLayout()
-            green_label = QLabel("Green:")
-            green_label.setStyleSheet("color: green; font-weight: bold;")
-            green_label.setFixedWidth(50)
-            green_slider = QSlider(Qt.Horizontal)
-            green_slider.setRange(-100, 100)
-            green_slider.setValue(self.channel_brightness.get('G', 0))
-            green_value = QLabel(str(self.channel_brightness.get('G', 0)))
-            green_value.setFixedWidth(40)
-            green_layout.addWidget(green_label)
-            green_layout.addWidget(green_slider)
-            green_layout.addWidget(green_value)
-            channel_layout.addLayout(green_layout)
-            channel_sliders['G'] = (green_slider, green_value)
+            def make_color_button(idx):
+                btn = QPushButton()
+                btn.setFixedWidth(44)
 
-            # Red channel
-            red_layout = QHBoxLayout()
-            red_label = QLabel("Red:")
-            red_label.setStyleSheet("color: red; font-weight: bold;")
-            red_label.setFixedWidth(50)
-            red_slider = QSlider(Qt.Horizontal)
-            red_slider.setRange(-100, 100)
-            red_slider.setValue(self.channel_brightness.get('R', 0))
-            red_value = QLabel(str(self.channel_brightness.get('R', 0)))
-            red_value.setFixedWidth(40)
-            red_layout.addWidget(red_label)
-            red_layout.addWidget(red_slider)
-            red_layout.addWidget(red_value)
-            channel_layout.addLayout(red_layout)
-            channel_sliders['R'] = (red_slider, red_value)
+                def paint(col):
+                    btn.setStyleSheet(
+                        f"background-color: rgb({col[0]},{col[1]},{col[2]}); border: 1px solid #888;")
+                paint(self.channel_colors.get(idx, _default_channel_color(idx)))
 
-            # Blue channel
-            blue_layout = QHBoxLayout()
-            blue_label = QLabel("Blue:")
-            blue_label.setStyleSheet("color: blue; font-weight: bold;")
-            blue_label.setFixedWidth(50)
-            blue_slider = QSlider(Qt.Horizontal)
-            blue_slider.setRange(-100, 100)
-            blue_slider.setValue(self.channel_brightness.get('B', 0))
-            blue_value = QLabel(str(self.channel_brightness.get('B', 0)))
-            blue_value.setFixedWidth(40)
-            blue_layout.addWidget(blue_label)
-            blue_layout.addWidget(blue_slider)
-            blue_layout.addWidget(blue_value)
-            channel_layout.addLayout(blue_layout)
-            channel_sliders['B'] = (blue_slider, blue_value)
+                def pick():
+                    cur = self.channel_colors.get(idx, _default_channel_color(idx))
+                    chosen = QColorDialog.getColor(QColor(*cur), dialog,
+                                                   f"Channel {idx + 1} colour")
+                    if chosen.isValid():
+                        self.channel_colors[idx] = (chosen.red(), chosen.green(), chosen.blue())
+                        paint(self.channel_colors[idx])
+                        self.update_display()
+                btn.clicked.connect(pick)
+                return btn
 
-            channel_group.setLayout(channel_layout)
-            layout.addWidget(channel_group)
-
-            def make_channel_updater(ch, value_label):
+            def make_updater(idx, value_label):
                 def updater(value):
                     value_label.setText(str(value))
-                    self.channel_brightness[ch] = value
+                    self.channel_brightness[idx] = value
                     self.update_display()
                 return updater
 
-            green_slider.valueChanged.connect(make_channel_updater('G', green_value))
-            red_slider.valueChanged.connect(make_channel_updater('R', red_value))
-            blue_slider.valueChanged.connect(make_channel_updater('B', blue_value))
+            for idx in range(int(nch)):
+                row = QHBoxLayout()
+                row.addWidget(QLabel(f"Ch {idx + 1}:"))
+                row.addWidget(make_color_button(idx))
+                slider = QSlider(Qt.Horizontal)
+                slider.setRange(-100, 100)
+                slider.setValue(self._channel_brightness(idx))
+                value_label = QLabel(str(self._channel_brightness(idx)))
+                value_label.setFixedWidth(40)
+                row.addWidget(slider)
+                row.addWidget(value_label)
+                channel_layout.addLayout(row)
+                channel_sliders[idx] = (slider, value_label)
+                slider.valueChanged.connect(make_updater(idx, value_label))
+
+            channel_group.setLayout(channel_layout)
+            layout.addWidget(channel_group)
 
         # Global Brightness slider
         brightness_group = QGroupBox("Global Brightness")
@@ -10284,13 +10297,11 @@ if __name__ == '__main__':
                             color_img = img_data['color_image']
                             if color_img.ndim == 3:
                                 h, w = color_img.shape[:2]
-                                c = min(color_img.shape[2], 3)
-                                composite = np.zeros((h, w, 3), dtype=np.float32)
-                                for i in range(c):
-                                    if i == self.grayscale_channel:
-                                        composite[:, :, i] = img_data['preview'].astype(np.float32)
-                                    else:
-                                        composite[:, :, i] = color_img[:, :, i].astype(np.float32)
+                                c = color_img.shape[2]
+                                composite = color_img.astype(np.float32).copy()
+                                if 0 <= self.grayscale_channel < c:
+                                    composite[:, :, self.grayscale_channel] = \
+                                        img_data['preview'].astype(np.float32)
                                 adjusted = self._apply_display_adjustments_color(composite)
                                 pixmap = self._array_to_pixmap_color(adjusted)
                             else:
@@ -10376,66 +10387,53 @@ if __name__ == '__main__':
 
         return adjusted.astype(np.uint8)
 
+    def _channel_brightness(self, idx):
+        """Per-channel display brightness by index (tolerates legacy R/G/B keys
+        that mapped channel0->G, channel1->R, channel2->B)."""
+        cb = self.channel_brightness
+        if idx in cb:
+            return cb[idx]
+        legacy = {0: 'G', 1: 'R', 2: 'B'}.get(idx)
+        return cb.get(legacy, 0) if legacy else 0
+
     def _apply_display_adjustments_color(self, img):
-        """Apply per-channel brightness adjustments for color images"""
+        """Blend every channel by its assigned display colour + per-channel
+        brightness into an RGB image for display. Supports any number of channels
+        (e.g. a 4th far-red channel), not just RGB. With the default colours this
+        reproduces the original green/red/blue look for the first three channels.
+        """
         if img is None:
             return None
 
-        # Work with a copy
-        adjusted = img.astype(np.float32).copy()
+        arr = np.asarray(img, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = arr[:, :, None]
+        h, w, c = arr.shape
+        out = np.zeros((h, w, 3), dtype=np.float32)
 
-        # Handle different array shapes - convert to RGB format
-        if adjusted.ndim == 2:
-            adjusted = np.stack([adjusted, adjusted, adjusted], axis=-1)
-        elif adjusted.ndim == 3:
-            if adjusted.shape[2] == 4:
-                adjusted = adjusted[:, :, :3]
-            elif adjusted.shape[2] != 3 and adjusted.shape[2] >= 2:
-                # Multi-channel - map to RGB (Green, Red, Blue)
-                h, w, c = adjusted.shape
-                rgb = np.zeros((h, w, 3), dtype=np.float32)
-                rgb[:, :, 1] = adjusted[:, :, 0]  # Green
-                rgb[:, :, 0] = adjusted[:, :, 1]  # Red
-                if c >= 3:
-                    rgb[:, :, 2] = adjusted[:, :, 2]  # Blue
-                adjusted = rgb
+        for i in range(c):
+            if not self.display_channels.get(i, True):
+                continue
+            chan = arr[:, :, i]
+            c_min, c_max = float(chan.min()), float(chan.max())
+            chan = (chan - c_min) / (c_max - c_min) * 255.0 if c_max > c_min \
+                else np.zeros_like(chan)
+            b = self._channel_brightness(i)
+            if b:
+                chan = chan + b * 1.5
+            chan = np.clip(chan, 0, 255)
+            color = self.channel_colors.get(i, _default_channel_color(i))
+            for k in range(3):
+                if color[k]:
+                    out[:, :, k] += chan * (color[k] / 255.0)
 
-        for i in range(3):
-            channel = adjusted[:, :, i]
-            c_min, c_max = channel.min(), channel.max()
-            if c_max > c_min:
-                adjusted[:, :, i] = (channel - c_min) / (c_max - c_min) * 255.0
+        if self.brightness_value:
+            out = out + (self.brightness_value * 1.5)
+        if self.contrast_value:
+            factor = 1.0 + (self.contrast_value / 100.0) * (2.0 if self.contrast_value > 0 else 0.9)
+            out = (out - 127.5) * factor + 127.5
 
-        # Apply per-channel brightness
-        # R channel (index 0)
-        brightness_r = self.channel_brightness.get('R', 0)
-        if brightness_r != 0:
-            adjusted[:, :, 0] = adjusted[:, :, 0] + (brightness_r * 1.5)
-
-        # G channel (index 1)
-        brightness_g = self.channel_brightness.get('G', 0)
-        if brightness_g != 0:
-            adjusted[:, :, 1] = adjusted[:, :, 1] + (brightness_g * 1.5)
-
-        # B channel (index 2)
-        brightness_b = self.channel_brightness.get('B', 0)
-        if brightness_b != 0:
-            adjusted[:, :, 2] = adjusted[:, :, 2] + (brightness_b * 1.5)
-
-        if self.brightness_value != 0:
-            adjusted = adjusted + (self.brightness_value * 1.5)
-
-        if self.contrast_value != 0:
-            if self.contrast_value > 0:
-                factor = 1.0 + (self.contrast_value / 100.0) * 2.0
-            else:
-                factor = 1.0 + (self.contrast_value / 100.0) * 0.9
-            midpoint = 127.5
-            adjusted = (adjusted - midpoint) * factor + midpoint
-
-        # Clip and return
-        adjusted = np.clip(adjusted, 0, 255)
-        return adjusted.astype(np.uint8)
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     def _build_processed_color_image(self, img_data):
         """Build a color composite with processed channels replacing the originals.
@@ -10451,8 +10449,8 @@ if __name__ == '__main__':
             return None
 
         h, w = color_img.shape[:2]
-        c = min(color_img.shape[2], 3)
-        composite = np.zeros((h, w, 3), dtype=np.float32)
+        c = color_img.shape[2]
+        composite = color_img.astype(np.float32).copy()
 
         for i in range(c):
             if i in processed_channels:
@@ -10460,8 +10458,6 @@ if __name__ == '__main__':
             elif i == self.grayscale_channel:
                 # Primary channel always uses the processed result
                 composite[:, :, i] = processed.astype(np.float32)
-            else:
-                composite[:, :, i] = color_img[:, :, i].astype(np.float32)
 
         return composite
 
