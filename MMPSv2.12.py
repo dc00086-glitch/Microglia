@@ -736,6 +736,71 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     return m
 
 
+def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None):
+    """Save a figure showing each tracer as a heatmap with the vessel outline
+    (cyan) and microglia outlines (lime) — so extravascular signal away from the
+    vessels reads as leak."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    names = list(tracers.keys()) or ['tracer']
+    fig, axes = plt.subplots(1, len(names), figsize=(6 * len(names), 6),
+                             squeeze=False)
+    for ax, name in zip(axes[0], names):
+        t = np.asarray(tracers.get(name), dtype=np.float64)
+        vmax = float(np.percentile(t, 99)) if t.size else 1.0
+        ax.imshow(t, cmap='inferno', vmax=vmax if vmax > 0 else 1.0)
+        ax.contour(vessel_mask > 0, levels=[0.5], colors='cyan', linewidths=0.6)
+        if cell_masks:
+            for cm in cell_masks:
+                ax.contour(cm > 0, levels=[0.5], colors='lime', linewidths=0.5)
+        ax.set_title("%s — cyan=vessels, lime=microglia" % name)
+        ax.axis('off')
+    fig.tight_layout()
+    fig.savefig(path, dpi=110, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _merge_bbb_into_morphology(csv_path, cell_rows, bbb_cols):
+    """Add the per-cell BBB columns to an existing morphology CSV in place,
+    matched on image_name + soma_id. Returns the number of rows matched."""
+    import csv as _csv
+
+    def norm_img(s):
+        s = str(s).strip()
+        low = s.lower()
+        if low.endswith('.tiff'):
+            return s[:-5]
+        if low.endswith('.tif'):
+            return s[:-4]
+        return s
+
+    with open(csv_path, 'r', newline='') as f:
+        reader = _csv.DictReader(f)
+        fields = list(reader.fieldnames or [])
+        rows = list(reader)
+    if 'image_name' not in fields or 'soma_id' not in fields:
+        return -1  # can't match
+
+    lut = {(norm_img(r['image_name']), str(r['soma_id']).strip()): r
+           for r in cell_rows}
+    matched = 0
+    for r in rows:
+        key = (norm_img(r.get('image_name', '')), str(r.get('soma_id', '')).strip())
+        hit = lut.get(key)
+        if hit:
+            matched += 1
+        for c in bbb_cols:
+            r[c] = hit.get(c, '') if hit else ''
+    out_fields = fields + [c for c in bbb_cols if c not in fields]
+    with open(csv_path, 'w', newline='') as f:
+        w = _csv.DictWriter(f, fieldnames=out_fields, extrasaction='ignore')
+        w.writeheader()
+        w.writerows(rows)
+    return matched
+
+
 def _compute_morphology_single(args):
     """Standalone morphology computation for a single mask.
 
@@ -8242,6 +8307,19 @@ if __name__ == '__main__':
                             'soma_id': sid}
                     crow.update(exp)
                     cell_rows.append(crow)
+
+                # Save a leak-overlay figure so the leak is visible.
+                if tracers:
+                    try:
+                        ov_dir = os.path.join(out_dir, 'bbb_overlays')
+                        os.makedirs(ov_dir, exist_ok=True)
+                        _save_bbb_overlay(
+                            os.path.join(ov_dir,
+                                         os.path.splitext(img_name)[0] + '_bbb.png'),
+                            vessel_mask, tracers,
+                            cell_masks=[m['mask'] for m in by_soma.values()])
+                    except Exception as e:
+                        self.log(f"BBB: overlay failed for {img_name}: {e}")
                 n_imgs += 1
             except Exception as e:
                 self.log(f"BBB: error on {img_name}: {e}")
@@ -8259,14 +8337,38 @@ if __name__ == '__main__':
 
         if vessel_rows:
             _write(os.path.join(out_dir, 'bbb_vessel_leakage.csv'), vessel_rows)
-        if cell_rows:
+
+        # Fold the per-cell BBB columns into the morphology master CSV so
+        # everything is in one file; keyed on image_name + soma_id. Fall back to
+        # a standalone CSV if the morphology results aren't there yet.
+        bbb_cols, merged_msg = [], ""
+        for r in cell_rows:
+            for k in r:
+                if k not in ('image_name', 'soma_id') and k not in bbb_cols:
+                    bbb_cols.append(k)
+        master_csv = os.path.join(out_dir, 'combined_morphology_results.csv')
+        if cell_rows and os.path.exists(master_csv):
+            matched = _merge_bbb_into_morphology(master_csv, cell_rows, bbb_cols)
+            if matched >= 0:
+                merged_msg = (f"Merged BBB columns into {matched} rows of "
+                              f"combined_morphology_results.csv")
+            else:
+                _write(os.path.join(out_dir, 'bbb_microglia_exposure.csv'), cell_rows)
+                merged_msg = ("morphology CSV lacked image_name/soma_id; wrote "
+                              "bbb_microglia_exposure.csv instead")
+        elif cell_rows:
             _write(os.path.join(out_dir, 'bbb_microglia_exposure.csv'), cell_rows)
+            merged_msg = ("no combined_morphology_results.csv yet; wrote "
+                          "bbb_microglia_exposure.csv (run morphology first to "
+                          "merge into the master)")
         self.log(f"BBB analysis complete: {n_imgs} images, {len(cell_rows)} microglia.")
-        self.log(f"  Wrote bbb_vessel_leakage.csv + bbb_microglia_exposure.csv to {out_dir}")
+        self.log(f"  {merged_msg}")
+        self.log(f"  Vessel/leakage: bbb_vessel_leakage.csv; overlays: bbb_overlays/")
         QMessageBox.information(
             self, "BBB Analysis",
             f"Done: {n_imgs} images, {len(cell_rows)} microglia.\n"
-            f"CSVs written to:\n{out_dir}")
+            f"{merged_msg}\n"
+            f"Leak overlays saved to bbb_overlays/ in:\n{out_dir}")
 
     def _toggle_colocalization_mode(self, checked):
         """Toggle colocalization mode on/off from the Mode menu."""
