@@ -92,10 +92,45 @@ def safe_tiff_read(filepath):
 
 
 def load_tiff_image(filepath):
-    """Load TIFF image using PIL to handle all compression types"""
-    img = Image.open(filepath)
-    img_array = np.array(img)
-    return img_array
+    """Load a TIFF preserving ALL channels and bit depth.
+
+    Uses tifffile with the file's own axis metadata to place any channel/sample
+    axis last -> (H, W, C), and max-projects any Z/T stack axis. This means a
+    4+ channel image (e.g. CD31 + red dextran + far-red albumin + IBA1) is read
+    correctly instead of being collapsed to 8-bit RGBA the way PIL does. Falls
+    back to PIL if tifffile can't read the file.
+    """
+    try:
+        import tifffile
+        with tifffile.TiffFile(filepath) as tf:
+            series = tf.series[0]
+            arr = np.asarray(series.asarray())
+            axes = series.axes or ''
+        # Max-project any stack/time axes (Z, T, I) — but NOT 'Q' (unknown),
+        # which on a plain channel-first array is actually the channel axis.
+        for ax in ('Z', 'T', 'I'):
+            while ax in axes and arr.ndim == len(axes):
+                i = axes.index(ax)
+                arr = arr.max(axis=i)
+                axes = axes[:i] + axes[i + 1:]
+        # Move a labelled channel/sample axis to the end.
+        moved = False
+        if arr.ndim == len(axes):
+            for ax in ('C', 'S'):
+                if ax in axes:
+                    arr = np.moveaxis(arr, axes.index(ax), -1)
+                    moved = True
+                    break
+        arr = np.squeeze(arr)
+        if arr.ndim == 3 and not moved:
+            # No usable metadata: assume the smallest small axis is channels.
+            small = int(np.argmin(arr.shape))
+            if arr.shape[small] <= 8:
+                arr = np.moveaxis(arr, small, -1)
+        return arr
+    except Exception:
+        img = Image.open(filepath)
+        return np.array(img)
 
 
 def ensure_grayscale(img):
@@ -743,22 +778,11 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
 
 
 def _load_bbb_image(path):
-    """Load a multi-channel image as (H, W, C), preserving ALL channels and bit
-    depth. Uses tifffile, not PIL — PIL collapses a 4+ channel microscope TIFF to
-    8-bit RGBA (mangling e.g. a far-red channel), whereas the BBB analysis reads
-    each channel's raw intensity by index (independent of any display pseudocolor).
-    """
-    import tifffile
-    arr = np.squeeze(np.asarray(tifffile.imread(path)))
-    if arr.ndim == 4:            # e.g. (Z, C, H, W) — max-project the leading axis
-        arr = np.squeeze(arr.max(axis=0))
+    """Load a multi-channel image as (H, W, C) for BBB analysis. Delegates to the
+    shared channel-preserving loader and guarantees a trailing channel axis."""
+    arr = np.asarray(load_tiff_image(path))
     if arr.ndim == 2:
         return arr[:, :, None]
-    if arr.ndim == 3:
-        ch = int(np.argmin(arr.shape))        # channel axis = the smallest
-        if arr.shape[ch] <= 8:
-            arr = np.moveaxis(arr, ch, -1)     # -> (H, W, C)
-        return arr
     return arr
 
 
@@ -2620,7 +2644,7 @@ class ChannelSelectDialog(QDialog):
         # Detect number of channels
         self.num_channels = 3
         if color_image is not None and color_image.ndim == 3:
-            self.num_channels = min(color_image.shape[2], 3)
+            self.num_channels = color_image.shape[2]  # show all channels (far-red etc.)
 
         layout = QVBoxLayout(self)
 
@@ -2824,7 +2848,7 @@ class GrayscaleChannelDialog(QDialog):
         # Detect number of channels
         self.num_channels = 3
         if color_image is not None and color_image.ndim == 3:
-            self.num_channels = min(color_image.shape[2], 3)
+            self.num_channels = color_image.shape[2]  # show all channels (far-red etc.)
 
         layout = QVBoxLayout(self)
 
