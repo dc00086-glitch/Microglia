@@ -1,0 +1,11 @@
+{
+  "levels": [
+    { "name": "Animal", "values": ["13-0", "13-1"] },
+    { "name": "Treatment", "values": ["V", "Nl"] },
+    { "name": "Day", "values": ["1d", "3d", "7d"] },
+    { "name": "Slice", "values": ["Slice_1", "Slice_2"] }
+  ],
+  "nested": true,
+  "separator": "_",
+  "leaf_subfolders": ["raw", "masks", "results"]
+}
