@@ -2985,7 +2985,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # --- 3D Z-stack mode state ---
         self.mode_3d = False
         self.current_z_slice = 0
-        self.voxel_size_z = 1.0
         self.mask_min_volume = 500
         self.mask_max_volume = 5000
         self.soma_intensity_tolerance = 30
@@ -7078,11 +7077,8 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                     'soma_idx': mask.get('soma_idx', 0),
                     'duplicate': mask.get('duplicate', False),
                 }
-                if self.mode_3d:
-                    mqa['volume_um3'] = mask.get('volume_um3', 0)
-                else:
-                    mqa['target_area_um2'] = mask.get('target_area_um2', mask.get('area_um2', 0))
-                    mqa['area_um2'] = mqa['target_area_um2']  # backward compat for older MMPS
+                mqa['target_area_um2'] = mask.get('target_area_um2', mask.get('area_um2', 0))
+                mqa['area_um2'] = mqa['target_area_um2']  # backward compat for older MMPS
                 mask_qa_state.append(mqa)
             img_session['mask_qa_state'] = mask_qa_state
 
@@ -8913,7 +8909,6 @@ if __name__ == '__main__':
             self.default_rolling_ball_radius = session.get('rolling_ball_radius', 50)
 
             # 3D mode has been removed — always load as 2D.
-            is_3d = False
             self.mode_3d = False
             if session.get('mode_3d', False):
                 self.log("Note: this was a 3D session; 3D mode has been removed — "
@@ -8955,10 +8950,7 @@ if __name__ == '__main__':
                         self, "Select Output Folder")
                     if new_output:
                         self.output_dir = new_output
-                        if is_3d:
-                            self.masks_dir = os.path.join(new_output, "masks_3d")
-                        else:
-                            self.masks_dir = os.path.join(new_output, "masks")
+                        self.masks_dir = os.path.join(new_output, "masks")
                         resolved_output_dir = new_output
                         resolved_masks_dir = self.masks_dir
                         # Re-resolve processed_path (check Processed Images subfolder first)
@@ -9085,17 +9077,8 @@ if __name__ == '__main__':
                     'treatment': img_session.get('treatment', ''),
                     'pixel_size': img_session.get('pixel_size'),
                 }
-                if is_3d:
-                    img_dict['raw_stack'] = None
-                    img_dict['soma_masks'] = {}
-                    # In 3D, processed is a stack - reload from disk
-                    if processed_data is not None and processed_data.ndim >= 3:
-                        img_dict['processed'] = processed_data
-                    else:
-                        img_dict['processed'] = None
-                else:
-                    img_dict['processed_channels'] = processed_channels
-                    img_dict['soma_outlines'] = restored_outlines
+                img_dict['processed_channels'] = processed_channels
+                img_dict['soma_outlines'] = restored_outlines
                 self.images[img_name] = img_dict
 
                 # If processed image wasn't found, downgrade status
@@ -9108,9 +9091,8 @@ if __name__ == '__main__':
                 orig_status = img_session.get('status', 'loaded')
                 if orig_status in ('masks_generated', 'qa_complete', 'analyzed') and self.masks_dir:
                     outline_lookup = {}
-                    if not is_3d:
-                        for ol in restored_outlines:
-                            outline_lookup[ol.get('soma_id', '')] = ol.get('soma_area_um2', 0)
+                    for ol in restored_outlines:
+                        outline_lookup[ol.get('soma_id', '')] = ol.get('soma_area_um2', 0)
                     soma_ids_list = self.images[img_name]['soma_ids']
 
                     mask_qa_state = img_session.get('mask_qa_state', [])
@@ -9131,22 +9113,14 @@ if __name__ == '__main__':
                                 'duplicate': qs.get('duplicate', False),
                                 'soma_area_um2': outline_lookup.get(qs_soma_id, 0),
                             }
-                            if is_3d:
-                                mask_entry['volume_um3'] = qs.get('volume_um3', 0)
-                            else:
-                                mask_entry['target_area_um2'] = qs.get('target_area_um2', qs.get('area_um2', 0))
+                            mask_entry['target_area_um2'] = qs.get('target_area_um2', qs.get('area_um2', 0))
                             self.images[img_name]['masks'].append(mask_entry)
                     elif all_mask_files is not None and os.path.isdir(self.masks_dir):
                         # FALLBACK: old session without mask_qa_state — scan directory
                         img_basename = os.path.splitext(img_name)[0]
-                        if is_3d:
-                            mask_pattern = re.compile(
-                                re.escape(img_basename) + r'_(soma_\d+_\d+_\d+)_vol(\d+)_mask3d\.tif$'
-                            )
-                        else:
-                            mask_pattern = re.compile(
-                                re.escape(img_basename) + r'_(soma_\d+_\d+)_area(\d+)_mask\.tif$'
-                            )
+                        mask_pattern = re.compile(
+                            re.escape(img_basename) + r'_(soma_\d+_\d+)_area(\d+)_mask\.tif$'
+                        )
                         # Group masks by soma_id to detect duplicates (same soma,
                         # different target areas that produced identical pixel masks).
                         # For each soma, keep only the largest-area mask per unique
@@ -9185,10 +9159,7 @@ if __name__ == '__main__':
                                     'approved': False if is_dup else approval,
                                     'duplicate': is_dup,
                                 }
-                                if is_3d:
-                                    mask_entry['volume_um3'] = size_val
-                                else:
-                                    mask_entry['target_area_um2'] = size_val
+                                mask_entry['target_area_um2'] = size_val
                                 mask_entry['soma_area_um2'] = outline_lookup.get(soma_id, 0)
                                 self.images[img_name]['masks'].append(mask_entry)
 
@@ -10229,17 +10200,14 @@ if __name__ == '__main__':
         if not folder:
             return
 
-        if self.colocalization_mode and not self.mode_3d:
+        if self.colocalization_mode:
             self.show_color_view = True
             self.color_toggle_btn.setText("Show Grayscale (C)")
             self.channel_select_btn.setVisible(True)
 
         # Include both lowercase and uppercase extensions for macOS compatibility
-        if self.mode_3d:
-            exts = ['*.tif', '*.tiff', '*.TIF', '*.TIFF']
-        else:
-            exts = ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg',
-                    '*.TIF', '*.TIFF', '*.PNG', '*.JPG', '*.JPEG']
+        exts = ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg',
+                '*.TIF', '*.TIFF', '*.PNG', '*.JPG', '*.JPEG']
         files = []
         for ext in exts:
             files.extend(glob.glob(os.path.join(folder, ext)))
@@ -10265,12 +10233,8 @@ if __name__ == '__main__':
                 'treatment': '',
                 'pixel_size': None,
             }
-            if self.mode_3d:
-                img_dict['raw_stack'] = None
-                img_dict['soma_masks'] = {}
-            else:
-                img_dict['processed_channels'] = {}
-                img_dict['soma_outlines'] = []
+            img_dict['processed_channels'] = {}
+            img_dict['soma_outlines'] = []
             self.images[img_name] = img_dict
             item = QListWidgetItem(f"  {img_name} [loaded]")
             item.setData(Qt.UserRole, img_name)
@@ -10301,10 +10265,7 @@ if __name__ == '__main__':
         )
         if folder:
             self.output_dir = folder
-            if self.mode_3d:
-                self.masks_dir = os.path.join(folder, "masks_3d")
-            else:
-                self.masks_dir = os.path.join(folder, "masks")
+            self.masks_dir = os.path.join(folder, "masks")
             self.somas_dir = os.path.join(folder, "somas")
             self.processed_dir = os.path.join(folder, "Processed Images")
             os.makedirs(self.masks_dir, exist_ok=True)
@@ -10917,25 +10878,16 @@ if __name__ == '__main__':
         self.prev_btn.setEnabled(True)
         self.next_btn.setEnabled(True)
         self.done_btn.setEnabled(True)
-        if self.mode_3d:
-            self.log("=" * 50)
-            self.log("BATCH SOMA PICKING MODE (3D)")
-            self.log(f"Click somas on: {self.current_image_name}")
-            self.log("Use Z-slider to find the soma's brightest slice")
-            self.log("Click 'Done with Current' (Enter) when finished")
-            self.log("Backspace = undo last, Escape = clear all on image")
-            self.log("=" * 50)
-        else:
-            pass_label = ""
-            if self._coloc_soma_pass == 1:
-                pass_label = " — PASS 1: Coloc cells (both channels)"
-            elif self._coloc_soma_pass == 2:
-                pass_label = " — PASS 2: Single-channel cells (cyan = already picked)"
-            self.log("=" * 50)
-            self.log(f"BATCH SOMA PICKING MODE{pass_label}")
-            self.log(f"Click somas on: {self.current_image_name}")
-            self.log("Click 'Done with Current' when finished with this image")
-            self.log("=" * 50)
+        pass_label = ""
+        if self._coloc_soma_pass == 1:
+            pass_label = " — PASS 1: Coloc cells (both channels)"
+        elif self._coloc_soma_pass == 2:
+            pass_label = " — PASS 2: Single-channel cells (cyan = already picked)"
+        self.log("=" * 50)
+        self.log(f"BATCH SOMA PICKING MODE{pass_label}")
+        self.log(f"Click somas on: {self.current_image_name}")
+        self.log("Click 'Done with Current' when finished with this image")
+        self.log("=" * 50)
 
     def _load_image_for_soma_picking(self):
         if not self.current_image_name:
@@ -13950,12 +13902,8 @@ if __name__ == '__main__':
             cl_rows = []
             for flat in self.all_masks_flat:
                 md = flat['mask_data']
-                if self.mode_3d:
-                    size_val = md.get('volume_um3', 0)
-                    key = f"{flat['image_name']}_{md.get('soma_id', '')}_vol{size_val}"
-                else:
-                    size_val = md.get('target_area_um2', 0)
-                    key = f"{flat['image_name']}_{md.get('soma_id', '')}_area{size_val}"
+                size_val = md.get('target_area_um2', 0)
+                key = f"{flat['image_name']}_{md.get('soma_id', '')}_area{size_val}"
                 passed = 1 if md.get('approved') is True else 0
                 cl_rows.append([key, str(passed)])
             self._write_checklist(qa_cl_path, cl_rows, ['Mask', 'Passed QA'])
@@ -14372,14 +14320,9 @@ if __name__ == '__main__':
         current_soma_id = mask_data.get('soma_id', '')
         current_img = flat_data['image_name']
 
-        if self.mode_3d:
-            current_size = mask_data.get('volume_um3', 0)
-            size_key = 'volume_um3'
-            size_unit = 'um^3'
-        else:
-            current_size = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
-            size_key = 'target_area_um2'
-            size_unit = 'um^2'
+        current_size = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
+        size_key = 'target_area_um2'
+        size_unit = 'um^2'
 
         self.log(f"APPROVED | {current_img} | {current_soma_id} | {size_key}: {current_size} {size_unit}")
 
@@ -14388,18 +14331,13 @@ if __name__ == '__main__':
         self._qa_approved_count += 1
 
         # Mark in deferred checklist
-        if self.mode_3d:
-            cl_key = f"{current_img}_{current_soma_id}_vol{current_size}"
-        else:
-            cl_key = f"{current_img}_{current_soma_id}_area{current_size}"
+        cl_key = f"{current_img}_{current_soma_id}_area{current_size}"
         self._qa_checklist_dirty[cl_key] = 1
 
         # Auto-approve ALL smaller masks from the SAME soma in the SAME image
         # Uses soma index for O(masks_per_soma) instead of O(all_masks)
         # Collect masks needing export — actual I/O is deferred below
-        pending_exports = []
-        if not self.mode_3d:
-            pending_exports.append(flat_data)
+        pending_exports = [flat_data]
 
         auto_approved = []
         soma_key = (current_img, current_soma_id)
@@ -14413,13 +14351,9 @@ if __name__ == '__main__':
                 auto_approved.append((idx + 1, other_size))
                 self.last_qa_decisions.append({'flat_data': other_flat, 'was_approved': True})
                 self._qa_approved_count += 1
-                if not self.mode_3d:
-                    pending_exports.append(other_flat)
+                pending_exports.append(other_flat)
                 # Mark in deferred checklist
-                if self.mode_3d:
-                    auto_key = f"{current_img}_{current_soma_id}_vol{other_size}"
-                else:
-                    auto_key = f"{current_img}_{current_soma_id}_area{other_size}"
+                auto_key = f"{current_img}_{current_soma_id}_area{other_size}"
                 self._qa_checklist_dirty[auto_key] = 1
 
         if auto_approved:
@@ -14468,12 +14402,8 @@ if __name__ == '__main__':
                 self._qa_approved_count += 1
 
                 # Mark in deferred checklist
-                if self.mode_3d:
-                    size_val = mask_data.get('volume_um3', 0)
-                    cl_key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_vol{size_val}"
-                else:
-                    size_val = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
-                    cl_key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{size_val}"
+                size_val = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
+                cl_key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{size_val}"
                 self._qa_checklist_dirty[cl_key] = 1
 
         self.log(f"Approved {approved_count} masks in bulk")
@@ -14722,30 +14652,22 @@ if __name__ == '__main__':
         if not was_already_rejected:
             self._qa_user_rejected_count += 1
 
-        if not self.mode_3d:
-            self.log(f"Rejected: {mask_data.get('soma_id', '')} ({mask_data.get('target_area_um2', mask_data.get('area_um2', 0))} um^2)")
-        else:
-            vol = mask_data.get('volume_um3', 0)
-            self.log(f"Rejected: {mask_data.get('soma_id', '')} ({vol} um^3)")
+        self.log(f"Rejected: {mask_data.get('soma_id', '')} ({mask_data.get('target_area_um2', mask_data.get('area_um2', 0))} um^2)")
 
         # Mark in deferred checklist
-        if self.mode_3d:
-            key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_vol{mask_data.get('volume_um3', 0)}"
-        else:
-            key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{mask_data.get('target_area_um2', mask_data.get('area_um2', 0))}"
+        key = f"{flat_data['image_name']}_{mask_data.get('soma_id', '')}_area{mask_data.get('target_area_um2', mask_data.get('area_um2', 0))}"
         self._qa_checklist_dirty[key] = 1
 
         # Show next mask FIRST so UI feels instant
         self._advance_to_next_unreviewed()
 
-        # Defer disk I/O (3D mask deletion, eviction) so UI stays responsive
-        delete_3d = self.mode_3d
+        # Defer disk I/O (eviction) so UI stays responsive
         reject_img = flat_data['image_name']
         reject_mask_data = mask_data
         QTimer.singleShot(0, lambda: self._deferred_reject_io(
-            delete_3d, reject_img, reject_mask_data))
+            reject_img, reject_mask_data))
 
-    def _deferred_reject_io(self, delete_3d, img_name, mask_data):
+    def _deferred_reject_io(self, img_name, mask_data):
         """Run disk I/O deferred from reject_current_mask via QTimer."""
         self._delete_rejected_mask_tiff(img_name, mask_data)
         self._evict_old_qa_masks()
