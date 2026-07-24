@@ -219,15 +219,22 @@ def _smooth_mask(mask, max_gap_size=4):
         return mask
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     smoothed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    # Fill small internal holes
+    # Fill small internal holes. Sizes and border-touching labels are computed
+    # for ALL components at once (bincount + border label set) instead of
+    # scanning the full array once per component — the old per-label loop was
+    # O(n_holes * H * W) and dominated mask generation on large images.
     inverted = (smoothed == 0).astype(np.uint8)
     labeled, n_features = ndimage.label(inverted)
-    for i in range(1, n_features + 1):
-        component = (labeled == i)
-        if np.count_nonzero(component) <= max_gap_size:
-            if not (component[0, :].any() or component[-1, :].any() or
-                    component[:, 0].any() or component[:, -1].any()):
-                smoothed[component] = 1
+    if n_features == 0:
+        return smoothed
+    sizes = np.bincount(labeled.ravel())
+    border_labels = np.unique(np.concatenate([
+        labeled[0, :], labeled[-1, :], labeled[:, 0], labeled[:, -1]]))
+    small = np.flatnonzero(sizes <= max_gap_size)
+    small = small[small != 0]                      # 0 is background (the mask)
+    fillable = np.setdiff1d(small, border_labels)   # keep only internal holes
+    if fillable.size:
+        smoothed[np.isin(labeled, fillable)] = 1
     return smoothed
 
 
@@ -7609,16 +7616,28 @@ IMAGE_DATA = {image_data_json}
 # ============================================================================
 
 def polygon_to_mask(polygon_points, shape):
-    """Convert polygon points to a binary mask."""
+    """Convert polygon points to a binary mask.
+
+    Point-in-polygon is evaluated only inside the polygon's bounding box (a soma
+    outline covers a tiny fraction of the frame), then written back into the
+    full-size mask. Testing every pixel of the image was ~2000x slower.
+    """
     if len(polygon_points) < 3:
         return np.zeros(shape, dtype=np.uint8)
-    poly_array = np.array([[p[1], p[0]] for p in polygon_points])
+    poly_array = np.array([[p[1], p[0]] for p in polygon_points], dtype=float)
     h, w = shape[:2]
-    yy, xx = np.mgrid[:h, :w]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    x0 = max(int(np.floor(poly_array[:, 0].min())), 0)
+    x1 = min(int(np.ceil(poly_array[:, 0].max())) + 1, w)
+    y0 = max(int(np.floor(poly_array[:, 1].min())), 0)
+    y1 = min(int(np.ceil(poly_array[:, 1].max())) + 1, h)
+    if x1 <= x0 or y1 <= y0:
+        return mask
+    yy, xx = np.mgrid[y0:y1, x0:x1]
     points = np.c_[xx.ravel(), yy.ravel()]
-    path = mplPath(poly_array)
-    mask = path.contains_points(points).reshape(h, w)
-    return mask.astype(np.uint8)
+    sub = mplPath(poly_array).contains_points(points).reshape(y1 - y0, x1 - x0)
+    mask[y0:y1, x0:x1] = sub.astype(np.uint8)
+    return mask
 
 
 def create_competitive_masks(processed_img, soma_outlines_data, area_list_um2,
@@ -8403,7 +8422,7 @@ if __name__ == '__main__':
                     # 2) traced soma outline polygon
                     if mk is None and sid in outline_by_sid:
                         try:
-                            pmk = polygon_to_mask(
+                            pmk = self._polygon_to_mask(
                                 outline_by_sid[sid]['polygon_points'], shape)
                             if np.any(pmk):
                                 mk = pmk
@@ -8425,7 +8444,7 @@ if __name__ == '__main__':
                     soma_region = None
                     if sid in outline_by_sid:
                         try:
-                            sr = polygon_to_mask(
+                            sr = self._polygon_to_mask(
                                 outline_by_sid[sid]['polygon_points'], shape)
                             if np.any(sr):
                                 soma_region = sr
@@ -10369,12 +10388,17 @@ if __name__ == '__main__':
             if img_data.get('processed') is None and img_data.get('status') not in (None, 'loaded'):
                 self._ensure_processed_loaded(self.current_image_name)
 
-            raw_img = load_tiff_image(img_data['raw_path'])
-
-            # Always store color image for toggle functionality
-            if raw_img.ndim == 3:
-                img_data['color_image'] = raw_img.copy()
-                img_data['num_channels'] = raw_img.shape[2]
+            # Reuse the cached colour image when present. Re-reading and copying
+            # the raw TIFF on every refresh (image click, brightness/contrast
+            # drag, colour toggle) was the main source of UI lag on large
+            # multi-channel images; the display helpers never mutate their input.
+            raw_img = img_data.get('color_image')
+            if raw_img is None:
+                raw_img = load_tiff_image(img_data['raw_path'])
+                # Always store color image for toggle functionality
+                if raw_img.ndim == 3:
+                    img_data['color_image'] = raw_img
+                    img_data['num_channels'] = raw_img.shape[2]
 
             # Display in color or grayscale based on toggle, with adjustments
             if self.show_color_view and raw_img.ndim == 3:
@@ -12405,15 +12429,28 @@ if __name__ == '__main__':
         self.log("=" * 50)
 
     def _polygon_to_mask(self, polygon, shape):
+        """Rasterize a soma polygon into a full-size binary mask.
+
+        Point-in-polygon is evaluated only within the polygon's bounding box —
+        a soma covers a tiny fraction of the frame, so testing every pixel of
+        the image (the old behaviour) was orders of magnitude slower.
+        """
         if len(polygon) < 3:
             return np.zeros(shape, dtype=np.uint8)
-        poly_array = np.array([[p[1], p[0]] for p in polygon])
+        poly_array = np.array([[p[1], p[0]] for p in polygon], dtype=float)
         h, w = shape[:2]
-        yy, xx = np.mgrid[:h, :w]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        x0 = max(int(np.floor(poly_array[:, 0].min())), 0)
+        x1 = min(int(np.ceil(poly_array[:, 0].max())) + 1, w)
+        y0 = max(int(np.floor(poly_array[:, 1].min())), 0)
+        y1 = min(int(np.ceil(poly_array[:, 1].max())) + 1, h)
+        if x1 <= x0 or y1 <= y0:
+            return mask
+        yy, xx = np.mgrid[y0:y1, x0:x1]
         points = np.c_[xx.ravel(), yy.ravel()]
-        path = mplPath(poly_array)
-        mask = path.contains_points(points).reshape(h, w)
-        return mask.astype(np.uint8)
+        sub = mplPath(poly_array).contains_points(points).reshape(y1 - y0, x1 - x0)
+        mask[y0:y1, x0:x1] = sub.astype(np.uint8)
+        return mask
 
     def _ensure_outline_masks(self, img_name, img_shape):
         """Reconstruct outline masks from polygon_points if they are None.
