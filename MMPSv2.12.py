@@ -346,62 +346,20 @@ def _growth_intensity_floor(roi, cy_roi, cx_roi, floor_mode,
     return intensity_floor, intensity_floor_map
 
 
-def _grow_masks_for_soma(args):
-    """Standalone region-growing mask generation for a single soma.
+def _priority_region_grow(roi, cy_roi, cx_roi, soma_outline_roi,
+                          intensity_floor, intensity_floor_map,
+                          territory_roi, my_label, max_radius_px_sq,
+                          largest_target_px):
+    """Brightest-first priority region growing from the soma seed.
 
-    Extracted from _create_annulus_masks so it can run in a subprocess.
-    Returns a list of mask dicts (with 'mask' as None — only growth_order
-    and metadata are returned to keep IPC lightweight).
+    Shared core of the single-soma mask growers. Seeds the growth with the soma
+    outline pixels (or the centroid if no outline), then repeatedly adds the
+    brightest 4-connected neighbour above the intensity floor, within the
+    watershed territory and the circular constraint, until the largest target
+    area is reached. Returns ``(growth_order, soma_seed_count)``.
     """
     import heapq
-
-    (centroid, area_list_um2, pixel_size_um, soma_idx, soma_id,
-     processed_img_shape, roi_data, roi_bounds,
-     soma_area_um2, soma_outline_roi,
-     territory_roi_data, my_territory_label,
-     use_circular_constraint, circular_buffer_um2,
-     use_min_intensity, min_intensity_percent, img_name,
-     local_intensity_window, smooth_enabled, smooth_gap_size) = args[:20]
-    # Optional trailing floor_mode ('percent' legacy default, or 'otsu_radial').
-    floor_mode = args[20] if len(args) > 20 else 'percent'
-    # Optional whole-image max so the percent floor matches the preview.
-    global_max = args[21] if len(args) > 21 else None
-
-    y_min, y_max, x_min, x_max = roi_bounds
-    roi = roi_data  # already float64
     h, w = roi.shape
-    cy, cx = int(centroid[0]), int(centroid[1])
-    cy_roi, cx_roi = cy - y_min, cx - x_min
-    cy_roi = max(0, min(h - 1, cy_roi))
-    cx_roi = max(0, min(w - 1, cx_roi))
-
-    sorted_areas = sorted(area_list_um2, reverse=True)
-    largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
-
-    # Circular constraint
-    max_radius_px_sq = None
-    if use_circular_constraint:
-        constraint_area_um2 = sorted_areas[0] + sorted_areas[0] * 4
-        constraint_area_px = constraint_area_um2 / (pixel_size_um ** 2)
-        max_radius_px = np.sqrt(constraint_area_px / np.pi)
-        max_radius_px_sq = max_radius_px ** 2
-
-    # Intensity floor. 'otsu_radial' always applies; 'percent' only when the
-    # min-intensity toggle is on (preserves legacy behaviour exactly).
-    intensity_floor = 0.0
-    intensity_floor_map = None
-    if floor_mode == 'otsu_radial':
-        intensity_floor, intensity_floor_map = _growth_intensity_floor(
-            roi, cy_roi, cx_roi, 'otsu_radial',
-            min_intensity_percent, local_intensity_window)
-    elif use_min_intensity and min_intensity_percent > 0:
-        intensity_floor, intensity_floor_map = _growth_intensity_floor(
-            roi, cy_roi, cx_roi, 'percent',
-            min_intensity_percent, local_intensity_window, global_max=global_max)
-
-    # Territory constraint
-    territory_roi = territory_roi_data
-    my_label = my_territory_label
 
     def _in_territory(r, c):
         if territory_roi is None:
@@ -458,6 +416,69 @@ def _grow_masks_for_soma(args):
                 if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
                     visited[nr, nc] = True
                     heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+
+    return growth_order, soma_seed_count
+
+
+def _grow_masks_for_soma(args):
+    """Standalone region-growing mask generation for a single soma.
+
+    Extracted from _create_annulus_masks so it can run in a subprocess.
+    Returns a list of mask dicts (with 'mask' as None — only growth_order
+    and metadata are returned to keep IPC lightweight).
+    """
+    import heapq
+
+    (centroid, area_list_um2, pixel_size_um, soma_idx, soma_id,
+     processed_img_shape, roi_data, roi_bounds,
+     soma_area_um2, soma_outline_roi,
+     territory_roi_data, my_territory_label,
+     use_circular_constraint, circular_buffer_um2,
+     use_min_intensity, min_intensity_percent, img_name,
+     local_intensity_window, smooth_enabled, smooth_gap_size) = args[:20]
+    # Optional trailing floor_mode ('percent' legacy default, or 'otsu_radial').
+    floor_mode = args[20] if len(args) > 20 else 'percent'
+    # Optional whole-image max so the percent floor matches the preview.
+    global_max = args[21] if len(args) > 21 else None
+
+    y_min, y_max, x_min, x_max = roi_bounds
+    roi = roi_data  # already float64
+    h, w = roi.shape
+    cy, cx = int(centroid[0]), int(centroid[1])
+    cy_roi, cx_roi = cy - y_min, cx - x_min
+    cy_roi = max(0, min(h - 1, cy_roi))
+    cx_roi = max(0, min(w - 1, cx_roi))
+
+    sorted_areas = sorted(area_list_um2, reverse=True)
+    largest_target_px = int(sorted_areas[0] / (pixel_size_um ** 2))
+
+    # Circular constraint
+    max_radius_px_sq = None
+    if use_circular_constraint:
+        constraint_area_um2 = sorted_areas[0] + sorted_areas[0] * 4
+        constraint_area_px = constraint_area_um2 / (pixel_size_um ** 2)
+        max_radius_px = np.sqrt(constraint_area_px / np.pi)
+        max_radius_px_sq = max_radius_px ** 2
+
+    # Intensity floor. 'otsu_radial' always applies; 'percent' only when the
+    # min-intensity toggle is on (preserves legacy behaviour exactly).
+    intensity_floor = 0.0
+    intensity_floor_map = None
+    if floor_mode == 'otsu_radial':
+        intensity_floor, intensity_floor_map = _growth_intensity_floor(
+            roi, cy_roi, cx_roi, 'otsu_radial',
+            min_intensity_percent, local_intensity_window)
+    elif use_min_intensity and min_intensity_percent > 0:
+        intensity_floor, intensity_floor_map = _growth_intensity_floor(
+            roi, cy_roi, cx_roi, 'percent',
+            min_intensity_percent, local_intensity_window, global_max=global_max)
+
+    # Priority region growing (shared core).
+    growth_order, soma_seed_count = _priority_region_grow(
+        roi, cy_roi, cx_roi, soma_outline_roi,
+        intensity_floor, intensity_floor_map,
+        territory_roi_data, my_territory_label,
+        max_radius_px_sq, largest_target_px)
 
     soma_area_px = soma_seed_count
     masks = []
@@ -13603,73 +13624,13 @@ if __name__ == '__main__':
                     if my_label > 0:
                         break
 
-        def _in_territory(r, c):
-            """Check if pixel (r,c) is within this soma's watershed territory."""
-            if territory_roi is None:
-                return True
-            return territory_roi[r, c] == my_label or territory_roi[r, c] <= 0
-
-        def _in_circle(r, c):
-            """Check if pixel (r,c) is within the circular growth constraint."""
-            if max_radius_px_sq is None:
-                return True
-            dy = r - cy_roi
-            dx = c - cx_roi
-            return (dy * dy + dx * dx) <= max_radius_px_sq
-
-        # Priority region growing: grow from soma outline, brightest neighbor first
-        # Use a max-heap (negate intensity for min-heap)
-        visited = np.zeros((h, w), dtype=bool)
-        growth_order = []  # list of (row, col) in the order pixels were added
-
-        heap = []
-
-        # Seed with all soma outline pixels (they are "free" — part of every mask)
-        soma_seed_count = 0
-        if soma_outline_mask is not None:
-            outline_roi = soma_outline_mask[y_min:y_max, x_min:x_max]
-            soma_ys, soma_xs = np.where(outline_roi > 0)
-            for sr, sc in zip(soma_ys, soma_xs):
-                if not visited[sr, sc]:
-                    visited[sr, sc] = True
-                    growth_order.append((sr, sc))
-                    soma_seed_count += 1
-            # Push boundary neighbors of the soma into the heap
-            for sr, sc in zip(soma_ys, soma_xs):
-                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    nr, nc = sr + dr, sc + dc
-                    if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                        floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
-                        if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
-                            visited[nr, nc] = True
-                            heapq.heappush(heap, (-roi[nr, nc], nr, nc))
-
-        # Fallback: if no soma outline available, seed with centroid
-        if soma_seed_count == 0:
-            visited[cy_roi, cx_roi] = True
-            growth_order.append((cy_roi, cx_roi))
-            soma_seed_count = 1
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nr, nc = cy_roi + dr, cx_roi + dc
-                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
-                    if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
-                        visited[nr, nc] = True
-                        heapq.heappush(heap, (-roi[nr, nc], nr, nc))
-
-        # Grow outward from the soma boundary up to largest target
-        while heap and len(growth_order) < largest_target_px:
-            neg_intensity, r, c = heapq.heappop(heap)
-
-            growth_order.append((r, c))
-
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
-                    if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
-                        visited[nr, nc] = True
-                        heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+        # Priority region growing (shared core), seeded from the soma outline.
+        soma_outline_roi = (soma_outline_mask[y_min:y_max, x_min:x_max]
+                            if soma_outline_mask is not None else None)
+        growth_order, soma_seed_count = _priority_region_grow(
+            roi, cy_roi, cx_roi, soma_outline_roi,
+            intensity_floor, intensity_floor_map,
+            territory_roi, my_label, max_radius_px_sq, largest_target_px)
 
         print(f"  {soma_id}: soma={soma_seed_count}px, grew to {len(growth_order)}px (target: {largest_target_px})")
 
