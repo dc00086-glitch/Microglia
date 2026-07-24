@@ -300,28 +300,6 @@ def _enforce_mask_subset_invariant(masks):
     return total_removed
 
 
-def _background_floor(roi):
-    """Absolute intensity gate just above the ROI background.
-
-    The region-growing floor needs a global minimum that stops growth from
-    spilling into dark background — but it must NOT scale with the soma (the
-    brightest object in the ROI). A soma-relative floor (``roi.max() * pct``)
-    cuts the dimmer, distal/tapering portions of BRIGHT processes: their tips
-    drop below a few-percent-of-soma and the mask stops partway along them.
-
-    This returns background + ~3σ, estimated robustly as
-    ``median + 3 * 1.4826 * MAD`` over the ROI (which is sized ~3× the cell
-    radius and is therefore dominated by background). Only true background and
-    its noise are excluded; real signal — however faint — is kept.
-    """
-    if roi is None or getattr(roi, 'size', 0) == 0:
-        return 0.0
-    finite = roi[np.isfinite(roi)]
-    if finite.size == 0:
-        return 0.0
-    bg = float(np.median(finite))
-    mad = float(np.median(np.abs(finite - bg)))
-    return bg + 3.0 * 1.4826 * mad
 
 
 def _radial_intensity_floor(roi, cy, cx, radius_px=100, thickness=3):
@@ -1062,88 +1040,6 @@ def _merge_bbb_into_morphology(csv_path, cell_rows, bbb_cols):
     return matched
 
 
-def _compute_morphology_single(args):
-    """Standalone morphology computation for a single mask.
-
-    Runs in a subprocess via ProcessPoolExecutor.
-    """
-    mask_path, pixel_size, soma_area_um2 = args
-
-    mask = safe_tiff_read(mask_path)
-    mask = (mask > 0).astype(np.uint8)
-
-    if not np.any(mask):
-        return None
-
-    props = measure.regionprops(mask.astype(int))
-    if not props:
-        return None
-
-    p = props[0]
-    params = {}
-
-    params['perimeter'] = p.perimeter * pixel_size
-    params['mask_area'] = p.area * (pixel_size ** 2)
-
-    major_axis = p.major_axis_length
-    minor_axis = p.minor_axis_length
-
-    if major_axis > 0:
-        axis_ratio = minor_axis / major_axis
-        params['eccentricity'] = np.sqrt(1 - axis_ratio ** 2)
-        params['roundness'] = axis_ratio ** 2
-    else:
-        params['eccentricity'] = 0
-        params['roundness'] = 0
-
-    centroid = np.array(p.centroid)
-    coords = np.array(p.coords)
-
-    top_point = coords[coords[:, 0].argmin()]
-    bottom_point = coords[coords[:, 0].argmax()]
-    left_point = coords[coords[:, 1].argmin()]
-    right_point = coords[coords[:, 1].argmax()]
-
-    extremities = np.array([top_point, bottom_point, left_point, right_point])
-    distances = np.sqrt(np.sum((extremities - centroid) ** 2, axis=1))
-    params['avg_centroid_distance'] = np.mean(distances) * pixel_size
-
-    if soma_area_um2 is not None:
-        params['soma_area'] = soma_area_um2
-    else:
-        params['soma_area'] = p.area * 0.1 * (pixel_size ** 2)
-
-    # Polarity via PCA
-    centered = coords - centroid
-    if len(centered) >= 3:
-        cov = np.cov(centered.T)
-        eigenvalues, eigenvectors = np.linalg.eigh(cov)
-        major_val = eigenvalues[-1]
-        minor_val = eigenvalues[0]
-        major_vec = eigenvectors[:, -1]
-
-        if major_val > 0:
-            params['polarity_index'] = round(1.0 - (minor_val / major_val), 4)
-        else:
-            params['polarity_index'] = 0
-
-        angle_rad = np.arctan2(major_vec[0], major_vec[1])
-        params['principal_angle'] = round(np.degrees(angle_rad) % 180, 2)
-        params['major_axis_um'] = round(2 * np.sqrt(major_val) * pixel_size, 4)
-        params['minor_axis_um'] = round(2 * np.sqrt(max(minor_val, 0)) * pixel_size, 4)
-    else:
-        params['polarity_index'] = 0
-        params['principal_angle'] = 0
-        params['major_axis_um'] = 0
-        params['minor_axis_um'] = 0
-
-    # Bulbous (spheroidal) terminal swellings — dystrophic microglia marker.
-    bulb = _detect_bulbous_endings(mask, pixel_size, soma_area_um2=soma_area_um2)
-    params['num_bulbous_endings'] = bulb['num_bulbous_endings']
-    params['mean_bulb_diameter_um'] = bulb['mean_bulb_diameter_um']
-    params['beading_index'] = bulb['beading_index']
-
-    return params
 
 
 def _export_mask_to_disk(args):
@@ -1498,85 +1394,6 @@ def auto_outline_threshold(image, centroid, sensitivity=50, region_size=200):
         return None
 
 
-def auto_outline_region_growing(image, centroid, sensitivity=50, max_iterations=10000):
-    """
-    Auto-outline using region growing from centroid.
-    Adapts to local intensity variations.
-
-    Args:
-        image: Grayscale image (2D numpy array)
-        centroid: (row, col) tuple of soma center
-        sensitivity: 0-100, higher = more tolerant intensity difference
-        max_iterations: Maximum pixels to grow
-
-    Returns:
-        List of (row, col) polygon points, or None if failed
-    """
-    try:
-        if image is None:
-            return None
-        if image.ndim > 2:
-            image = image[:, :, 0] if image.shape[2] > 0 else image.squeeze()
-
-        h, w = image.shape[:2]
-        cy, cx = int(centroid[0]), int(centroid[1])
-
-        if not (0 <= cy < h and 0 <= cx < w):
-            return None
-
-        img_norm = image.astype(np.float64)
-        imin, imax = img_norm.min(), img_norm.max()
-        if imax > imin:
-            img_norm = (img_norm - imin) / (imax - imin) * 255
-
-        seed_val = float(img_norm[cy, cx])
-
-        # Tolerance based on sensitivity (higher = more tolerant)
-        tolerance = (sensitivity / 100) * 100 + 20  # Range: 20-120
-
-        # Region growing
-        visited = np.zeros((h, w), dtype=bool)
-        region = np.zeros((h, w), dtype=bool)
-        queue = [(cy, cx)]
-        visited[cy, cx] = True
-        region[cy, cx] = True
-
-        iterations = 0
-        while queue and iterations < max_iterations:
-            y, x = queue.pop(0)
-            iterations += 1
-
-            for dy in [-1, 0, 1]:
-                for dx in [-1, 0, 1]:
-                    if dy == 0 and dx == 0:
-                        continue
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx]:
-                        visited[ny, nx] = True
-                        pixel_val = float(img_norm[ny, nx])
-                        if abs(pixel_val - seed_val) <= tolerance:
-                            region[ny, nx] = True
-                            queue.append((ny, nx))
-
-        if np.sum(region) < 20:
-            return None
-
-        region_uint8 = (region * 255).astype(np.uint8)
-        contours, _ = cv2.findContours(region_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if not contours:
-            return None
-
-        contour = max(contours, key=cv2.contourArea)
-
-        approx = _simplify_contour(contour)
-
-        points = [(pt[0][1], pt[0][0]) for pt in approx]  # (row, col) format
-        return points if len(points) >= MIN_OUTLINE_POINTS else None
-
-    except Exception as e:
-        print(f"Auto-outline region growing error: {e}")
-        return None
 
 
 def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
@@ -1665,83 +1482,6 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
         return None
 
 
-def auto_outline_active_contours(image, centroid, sensitivity=50, region_size=150):
-    """
-    Auto-outline using active contours (snakes).
-    Produces smooth, precise outlines.
-
-    Args:
-        image: Grayscale image (2D numpy array)
-        centroid: (row, col) tuple of soma center
-        sensitivity: 0-100, affects initial circle size and snake parameters
-        region_size: Size of region around centroid
-
-    Returns:
-        List of (row, col) polygon points, or None if failed
-    """
-    try:
-        from skimage.segmentation import active_contour
-        from skimage.filters import gaussian
-
-        if image is None:
-            return None
-        if image.ndim > 2:
-            image = image[:, :, 0] if image.shape[2] > 0 else image.squeeze()
-
-        h, w = image.shape[:2]
-        cy, cx = int(centroid[0]), int(centroid[1])
-
-        half = region_size // 2
-        y1, y2 = max(0, cy - half), min(h, cy + half)
-        x1, x2 = max(0, cx - half), min(w, cx + half)
-        region = image[y1:y2, x1:x2].copy().astype(np.float64)
-
-        if region.size == 0:
-            return None
-
-        rmin, rmax = region.min(), region.max()
-        if rmax > rmin:
-            region = (region - rmin) / (rmax - rmin)
-
-        region = gaussian(region, sigma=2)
-
-        # Initial circle
-        local_cx, local_cy = cx - x1, cy - y1
-
-        if not (0 <= local_cx < region.shape[1] and 0 <= local_cy < region.shape[0]):
-            return None
-
-        # Initial radius based on sensitivity
-        init_radius = 10 + sensitivity / 3  # Range: 10-43 pixels
-
-        # Create initial snake points (circle)
-        s = np.linspace(0, 2 * np.pi, 100)
-        init_x = local_cx + init_radius * np.cos(s)
-        init_y = local_cy + init_radius * np.sin(s)
-        init = np.array([init_x, init_y]).T
-
-        # Snake parameters based on sensitivity
-        alpha = 0.01 + (100 - sensitivity) / 5000  # Smoothness
-        beta = 0.1 + (100 - sensitivity) / 500     # Curvature
-
-        snake = active_contour(
-            region, init,
-            alpha=alpha, beta=beta,
-            gamma=0.01,
-            max_num_iter=250
-        )
-
-        # Simplify snake to polygon, ensuring at least MIN_OUTLINE_POINTS
-        target_pts = max(30, MIN_OUTLINE_POINTS)
-        step = max(1, len(snake) // target_pts)
-        simplified = snake[::step]
-
-        points = [(pt[1] + y1, pt[0] + x1) for pt in simplified]
-        return points if len(points) >= MIN_OUTLINE_POINTS else None
-
-    except Exception as e:
-        print(f"Auto-outline active contours error: {e}")
-        return None
 
 
 def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
@@ -1928,56 +1668,6 @@ class MorphologyCalculator:
         return params
 
 
-class BatchProcessingThread(QThread):
-    """Thread for batch processing images in the background"""
-    progress = pyqtSignal(int)
-    status_update = pyqtSignal(str)
-    finished_image = pyqtSignal(str, str, object)
-    error_occurred = pyqtSignal(str)
-
-    def __init__(self, image_data_list, output_dir):
-        super().__init__()
-        self.image_data_list = image_data_list
-        self.output_dir = output_dir
-
-    def run(self):
-        try:
-            total = len(self.image_data_list)
-            for i, (
-                    img_path, img_name, radius, rb_enabled, denoise_enabled, denoise_size,
-                    sharpen_enabled, sharpen_amount, process_channel) in enumerate(
-                self.image_data_list):
-                try:
-                    self.status_update.emit(f"Processing: {img_name}")
-                    img = load_tiff_image(img_path)
-                    if img.ndim == 3:
-                        img = extract_channel(img, process_channel)
-                    img_dtype = img.dtype
-                    result = img.copy()
-
-                    if rb_enabled:
-                        background = restoration.rolling_ball(img, radius=radius)
-                        result = img - background
-                        result = np.clip(result, 0, np.iinfo(img_dtype).max)
-
-                    if denoise_enabled:
-                        result = ndimage.median_filter(result, size=denoise_size)
-
-                    if sharpen_enabled:
-                        blurred = ndimage.gaussian_filter(result.astype(np.float32), sigma=2)
-                        result_float = result.astype(np.float32)
-                        sharpened = result_float + sharpen_amount * (result_float - blurred)
-                        result = np.clip(sharpened, 0, np.iinfo(img_dtype).max).astype(img_dtype)
-
-                    name = os.path.splitext(img_name)[0]
-                    out_path = os.path.join(self.output_dir, f"{name}_processed.tif")
-                    tifffile.imwrite(out_path, result.astype(img_dtype))
-                    self.finished_image.emit(out_path, img_name, result)
-                    self.progress.emit(int((i + 1) / total * 100))
-                except Exception as e:
-                    self.error_occurred.emit(f"Error: {img_name}: {e}")
-        except Exception as e:
-            self.error_occurred.emit(f"Fatal error: {e}")
 
 
 class MorphologyCalculationThread(QThread):
@@ -2361,10 +2051,6 @@ class InteractiveImageLabel(QLabel):
         self.view_center_y = 0.5
         self._update_display()
 
-    def set_zoom(self, level):
-        """Set zoom to a specific level"""
-        self.zoom_level = max(self.min_zoom, min(self.max_zoom, level))
-        self._update_display()
 
     def zoom_to_point(self, img_row, img_col, zoom_level=3.0):
         """Center the view on a specific image coordinate and zoom in."""
@@ -2509,16 +2195,6 @@ class InteractiveImageLabel(QLabel):
         super().resizeEvent(event)
         self._update_display()
 
-    def center_on_soma(self):
-        """Center the view on the current soma (first centroid)"""
-        if not self.pix_source or not self.centroids:
-            return
-        # Get first centroid (current soma)
-        soma = self.centroids[0]
-        img_h, img_w = self.pix_source.height(), self.pix_source.width()
-        self.view_center_x = soma[1] / img_w
-        self.view_center_y = soma[0] / img_h
-        self._update_display()
 
     def wheelEvent(self, event):
         """Mouse wheel disabled - use Z+click to zoom"""
@@ -3320,8 +2996,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         {'name': 'far_red_albumin', 'channel': 2}]}
         # Channel names (can be customized by user)
         self.channel_names = {0: '', 1: '', 2: ''}
-        # Color/grayscale display toggle
-        self.show_color_view = False
+        # Color/grayscale display toggle — color view is on by default.
+        self.show_color_view = True
         # Z key tracking for zoom functionality
         self.z_key_held = False
         # Measurement tool state
@@ -3961,8 +3637,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         display_adjust_btn.clicked.connect(self.open_display_adjustments)
         display_btn_layout.addWidget(display_adjust_btn)
 
-        # Color/Grayscale toggle button
-        self.color_toggle_btn = QPushButton("Show Color (C)")
+        # Color/Grayscale toggle button — color view is on by default.
+        self.color_toggle_btn = QPushButton("Show Grayscale (C)")
         self.color_toggle_btn.clicked.connect(self.toggle_color_view)
         self.color_toggle_btn.setToolTip("Toggle between color and grayscale display")
         display_btn_layout.addWidget(self.color_toggle_btn)
@@ -9926,55 +9602,6 @@ if __name__ == '__main__':
     # IMPORT IMAGEJ RESULTS
     # ========================================================================
 
-    def _detect_imagej_csv_type(self, file_path):
-        """Detect the type of ImageJ result CSV from its column headers.
-        Returns one of: 'sholl', 'skeleton', 'fractal', 'combined', or None."""
-        import csv
-        try:
-            with open(file_path, 'r') as f:
-                reader = csv.reader(f)
-                headers = next(reader, [])
-        except Exception:
-            return None
-
-        headers_lower = set(h.strip().lower() for h in headers)
-
-        # Check for Sholl (uses 'Mask Name', 'Primary Branches', etc.)
-        sholl_markers = {'mask name', 'primary branches', 'sum of intersections',
-                         'intersecting radii', 'enclosing radius'}
-        if len(sholl_markers & headers_lower) >= 2:
-            return 'sholl'
-
-        has_sholl_prefix = any(h.startswith('sholl_') for h in headers_lower)
-        has_skel_prefix = any(h.startswith('skel_') for h in headers_lower)
-        has_fractal_prefix = any(h.startswith('fractal_') for h in headers_lower)
-        if sum([has_sholl_prefix, has_skel_prefix, has_fractal_prefix]) >= 2:
-            return 'combined'
-
-        skel_markers = {'num_branches', 'num_junctions', 'skeleton_area_um2',
-                        'num_end_points', 'avg_branch_length_um'}
-        if len(skel_markers & headers_lower) >= 2:
-            return 'skeleton'
-
-        # Check for Fractal (includes hull columns from same script)
-        fractal_markers = {'fractal_dimension', 'fractal_lacunarity_mean',
-                           'fractal_r_squared', 'fractal_foreground_pixels'}
-        hull_markers = {'hull_area_um2', 'hull_circularity', 'hull_density'}
-        if len(fractal_markers & headers_lower) >= 1 or len(hull_markers & headers_lower) >= 2:
-            return 'fractal'
-
-        # Filename fallback
-        basename = os.path.basename(file_path).lower()
-        if 'sholl' in basename:
-            return 'sholl'
-        if 'skeleton' in basename or 'skel' in basename:
-            return 'skeleton'
-        if 'fractal' in basename:
-            return 'fractal'
-        if 'combined_analysis' in basename:
-            return 'combined'
-
-        return None
 
     def _load_imagej_csv(self, file_path, csv_type):
         """Load an ImageJ CSV, returning a dict of {cell_name: {'data': {...}, 'area': int|None}}.
@@ -10567,11 +10194,6 @@ if __name__ == '__main__':
                 orig_pixmap = self._array_to_pixmap_color(adjusted_orig)
                 self.original_label.set_image(orig_pixmap)
 
-    def reset_display_adjustments(self):
-        """Reset brightness and contrast to default"""
-        self.brightness_value = 0
-        self.contrast_value = 0
-        self.update_display()
 
     def toggle_color_view(self):
         """Toggle between color and grayscale display"""
@@ -11664,24 +11286,7 @@ if __name__ == '__main__':
         QMessageBox.information(self, "Complete",
                                 f"Processed {total} Z-stacks!\n\nReady for soma picking.")
 
-    def update_workflow_status(self):
-        selected = [name for name, data in self.images.items() if data['selected']]
-        if not selected:
-            self.workflow_status_label.setText("No images selected")
-            return
-        status_counts = {}
-        for img_name in selected:
-            status = self.images[img_name]['status']
-            status_counts[status] = status_counts.get(status, 0) + 1
-        status_text = f"Selected: {len(selected)} images\n"
-        for status, count in sorted(status_counts.items()):
-            status_text += f"{status}: {count}\n"
-        self.workflow_status_label.setText(status_text)
 
-    def get_current_processed_image(self):
-        if not self.current_image_name or self.current_image_name not in self.images:
-            return None
-        return self.images[self.current_image_name]['processed']
 
     def start_batch_soma_picking(self):
         try:
@@ -13235,106 +12840,6 @@ if __name__ == '__main__':
         self.accept_outline_btn.setEnabled(True)
         self.manual_draw_btn.setEnabled(True)  # Can still switch to manual
 
-    def auto_outline_all_somas(self):
-        """Auto-outline all remaining somas in the queue"""
-        if not self.outlining_queue:
-            QMessageBox.warning(self, "Warning", "No somas in outlining queue")
-            return
-
-        queue_idx = getattr(self, 'current_outline_idx', 0)
-        remaining = len(self.outlining_queue) - queue_idx
-
-        if remaining <= 0:
-            QMessageBox.warning(self, "Warning", "All somas already outlined")
-            return
-
-        reply = QMessageBox.question(
-            self, 'Auto-Outline All',
-            f"Auto-outline {remaining} remaining soma(s)?\n\n"
-            f"Method: {self.auto_outline_method.currentText()}\n"
-            f"Sensitivity: {self._auto_outline_sensitivity_value}\n\n"
-            "You can review and adjust each outline afterward.",
-            QMessageBox.Yes | QMessageBox.No
-        )
-
-        if reply == QMessageBox.No:
-            return
-
-        method = self._get_auto_outline_method()
-        sensitivity = self._auto_outline_sensitivity_value
-
-        success_count = 0
-        fail_count = 0
-        failed_somas = []
-
-        self.log(f"Auto-outlining {remaining} somas...")
-
-        for i in range(queue_idx, len(self.outlining_queue)):
-            img_name, soma_idx = self.outlining_queue[i]
-            # Skip already-outlined somas
-            if self._soma_has_outline(img_name, soma_idx):
-                continue
-            img_data = self.images[img_name]
-            soma = img_data['somas'][soma_idx]
-            soma_id = img_data['soma_ids'][soma_idx]
-
-            outline_img = self._get_image_for_outlining(img_data)
-            if outline_img is None:
-                fail_count += 1
-                failed_somas.append(soma_id)
-                continue
-
-            try:
-                points = method(outline_img, soma, sensitivity)
-            except Exception:
-                points = None
-
-            if points is None or len(points) < 3:
-                fail_count += 1
-                failed_somas.append(soma_id)
-                continue
-
-            points = _remove_branch_juts(points, soma)
-
-            mask = self._polygon_to_mask(points, outline_img.shape)
-            pixel_size = self._get_pixel_size(img_name)
-            soma_area_um2 = np.sum(mask) * (pixel_size ** 2)
-
-            img_data['soma_outlines'].append({
-                'soma_idx': soma_idx,
-                'soma_id': soma_id,
-                'centroid': soma,
-                'outline': mask,
-                'polygon_points': list(points),
-                'soma_area_um2': soma_area_um2,
-                'auto_outlined': True  # Mark as auto-outlined for review
-            })
-
-            # Export soma outline
-            self._export_soma_outline(img_name, soma_id, mask, pixel_size, soma_area_um2)
-            success_count += 1
-
-        self.log(f"✓ Auto-outlined {success_count} somas")
-        if fail_count > 0:
-            self.log(f"⚠ Failed to auto-outline {fail_count} somas: {', '.join(failed_somas)}")
-
-        self._update_outline_progress()
-
-        # Check if all done — find first queue entry without an outline
-        next_idx = self._find_next_unoutlined_idx()
-        if next_idx is None:
-            self._finish_outlining()
-        else:
-            self._load_soma_for_outlining(next_idx)
-            self.auto_outline_btn.setEnabled(True)
-            self.manual_draw_btn.setEnabled(True)
-
-        QMessageBox.information(
-            self, "Auto-Outline Complete",
-            f"Successfully outlined: {success_count}\n"
-            f"Failed (need manual): {fail_count}\n\n"
-            f"{'All somas outlined!' if fail_count == 0 else 'Please manually outline the remaining somas.'}"
-        )
 
     def start_manual_outline(self):
         """Switch to manual outline mode - clear any auto points and let user draw"""
@@ -13365,9 +12870,6 @@ if __name__ == '__main__':
             return
         self.finish_polygon()
 
-    def manual_override_outline(self):
-        """Legacy function - redirects to start_manual_outline"""
-        self.start_manual_outline()
 
     def clear_all_masks(self):
         """Delete all generated masks and allow regeneration"""
