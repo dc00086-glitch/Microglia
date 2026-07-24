@@ -109,6 +109,11 @@ def load_tiff_image(filepath):
         return np.array(img)
 
 
+def _mask_tif_name(img_basename, soma_id, area_um2):
+    """Canonical mask filename: <image>_<soma_id>_area<N>_mask.tif."""
+    return _mask_tif_name(img_basename, soma_id, area_um2)
+
+
 def ensure_grayscale(img):
     """Convert image to grayscale if needed"""
     if img is None:
@@ -1704,7 +1709,7 @@ class MorphologyCalculationThread(QThread):
                     img_basename = os.path.splitext(img_name)[0]
                     soma_id = mask_data['soma_id']
                     area_um2 = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
-                    mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+                    mask_filename = _mask_tif_name(img_basename, soma_id, area_um2)
                     mask_path = os.path.join(self.masks_dir, mask_filename)
                     if os.path.exists(mask_path):
                         parallel_tasks.append((i, mask_path, img_pixel_size, soma_area_um2))
@@ -1746,7 +1751,7 @@ class MorphologyCalculationThread(QThread):
                     img_basename = os.path.splitext(img_name)[0]
                     soma_id = mask_data['soma_id']
                     area_um2 = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
-                    mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+                    mask_filename = _mask_tif_name(img_basename, soma_id, area_um2)
                     mask_path = os.path.join(self.masks_dir, mask_filename)
                     if os.path.exists(mask_path):
                         mask_arr = safe_tiff_read(mask_path)
@@ -8369,7 +8374,7 @@ if __name__ == '__main__':
                                              m.get('area_um2', 0)) or 0)
                             mpath = os.path.join(
                                 self.masks_dir,
-                                f"{img_base}_{sid}_area{area}_mask.tif")
+                                _mask_tif_name(img_base, sid, area))
                             if os.path.exists(mpath):
                                 try:
                                     mk = (safe_tiff_read(mpath) > 0).astype(np.uint8)
@@ -9917,12 +9922,7 @@ if __name__ == '__main__':
         # Refresh if color view is on and we have color data
         if self._color_display(img_data):
             # Use processed channel in color composite if available
-            proc_color = self._build_processed_color_image(img_data)
-            if proc_color is not None:
-                adjusted = self._apply_display_adjustments_color(proc_color)
-            else:
-                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
-            pixmap = self._array_to_pixmap_color(adjusted)
+            pixmap = self._processed_color_pixmap(img_data)
             # Preserve markers
             if self.processed_label.polygon_mode and hasattr(self, 'outlining_queue') and self.outlining_queue:
                 queue_idx = getattr(self, 'current_outline_idx', 0)
@@ -9949,6 +9949,29 @@ if __name__ == '__main__':
     def _color_display(self, img_data):
         """True when the color view is on and this image has multi-channel data."""
         return self.show_color_view and img_data is not None and 'color_image' in img_data
+
+    def _processed_color_pixmap(self, img_data):
+        """Color pixmap of the processed composite, falling back to the raw
+        color_image when no processed channels exist."""
+        proc_color = self._build_processed_color_image(img_data)
+        src = proc_color if proc_color is not None else img_data['color_image']
+        return self._array_to_pixmap_color(self._apply_display_adjustments_color(src))
+
+    def _ensure_color_image(self, img_data, grayscale_fallback=False):
+        """Lazily populate img_data['color_image'] (+ num_channels) from raw_path
+        if missing. With grayscale_fallback, a 2D raw fills 'processed' when none."""
+        if img_data is None or 'color_image' in img_data or 'raw_path' not in img_data:
+            return
+        try:
+            raw_img = load_tiff_image(img_data['raw_path'])
+            if raw_img is not None and raw_img.ndim == 3:
+                img_data['color_image'] = raw_img.copy()
+                img_data['num_channels'] = raw_img.shape[2]
+            elif (grayscale_fallback and raw_img is not None and raw_img.ndim == 2
+                  and img_data.get('processed') is None):
+                img_data['processed'] = raw_img.copy()
+        except Exception:
+            pass
 
     def toggle_color_view(self):
         """Toggle between color and grayscale display"""
@@ -10901,12 +10924,7 @@ if __name__ == '__main__':
         # Show color or grayscale based on toggle, with display adjustments
         if self._color_display(img_data):
             # Use processed channel in color composite if available
-            proc_color = self._build_processed_color_image(img_data)
-            if proc_color is not None:
-                adjusted = self._apply_display_adjustments_color(proc_color)
-            else:
-                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
-            pixmap = self._array_to_pixmap_color(adjusted)
+            pixmap = self._processed_color_pixmap(img_data)
         else:
             # Use processed image if available, otherwise extract from color
             if img_data['processed'] is not None:
@@ -11026,12 +11044,7 @@ if __name__ == '__main__':
         # Show color or grayscale based on toggle, with display adjustments
         if self._color_display(img_data):
             # Use processed channel in color composite if available
-            proc_color = self._build_processed_color_image(img_data)
-            if proc_color is not None:
-                adjusted = self._apply_display_adjustments_color(proc_color)
-            else:
-                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
-            pixmap = self._array_to_pixmap_color(adjusted)
+            pixmap = self._processed_color_pixmap(img_data)
         else:
             # Use processed image if available, otherwise extract from color
             if img_data['processed'] is not None:
@@ -11069,12 +11082,7 @@ if __name__ == '__main__':
 
         if self._color_display(img_data):
             # Use processed channel in color composite if available
-            proc_color = self._build_processed_color_image(img_data)
-            if proc_color is not None:
-                adjusted = self._apply_display_adjustments_color(proc_color)
-            else:
-                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
-            pixmap = self._array_to_pixmap_color(adjusted)
+            pixmap = self._processed_color_pixmap(img_data)
         else:
             # Use processed image if available, otherwise extract from color
             if img_data['processed'] is not None:
@@ -11805,16 +11813,7 @@ if __name__ == '__main__':
                 except Exception:
                     pass
 
-        if 'color_image' not in img_data and 'raw_path' in img_data:
-            try:
-                raw_img = load_tiff_image(img_data['raw_path'])
-                if raw_img is not None and raw_img.ndim == 3:
-                    img_data['color_image'] = raw_img.copy()
-                    img_data['num_channels'] = raw_img.shape[2]
-                elif raw_img is not None and raw_img.ndim == 2 and img_data.get('processed') is None:
-                    img_data['processed'] = raw_img.copy()
-            except Exception:
-                pass
+        self._ensure_color_image(img_data, grayscale_fallback=True)
 
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
@@ -11857,12 +11856,7 @@ if __name__ == '__main__':
         # Support color view toggle during outlining
         if self._color_display(img_data):
             # Use processed channel in color composite if available
-            proc_color = self._build_processed_color_image(img_data)
-            if proc_color is not None:
-                adjusted = self._apply_display_adjustments_color(proc_color)
-            else:
-                adjusted = self._apply_display_adjustments_color(img_data['color_image'])
-            return self._array_to_pixmap_color(adjusted)
+            return self._processed_color_pixmap(img_data)
 
         # Grayscale mode
         if self.colocalization_mode and 'color_image' in img_data:
@@ -11917,17 +11911,7 @@ if __name__ == '__main__':
                 except Exception:
                     pass
 
-        if 'color_image' not in img_data and 'raw_path' in img_data:
-            try:
-                raw_img = load_tiff_image(img_data['raw_path'])
-                if raw_img is not None and raw_img.ndim == 3:
-                    img_data['color_image'] = raw_img.copy()
-                    img_data['num_channels'] = raw_img.shape[2]
-                elif raw_img is not None and raw_img.ndim == 2 and img_data.get('processed') is None:
-                    # Fallback: use raw grayscale image as processed
-                    img_data['processed'] = raw_img.copy()
-            except Exception:
-                pass
+        self._ensure_color_image(img_data, grayscale_fallback=True)
 
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
@@ -14097,7 +14081,7 @@ if __name__ == '__main__':
         img_basename = os.path.splitext(img_name)[0]
         soma_id = mask_data['soma_id']
         area_um2 = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
-        mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+        mask_filename = _mask_tif_name(img_basename, soma_id, area_um2)
         mask_path = os.path.join(self.masks_dir, mask_filename)
         if os.path.exists(mask_path):
             try:
@@ -14122,7 +14106,7 @@ if __name__ == '__main__':
         area_um2 = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
 
         # Try exact filename first
-        mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+        mask_filename = _mask_tif_name(img_basename, soma_id, area_um2)
         mask_path = os.path.join(self.masks_dir, mask_filename)
 
         if os.path.exists(mask_path):
@@ -14136,7 +14120,7 @@ if __name__ == '__main__':
         # Try rounding to nearest int (handles float precision issues)
         alt_area = int(round(float(area_um2)))
         if alt_area != int(area_um2):
-            alt_filename = f"{img_basename}_{soma_id}_area{alt_area}_mask.tif"
+            alt_filename = _mask_tif_name(img_basename, soma_id, alt_area)
             alt_path = os.path.join(self.masks_dir, alt_filename)
             if os.path.exists(alt_path):
                 try:
@@ -14256,14 +14240,7 @@ if __name__ == '__main__':
 
             # Display in color or grayscale based on toggle
             # Ensure color_image is loaded for color toggle
-            if 'color_image' not in img_data and 'raw_path' in img_data:
-                try:
-                    raw_img = load_tiff_image(img_data['raw_path'])
-                    if raw_img is not None and raw_img.ndim == 3:
-                        img_data['color_image'] = raw_img.copy()
-                        img_data['num_channels'] = raw_img.shape[2]
-                except Exception:
-                    pass
+            self._ensure_color_image(img_data)
             if self._color_display(img_data):
                 proc_color = self._build_processed_color_image(img_data)
                 if proc_color is not None:
@@ -14447,7 +14424,7 @@ if __name__ == '__main__':
 
         # Create unique filename with area to distinguish different masks for same soma
         img_basename = os.path.splitext(img_name)[0]
-        mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+        mask_filename = _mask_tif_name(img_basename, soma_id, area_um2)
         mask_path = os.path.join(self.masks_dir, mask_filename)
 
         mask = mask_data.get('mask')
@@ -14515,7 +14492,7 @@ if __name__ == '__main__':
 
             soma_id = mask_data['soma_id']
             area_um2 = mask_data.get('target_area_um2', mask_data.get('area_um2', 0))
-            mask_filename = f"{img_basename}_{soma_id}_area{int(area_um2)}_mask.tif"
+            mask_filename = _mask_tif_name(img_basename, soma_id, area_um2)
             mask_path = os.path.join(self.masks_dir, mask_filename)
 
             # Don't write auto-rejected duplicates to disk — delete if stale
@@ -14962,14 +14939,7 @@ if __name__ == '__main__':
 
         # Ensure color image is loaded for color toggle
         img_data = self.images.get(img_name, {})
-        if 'color_image' not in img_data and 'raw_path' in img_data:
-            try:
-                raw_img = load_tiff_image(img_data['raw_path'])
-                if raw_img is not None and raw_img.ndim == 3:
-                    img_data['color_image'] = raw_img.copy()
-                    img_data['num_channels'] = raw_img.shape[2]
-            except Exception:
-                pass
+        self._ensure_color_image(img_data)
 
         # Get soma centroid for cropping
         soma_idx = self.all_masks_flat[flat_indices[0]]['mask_data'].get('soma_idx', 0)
