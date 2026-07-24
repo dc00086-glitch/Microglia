@@ -9915,7 +9915,7 @@ if __name__ == '__main__':
         img_data = self.images[self.current_image_name]
 
         # Refresh if color view is on and we have color data
-        if self.show_color_view and 'color_image' in img_data:
+        if self._color_display(img_data):
             # Use processed channel in color composite if available
             proc_color = self._build_processed_color_image(img_data)
             if proc_color is not None:
@@ -9945,6 +9945,10 @@ if __name__ == '__main__':
                 orig_pixmap = self._array_to_pixmap_color(adjusted_orig)
                 self.original_label.set_image(orig_pixmap)
 
+
+    def _color_display(self, img_data):
+        """True when the color view is on and this image has multi-channel data."""
+        return self.show_color_view and img_data is not None and 'color_image' in img_data
 
     def toggle_color_view(self):
         """Toggle between color and grayscale display"""
@@ -10347,7 +10351,7 @@ if __name__ == '__main__':
 
             if img_data['processed'] is not None:
                 # Processed images - show color or grayscale based on toggle
-                if self.show_color_view and 'color_image' in img_data:
+                if self._color_display(img_data):
                     proc_color = self._build_processed_color_image(img_data)
                     if proc_color is not None:
                         adjusted_proc = self._apply_display_adjustments_color(proc_color)
@@ -10716,7 +10720,7 @@ if __name__ == '__main__':
 
             self._update_file_list_item(img_name)
             if img_name == self.current_image_name:
-                if self.show_color_view and 'color_image' in self.images[img_name]:
+                if self._color_display(self.images.get(img_name)):
                     proc_color = self._build_processed_color_image(self.images[img_name])
                     if proc_color is not None:
                         adjusted = self._apply_display_adjustments_color(proc_color)
@@ -10895,7 +10899,7 @@ if __name__ == '__main__':
         img_data = self.images[self.current_image_name]
 
         # Show color or grayscale based on toggle, with display adjustments
-        if self.show_color_view and 'color_image' in img_data:
+        if self._color_display(img_data):
             # Use processed channel in color composite if available
             proc_color = self._build_processed_color_image(img_data)
             if proc_color is not None:
@@ -11020,7 +11024,7 @@ if __name__ == '__main__':
         img_data['soma_groups'].append(group)
 
         # Show color or grayscale based on toggle, with display adjustments
-        if self.show_color_view and 'color_image' in img_data:
+        if self._color_display(img_data):
             # Use processed channel in color composite if available
             proc_color = self._build_processed_color_image(img_data)
             if proc_color is not None:
@@ -11063,7 +11067,7 @@ if __name__ == '__main__':
         if img_data.get('soma_groups'):
             img_data['soma_groups'].pop()
 
-        if self.show_color_view and 'color_image' in img_data:
+        if self._color_display(img_data):
             # Use processed channel in color composite if available
             proc_color = self._build_processed_color_image(img_data)
             if proc_color is not None:
@@ -11851,7 +11855,7 @@ if __name__ == '__main__':
     def _get_outlining_pixmap(self, img_data):
         """Get the appropriate pixmap for outlining with display adjustments"""
         # Support color view toggle during outlining
-        if self.show_color_view and 'color_image' in img_data:
+        if self._color_display(img_data):
             # Use processed channel in color composite if available
             proc_color = self._build_processed_color_image(img_data)
             if proc_color is not None:
@@ -14260,7 +14264,7 @@ if __name__ == '__main__':
                         img_data['num_channels'] = raw_img.shape[2]
                 except Exception:
                     pass
-            if self.show_color_view and 'color_image' in img_data:
+            if self._color_display(img_data):
                 proc_color = self._build_processed_color_image(img_data)
                 if proc_color is not None:
                     adjusted = self._apply_display_adjustments_color(proc_color)
@@ -15038,7 +15042,7 @@ if __name__ == '__main__':
         crop_c2 = min(img_w, cx + crop_radius)
 
         # Build crop background — color or grayscale based on toggle
-        use_color = self.show_color_view and 'color_image' in img_data
+        use_color = self._color_display(img_data)
         if use_color:
             proc_color = self._build_processed_color_image(img_data)
             if proc_color is not None:
