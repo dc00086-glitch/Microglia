@@ -799,6 +799,19 @@ def _vessel_response(cd31, use_tubeness=False, sigmas=_VESSEL_TUBENESS_SIGMAS):
     return base, thr
 
 
+def _vessel_threshold_for_area(base, target_area_frac):
+    """Threshold on ``base`` that yields roughly ``target_area_frac`` of pixels.
+
+    Applying one target area across a dataset keeps the CRITERION identical for
+    every image ("the most vessel-like N% of pixels") while the actual intensity
+    cut adapts to each image's own response distribution — consistent between
+    images without ignoring their individual differences.
+    """
+    f = float(np.clip(target_area_frac, 1e-6, 0.999))
+    return float(np.percentile(np.asarray(base, dtype=np.float64),
+                               100.0 * (1.0 - f)))
+
+
 def _vessel_mask_from_response(base, thr, pixel_size_um,
                                min_object_um2=5.0, close_radius_px=2):
     """Threshold a vessel response map and clean it up (close + despeckle)."""
@@ -817,7 +830,8 @@ def _vessel_mask_from_response(base, thr, pixel_size_um,
 
 def _vessel_binary(cd31, pixel_size_um, use_tubeness=False,
                    sigmas=_VESSEL_TUBENESS_SIGMAS,
-                   min_object_um2=5.0, close_radius_px=2, thr_scale=1.0):
+                   min_object_um2=5.0, close_radius_px=2, thr_scale=1.0,
+                   target_area_frac=None):
     """Binary CD31 vessel mask. With ``use_tubeness`` the CD31 is first passed
     through a multi-scale Sato tubeness filter (bright ridges) and that response
     is thresholded, keeping tube-like vessels and dropping speckle blobs.
@@ -827,7 +841,10 @@ def _vessel_binary(cd31, pixel_size_um, use_tubeness=False,
     if img.max() <= 0 or not np.any(img > 0):
         return np.zeros(img.shape, dtype=bool), 0.0
     base, thr = _vessel_response(img, use_tubeness, sigmas)
-    thr = thr * float(thr_scale)
+    if target_area_frac:
+        thr = _vessel_threshold_for_area(base, target_area_frac)
+    else:
+        thr = thr * float(thr_scale)
     vessels = base > thr
     if close_radius_px > 0:
         vessels = ndimage.binary_closing(vessels, structure=_disk_struct(close_radius_px))
@@ -843,7 +860,7 @@ def _vessel_binary(cd31, pixel_size_um, use_tubeness=False,
 
 def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2,
                      use_tubeness=False, sigmas=_VESSEL_TUBENESS_SIGMAS,
-                     thr_scale=1.0, vessel_mask=None):
+                     thr_scale=1.0, vessel_mask=None, target_area_frac=None):
     """Segment the CD31 channel into a vessel mask and compute REAVER-style
     vascular morphometrics.
 
@@ -863,7 +880,8 @@ def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2,
         thr = 0.0
     else:
         vessels, thr = _vessel_binary(cd31, pixel_size_um, use_tubeness, sigmas,
-                                      min_object_um2, close_radius_px, thr_scale)
+                                      min_object_um2, close_radius_px, thr_scale,
+                                      target_area_frac)
     if not np.any(vessels):
         return empty
 
@@ -2928,7 +2946,7 @@ class VesselReviewDialog(QDialog):
     """
 
     def __init__(self, parent, cd31, pixel_size_um, img_name,
-                 use_tubeness=True, thr_scale=1.0):
+                 use_tubeness=True, thr_scale=1.0, target_area_pct=None):
         super().__init__(parent)
         from PyQt5.QtWidgets import QSlider as _QS
         self.setWindowTitle(f"Review vessel segmentation — {img_name}")
@@ -2956,6 +2974,19 @@ class VesselReviewDialog(QDialog):
         self.tube_check.toggled.connect(self._recompute)
         layout.addWidget(self.tube_check)
 
+        # --- thresholding mode -------------------------------------------
+        from PyQt5.QtWidgets import QComboBox, QDoubleSpinBox
+        mrow = QHBoxLayout()
+        mrow.addWidget(QLabel("Threshold rule:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Auto (Otsu) × sensitivity", "auto")
+        self.mode_combo.addItem("Target vessel area % (consistent across images)",
+                                "target")
+        self.mode_combo.setCurrentIndex(1 if target_area_pct else 0)
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        mrow.addWidget(self.mode_combo)
+        layout.addLayout(mrow)
+
         srow = QHBoxLayout()
         srow.addWidget(QLabel("Sensitivity:"))
         self.thr_slider = _QS(Qt.Horizontal)
@@ -2968,9 +2999,41 @@ class VesselReviewDialog(QDialog):
         self.thr_label = QLabel("1.00x")
         self.thr_label.setFixedWidth(52)
         srow.addWidget(self.thr_label)
-        layout.addLayout(srow)
+        self.sens_row = QWidget()
+        self.sens_row.setLayout(srow)
+        layout.addWidget(self.sens_row)
+
+        trow = QHBoxLayout()
+        trow.addWidget(QLabel("Target vessel area:"))
+        self.target_spin = QDoubleSpinBox()
+        self.target_spin.setRange(0.1, 40.0)
+        self.target_spin.setSingleStep(0.5)
+        self.target_spin.setDecimals(1)
+        self.target_spin.setSuffix(" %")
+        self.target_spin.setValue(float(target_area_pct or 3.0))
+        self.target_spin.valueChanged.connect(self._rethreshold)
+        trow.addWidget(self.target_spin)
+        trow.addWidget(QLabel("<i>same rule every image; cut adapts per image</i>"))
+        trow.addStretch()
+        self.target_row = QWidget()
+        self.target_row.setLayout(trow)
+        layout.addWidget(self.target_row)
+
+        # --- display scaling (does not affect the mask) -------------------
+        drow = QHBoxLayout()
+        drow.addWidget(QLabel("Display scale:"))
+        self.disp_slider = _QS(Qt.Horizontal)
+        self.disp_slider.setRange(50, 100)   # upper display percentile x10 -> 5.0..10.0
+        self.disp_slider.setValue(99)
+        self.disp_slider.valueChanged.connect(lambda _v: self._draw())
+        drow.addWidget(self.disp_slider)
+        self.disp_label = QLabel("99.0%")
+        self.disp_label.setFixedWidth(52)
+        drow.addWidget(self.disp_label)
+        layout.addLayout(drow)
         layout.addWidget(QLabel(
-            "<i>Left = include more (lower threshold), right = stricter.</i>"))
+            "<i>Brightness of the preview only — has no effect on the mask or "
+            "any measurement.</i>"))
 
         self.stat_label = QLabel("")
         self.stat_label.setStyleSheet("font-weight: bold;")
@@ -2989,7 +3052,7 @@ class VesselReviewDialog(QDialog):
         btns.addWidget(skip_btn)
         layout.addLayout(btns)
 
-        self._recompute()
+        self._mode_changed()      # sets row visibility and does the first draw
 
     # -- computation ---------------------------------------------------
     def _response(self):
@@ -3006,11 +3069,21 @@ class VesselReviewDialog(QDialog):
             QApplication.restoreOverrideCursor()
         self._rethreshold()
 
+    def _mode_changed(self):
+        target = self.mode_combo.currentData() == 'target'
+        self.sens_row.setVisible(not target)
+        self.target_row.setVisible(target)
+        self._rethreshold()
+
     def _rethreshold(self):
         base, auto_thr = self._response()
         scale = self.thr_slider.value() / 100.0
         self.thr_label.setText(f"{scale:.2f}x")
-        self.mask = _vessel_mask_from_response(base, auto_thr * scale, self.ps)
+        if self.mode_combo.currentData() == 'target':
+            thr = _vessel_threshold_for_area(base, self.target_spin.value() / 100.0)
+        else:
+            thr = auto_thr * scale
+        self.mask = _vessel_mask_from_response(base, thr, self.ps)
         frac = 100.0 * float(self.mask.mean())
         warn = "  ⚠ implausibly high" if frac > 20 else (
             "  ⚠ nothing found" if frac < 0.05 else "")
@@ -3021,7 +3094,10 @@ class VesselReviewDialog(QDialog):
     def _draw(self):
         from PyQt5.QtGui import QImage, QPixmap
         img = self.cd31
-        lo, hi = float(np.percentile(img, 1)), float(np.percentile(img, 99))
+        up = self.disp_slider.value() / 10.0 + 90.0   # 95.0 .. 100.0 percentile
+        up = min(max(up, 90.0), 100.0)
+        self.disp_label.setText(f"{up:.1f}%")
+        lo, hi = float(np.percentile(img, 1)), float(np.percentile(img, up))
         if hi <= lo:
             hi = lo + 1.0
         g = np.clip((img - lo) / (hi - lo), 0, 1)
@@ -3044,8 +3120,10 @@ class VesselReviewDialog(QDialog):
         self.accept()
 
     def settings(self):
+        target = self.mode_combo.currentData() == 'target'
         return {'use_tubeness': bool(self.tube_check.isChecked()),
                 'thr_scale': self.thr_slider.value() / 100.0,
+                'target_area_pct': self.target_spin.value() if target else None,
                 'mask': self.mask,
                 'action': self.result_action}
 
@@ -8547,6 +8625,7 @@ if __name__ == '__main__':
         bad_vessel_imgs = []   # images whose CD31 threshold looks implausible
         review_vessels = bool(channels.get('review_vessels', False))
         thr_scale = 1.0        # carried forward once the user accepts settings
+        target_area_pct = None  # if set, the same target area rule for all images
 
         # Process every image that has microglia defined — by generated mask OR
         # by picked soma (so every microglia gets a leakage row, mask or not).
@@ -8599,7 +8678,8 @@ if __name__ == '__main__':
                     progress.hide()
                     dlg = VesselReviewDialog(self, cd31, ps, img_base,
                                              use_tubeness=use_tube,
-                                             thr_scale=thr_scale)
+                                             thr_scale=thr_scale,
+                                             target_area_pct=target_area_pct)
                     dlg.exec_()
                     st = dlg.settings()
                     progress.show()
@@ -8609,16 +8689,21 @@ if __name__ == '__main__':
                         continue
                     use_tube = st['use_tubeness']
                     thr_scale = st['thr_scale']
+                    target_area_pct = st['target_area_pct']
                     reviewed_mask = st['mask']
                     self.bbb_use_tubeness = use_tube
                     if st['action'] == 'accept_all':
                         review_vessels = False
+                        rule = (f"target area {target_area_pct:.1f}%"
+                                if target_area_pct else
+                                f"sensitivity {thr_scale:.2f}x")
                         self.log(f"BBB: using reviewed settings (tubeness="
-                                 f"{use_tube}, sensitivity={thr_scale:.2f}x) "
-                                 f"for all remaining images")
+                                 f"{use_tube}, {rule}) for all remaining images")
                 vessel_mask, vmetrics = _segment_vessels(
                     cd31, ps, use_tubeness=use_tube, thr_scale=thr_scale,
-                    vessel_mask=reviewed_mask)
+                    vessel_mask=reviewed_mask,
+                    target_area_frac=(target_area_pct / 100.0
+                                      if target_area_pct else None))
                 # Sanity check: cortical vessel area fraction is normally a few
                 # percent. A large value means the threshold caught background
                 # haze rather than vessels, which biases every leakage metric.
