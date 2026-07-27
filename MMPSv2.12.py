@@ -2956,8 +2956,14 @@ class BBBAnalysisDialog(QDialog):
         _update_visible(self.ntracer_spin.value())
 
         self.tubeness_check = QCheckBox(
-            "Enhance vessels with tubeness (Sato) — cleaner vessels from noisy CD31")
-        self.tubeness_check.setChecked(False)
+            "Enhance vessels with tubeness (Sato) — recommended for faint CD31")
+        # On by default: plain Otsu splits a hazy CD31 background into large
+        # blobs instead of finding the thin vessel slits (measured ~39% "vessel"
+        # area vs ~3% with tubeness). Untick only if your CD31 is high-contrast.
+        self.tubeness_check.setChecked(True)
+        self.tubeness_check.setToolTip(
+            "Runs a multi-scale ridge filter before thresholding so thin, faint "
+            "vessels are found instead of bright background patches.")
         layout.addWidget(self.tubeness_check)
 
         note = QLabel("Runs on all loaded images with masks. Saves leak overlays\n"
@@ -8353,6 +8359,7 @@ if __name__ == '__main__':
                             for n in ('dextran', 'albumin')
                             if channels.get(n, -1) >= 0]
         vessel_rows, cell_rows, n_imgs = [], [], 0
+        bad_vessel_imgs = []   # images whose CD31 threshold looks implausible
 
         # Process every image that has microglia defined — by generated mask OR
         # by picked soma (so every microglia gets a leakage row, mask or not).
@@ -8399,6 +8406,17 @@ if __name__ == '__main__':
                 use_tube = bool(getattr(self, 'bbb_use_tubeness', False))
                 vessel_mask, vmetrics = _segment_vessels(cd31, ps, use_tubeness=use_tube)
                 img_base = os.path.splitext(img_name)[0]
+                # Sanity check: cortical vessel area fraction is normally a few
+                # percent. A large value means the threshold caught background
+                # haze rather than vessels, which biases every leakage metric.
+                _vaf = vmetrics.get('vessel_area_fraction', 0.0)
+                if _vaf > 0.20:
+                    bad_vessel_imgs.append((img_base, _vaf))
+                    self.log(f"  ⚠️ {img_base}: vessel area {_vaf * 100:.0f}% — "
+                             f"implausibly high; CD31 threshold is catching "
+                             f"background, not vessels."
+                             + ("" if use_tube else " Try ticking 'Enhance "
+                                                    "vessels with tubeness'."))
                 # Save an Otsu-vs-tubeness vessel comparison so the choice is visible.
                 try:
                     prev_dir = os.path.join(out_dir, 'bbb_vessel_previews')
@@ -8595,6 +8613,20 @@ if __name__ == '__main__':
             f"Done: {n_imgs} images, {len(cell_rows)} microglia.\n"
             f"{merged_msg}\n"
             f"Leak overlays saved to bbb_overlays/ in:\n{out_dir}")
+        if bad_vessel_imgs:
+            worst = sorted(bad_vessel_imgs, key=lambda t: -t[1])[:10]
+            lines = "\n".join(f"  {b}: {v * 100:.0f}% vessel area" for b, v in worst)
+            more = (f"\n  ...and {len(bad_vessel_imgs) - 10} more"
+                    if len(bad_vessel_imgs) > 10 else "")
+            QMessageBox.warning(
+                self, "Check vessel segmentation",
+                f"{len(bad_vessel_imgs)} image(s) produced an implausibly large "
+                f"vessel area (cortical vasculature is normally a few percent):\n\n"
+                f"{lines}{more}\n\n"
+                f"The CD31 threshold is catching background haze rather than "
+                f"vessels, which biases every leakage metric. Compare the two "
+                f"panels in bbb_vessel_previews/ and re-run with "
+                f"'Enhance vessels with tubeness' ticked.")
 
     def _toggle_colocalization_mode(self, checked):
         """Toggle colocalization mode on/off from the Mode menu."""
