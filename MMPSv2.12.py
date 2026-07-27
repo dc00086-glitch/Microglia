@@ -773,16 +773,18 @@ def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
 _VESSEL_TUBENESS_SIGMAS = (1, 2, 3, 4, 6)
 
 
-def _vessel_binary(cd31, pixel_size_um, use_tubeness=False,
-                   sigmas=_VESSEL_TUBENESS_SIGMAS,
-                   min_object_um2=5.0, close_radius_px=2):
-    """Binary CD31 vessel mask. With ``use_tubeness`` the CD31 is first passed
-    through a multi-scale Sato tubeness filter (bright ridges) and that response
-    is thresholded, keeping tube-like vessels and dropping speckle blobs."""
+def _vessel_response(cd31, use_tubeness=False, sigmas=_VESSEL_TUBENESS_SIGMAS):
+    """Return (response, otsu_threshold) for the CD31 channel.
+
+    The response is either the raw CD31 or its multi-scale Sato tubeness map.
+    Split out from _vessel_binary so an interactive reviewer can compute this
+    once (the expensive part) and then re-threshold instantly while the user
+    drags a sensitivity slider.
+    """
     from skimage.filters import threshold_otsu
     img = np.asarray(cd31, dtype=np.float64)
     if img.max() <= 0 or not np.any(img > 0):
-        return np.zeros(img.shape, dtype=bool), 0.0
+        return np.zeros(img.shape, dtype=np.float64), 0.0
     if use_tubeness:
         from skimage.filters import sato
         mx = float(img.max())
@@ -794,6 +796,38 @@ def _vessel_binary(cd31, pixel_size_um, use_tubeness=False,
         thr = float(threshold_otsu(pos))
     else:
         thr = float(pos.min()) - 1.0 if pos.size else 0.0
+    return base, thr
+
+
+def _vessel_mask_from_response(base, thr, pixel_size_um,
+                               min_object_um2=5.0, close_radius_px=2):
+    """Threshold a vessel response map and clean it up (close + despeckle)."""
+    vessels = base > thr
+    if close_radius_px > 0:
+        vessels = ndimage.binary_closing(vessels, structure=_disk_struct(close_radius_px))
+    min_px = max(int(min_object_um2 / (pixel_size_um ** 2)), 1)
+    lab, n = ndimage.label(vessels)
+    if n:
+        sizes = np.bincount(lab.ravel())
+        keep = np.where(sizes >= min_px)[0]
+        keep = keep[keep != 0]
+        vessels = np.isin(lab, keep)
+    return vessels
+
+
+def _vessel_binary(cd31, pixel_size_um, use_tubeness=False,
+                   sigmas=_VESSEL_TUBENESS_SIGMAS,
+                   min_object_um2=5.0, close_radius_px=2, thr_scale=1.0):
+    """Binary CD31 vessel mask. With ``use_tubeness`` the CD31 is first passed
+    through a multi-scale Sato tubeness filter (bright ridges) and that response
+    is thresholded, keeping tube-like vessels and dropping speckle blobs.
+    ``thr_scale`` multiplies the auto threshold (>1 stricter, <1 more inclusive).
+    """
+    img = np.asarray(cd31, dtype=np.float64)
+    if img.max() <= 0 or not np.any(img > 0):
+        return np.zeros(img.shape, dtype=bool), 0.0
+    base, thr = _vessel_response(img, use_tubeness, sigmas)
+    thr = thr * float(thr_scale)
     vessels = base > thr
     if close_radius_px > 0:
         vessels = ndimage.binary_closing(vessels, structure=_disk_struct(close_radius_px))
@@ -808,7 +842,8 @@ def _vessel_binary(cd31, pixel_size_um, use_tubeness=False,
 
 
 def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2,
-                     use_tubeness=False, sigmas=_VESSEL_TUBENESS_SIGMAS):
+                     use_tubeness=False, sigmas=_VESSEL_TUBENESS_SIGMAS,
+                     thr_scale=1.0, vessel_mask=None):
     """Segment the CD31 channel into a vessel mask and compute REAVER-style
     vascular morphometrics.
 
@@ -822,8 +857,13 @@ def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2,
         'vessel_area_fraction': 0.0, 'vessel_length_density_um_per_um2': 0.0,
         'vessel_branchpoint_density_per_mm2': 0.0, 'vessel_mean_diameter_um': 0.0,
         'vessel_threshold': 0.0})
-    vessels, thr = _vessel_binary(cd31, pixel_size_um, use_tubeness, sigmas,
-                                  min_object_um2, close_radius_px)
+    if vessel_mask is not None:
+        # Caller supplied a reviewed/edited mask — measure that instead.
+        vessels = np.asarray(vessel_mask) > 0
+        thr = 0.0
+    else:
+        vessels, thr = _vessel_binary(cd31, pixel_size_um, use_tubeness, sigmas,
+                                      min_object_um2, close_radius_px, thr_scale)
     if not np.any(vessels):
         return empty
 
@@ -2875,6 +2915,141 @@ class GrayscaleChannelDialog(QDialog):
         return ch1, ch2
 
 
+class VesselReviewDialog(QDialog):
+    """Manually review / tune the CD31 vessel segmentation for one image.
+
+    Shows the CD31 channel with the current vessel mask outlined, plus a
+    tubeness toggle and a sensitivity slider. The expensive part (the Sato
+    response) is computed once per tubeness state and cached, so dragging the
+    slider only re-thresholds and is instant.
+
+    result: 'accept' (use this mask), 'accept_all' (use these settings for every
+    remaining image without asking), or 'skip'.
+    """
+
+    def __init__(self, parent, cd31, pixel_size_um, img_name,
+                 use_tubeness=True, thr_scale=1.0):
+        super().__init__(parent)
+        from PyQt5.QtWidgets import QSlider as _QS
+        self.setWindowTitle(f"Review vessel segmentation — {img_name}")
+        self.setModal(True)
+        self.cd31 = np.asarray(cd31, dtype=np.float64)
+        self.ps = float(pixel_size_um)
+        self.result_action = 'skip'
+        self._cache = {}          # use_tubeness -> (response, otsu_thr)
+        self.mask = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "<b>Check the vessel outline before the leak metrics are computed.</b><br>"
+            "<i>Every BBB measure is relative to this mask. Cortical vessel area "
+            "is normally a few percent.</i>"))
+
+        self.preview = QLabel()
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumSize(560, 420)
+        self.preview.setStyleSheet("border: 1px solid #666;")
+        layout.addWidget(self.preview)
+
+        self.tube_check = QCheckBox("Enhance vessels with tubeness (Sato)")
+        self.tube_check.setChecked(bool(use_tubeness))
+        self.tube_check.toggled.connect(self._recompute)
+        layout.addWidget(self.tube_check)
+
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("Sensitivity:"))
+        self.thr_slider = _QS(Qt.Horizontal)
+        self.thr_slider.setRange(20, 300)          # 0.20x .. 3.00x the auto threshold
+        self.thr_slider.setValue(int(round(float(thr_scale) * 100)))
+        self.thr_slider.setTickPosition(_QS.TicksBelow)
+        self.thr_slider.setTickInterval(20)
+        self.thr_slider.valueChanged.connect(self._rethreshold)
+        srow.addWidget(self.thr_slider)
+        self.thr_label = QLabel("1.00x")
+        self.thr_label.setFixedWidth(52)
+        srow.addWidget(self.thr_label)
+        layout.addLayout(srow)
+        layout.addWidget(QLabel(
+            "<i>Left = include more (lower threshold), right = stricter.</i>"))
+
+        self.stat_label = QLabel("")
+        self.stat_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.stat_label)
+
+        btns = QHBoxLayout()
+        accept_btn = QPushButton("Use this mask")
+        accept_btn.setDefault(True)
+        accept_btn.clicked.connect(lambda: self._finish('accept'))
+        all_btn = QPushButton("Use for ALL remaining images")
+        all_btn.clicked.connect(lambda: self._finish('accept_all'))
+        skip_btn = QPushButton("Skip this image")
+        skip_btn.clicked.connect(lambda: self._finish('skip'))
+        btns.addWidget(accept_btn)
+        btns.addWidget(all_btn)
+        btns.addWidget(skip_btn)
+        layout.addLayout(btns)
+
+        self._recompute()
+
+    # -- computation ---------------------------------------------------
+    def _response(self):
+        key = bool(self.tube_check.isChecked())
+        if key not in self._cache:
+            self._cache[key] = _vessel_response(self.cd31, key)
+        return self._cache[key]
+
+    def _recompute(self):
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self._response()
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._rethreshold()
+
+    def _rethreshold(self):
+        base, auto_thr = self._response()
+        scale = self.thr_slider.value() / 100.0
+        self.thr_label.setText(f"{scale:.2f}x")
+        self.mask = _vessel_mask_from_response(base, auto_thr * scale, self.ps)
+        frac = 100.0 * float(self.mask.mean())
+        warn = "  ⚠ implausibly high" if frac > 20 else (
+            "  ⚠ nothing found" if frac < 0.05 else "")
+        self.stat_label.setText(f"Vessel area: {frac:.2f}%{warn}")
+        self._draw()
+
+    # -- display -------------------------------------------------------
+    def _draw(self):
+        from PyQt5.QtGui import QImage, QPixmap
+        img = self.cd31
+        lo, hi = float(np.percentile(img, 1)), float(np.percentile(img, 99))
+        if hi <= lo:
+            hi = lo + 1.0
+        g = np.clip((img - lo) / (hi - lo), 0, 1)
+        rgb = np.repeat((g * 255).astype(np.uint8)[:, :, None], 3, axis=2)
+        # outline the mask in cyan
+        if self.mask is not None and np.any(self.mask):
+            m = self.mask
+            edge = m ^ ndimage.binary_erosion(m)
+            rgb[edge] = (0, 255, 255)
+        h, w, _ = rgb.shape
+        rgb = np.ascontiguousarray(rgb)
+        qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+        pm = QPixmap.fromImage(qimg).scaled(
+            self.preview.width(), self.preview.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.preview.setPixmap(pm)
+
+    def _finish(self, action):
+        self.result_action = action
+        self.accept()
+
+    def settings(self):
+        return {'use_tubeness': bool(self.tube_check.isChecked()),
+                'thr_scale': self.thr_slider.value() / 100.0,
+                'mask': self.mask,
+                'action': self.result_action}
+
+
 class BBBAnalysisDialog(QDialog):
     """Assign channels and run BBB analysis: CD31 vessel segmentation, tracer
     extravasation/leakage, and per-microglia tracer exposure. The number of
@@ -2966,6 +3141,15 @@ class BBBAnalysisDialog(QDialog):
             "vessels are found instead of bright background patches.")
         layout.addWidget(self.tubeness_check)
 
+        self.review_check = QCheckBox(
+            "Manually review the vessel mask for each image before measuring")
+        self.review_check.setChecked(True)
+        self.review_check.setToolTip(
+            "Shows the CD31 image with the vessel outline and a sensitivity "
+            "slider so you can confirm or adjust it. You can accept settings "
+            "for all remaining images from inside that dialog.")
+        layout.addWidget(self.review_check)
+
         note = QLabel("Runs on all loaded images with masks. Saves leak overlays\n"
                       "(bbb_overlays/), an Otsu-vs-tubeness vessel comparison\n"
                       "(bbb_vessel_previews/), and folds per-cell exposure into\n"
@@ -2996,7 +3180,8 @@ class BBBAnalysisDialog(QDialog):
         return {'cd31': self.cd31_combo.currentData(),
                 'iba1': self.iba1_combo.currentData(),
                 'tracers': tracers,
-                'use_tubeness': self.tubeness_check.isChecked()}
+                'use_tubeness': self.tubeness_check.isChecked(),
+                'review_vessels': self.review_check.isChecked()}
 
 
 class MicrogliaAnalysisGUI(QMainWindow):
@@ -8360,6 +8545,8 @@ if __name__ == '__main__':
                             if channels.get(n, -1) >= 0]
         vessel_rows, cell_rows, n_imgs = [], [], 0
         bad_vessel_imgs = []   # images whose CD31 threshold looks implausible
+        review_vessels = bool(channels.get('review_vessels', False))
+        thr_scale = 1.0        # carried forward once the user accepts settings
 
         # Process every image that has microglia defined — by generated mask OR
         # by picked soma (so every microglia gets a leakage row, mask or not).
@@ -8404,8 +8591,34 @@ if __name__ == '__main__':
             try:
                 cd31 = color[:, :, cd31_i].astype(np.float64)
                 use_tube = bool(getattr(self, 'bbb_use_tubeness', False))
-                vessel_mask, vmetrics = _segment_vessels(cd31, ps, use_tubeness=use_tube)
                 img_base = os.path.splitext(img_name)[0]
+                reviewed_mask = None
+                # Manual review of the vessel mask, unless the user already
+                # accepted settings for all remaining images (or opted out).
+                if review_vessels:
+                    progress.hide()
+                    dlg = VesselReviewDialog(self, cd31, ps, img_base,
+                                             use_tubeness=use_tube,
+                                             thr_scale=thr_scale)
+                    dlg.exec_()
+                    st = dlg.settings()
+                    progress.show()
+                    QApplication.processEvents()
+                    if st['action'] == 'skip':
+                        self.log(f"BBB: skipped {img_base} (vessel review)")
+                        continue
+                    use_tube = st['use_tubeness']
+                    thr_scale = st['thr_scale']
+                    reviewed_mask = st['mask']
+                    self.bbb_use_tubeness = use_tube
+                    if st['action'] == 'accept_all':
+                        review_vessels = False
+                        self.log(f"BBB: using reviewed settings (tubeness="
+                                 f"{use_tube}, sensitivity={thr_scale:.2f}x) "
+                                 f"for all remaining images")
+                vessel_mask, vmetrics = _segment_vessels(
+                    cd31, ps, use_tubeness=use_tube, thr_scale=thr_scale,
+                    vessel_mask=reviewed_mask)
                 # Sanity check: cortical vessel area fraction is normally a few
                 # percent. A large value means the threshold caught background
                 # haze rather than vessels, which biases every leakage metric.
