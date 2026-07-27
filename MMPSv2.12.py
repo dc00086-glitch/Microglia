@@ -131,7 +131,7 @@ def load_tiff_image(filepath):
 
 def _mask_tif_name(img_basename, soma_id, area_um2):
     """Canonical mask filename: <image>_<soma_id>_area<N>_mask.tif."""
-    return _mask_tif_name(img_basename, soma_id, area_um2)
+    return "%s_%s_area%d_mask.tif" % (img_basename, soma_id, int(area_um2))
 
 
 def ensure_grayscale(img):
