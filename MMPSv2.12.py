@@ -3420,9 +3420,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         denoise_layout = QHBoxLayout()
         denoise_layout.addWidget(QLabel("  Denoise size:"))
         self.denoise_spin = QSpinBox()
-        self.denoise_spin.setRange(3, 7)
+        self.denoise_spin.setRange(1, 10)
         self.denoise_spin.setValue(3)
-        self.denoise_spin.setSingleStep(2)
+        self.denoise_spin.setSingleStep(1)
         denoise_layout.addWidget(self.denoise_spin)
         denoise_layout.addWidget(QLabel("(3=gentle, 7=strong)"))
         denoise_layout.addStretch()
@@ -3453,20 +3453,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
         branch_boost_layout = QHBoxLayout()
         branch_boost_layout.addWidget(QLabel("  Boost strength:"))
         self.branch_boost_slider = QSlider(Qt.Horizontal)
-        self.branch_boost_slider.setRange(0, 10)      # simple 0-10 dial
-        self.branch_boost_slider.setValue(3)
+        self.branch_boost_slider.setRange(0, 100)     # 0-100 strength dial
+        self.branch_boost_slider.setValue(30)
         self.branch_boost_slider.setSingleStep(1)
-        self.branch_boost_slider.setPageStep(1)
+        self.branch_boost_slider.setPageStep(5)
         self.branch_boost_slider.setTickPosition(QSlider.TicksBelow)
-        self.branch_boost_slider.setTickInterval(1)
+        self.branch_boost_slider.setTickInterval(10)
         branch_boost_layout.addWidget(self.branch_boost_slider)
         self.branch_boost_spin = QSpinBox()
-        self.branch_boost_spin.setRange(0, 10)
-        self.branch_boost_spin.setValue(3)
+        self.branch_boost_spin.setRange(0, 100)
+        self.branch_boost_spin.setValue(30)
         self.branch_boost_slider.valueChanged.connect(self.branch_boost_spin.setValue)
         self.branch_boost_spin.valueChanged.connect(self.branch_boost_slider.setValue)
         branch_boost_layout.addWidget(self.branch_boost_spin)
-        branch_boost_layout.addWidget(QLabel("(0–10)"))
+        branch_boost_layout.addWidget(QLabel("(0–100)"))
         extra_layout.addLayout(branch_boost_layout)
 
         extra_processing_group.setLayout(extra_layout)
@@ -10685,7 +10685,7 @@ if __name__ == '__main__':
             result = np.clip(sharpened, 0, channel_img.max()).astype(result.dtype)
 
         if self.branch_boost_check.isChecked() and self.branch_boost_slider.value() > 0:
-            result = _branch_boost(result, self.branch_boost_slider.value() * 20)
+            result = _branch_boost(result, self.branch_boost_slider.value() * 2)
 
         # Store the preview (without adjustments)
         img_data['preview'] = result
@@ -10822,8 +10822,8 @@ if __name__ == '__main__':
         sharpen_enabled = self.sharpen_check.isChecked()
         sharpen_amount = self.sharpen_slider.value() / 10.0
         branch_boost_enabled = self.branch_boost_check.isChecked()
-        branch_boost_level = self.branch_boost_slider.value()   # 0-10 dial
-        branch_boost_amount = branch_boost_level * 20           # internal 0-200
+        branch_boost_level = self.branch_boost_slider.value()   # 0-100 dial
+        branch_boost_amount = branch_boost_level * 2            # internal 0-200
 
         channels_to_clean = self._get_channels_to_clean()
         process_channel = self.grayscale_channel
