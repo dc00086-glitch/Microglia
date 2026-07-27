@@ -9819,6 +9819,43 @@ if __name__ == '__main__':
         dialog.setTextFormat(Qt.RichText)
         dialog.exec_()
 
+    def _detect_channel_count(self, default=3):
+        """Best guess at how many channels the loaded images have.
+
+        Prefers the current image, then falls back to the largest channel count
+        across all loaded images, then to reading a raw file. Used to size the
+        per-channel display controls so a 4th (far-red) channel gets a row.
+        """
+        def _n(idata):
+            ci = idata.get('color_image')
+            if ci is not None and getattr(ci, 'ndim', 0) == 3:
+                return int(ci.shape[2])
+            n = idata.get('num_channels')
+            return int(n) if n else 0
+
+        cur = _n(self.images.get(self.current_image_name, {}) or {})
+        if cur:
+            return cur
+        best = 0
+        for idata in self.images.values():
+            best = max(best, _n(idata))
+        if best:
+            return best
+        # Nothing cached yet — peek at a raw file.
+        for idata in self.images.values():
+            rp = idata.get('raw_path')
+            if rp and os.path.exists(rp):
+                try:
+                    arr = load_tiff_image(rp)
+                    if arr is not None and arr.ndim == 3:
+                        return int(arr.shape[2])
+                    if arr is not None:
+                        return 1
+                except Exception:
+                    pass
+                break
+        return default
+
     def open_display_adjustments(self):
         """Open display adjustments dialog"""
         dialog = QDialog(self)
@@ -9834,21 +9871,15 @@ if __name__ == '__main__':
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
-        # Per-channel display colour + brightness in colocalization mode. One row
-        # per channel (including a 4th far-red), each with a colour swatch that
-        # opens a colour picker and a brightness slider.
+        # Per-channel display colour + brightness. One row per channel (a 4th
+        # far-red channel included), each with a colour swatch that opens a
+        # colour picker and a brightness slider. Always available — it used to
+        # be hidden unless Colocalization mode was on.
         channel_sliders = {}
-        if self.colocalization_mode:
+        nch = self._detect_channel_count()
+        if nch >= 2:
             from PyQt5.QtWidgets import QColorDialog
             from PyQt5.QtGui import QColor
-
-            nch = 3
-            idata = self.images.get(self.current_image_name, {})
-            ci = idata.get('color_image')
-            if ci is not None and getattr(ci, 'ndim', 0) == 3:
-                nch = ci.shape[2]
-            elif idata.get('num_channels'):
-                nch = idata['num_channels']
 
             channel_group = QGroupBox("Channel colour + brightness")
             channel_layout = QVBoxLayout()
