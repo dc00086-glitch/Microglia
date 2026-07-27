@@ -3335,6 +3335,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         channel_layout = QHBoxLayout()
         channel_layout.addWidget(QLabel("Process channel:"))
         self.process_channel_combo = QComboBox()
+        # Populated for 3 channels up front; _refresh_channel_widgets() re-fills
+        # this from the loaded image so 4th+ channels (far-red) are selectable.
         self.process_channel_combo.addItems(["Channel 1", "Channel 2", "Channel 3"])
         self.process_channel_combo.setCurrentIndex(0)
         self.process_channel_combo.currentIndexChanged.connect(self._on_process_channel_changed)
@@ -3354,6 +3356,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         extra_ch_layout.setContentsMargins(20, 0, 0, 0)
         extra_ch_layout.addWidget(QLabel("Clean:"))
         self.clean_ch_checks = []
+        self._extra_ch_layout = extra_ch_layout   # kept so channels can be added
         for i in range(3):
             ch_check = QCheckBox(f"Ch {i + 1}")
             ch_check.setChecked(False)
@@ -10072,6 +10075,46 @@ if __name__ == '__main__':
             for i, ch_check in enumerate(self.clean_ch_checks):
                 ch_check.setChecked(i == self.grayscale_channel)
 
+    def _refresh_channel_widgets(self, n_channels):
+        """Grow the channel pickers to match the loaded image.
+
+        The 'Process channel' dropdown and the 'Also clean additional channels'
+        checkboxes are built for 3 channels at startup (before any image is
+        loaded). Images with a 4th+ channel — e.g. a far-red tracer displayed as
+        magenta — need those extra entries or the channel can't be selected.
+        """
+        try:
+            n = int(n_channels)
+        except (TypeError, ValueError):
+            return
+        if n < 1:
+            return
+
+        # Grow the process-channel dropdown (keep the current selection).
+        combo = self.process_channel_combo
+        if combo.count() != n:
+            prev = combo.currentIndex()
+            combo.blockSignals(True)
+            combo.clear()
+            for i in range(n):
+                combo.addItem(f"Channel {i + 1}")
+            combo.setCurrentIndex(prev if 0 <= prev < n else 0)
+            combo.blockSignals(False)
+            if self.grayscale_channel >= n:
+                self.grayscale_channel = 0
+
+        # Grow the per-channel "also clean" checkboxes.
+        while len(self.clean_ch_checks) < n:
+            i = len(self.clean_ch_checks)
+            ch_check = QCheckBox(f"Ch {i + 1}")
+            ch_check.setChecked(False)
+            # insert before the trailing stretch
+            self._extra_ch_layout.insertWidget(
+                self._extra_ch_layout.count() - 1, ch_check)
+            self.clean_ch_checks.append(ch_check)
+        for i, ch_check in enumerate(self.clean_ch_checks):
+            ch_check.setVisible(i < n)
+
     def _get_channels_to_clean(self):
         """Return list of channel indices to clean. Always includes the primary channel."""
         channels = [self.grayscale_channel]
@@ -10436,6 +10479,11 @@ if __name__ == '__main__':
                 if raw_img.ndim == 3:
                     img_data['color_image'] = raw_img
                     img_data['num_channels'] = raw_img.shape[2]
+
+            # Make sure the channel pickers cover every channel in this image
+            # (4th+ / far-red included).
+            if raw_img is not None and raw_img.ndim == 3:
+                self._refresh_channel_widgets(raw_img.shape[2])
 
             # Display in color or grayscale based on toggle, with adjustments
             if self.show_color_view and raw_img.ndim == 3:
