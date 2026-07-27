@@ -217,6 +217,24 @@ def _smooth_mask(mask, max_gap_size=4):
     """
     if mask is None or np.count_nonzero(mask) == 0:
         return mask
+    # Work only inside the mask's bounding box (+2 px so the 3x3 close and the
+    # surrounding background ring are included). A cell mask covers a tiny part
+    # of the frame, so labelling the whole image was the dominant cost of mask
+    # generation. The pad guarantees the outside background stays one component
+    # touching the crop border, so hole-filling decisions are unchanged.
+    H, W = mask.shape[:2]
+    rows = np.any(mask, axis=1)          # cheap reductions; np.nonzero would
+    cols = np.any(mask, axis=0)          # materialise every set coordinate
+    y0 = max(int(np.argmax(rows)) - 2, 0)
+    y1 = min(H - int(np.argmax(rows[::-1])) + 2, H)
+    x0 = max(int(np.argmax(cols)) - 2, 0)
+    x1 = min(W - int(np.argmax(cols[::-1])) + 2, W)
+    if (y1 - y0) < H or (x1 - x0) < W:
+        sub = np.ascontiguousarray(mask[y0:y1, x0:x1])
+        result = mask.copy()
+        result[y0:y1, x0:x1] = _smooth_mask(sub, max_gap_size)
+        return result
+
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     smoothed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     # Fill small internal holes. Sizes and border-touching labels are computed
