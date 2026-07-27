@@ -868,8 +868,15 @@ def _quantify_leakage(vessel_mask, tracer, pixel_size_um,
     return m
 
 
+#: Soma-to-vessel distance (µm) at or below which a microglia is classified as
+#: juxtavascular. 10 µm is the common convention for soma apposition to the
+#: vessel wall; 0 would mean strict contact only.
+_JUXTAVASCULAR_MAX_UM = 10.0
+
+
 def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
-                                dist_um=None, soma_mask=None, cd31=None):
+                                dist_um=None, soma_mask=None, cd31=None,
+                                juxta_max_um=_JUXTAVASCULAR_MAX_UM):
     """Per-microglia leakage exposure to join onto the morphology row.
 
     ``tracers`` is a dict name -> channel array. Returns distance to the nearest
@@ -903,7 +910,13 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
             dist_region = sm
     if dist_region is None:
         dist_region = cm
-    m['dist_to_vessel_um'] = round(float(dist_um[dist_region].min()), 3)
+    d_soma = float(dist_um[dist_region].min())
+    m['dist_to_vessel_um'] = round(d_soma, 3)
+    # Juxtavascular: soma apposed to a vessel wall (standard field convention).
+    # Uses the same soma-based distance, so a lone process touching a vessel
+    # does not make the cell count as juxtavascular.
+    m['juxtavascular'] = 1 if d_soma <= juxta_max_um else 0
+    m['juxtavascular_threshold_um'] = juxta_max_um
     outside = cm & ~vessel_mask
     reg = outside if np.any(outside) else cm
     for name, ch in tracers.items():
@@ -911,8 +924,14 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
             float(np.asarray(ch, dtype=np.float64)[reg].mean()), 3)
     # Blood-vessel metrics for this cell.
     n_cell = int(cm.sum())
+    overlap = cm & vessel_mask
     m['vessel_contact_fraction'] = (
-        round(float((cm & vessel_mask).sum()) / n_cell, 4) if n_cell else 0.0)
+        round(float(overlap.sum()) / n_cell, 4) if n_cell else 0.0)
+    # Contact extent along the vessel wall, in µm² — area of the cell that
+    # actually sits on vessel. Complements the fraction (which is normalised by
+    # cell size, so a big ramified cell and a small round one aren't comparable).
+    m['vessel_contact_area_um2'] = round(
+        float(overlap.sum()) * (pixel_size_um ** 2), 3)
     if cd31 is not None:
         m['cd31_exposure_mean'] = round(
             float(np.asarray(cd31, dtype=np.float64)[cm].mean()), 3)
