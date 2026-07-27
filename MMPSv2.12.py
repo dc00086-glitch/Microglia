@@ -3009,6 +3009,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.pixel_size = 0.316
         self.default_rolling_ball_radius = 50
         self.all_masks_flat = []
+        # Border-touching cells auto-rejected during a generation run; reported
+        # once when the run finishes instead of a popup per image.
+        self._border_rejected_report = []
         self.mask_qa_idx = 0
         self.mask_qa_active = False
         self.last_qa_decisions = []
@@ -12955,6 +12958,9 @@ if __name__ == '__main__':
             total_outlines = sum(len(data['soma_outlines']) for data in self.images.values()
                                  if data['selected'] and data['soma_outlines'])
             current_count = 0
+            # Auto-rejections are collected here and reported once at the end
+            # rather than interrupting the run with a popup per image.
+            self._border_rejected_report = []
 
             temp_cl_dir = None
             if self.output_dir:
@@ -13181,6 +13187,8 @@ if __name__ == '__main__':
                 self, "Success",
                 f"Generated {total_masks} masks!\n\nReady for QA."
             )
+            # Deferred auto-rejection report for the whole run.
+            self._show_border_rejection_summary()
 
         except Exception as e:
             self.progress_bar.setVisible(False)
@@ -13932,13 +13940,40 @@ if __name__ == '__main__':
                     fully_rejected.append(soma_id)
 
         if fully_rejected:
-            cell_list = "\n".join(f"  {sid}" for sid in fully_rejected[:20])
-            extra = f"\n  ...and {len(fully_rejected) - 20} more" if len(fully_rejected) > 20 else ""
-            QMessageBox.warning(self, "Border-Touching Cells",
-                f"{len(fully_rejected)} cell(s) in {os.path.splitext(img_name)[0]} had ALL masks "
-                f"rejected (touching image border):\n\n{cell_list}{extra}")
+            # Don't interrupt the run with a modal dialog per image — collect
+            # these and report them once when generation finishes.
+            base = os.path.splitext(img_name)[0]
+            self._border_rejected_report.extend((base, sid) for sid in fully_rejected)
             for sid in fully_rejected:
                 self.log(f"    {sid}: all masks touch border")
+
+    def _show_border_rejection_summary(self):
+        """Report border-rejected cells collected during a whole generation run.
+
+        Shown once at the end instead of a modal popup per image.
+        """
+        report = getattr(self, '_border_rejected_report', [])
+        if not report:
+            return
+        by_img = {}
+        for base, sid in report:
+            by_img.setdefault(base, []).append(sid)
+        lines = []
+        for base in sorted(by_img):
+            sids = by_img[base]
+            lines.append(f"{base}  ({len(sids)} cell(s))")
+            for sid in sids[:5]:
+                lines.append(f"    {sid}")
+            if len(sids) > 5:
+                lines.append(f"    ...and {len(sids) - 5} more")
+        shown = "\n".join(lines[:40])
+        extra = "\n..." if len(lines) > 40 else ""
+        QMessageBox.warning(
+            self, "Border-Touching Cells",
+            f"{len(report)} cell(s) across {len(by_img)} image(s) had ALL masks "
+            f"auto-rejected for touching the image border:\n\n{shown}{extra}\n\n"
+            f"These cells are excluded from QA and analysis.")
+        self._border_rejected_report = []
 
     def start_batch_qa(self):
         # Flatten all masks from all images
