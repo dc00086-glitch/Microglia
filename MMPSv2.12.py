@@ -82,8 +82,28 @@ def load_tiff_image(filepath):
             series = tf.series[0]
             arr = np.asarray(series.asarray())
             axes = series.axes or ''
-        # Max-project any stack/time axes (Z, T, I) — but NOT 'Q' (unknown),
-        # which on a plain channel-first array is actually the channel axis.
+            # Some exporters write each channel as its OWN series, so series[0]
+            # is a single plane and the rest would be silently dropped. If every
+            # series is one identical-shaped 2D plane, stack them as channels.
+            if (arr.ndim == 2 and 1 < len(tf.series) <= 8
+                    and all(s.shape == series.shape and s.dtype == series.dtype
+                            for s in tf.series)):
+                arr = np.stack([np.asarray(s.asarray()) for s in tf.series],
+                               axis=-1)
+                axes = 'YXC'
+        # Some exporters store each channel as a separate page/sequence entry
+        # and label the axis 'I' (or 'Q') with no 'C'/'S' axis at all. Treat a
+        # small such axis as the channel axis instead of max-projecting it,
+        # which would collapse every channel into one plane.
+        if 'C' not in axes and 'S' not in axes:
+            for ax in ('I', 'Q'):
+                if (ax in axes and arr.ndim == len(axes) == 3
+                        and arr.shape[axes.index(ax)] <= 8):  # -> (H, W, C)
+                    arr = np.moveaxis(arr, axes.index(ax), -1)
+                    axes = axes.replace(ax, '') + 'C'
+                    break
+        # Max-project any remaining stack/time axes (Z, T, I) — but NOT 'Q'
+        # (unknown), which on a plain channel-first array is the channel axis.
         for ax in ('Z', 'T', 'I'):
             while ax in axes and arr.ndim == len(axes):
                 i = axes.index(ax)
