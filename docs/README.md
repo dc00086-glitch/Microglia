@@ -1,17 +1,17 @@
-# Spin & Sweat — camera rep counter
+# Sweat Slots — camera rep counter
 
-A web-based workout roulette. **Spin the wheel** to get a random exercise and rep
-count, then the **front camera counts your reps** using in-browser pose detection
-(TensorFlow.js MoveNet). Everything runs on your phone — nothing is recorded or
-uploaded. No Mac, no App Store, no cost.
+A slot-machine workout. **Pull the lever** on three reels of exercise symbols to
+get a random mini-circuit, then the **front camera counts your reps** with
+in-browser pose detection (TensorFlow.js MoveNet). Everything runs on your phone —
+nothing is recorded or uploaded. No Mac, no App Store, no cost.
 
 ## How it works
-- Spin the wheel → it lands on something like "15 Squats" or "10 Push-ups".
-- Tap **Let's go**, prop your phone so your whole body is in frame.
-- It tracks your joints and counts each clean rep (squats = knee angle, push-ups
-  = elbow angle, sit-ups = hip angle). Reps that are too fast to be real don't
-  count.
-- Hit the goal → celebrate → spin again.
+- Pull the slot → the 3 reels land on exercises (🦵 Squats / 💪 Push-ups / 🔥 Sit-ups).
+- You get a **3-exercise circuit** — e.g. 10 Squats, then 5 Push-ups, then 15 Sit-ups.
+- **Match all three reels = JACKPOT**: one big 30-rep set of that exercise.
+- The camera tracks your joints and counts each clean rep (squats = knee angle,
+  push-ups = elbow angle, sit-ups = hip angle). Reps too fast to be real don't count.
+- Finish a set → tap Continue for the next → celebrate → pull again.
 
 ## Get it onto your phone (free, ~2 min, no Mac)
 The camera only works over **HTTPS**, so it needs hosting. GitHub Pages is free:
@@ -21,13 +21,11 @@ The camera only works over **HTTPS**, so it needs hosting. GitHub Pages is free:
 3. Pick this branch (or merge to your default branch first) and folder **/docs**,
    then **Save**.
 4. Wait ~1 minute for the URL, e.g. `https://dc00086-glitch.github.io/Microglia/`.
-5. Open it in **Safari on iPhone**, tap **SPIN**, then **Let's go**, and allow
-   camera access.
+5. Open it in **Safari on iPhone**, tap **PULL**, then **Let's go**, and allow camera access.
 
 Tip: Safari **Share → Add to Home Screen** makes it launch like an app.
 
-## Tweaking
-- **Wheel options:** edit the `SEG` array in `index.html` to change the exercise
-  and rep combinations.
-- **Counting sensitivity:** adjust the `flexed` / `extended` angle thresholds in
-  the `EXERCISES` object if reps aren't registering for your camera setup.
+## Tweaking (in `index.html`)
+- **Rep amounts:** edit `REP_CHOICES` (per set) and `JACKPOT_REPS`.
+- **Exercises on the reels:** edit `EX_ORDER` / the `EXERCISES` object.
+- **Counting sensitivity:** adjust each exercise's `flexed` / `extended` angles.

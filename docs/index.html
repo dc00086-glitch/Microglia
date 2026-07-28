@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Spin & Sweat</title>
+<title>Sweat Slots</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -14,36 +14,39 @@
     object-fit: cover; transform: scaleX(-1); }
   #overlay { pointer-events: none; }
 
-  /* ---------- Wheel screen ---------- */
-  #wheelScreen { position: absolute; inset: 0; z-index: 10; display: flex;
-    flex-direction: column; align-items: center; justify-content: center; gap: 26px;
+  /* ---------- Slot screen ---------- */
+  #slotScreen { position: absolute; inset: 0; z-index: 10; display: flex;
+    flex-direction: column; align-items: center; justify-content: center; gap: 24px;
     padding: 24px; text-align: center;
-    background: radial-gradient(circle at 50% 25%, #1c2b4a, #000); }
-  #wheelScreen h1 { font-size: 30px; margin: 0; }
-  .wheelWrap { position: relative; width: min(82vw, 340px); aspect-ratio: 1; }
-  #wheel { width: 100%; height: 100%; border-radius: 50%;
-    box-shadow: 0 0 0 6px rgba(255,255,255,.12), 0 14px 40px rgba(0,0,0,.6);
-    transition: transform 4.2s cubic-bezier(.15,.85,.25,1); }
-  .pointer { position: absolute; top: -6px; left: 50%; transform: translateX(-50%);
-    width: 0; height: 0; border-left: 15px solid transparent; border-right: 15px solid transparent;
-    border-top: 26px solid #fff; filter: drop-shadow(0 2px 3px rgba(0,0,0,.5)); z-index: 2; }
-  .hub { position: absolute; top: 50%; left: 50%; width: 46px; height: 46px;
-    transform: translate(-50%,-50%); background: #fff; border-radius: 50%;
-    display: flex; align-items: center; justify-content: center; font-size: 22px; }
+    background: radial-gradient(circle at 50% 22%, #3a1c4a, #000); }
+  #slotScreen h1 { font-size: 30px; margin: 0; }
+
+  .cabinet { display: flex; gap: 10px; padding: 16px; border-radius: 20px;
+    background: linear-gradient(#2a2130, #171018);
+    box-shadow: 0 0 0 4px #f5c542, 0 16px 40px rgba(0,0,0,.6); position: relative; }
+  .reel { width: 84px; height: 88px; overflow: hidden; border-radius: 12px;
+    background: #0e0e13; box-shadow: inset 0 8px 12px rgba(0,0,0,.8), inset 0 -8px 12px rgba(0,0,0,.8); }
+  .strip { display: flex; flex-direction: column; will-change: transform; }
+  .sym { height: 88px; display: flex; align-items: center; justify-content: center; font-size: 50px; }
+  .payline { position: absolute; left: 6px; right: 6px; top: 50%; height: 88px;
+    transform: translateY(-50%); border: 2px solid rgba(245,197,66,.9); border-radius: 12px;
+    pointer-events: none; }
 
   .bigbtn { padding: 16px 46px; font-size: 20px; font-weight: 800; border: 0;
-    border-radius: 16px; background: #34c759; color: #000; }
+    border-radius: 16px; background: #f5c542; color: #000; }
   .bigbtn:active { transform: scale(.97); }
+  .bigbtn:disabled { opacity: .5; }
   .ghost { background: rgba(255,255,255,.16); color: #fff; padding: 12px 26px;
     font-size: 15px; font-weight: 700; border: 0; border-radius: 14px; }
   #result { display: none; flex-direction: column; align-items: center; gap: 16px; }
-  #resultText { font-size: 26px; font-weight: 800; }
+  #resultText { font-size: 24px; font-weight: 800; line-height: 1.4; }
   .row { display: flex; gap: 12px; }
   .hint { font-size: 13px; opacity: .5; max-width: 300px; line-height: 1.5; }
 
   /* ---------- Counter ---------- */
   #counter { position: absolute; left: 0; right: 0; bottom: 12%; text-align: center;
     text-shadow: 0 2px 10px rgba(0,0,0,.7); pointer-events: none; display: none; }
+  .set { font-size: 4.5vw; opacity: .8; margin-bottom: 1vh; letter-spacing: .5px; }
   .reps { font-size: 22vw; font-weight: 800; line-height: 1; }
   .label { font-size: 6vw; opacity: .9; margin-top: 1vh; }
   .angle { font-size: 4vw; opacity: .55; margin-top: 1vh; font-variant-numeric: tabular-nums; }
@@ -51,11 +54,12 @@
     width: 44px; height: 44px; border-radius: 50%; border: 0; font-size: 20px;
     background: rgba(0,0,0,.4); color: #fff; backdrop-filter: blur(6px); }
 
-  /* ---------- Done ---------- */
-  #done { position: absolute; inset: 0; display: none; z-index: 20;
+  /* ---------- Overlays ---------- */
+  .cover { position: absolute; inset: 0; z-index: 20; display: none;
     flex-direction: column; align-items: center; justify-content: center; gap: 18px;
     background: rgba(0,0,0,.85); text-align: center; padding: 28px; }
-  #done h1 { font-size: 38px; margin: 0; }
+  .cover h1 { font-size: 34px; margin: 0; }
+  .cover p { font-size: 20px; opacity: .85; margin: 0; }
 </style>
 </head>
 <body>
@@ -65,33 +69,40 @@
 
   <button id="closeBtn">✕</button>
   <div class="counter" id="counter">
+    <div class="set" id="setLabel"></div>
     <div class="reps" id="reps">0</div>
     <div class="label" id="goalLabel"></div>
     <div class="angle" id="angle"></div>
   </div>
 
-  <div id="wheelScreen">
-    <h1>🎰 Spin &amp; Sweat</h1>
-    <div class="wheelWrap">
-      <div class="pointer"></div>
-      <canvas id="wheel" width="360" height="360"></canvas>
-      <div class="hub">🎯</div>
+  <div id="slotScreen">
+    <h1>🎰 Sweat Slots</h1>
+    <div class="cabinet">
+      <div class="reel"><div class="strip" id="reel0"></div></div>
+      <div class="reel"><div class="strip" id="reel1"></div></div>
+      <div class="reel"><div class="strip" id="reel2"></div></div>
+      <div class="payline"></div>
     </div>
-    <button class="bigbtn" id="spinBtn">SPIN</button>
+    <button class="bigbtn" id="spinBtn">PULL 🎲</button>
     <div id="result">
       <div id="resultText"></div>
       <div class="row">
         <button class="bigbtn" id="startBtn">Let's go</button>
-        <button class="ghost" id="respinBtn">Spin again</button>
+        <button class="ghost" id="respinBtn">Pull again</button>
       </div>
     </div>
-    <div class="hint">The wheel picks your exercise and reps. Camera counts them —
-      everything runs on your phone, nothing is recorded.</div>
+    <div class="hint">Three reels = a mini circuit. Match all three for the jackpot.
+      The camera counts your reps — everything runs on your phone.</div>
   </div>
 
-  <div id="done">
-    <h1>✅ Crushed it!</h1>
-    <button class="bigbtn" id="againBtn">Spin again</button>
+  <div class="cover" id="next">
+    <p id="nextText"></p>
+    <button class="bigbtn" id="continueBtn">Continue</button>
+  </div>
+
+  <div class="cover" id="done">
+    <h1>✅ Circuit complete!</h1>
+    <button class="bigbtn" id="againBtn">Pull again</button>
   </div>
 </div>
 
@@ -110,56 +121,32 @@ const EXERCISES = {
             sides: [['left_shoulder','left_hip','left_knee'], ['right_shoulder','right_hip','right_knee']],
             flexed: 95,  extended: 150, minSec: 0.7 },
 };
+const EX_ORDER = ['squat', 'pushup', 'situp'];
+const REP_CHOICES = [5, 10, 15];
+const JACKPOT_REPS = 30;
 
-// ---------- Wheel segments (exercise + rep combos) ----------
-const SEG = [
-  { ex: 'squat',  reps: 5  }, { ex: 'pushup', reps: 10 }, { ex: 'situp',  reps: 15 },
-  { ex: 'squat',  reps: 20 }, { ex: 'pushup', reps: 5  }, { ex: 'situp',  reps: 10 },
-  { ex: 'squat',  reps: 15 }, { ex: 'pushup', reps: 15 }, { ex: 'situp',  reps: 5  },
-  { ex: 'squat',  reps: 10 },
-];
-const COLORS = ['#ef4444','#f59e0b','#10b981','#3b82f6','#8b5cf6',
-                '#ec4899','#14b8a6','#f97316','#6366f1','#22c55e'];
-const N = SEG.length;
-const segDeg = 360 / N;
-
-// ---------- Wheel drawing & spin ----------
-const wheel = document.getElementById('wheel');
-const wctx = wheel.getContext('2d');
-let rotation = 0;
-let chosen = null;
-
-function drawWheel() {
-  const size = wheel.width, r = size / 2;
-  wctx.clearRect(0, 0, size, size);
-  for (let i = 0; i < N; i++) {
-    const start = (-90 - segDeg / 2 + i * segDeg) * Math.PI / 180;
-    const end = start + segDeg * Math.PI / 180;
-    wctx.beginPath();
-    wctx.moveTo(r, r);
-    wctx.arc(r, r, r - 3, start, end);
-    wctx.closePath();
-    wctx.fillStyle = COLORS[i % COLORS.length];
-    wctx.fill();
-
-    wctx.save();
-    wctx.translate(r, r);
-    wctx.rotate((-90 + i * segDeg) * Math.PI / 180);
-    wctx.textAlign = 'right';
-    wctx.fillStyle = '#fff';
-    wctx.font = 'bold 26px -apple-system, sans-serif';
-    wctx.fillText(String(SEG[i].reps), r - 22, -4);
-    wctx.font = '600 20px -apple-system, sans-serif';
-    wctx.fillText(EXERCISES[SEG[i].ex].emoji, r - 24, 20);
-    wctx.restore();
+// ---------- Build the 3 reels ----------
+const SYMH = 88;   // must match .reel / .sym height in CSS
+const LOOPS = 14;  // symbol repeats per reel strip
+const reels = [document.getElementById('reel0'),
+               document.getElementById('reel1'),
+               document.getElementById('reel2')];
+reels.forEach(strip => {
+  for (let k = 0; k < LOOPS * 3; k++) {
+    const d = document.createElement('div');
+    d.className = 'sym';
+    d.textContent = EXERCISES[EX_ORDER[k % 3]].emoji;
+    strip.appendChild(d);
   }
-}
-drawWheel();
+  strip.style.transform = 'translateY(0)';
+});
 
+// ---------- Spin logic ----------
 const spinBtn = document.getElementById('spinBtn');
 const resultBox = document.getElementById('result');
 const resultText = document.getElementById('resultText');
 let spinning = false;
+let queue = [];   // [{ ex, reps }] stations for this pull
 
 spinBtn.onclick = () => {
   if (spinning) return;
@@ -167,49 +154,66 @@ spinBtn.onclick = () => {
   spinBtn.style.display = 'none';
   resultBox.style.display = 'none';
 
-  const i = Math.floor(Math.random() * N);
-  const desiredMod = (360 - i * segDeg) % 360;                 // rotation to land segment i at top
-  const delta = 5 * 360 + (((desiredMod - (rotation % 360)) + 360) % 360);
-  rotation += delta;
-  wheel.style.transform = `rotate(${rotation}deg)`;
+  const idx = [rand3(), rand3(), rand3()];               // exercise index per reel
+  reels.forEach((strip, i) => {
+    strip.style.transition = 'none';
+    strip.style.transform = 'translateY(0)';
+    void strip.offsetHeight;                             // force reflow so the reset takes
+    const p = ((LOOPS - 3) - i) * 3 + idx[i];           // land payline on idx[i]
+    strip.style.transition = `transform ${1.8 + i * 0.6}s cubic-bezier(.12,.62,.2,1)`;
+    strip.style.transform = `translateY(${-p * SYMH}px)`;
+  });
 
-  wheel.addEventListener('transitionend', function reveal() {
-    wheel.removeEventListener('transitionend', reveal);
-    chosen = SEG[i];
-    resultText.textContent = `${chosen.reps} ${EXERCISES[chosen.ex].name} ${EXERCISES[chosen.ex].emoji}`;
-    resultBox.style.display = 'flex';
-    spinning = false;
+  reels[2].addEventListener('transitionend', function reveal() {
+    reels[2].removeEventListener('transitionend', reveal);
+    finishSpin(idx);
   }, { once: true });
 };
+
+function rand3() { return Math.floor(Math.random() * 3); }
+function pickReps() { return REP_CHOICES[Math.floor(Math.random() * REP_CHOICES.length)]; }
+
+function finishSpin(idx) {
+  const jackpot = idx[0] === idx[1] && idx[1] === idx[2];
+  if (jackpot) {
+    const ex = EX_ORDER[idx[0]];
+    queue = [{ ex, reps: JACKPOT_REPS }];
+    resultText.innerHTML = `🎰 JACKPOT!<br>${JACKPOT_REPS} ${EXERCISES[ex].name} ${EXERCISES[ex].emoji}`;
+  } else {
+    queue = idx.map(t => ({ ex: EX_ORDER[t], reps: pickReps() }));
+    resultText.innerHTML = 'Your circuit:<br>' +
+      queue.map(s => `${s.reps} ${EXERCISES[s.ex].emoji}`).join(' &nbsp;·&nbsp; ');
+  }
+  resultBox.style.display = 'flex';
+  spinning = false;
+}
 
 document.getElementById('respinBtn').onclick = () => {
   resultBox.style.display = 'none';
   spinBtn.style.display = 'block';
 };
-document.getElementById('startBtn').onclick = beginWorkout;
-document.getElementById('againBtn').onclick = backToWheel;
-document.getElementById('closeBtn').onclick = backToWheel;
+document.getElementById('startBtn').onclick = startCircuit;
+document.getElementById('continueBtn').onclick = () => {
+  document.getElementById('next').style.display = 'none';
+  startStation();
+};
+document.getElementById('againBtn').onclick = backToSlots;
+document.getElementById('closeBtn').onclick = backToSlots;
 
 // ---------- Camera + pose ----------
 const video = document.getElementById('video');
 const overlay = document.getElementById('overlay');
 const octx = overlay.getContext('2d');
 let detector = null, started = false, active = false;
-let exercise, goal, reps, phase, flexedAt;
+let stationIdx = 0, exercise, goal, reps, phase, flexedAt;
 
-async function beginWorkout() {
-  exercise = EXERCISES[chosen.ex];
-  goal = chosen.reps;
-  reps = 0; phase = 'extended';
-
-  document.getElementById('wheelScreen').style.display = 'none';
-  document.getElementById('counter').style.display = 'block';
-  document.getElementById('closeBtn').style.display = 'block';
-  document.getElementById('reps').textContent = '0';
-  document.getElementById('goalLabel').textContent = `/ ${goal} ${exercise.name}`;
+async function startCircuit() {
+  stationIdx = 0;
+  document.getElementById('slotScreen').style.display = 'none';
 
   if (!started) {
-    startBtnBusy(true);
+    const btn = document.getElementById('startBtn');
+    btn.textContent = 'Loading…'; btn.disabled = true;
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false
     });
@@ -221,27 +225,36 @@ async function beginWorkout() {
       poseDetection.SupportedModels.MoveNet,
       { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING });
     started = true;
-    startBtnBusy(false);
+    btn.textContent = "Let's go"; btn.disabled = false;
     loop();
   }
+  startStation();
+}
+
+function startStation() {
+  const s = queue[stationIdx];
+  exercise = EXERCISES[s.ex];
+  goal = s.reps;
+  reps = 0; phase = 'extended';
+  document.getElementById('reps').textContent = '0';
+  document.getElementById('goalLabel').textContent = `/ ${goal} ${exercise.name}`;
+  document.getElementById('setLabel').textContent =
+    queue.length > 1 ? `Set ${stationIdx + 1} of ${queue.length}` : '';
+  document.getElementById('counter').style.display = 'block';
+  document.getElementById('closeBtn').style.display = 'block';
   active = true;
 }
 
-function startBtnBusy(b) {
-  const btn = document.getElementById('startBtn');
-  btn.textContent = b ? 'Loading…' : "Let's go";
-  btn.disabled = b;
-}
-
-function backToWheel() {
+function backToSlots() {
   active = false;
   octx.clearRect(0, 0, overlay.width, overlay.height);
   document.getElementById('counter').style.display = 'none';
   document.getElementById('closeBtn').style.display = 'none';
+  document.getElementById('next').style.display = 'none';
   document.getElementById('done').style.display = 'none';
   resultBox.style.display = 'none';
   spinBtn.style.display = 'block';
-  document.getElementById('wheelScreen').style.display = 'flex';
+  document.getElementById('slotScreen').style.display = 'flex';
 }
 
 async function loop() {
@@ -256,7 +269,7 @@ async function loop() {
   requestAnimationFrame(loop);
 }
 
-function angle(a, b, c) {
+function angleAt(a, b, c) {
   const v1x = a.x - b.x, v1y = a.y - b.y, v2x = c.x - b.x, v2y = c.y - b.y;
   const m1 = Math.hypot(v1x, v1y), m2 = Math.hypot(v2x, v2y);
   if (!m1 || !m2) return null;
@@ -267,7 +280,7 @@ function angle(a, b, c) {
 function updateReps(kp) {
   const vals = [];
   for (const [a, b, c] of exercise.sides) {
-    if (kp[a] && kp[b] && kp[c]) { const d = angle(kp[a], kp[b], kp[c]); if (d != null) vals.push(d); }
+    if (kp[a] && kp[b] && kp[c]) { const d = angleAt(kp[a], kp[b], kp[c]); if (d != null) vals.push(d); }
   }
   const angleEl = document.getElementById('angle');
   if (!vals.length) { angleEl.textContent = 'get your whole body in frame'; return; }
@@ -288,15 +301,24 @@ function countRep() {
   el.textContent = reps;
   el.animate([{ transform: 'scale(1.4)' }, { transform: 'scale(1)' }], { duration: 250 });
   if (navigator.vibrate) navigator.vibrate(40);
-  if (reps >= goal) finish();
+  if (reps >= goal) finishStation();
 }
 
-function finish() {
+function finishStation() {
   active = false;
   if (navigator.vibrate) navigator.vibrate([80, 60, 80]);
   document.getElementById('counter').style.display = 'none';
   document.getElementById('closeBtn').style.display = 'none';
-  document.getElementById('done').style.display = 'flex';
+
+  stationIdx++;
+  if (stationIdx < queue.length) {
+    const s = queue[stationIdx];
+    document.getElementById('nextText').innerHTML =
+      `Next up:<br>${s.reps} ${EXERCISES[s.ex].name} ${EXERCISES[s.ex].emoji}`;
+    document.getElementById('next').style.display = 'flex';
+  } else {
+    document.getElementById('done').style.display = 'flex';
+  }
 }
 
 const BONES = [
