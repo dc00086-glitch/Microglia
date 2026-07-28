@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Move to Unlock</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff;
+    font-family: -apple-system, system-ui, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; transform: scaleX(-1); }
+  canvas { pointer-events: none; }
+
+  .counter { position: absolute; left: 0; right: 0; bottom: 12%;
+    text-align: center; text-shadow: 0 2px 10px rgba(0,0,0,.7); pointer-events: none; }
+  .reps { font-size: 22vw; font-weight: 800; line-height: 1; }
+  .label { font-size: 6vw; opacity: .9; margin-top: 1vh; }
+  .angle { font-size: 4vw; opacity: .55; margin-top: 1vh; font-variant-numeric: tabular-nums; }
+
+  .topbar { position: absolute; top: 0; left: 0; right: 0; padding: 14px;
+    display: flex; gap: 8px; justify-content: center; z-index: 5; }
+  .topbar button { flex: 1; max-width: 130px; padding: 12px 0; border: 0; border-radius: 14px;
+    font-size: 15px; font-weight: 700; background: rgba(255,255,255,.14);
+    color: #fff; backdrop-filter: blur(8px); }
+  .topbar button.active { background: #34c759; color: #000; }
+
+  #setup { position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 22px; padding: 28px;
+    background: radial-gradient(circle at 50% 30%, #14311f, #000); z-index: 10; text-align: center; }
+  #setup h1 { font-size: 30px; margin: 0; }
+  #setup p { opacity: .75; margin: 0; max-width: 320px; line-height: 1.5; }
+  .goalrow { display: flex; align-items: center; gap: 20px; font-size: 20px; }
+  .goalrow button { width: 54px; height: 54px; border-radius: 50%; border: 0;
+    font-size: 26px; font-weight: 700; background: rgba(255,255,255,.14); color: #fff; }
+  #goalNum { font-size: 40px; font-weight: 800; min-width: 60px; }
+  #startBtn { padding: 16px 40px; font-size: 19px; font-weight: 800; border: 0;
+    border-radius: 16px; background: #34c759; color: #000; }
+  .hint { font-size: 13px; opacity: .5; }
+
+  #done { position: absolute; inset: 0; display: none; flex-direction: column;
+    align-items: center; justify-content: center; gap: 16px;
+    background: rgba(0,0,0,.82); z-index: 20; text-align: center; padding: 28px; }
+  #done h1 { font-size: 34px; margin: 0; }
+  #done button { padding: 14px 34px; font-size: 17px; font-weight: 700; border: 0;
+    border-radius: 14px; background: #fff; color: #000; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="canvas"></canvas>
+
+  <div class="topbar" id="exBar" style="display:none">
+    <button data-ex="squat" class="active">Squats</button>
+    <button data-ex="pushup">Push-ups</button>
+    <button data-ex="situp">Sit-ups</button>
+  </div>
+
+  <div class="counter" id="counter" style="display:none">
+    <div class="reps" id="reps">0</div>
+    <div class="label" id="goalLabel">/ 10</div>
+    <div class="angle" id="angle"></div>
+  </div>
+
+  <div id="setup">
+    <h1>💪 Move to Unlock</h1>
+    <p>Do your reps in front of the camera. Prop your phone so your whole body is
+       in frame, then earn your scroll.</p>
+    <div class="goalrow">
+      <button id="minus">–</button>
+      <div id="goalNum">10</div>
+      <button id="plus">+</button>
+    </div>
+    <div class="hint">reps to hit</div>
+    <button id="startBtn">Start camera</button>
+    <div class="hint">Runs entirely on your phone. Nothing is recorded or uploaded.</div>
+  </div>
+
+  <div id="done">
+    <h1>✅ Done!</h1>
+    <p>Nice. Go enjoy your break.</p>
+    <button id="againBtn">Go again</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
+<script>
+const video  = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx    = canvas.getContext('2d');
+
+// Exercise definitions: the joint angle that defines a rep, plus thresholds.
+// Keypoint names are MoveNet's (COCO). We measure both sides and average.
+const EXERCISES = {
+  squat:  { name: 'Squats',    sides: [['left_hip','left_knee','left_ankle'],
+                                       ['right_hip','right_knee','right_ankle']],
+            flexed: 100, extended: 160, minSec: 0.8 },
+  pushup: { name: 'Push-ups',  sides: [['left_shoulder','left_elbow','left_wrist'],
+                                       ['right_shoulder','right_elbow','right_wrist']],
+            flexed: 95,  extended: 150, minSec: 0.7 },
+  situp:  { name: 'Sit-ups',   sides: [['left_shoulder','left_hip','left_knee'],
+                                       ['right_shoulder','right_hip','right_knee']],
+            flexed: 95,  extended: 150, minSec: 0.7 },
+};
+
+let exercise = 'squat';
+let goal = 10;
+let reps = 0;
+let phase = 'extended';       // rep state machine
+let flexedAt = 0;
+let detector = null;
+
+// ---- Setup UI ----
+const goalNum = document.getElementById('goalNum');
+document.getElementById('plus').onclick  = () => { goal = Math.min(100, goal + 1); goalNum.textContent = goal; };
+document.getElementById('minus').onclick = () => { goal = Math.max(1, goal - 1); goalNum.textContent = goal; };
+
+document.querySelectorAll('#exBar button').forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll('#exBar button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    exercise = btn.dataset.ex;
+    resetReps();
+  };
+});
+
+document.getElementById('startBtn').onclick = start;
+document.getElementById('againBtn').onclick = () => {
+  document.getElementById('done').style.display = 'none';
+  resetReps();
+};
+
+function resetReps() {
+  reps = 0; phase = 'extended';
+  document.getElementById('reps').textContent = '0';
+  document.getElementById('goalLabel').textContent = '/ ' + goal;
+}
+
+// ---- Geometry ----
+function angle(a, b, c) {
+  const v1x = a.x - b.x, v1y = a.y - b.y;
+  const v2x = c.x - b.x, v2y = c.y - b.y;
+  const m1 = Math.hypot(v1x, v1y), m2 = Math.hypot(v2x, v2y);
+  if (m1 === 0 || m2 === 0) return null;
+  const cos = Math.max(-1, Math.min(1, (v1x*v2x + v1y*v2y) / (m1*m2)));
+  return Math.acos(cos) * 180 / Math.PI;
+}
+
+// ---- Main loop ----
+async function start() {
+  document.getElementById('setup').style.display = 'none';
+  document.getElementById('startBtn').textContent = 'Loading…';
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+
+  detector = await poseDetection.createDetector(
+    poseDetection.SupportedModels.MoveNet,
+    { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING }
+  );
+
+  document.getElementById('exBar').style.display = 'flex';
+  document.getElementById('counter').style.display = 'block';
+  resetReps();
+  loop();
+}
+
+async function loop() {
+  const poses = await detector.estimatePoses(video, { flipHorizontal: false });
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (poses[0]) {
+    const kp = {};
+    poses[0].keypoints.forEach(p => { if (p.score > 0.3) kp[p.name] = p; });
+    drawSkeleton(kp);
+    updateReps(kp);
+  }
+  requestAnimationFrame(loop);
+}
+
+function updateReps(kp) {
+  const ex = EXERCISES[exercise];
+  const vals = [];
+  for (const [a, b, c] of ex.sides) {
+    if (kp[a] && kp[b] && kp[c]) {
+      const deg = angle(kp[a], kp[b], kp[c]);
+      if (deg != null) vals.push(deg);
+    }
+  }
+  if (!vals.length) { document.getElementById('angle').textContent = 'move into frame'; return; }
+  const deg = vals.reduce((s, v) => s + v, 0) / vals.length;
+  document.getElementById('angle').textContent = Math.round(deg) + '°';
+
+  const now = performance.now() / 1000;
+  if (phase === 'extended' && deg < ex.flexed) {
+    phase = 'flexed'; flexedAt = now;
+  } else if (phase === 'flexed' && deg > ex.extended) {
+    phase = 'extended';
+    if (now - flexedAt >= ex.minSec) countRep();
+  }
+}
+
+function countRep() {
+  reps++;
+  const el = document.getElementById('reps');
+  el.textContent = reps;
+  el.animate([{ transform: 'scale(1.4)' }, { transform: 'scale(1)' }], { duration: 250 });
+  if (navigator.vibrate) navigator.vibrate(40);
+  if (reps >= goal) finish();
+}
+
+function finish() {
+  if (navigator.vibrate) navigator.vibrate([80, 60, 80]);
+  document.getElementById('done').style.display = 'flex';
+}
+
+// ---- Drawing ----
+const BONES = [
+  ['left_shoulder','right_shoulder'],['left_shoulder','left_elbow'],['left_elbow','left_wrist'],
+  ['right_shoulder','right_elbow'],['right_elbow','right_wrist'],
+  ['left_shoulder','left_hip'],['right_shoulder','right_hip'],['left_hip','right_hip'],
+  ['left_hip','left_knee'],['left_knee','left_ankle'],
+  ['right_hip','right_knee'],['right_knee','right_ankle'],
+];
+function drawSkeleton(kp) {
+  ctx.strokeStyle = '#34c759'; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  for (const [a, b] of BONES) {
+    if (kp[a] && kp[b]) {
+      ctx.beginPath(); ctx.moveTo(kp[a].x, kp[a].y); ctx.lineTo(kp[b].x, kp[b].y); ctx.stroke();
+    }
+  }
+  ctx.fillStyle = '#fff';
+  for (const name in kp) {
+    ctx.beginPath(); ctx.arc(kp[name].x, kp[name].y, 5, 0, Math.PI * 2); ctx.fill();
+  }
+}
+</script>
+</body>
+</html>
