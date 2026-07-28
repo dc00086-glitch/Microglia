@@ -3334,6 +3334,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
                         {'name': 'far_red_albumin', 'channel': 2}]}
         # Channel names (can be customized by user)
         self.channel_names = {0: '', 1: '', 2: ''}
+        # What the grayscale view shows: 'process' (the analysed channel) or
+        # 'merged' (all enabled channels combined). Display only.
+        self.grayscale_view_mode = 'process'
         # Color/grayscale display toggle — color view is on by default.
         self.show_color_view = True
         # Z key tracking for zoom functionality
@@ -10211,8 +10214,25 @@ if __name__ == '__main__':
         channel_sliders = {}
         nch = self._detect_channel_count()
         if nch >= 2:
-            from PyQt5.QtWidgets import QColorDialog
+            from PyQt5.QtWidgets import QColorDialog, QComboBox
             from PyQt5.QtGui import QColor
+
+            # What the grayscale view (C key / "Show Grayscale") displays.
+            gv_row = QHBoxLayout()
+            gv_row.addWidget(QLabel("Grayscale view shows:"))
+            gv_combo = QComboBox()
+            gv_combo.addItem("Processing channel only", "process")
+            gv_combo.addItem("All enabled channels merged", "merged")
+            cur_mode = getattr(self, 'grayscale_view_mode', 'process')
+            gv_combo.setCurrentIndex(1 if cur_mode == 'merged' else 0)
+
+            def _gv_changed(_i):
+                self.grayscale_view_mode = gv_combo.currentData()
+                self.update_display()
+            gv_combo.currentIndexChanged.connect(_gv_changed)
+            gv_row.addWidget(gv_combo)
+            gv_row.addStretch()
+            layout.addLayout(gv_row)
 
             channel_group = QGroupBox("Channel colour + brightness")
             channel_layout = QVBoxLayout()
@@ -10407,6 +10427,35 @@ if __name__ == '__main__':
                 self.original_label.set_image(orig_pixmap)
 
 
+    def _grayscale_view(self, color_img):
+        """2D array to show in grayscale view.
+
+        'process' (default) shows the channel being analysed — what you want
+        while picking somas or reviewing masks. 'merged' combines the channels
+        that are enabled for display, so you see the whole structure instead of
+        one channel. Never used for analysis input, display only.
+        """
+        if color_img is None:
+            return None
+        arr = np.asarray(color_img)
+        if arr.ndim != 3:
+            return arr
+        mode = getattr(self, 'grayscale_view_mode', 'process')
+        if mode != 'merged':
+            return extract_channel(arr, self.grayscale_channel)
+        nch = arr.shape[2]
+        use = [i for i in range(nch) if self.display_channels.get(i, True)]
+        if not use:
+            use = list(range(nch))
+        acc = np.zeros(arr.shape[:2], dtype=np.float64)
+        for i in use:
+            ch = arr[:, :, i].astype(np.float64)
+            lo, hi = float(ch.min()), float(ch.max())
+            if hi > lo:
+                acc += (ch - lo) / (hi - lo)      # normalise so one bright
+        acc /= max(len(use), 1)                    # channel can't dominate
+        return (np.clip(acc, 0, 1) * 255).astype(np.uint8)
+
     def _color_display(self, img_data):
         """True when the color view is on and this image has multi-channel data."""
         return self.show_color_view and img_data is not None and 'color_image' in img_data
@@ -10545,7 +10594,7 @@ if __name__ == '__main__':
                             pixmap = self._array_to_pixmap_color(adjusted)
                         else:
                             if raw_img.ndim == 3:
-                                gray_img = extract_channel(raw_img, self.grayscale_channel)
+                                gray_img = self._grayscale_view(raw_img)
                             else:
                                 gray_img = raw_img
                             adjusted = self._apply_display_adjustments(gray_img)
@@ -10876,7 +10925,7 @@ if __name__ == '__main__':
                 self.original_label.set_image(pixmap)
             else:
                 if raw_img.ndim == 3:
-                    raw_gray = extract_channel(raw_img, self.grayscale_channel)
+                    raw_gray = self._grayscale_view(raw_img)
                 else:
                     raw_gray = raw_img
                 adjusted_raw = self._apply_display_adjustments(raw_gray)
@@ -11264,7 +11313,7 @@ if __name__ == '__main__':
                 else:
                     # Use selected channel from color image if available
                     if 'color_image' in self.images[img_name]:
-                        gray_img = extract_channel(self.images[img_name]['color_image'], self.grayscale_channel)
+                        gray_img = self._grayscale_view(self.images[img_name]['color_image'])
                     else:
                         gray_img = processed_data
                     adjusted = self._apply_display_adjustments(gray_img)
@@ -11441,7 +11490,7 @@ if __name__ == '__main__':
             if img_data['processed'] is not None:
                 gray_img = img_data['processed']
             elif 'color_image' in img_data:
-                gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
+                gray_img = self._grayscale_view(img_data['color_image'])
             else:
                 # No processed or color image available — load raw from disk
                 try:
@@ -11489,7 +11538,7 @@ if __name__ == '__main__':
         if img_data['processed'] is not None:
             gray = img_data['processed']
         elif 'color_image' in img_data:
-            gray = extract_channel(img_data['color_image'], self.grayscale_channel)
+            gray = self._grayscale_view(img_data['color_image'])
         else:
             return coords
         pixel_size = self._get_pixel_size(self.current_image_name)
@@ -11561,7 +11610,7 @@ if __name__ == '__main__':
             if img_data['processed'] is not None:
                 gray_img = img_data['processed']
             elif 'color_image' in img_data:
-                gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
+                gray_img = self._grayscale_view(img_data['color_image'])
             else:
                 # No processed or color image available — load raw from disk
                 try:
@@ -11599,7 +11648,7 @@ if __name__ == '__main__':
             if img_data['processed'] is not None:
                 gray_img = img_data['processed']
             elif 'color_image' in img_data:
-                gray_img = extract_channel(img_data['color_image'], self.grayscale_channel)
+                gray_img = self._grayscale_view(img_data['color_image'])
             else:
                 # No processed or color image available — load raw from disk
                 try:
@@ -12736,7 +12785,7 @@ if __name__ == '__main__':
         if img_data.get('processed') is not None:
             return img_data['processed']
         elif 'color_image' in img_data:
-            return extract_channel(img_data['color_image'], self.grayscale_channel)
+            return self._grayscale_view(img_data['color_image'])
         # Last resort: try loading the raw image
         raw_path = img_data.get('raw_path')
         if raw_path and os.path.exists(raw_path):
