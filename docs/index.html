@@ -3,184 +3,251 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Move to Unlock</title>
+<title>Spin & Sweat</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { margin: 0; height: 100%; background: #000; color: #fff;
     font-family: -apple-system, system-ui, sans-serif; overflow: hidden; }
   #stage { position: fixed; inset: 0; }
-  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%;
+  video, #overlay { position: absolute; inset: 0; width: 100%; height: 100%;
     object-fit: cover; transform: scaleX(-1); }
-  canvas { pointer-events: none; }
+  #overlay { pointer-events: none; }
 
-  .counter { position: absolute; left: 0; right: 0; bottom: 12%;
-    text-align: center; text-shadow: 0 2px 10px rgba(0,0,0,.7); pointer-events: none; }
+  /* ---------- Wheel screen ---------- */
+  #wheelScreen { position: absolute; inset: 0; z-index: 10; display: flex;
+    flex-direction: column; align-items: center; justify-content: center; gap: 26px;
+    padding: 24px; text-align: center;
+    background: radial-gradient(circle at 50% 25%, #1c2b4a, #000); }
+  #wheelScreen h1 { font-size: 30px; margin: 0; }
+  .wheelWrap { position: relative; width: min(82vw, 340px); aspect-ratio: 1; }
+  #wheel { width: 100%; height: 100%; border-radius: 50%;
+    box-shadow: 0 0 0 6px rgba(255,255,255,.12), 0 14px 40px rgba(0,0,0,.6);
+    transition: transform 4.2s cubic-bezier(.15,.85,.25,1); }
+  .pointer { position: absolute; top: -6px; left: 50%; transform: translateX(-50%);
+    width: 0; height: 0; border-left: 15px solid transparent; border-right: 15px solid transparent;
+    border-top: 26px solid #fff; filter: drop-shadow(0 2px 3px rgba(0,0,0,.5)); z-index: 2; }
+  .hub { position: absolute; top: 50%; left: 50%; width: 46px; height: 46px;
+    transform: translate(-50%,-50%); background: #fff; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center; font-size: 22px; }
+
+  .bigbtn { padding: 16px 46px; font-size: 20px; font-weight: 800; border: 0;
+    border-radius: 16px; background: #34c759; color: #000; }
+  .bigbtn:active { transform: scale(.97); }
+  .ghost { background: rgba(255,255,255,.16); color: #fff; padding: 12px 26px;
+    font-size: 15px; font-weight: 700; border: 0; border-radius: 14px; }
+  #result { display: none; flex-direction: column; align-items: center; gap: 16px; }
+  #resultText { font-size: 26px; font-weight: 800; }
+  .row { display: flex; gap: 12px; }
+  .hint { font-size: 13px; opacity: .5; max-width: 300px; line-height: 1.5; }
+
+  /* ---------- Counter ---------- */
+  #counter { position: absolute; left: 0; right: 0; bottom: 12%; text-align: center;
+    text-shadow: 0 2px 10px rgba(0,0,0,.7); pointer-events: none; display: none; }
   .reps { font-size: 22vw; font-weight: 800; line-height: 1; }
   .label { font-size: 6vw; opacity: .9; margin-top: 1vh; }
   .angle { font-size: 4vw; opacity: .55; margin-top: 1vh; font-variant-numeric: tabular-nums; }
+  #closeBtn { position: absolute; top: 14px; left: 14px; z-index: 6; display: none;
+    width: 44px; height: 44px; border-radius: 50%; border: 0; font-size: 20px;
+    background: rgba(0,0,0,.4); color: #fff; backdrop-filter: blur(6px); }
 
-  .topbar { position: absolute; top: 0; left: 0; right: 0; padding: 14px;
-    display: flex; gap: 8px; justify-content: center; z-index: 5; }
-  .topbar button { flex: 1; max-width: 130px; padding: 12px 0; border: 0; border-radius: 14px;
-    font-size: 15px; font-weight: 700; background: rgba(255,255,255,.14);
-    color: #fff; backdrop-filter: blur(8px); }
-  .topbar button.active { background: #34c759; color: #000; }
-
-  #setup { position: absolute; inset: 0; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; gap: 22px; padding: 28px;
-    background: radial-gradient(circle at 50% 30%, #14311f, #000); z-index: 10; text-align: center; }
-  #setup h1 { font-size: 30px; margin: 0; }
-  #setup p { opacity: .75; margin: 0; max-width: 320px; line-height: 1.5; }
-  .goalrow { display: flex; align-items: center; gap: 20px; font-size: 20px; }
-  .goalrow button { width: 54px; height: 54px; border-radius: 50%; border: 0;
-    font-size: 26px; font-weight: 700; background: rgba(255,255,255,.14); color: #fff; }
-  #goalNum { font-size: 40px; font-weight: 800; min-width: 60px; }
-  #startBtn { padding: 16px 40px; font-size: 19px; font-weight: 800; border: 0;
-    border-radius: 16px; background: #34c759; color: #000; }
-  .hint { font-size: 13px; opacity: .5; }
-
-  #done { position: absolute; inset: 0; display: none; flex-direction: column;
-    align-items: center; justify-content: center; gap: 16px;
-    background: rgba(0,0,0,.82); z-index: 20; text-align: center; padding: 28px; }
-  #done h1 { font-size: 34px; margin: 0; }
-  #done button { padding: 14px 34px; font-size: 17px; font-weight: 700; border: 0;
-    border-radius: 14px; background: #fff; color: #000; }
+  /* ---------- Done ---------- */
+  #done { position: absolute; inset: 0; display: none; z-index: 20;
+    flex-direction: column; align-items: center; justify-content: center; gap: 18px;
+    background: rgba(0,0,0,.85); text-align: center; padding: 28px; }
+  #done h1 { font-size: 38px; margin: 0; }
 </style>
 </head>
 <body>
 <div id="stage">
   <video id="video" playsinline muted autoplay></video>
-  <canvas id="canvas"></canvas>
+  <canvas id="overlay"></canvas>
 
-  <div class="topbar" id="exBar" style="display:none">
-    <button data-ex="squat" class="active">Squats</button>
-    <button data-ex="pushup">Push-ups</button>
-    <button data-ex="situp">Sit-ups</button>
-  </div>
-
-  <div class="counter" id="counter" style="display:none">
+  <button id="closeBtn">✕</button>
+  <div class="counter" id="counter">
     <div class="reps" id="reps">0</div>
-    <div class="label" id="goalLabel">/ 10</div>
+    <div class="label" id="goalLabel"></div>
     <div class="angle" id="angle"></div>
   </div>
 
-  <div id="setup">
-    <h1>💪 Move to Unlock</h1>
-    <p>Do your reps in front of the camera. Prop your phone so your whole body is
-       in frame, then earn your scroll.</p>
-    <div class="goalrow">
-      <button id="minus">–</button>
-      <div id="goalNum">10</div>
-      <button id="plus">+</button>
+  <div id="wheelScreen">
+    <h1>🎰 Spin &amp; Sweat</h1>
+    <div class="wheelWrap">
+      <div class="pointer"></div>
+      <canvas id="wheel" width="360" height="360"></canvas>
+      <div class="hub">🎯</div>
     </div>
-    <div class="hint">reps to hit</div>
-    <button id="startBtn">Start camera</button>
-    <div class="hint">Runs entirely on your phone. Nothing is recorded or uploaded.</div>
+    <button class="bigbtn" id="spinBtn">SPIN</button>
+    <div id="result">
+      <div id="resultText"></div>
+      <div class="row">
+        <button class="bigbtn" id="startBtn">Let's go</button>
+        <button class="ghost" id="respinBtn">Spin again</button>
+      </div>
+    </div>
+    <div class="hint">The wheel picks your exercise and reps. Camera counts them —
+      everything runs on your phone, nothing is recorded.</div>
   </div>
 
   <div id="done">
-    <h1>✅ Done!</h1>
-    <p>Nice. Go enjoy your break.</p>
-    <button id="againBtn">Go again</button>
+    <h1>✅ Crushed it!</h1>
+    <button class="bigbtn" id="againBtn">Spin again</button>
   </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
 <script>
-const video  = document.getElementById('video');
-const canvas = document.getElementById('canvas');
-const ctx    = canvas.getContext('2d');
-
-// Exercise definitions: the joint angle that defines a rep, plus thresholds.
-// Keypoint names are MoveNet's (COCO). We measure both sides and average.
+// ---------- Exercise rules (angle at a joint defines a rep) ----------
 const EXERCISES = {
-  squat:  { name: 'Squats',    sides: [['left_hip','left_knee','left_ankle'],
-                                       ['right_hip','right_knee','right_ankle']],
+  squat:  { name: 'Squats',    emoji: '🦵',
+            sides: [['left_hip','left_knee','left_ankle'], ['right_hip','right_knee','right_ankle']],
             flexed: 100, extended: 160, minSec: 0.8 },
-  pushup: { name: 'Push-ups',  sides: [['left_shoulder','left_elbow','left_wrist'],
-                                       ['right_shoulder','right_elbow','right_wrist']],
+  pushup: { name: 'Push-ups',  emoji: '💪',
+            sides: [['left_shoulder','left_elbow','left_wrist'], ['right_shoulder','right_elbow','right_wrist']],
             flexed: 95,  extended: 150, minSec: 0.7 },
-  situp:  { name: 'Sit-ups',   sides: [['left_shoulder','left_hip','left_knee'],
-                                       ['right_shoulder','right_hip','right_knee']],
+  situp:  { name: 'Sit-ups',   emoji: '🔥',
+            sides: [['left_shoulder','left_hip','left_knee'], ['right_shoulder','right_hip','right_knee']],
             flexed: 95,  extended: 150, minSec: 0.7 },
 };
 
-let exercise = 'squat';
-let goal = 10;
-let reps = 0;
-let phase = 'extended';       // rep state machine
-let flexedAt = 0;
-let detector = null;
+// ---------- Wheel segments (exercise + rep combos) ----------
+const SEG = [
+  { ex: 'squat',  reps: 5  }, { ex: 'pushup', reps: 10 }, { ex: 'situp',  reps: 15 },
+  { ex: 'squat',  reps: 20 }, { ex: 'pushup', reps: 5  }, { ex: 'situp',  reps: 10 },
+  { ex: 'squat',  reps: 15 }, { ex: 'pushup', reps: 15 }, { ex: 'situp',  reps: 5  },
+  { ex: 'squat',  reps: 10 },
+];
+const COLORS = ['#ef4444','#f59e0b','#10b981','#3b82f6','#8b5cf6',
+                '#ec4899','#14b8a6','#f97316','#6366f1','#22c55e'];
+const N = SEG.length;
+const segDeg = 360 / N;
 
-// ---- Setup UI ----
-const goalNum = document.getElementById('goalNum');
-document.getElementById('plus').onclick  = () => { goal = Math.min(100, goal + 1); goalNum.textContent = goal; };
-document.getElementById('minus').onclick = () => { goal = Math.max(1, goal - 1); goalNum.textContent = goal; };
+// ---------- Wheel drawing & spin ----------
+const wheel = document.getElementById('wheel');
+const wctx = wheel.getContext('2d');
+let rotation = 0;
+let chosen = null;
 
-document.querySelectorAll('#exBar button').forEach(btn => {
-  btn.onclick = () => {
-    document.querySelectorAll('#exBar button').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    exercise = btn.dataset.ex;
-    resetReps();
-  };
-});
+function drawWheel() {
+  const size = wheel.width, r = size / 2;
+  wctx.clearRect(0, 0, size, size);
+  for (let i = 0; i < N; i++) {
+    const start = (-90 - segDeg / 2 + i * segDeg) * Math.PI / 180;
+    const end = start + segDeg * Math.PI / 180;
+    wctx.beginPath();
+    wctx.moveTo(r, r);
+    wctx.arc(r, r, r - 3, start, end);
+    wctx.closePath();
+    wctx.fillStyle = COLORS[i % COLORS.length];
+    wctx.fill();
 
-document.getElementById('startBtn').onclick = start;
-document.getElementById('againBtn').onclick = () => {
-  document.getElementById('done').style.display = 'none';
-  resetReps();
+    wctx.save();
+    wctx.translate(r, r);
+    wctx.rotate((-90 + i * segDeg) * Math.PI / 180);
+    wctx.textAlign = 'right';
+    wctx.fillStyle = '#fff';
+    wctx.font = 'bold 26px -apple-system, sans-serif';
+    wctx.fillText(String(SEG[i].reps), r - 22, -4);
+    wctx.font = '600 20px -apple-system, sans-serif';
+    wctx.fillText(EXERCISES[SEG[i].ex].emoji, r - 24, 20);
+    wctx.restore();
+  }
+}
+drawWheel();
+
+const spinBtn = document.getElementById('spinBtn');
+const resultBox = document.getElementById('result');
+const resultText = document.getElementById('resultText');
+let spinning = false;
+
+spinBtn.onclick = () => {
+  if (spinning) return;
+  spinning = true;
+  spinBtn.style.display = 'none';
+  resultBox.style.display = 'none';
+
+  const i = Math.floor(Math.random() * N);
+  const desiredMod = (360 - i * segDeg) % 360;                 // rotation to land segment i at top
+  const delta = 5 * 360 + (((desiredMod - (rotation % 360)) + 360) % 360);
+  rotation += delta;
+  wheel.style.transform = `rotate(${rotation}deg)`;
+
+  wheel.addEventListener('transitionend', function reveal() {
+    wheel.removeEventListener('transitionend', reveal);
+    chosen = SEG[i];
+    resultText.textContent = `${chosen.reps} ${EXERCISES[chosen.ex].name} ${EXERCISES[chosen.ex].emoji}`;
+    resultBox.style.display = 'flex';
+    spinning = false;
+  }, { once: true });
 };
 
-function resetReps() {
+document.getElementById('respinBtn').onclick = () => {
+  resultBox.style.display = 'none';
+  spinBtn.style.display = 'block';
+};
+document.getElementById('startBtn').onclick = beginWorkout;
+document.getElementById('againBtn').onclick = backToWheel;
+document.getElementById('closeBtn').onclick = backToWheel;
+
+// ---------- Camera + pose ----------
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const octx = overlay.getContext('2d');
+let detector = null, started = false, active = false;
+let exercise, goal, reps, phase, flexedAt;
+
+async function beginWorkout() {
+  exercise = EXERCISES[chosen.ex];
+  goal = chosen.reps;
   reps = 0; phase = 'extended';
-  document.getElementById('reps').textContent = '0';
-  document.getElementById('goalLabel').textContent = '/ ' + goal;
-}
 
-// ---- Geometry ----
-function angle(a, b, c) {
-  const v1x = a.x - b.x, v1y = a.y - b.y;
-  const v2x = c.x - b.x, v2y = c.y - b.y;
-  const m1 = Math.hypot(v1x, v1y), m2 = Math.hypot(v2x, v2y);
-  if (m1 === 0 || m2 === 0) return null;
-  const cos = Math.max(-1, Math.min(1, (v1x*v2x + v1y*v2y) / (m1*m2)));
-  return Math.acos(cos) * 180 / Math.PI;
-}
-
-// ---- Main loop ----
-async function start() {
-  document.getElementById('setup').style.display = 'none';
-  document.getElementById('startBtn').textContent = 'Loading…';
-
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
-    audio: false
-  });
-  video.srcObject = stream;
-  await video.play();
-
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-
-  detector = await poseDetection.createDetector(
-    poseDetection.SupportedModels.MoveNet,
-    { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING }
-  );
-
-  document.getElementById('exBar').style.display = 'flex';
+  document.getElementById('wheelScreen').style.display = 'none';
   document.getElementById('counter').style.display = 'block';
-  resetReps();
-  loop();
+  document.getElementById('closeBtn').style.display = 'block';
+  document.getElementById('reps').textContent = '0';
+  document.getElementById('goalLabel').textContent = `/ ${goal} ${exercise.name}`;
+
+  if (!started) {
+    startBtnBusy(true);
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    overlay.width = video.videoWidth;
+    overlay.height = video.videoHeight;
+    detector = await poseDetection.createDetector(
+      poseDetection.SupportedModels.MoveNet,
+      { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING });
+    started = true;
+    startBtnBusy(false);
+    loop();
+  }
+  active = true;
+}
+
+function startBtnBusy(b) {
+  const btn = document.getElementById('startBtn');
+  btn.textContent = b ? 'Loading…' : "Let's go";
+  btn.disabled = b;
+}
+
+function backToWheel() {
+  active = false;
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  document.getElementById('counter').style.display = 'none';
+  document.getElementById('closeBtn').style.display = 'none';
+  document.getElementById('done').style.display = 'none';
+  resultBox.style.display = 'none';
+  spinBtn.style.display = 'block';
+  document.getElementById('wheelScreen').style.display = 'flex';
 }
 
 async function loop() {
   const poses = await detector.estimatePoses(video, { flipHorizontal: false });
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  if (poses[0]) {
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  if (active && poses[0]) {
     const kp = {};
     poses[0].keypoints.forEach(p => { if (p.score > 0.3) kp[p.name] = p; });
     drawSkeleton(kp);
@@ -189,25 +256,29 @@ async function loop() {
   requestAnimationFrame(loop);
 }
 
+function angle(a, b, c) {
+  const v1x = a.x - b.x, v1y = a.y - b.y, v2x = c.x - b.x, v2y = c.y - b.y;
+  const m1 = Math.hypot(v1x, v1y), m2 = Math.hypot(v2x, v2y);
+  if (!m1 || !m2) return null;
+  const cos = Math.max(-1, Math.min(1, (v1x * v2x + v1y * v2y) / (m1 * m2)));
+  return Math.acos(cos) * 180 / Math.PI;
+}
+
 function updateReps(kp) {
-  const ex = EXERCISES[exercise];
   const vals = [];
-  for (const [a, b, c] of ex.sides) {
-    if (kp[a] && kp[b] && kp[c]) {
-      const deg = angle(kp[a], kp[b], kp[c]);
-      if (deg != null) vals.push(deg);
-    }
+  for (const [a, b, c] of exercise.sides) {
+    if (kp[a] && kp[b] && kp[c]) { const d = angle(kp[a], kp[b], kp[c]); if (d != null) vals.push(d); }
   }
-  if (!vals.length) { document.getElementById('angle').textContent = 'move into frame'; return; }
+  const angleEl = document.getElementById('angle');
+  if (!vals.length) { angleEl.textContent = 'get your whole body in frame'; return; }
   const deg = vals.reduce((s, v) => s + v, 0) / vals.length;
-  document.getElementById('angle').textContent = Math.round(deg) + '°';
+  angleEl.textContent = Math.round(deg) + '°';
 
   const now = performance.now() / 1000;
-  if (phase === 'extended' && deg < ex.flexed) {
-    phase = 'flexed'; flexedAt = now;
-  } else if (phase === 'flexed' && deg > ex.extended) {
+  if (phase === 'extended' && deg < exercise.flexed) { phase = 'flexed'; flexedAt = now; }
+  else if (phase === 'flexed' && deg > exercise.extended) {
     phase = 'extended';
-    if (now - flexedAt >= ex.minSec) countRep();
+    if (now - flexedAt >= exercise.minSec) countRep();
   }
 }
 
@@ -221,29 +292,26 @@ function countRep() {
 }
 
 function finish() {
+  active = false;
   if (navigator.vibrate) navigator.vibrate([80, 60, 80]);
+  document.getElementById('counter').style.display = 'none';
+  document.getElementById('closeBtn').style.display = 'none';
   document.getElementById('done').style.display = 'flex';
 }
 
-// ---- Drawing ----
 const BONES = [
   ['left_shoulder','right_shoulder'],['left_shoulder','left_elbow'],['left_elbow','left_wrist'],
   ['right_shoulder','right_elbow'],['right_elbow','right_wrist'],
   ['left_shoulder','left_hip'],['right_shoulder','right_hip'],['left_hip','right_hip'],
-  ['left_hip','left_knee'],['left_knee','left_ankle'],
-  ['right_hip','right_knee'],['right_knee','right_ankle'],
+  ['left_hip','left_knee'],['left_knee','left_ankle'],['right_hip','right_knee'],['right_knee','right_ankle'],
 ];
 function drawSkeleton(kp) {
-  ctx.strokeStyle = '#34c759'; ctx.lineWidth = 6; ctx.lineCap = 'round';
-  for (const [a, b] of BONES) {
-    if (kp[a] && kp[b]) {
-      ctx.beginPath(); ctx.moveTo(kp[a].x, kp[a].y); ctx.lineTo(kp[b].x, kp[b].y); ctx.stroke();
-    }
+  octx.strokeStyle = '#34c759'; octx.lineWidth = 6; octx.lineCap = 'round';
+  for (const [a, b] of BONES) if (kp[a] && kp[b]) {
+    octx.beginPath(); octx.moveTo(kp[a].x, kp[a].y); octx.lineTo(kp[b].x, kp[b].y); octx.stroke();
   }
-  ctx.fillStyle = '#fff';
-  for (const name in kp) {
-    ctx.beginPath(); ctx.arc(kp[name].x, kp[name].y, 5, 0, Math.PI * 2); ctx.fill();
-  }
+  octx.fillStyle = '#fff';
+  for (const n in kp) { octx.beginPath(); octx.arc(kp[n].x, kp[n].y, 5, 0, Math.PI * 2); octx.fill(); }
 }
 </script>
 </body>
