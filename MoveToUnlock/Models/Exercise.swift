@@ -23,18 +23,26 @@ enum Exercise: String, CaseIterable, Identifiable {
         }
     }
 
-    /// The three joints whose angle defines a rep, in the order A–B–C where the
-    /// angle is measured at B. We track the right side; you could average both.
-    var joints: (a: VNHumanBodyPoseObservation.JointName,
-                 b: VNHumanBodyPoseObservation.JointName,
-                 c: VNHumanBodyPoseObservation.JointName) {
+    /// Right-side joints whose angle defines a rep, in order A–B–C (angle at B).
+    var rightJoints: (a: VNHumanBodyPoseObservation.JointName,
+                      b: VNHumanBodyPoseObservation.JointName,
+                      c: VNHumanBodyPoseObservation.JointName) {
         switch self {
-        case .squat:
-            return (.rightHip, .rightKnee, .rightAnkle)
-        case .pushup:
-            return (.rightShoulder, .rightElbow, .rightWrist)
-        case .situp:
-            return (.rightShoulder, .rightHip, .rightKnee)
+        case .squat:  return (.rightHip, .rightKnee, .rightAnkle)
+        case .pushup: return (.rightShoulder, .rightElbow, .rightWrist)
+        case .situp:  return (.rightShoulder, .rightHip, .rightKnee)
+        }
+    }
+
+    /// Left-side mirror of `rightJoints`. When both sides are visible we average
+    /// them, which makes counting steadier and harder to fake with a half-rep.
+    var leftJoints: (a: VNHumanBodyPoseObservation.JointName,
+                     b: VNHumanBodyPoseObservation.JointName,
+                     c: VNHumanBodyPoseObservation.JointName) {
+        switch self {
+        case .squat:  return (.leftHip, .leftKnee, .leftAnkle)
+        case .pushup: return (.leftShoulder, .leftElbow, .leftWrist)
+        case .situp:  return (.leftShoulder, .leftHip, .leftKnee)
         }
     }
 
@@ -54,6 +62,16 @@ enum Exercise: String, CaseIterable, Identifiable {
         case .squat: return 160
         case .pushup: return 150
         case .situp: return 150
+        }
+    }
+
+    /// Minimum seconds a rep must take (flex → extend). Rejects impossibly fast
+    /// twitches that aren't real reps, which is the easiest way to cheat.
+    var minRepSeconds: Double {
+        switch self {
+        case .squat: return 0.8
+        case .pushup: return 0.7
+        case .situp: return 0.7
         }
     }
 }

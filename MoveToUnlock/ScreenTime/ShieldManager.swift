@@ -16,16 +16,15 @@ import ManagedSettings
 final class ShieldManager: ObservableObject {
     /// The apps/categories the user chose to lock. Bound to a FamilyActivityPicker.
     @Published var selection = FamilyActivitySelection() {
-        didSet { persistSelection() }
+        didSet { SelectionStore.save(selection) }
     }
     @Published var isAuthorized = false
     @Published var isLocked = false
 
     private let store = ManagedSettingsStore()
-    private let selectionKey = "MoveToUnlock.selection"
 
     init() {
-        loadSelection()
+        selection = SelectionStore.load()
     }
 
     /// Ask the user to grant Screen Time control. Call once at first launch.
@@ -67,16 +66,4 @@ final class ShieldManager: ObservableObject {
         }
     }
 
-    private func persistSelection() {
-        if let data = try? JSONEncoder().encode(selection) {
-            UserDefaults.standard.set(data, forKey: selectionKey)
-        }
-    }
-
-    private func loadSelection() {
-        guard let data = UserDefaults.standard.data(forKey: selectionKey),
-              let saved = try? JSONDecoder().decode(FamilyActivitySelection.self, from: data)
-        else { return }
-        selection = saved
-    }
 }

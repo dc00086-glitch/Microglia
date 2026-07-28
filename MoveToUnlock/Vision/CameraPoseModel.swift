@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import CoreGraphics
+import QuartzCore
 import Vision
 
 /// Owns the camera session, runs Vision body-pose detection on every frame, and
@@ -88,13 +89,19 @@ final class CameraPoseModel: NSObject, ObservableObject {
             mapped[name] = CGPoint(x: point.location.x, y: 1 - point.location.y)
         }
 
-        let joints = exercise.joints
-        var angle: Double?
-        if let a = mapped[joints.a], let b = mapped[joints.b], let c = mapped[joints.c] {
-            angle = angleBetween(a, b, c)
-        }
+        // Measure the tracked angle on each side that's visible, then average.
+        // Using both sides when available is steadier and harder to fake.
+        let r = exercise.rightJoints
+        let l = exercise.leftJoints
+        var angles: [Double] = []
+        if let a = mapped[r.a], let b = mapped[r.b], let c = mapped[r.c],
+           let deg = angleBetween(a, b, c) { angles.append(deg) }
+        if let a = mapped[l.a], let b = mapped[l.b], let c = mapped[l.c],
+           let deg = angleBetween(a, b, c) { angles.append(deg) }
+        let angle: Double? = angles.isEmpty ? nil : angles.reduce(0, +) / Double(angles.count)
 
-        let didRep = angle.map { counter.update(angle: $0) } ?? false
+        let now = CACurrentMediaTime()
+        let didRep = angle.map { counter.update(angle: $0, at: now) } ?? false
 
         Task { @MainActor in
             self.points = mapped

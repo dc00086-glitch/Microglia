@@ -4,14 +4,16 @@ import Foundation
 /// Counts repetitions for one exercise by running a small state machine over a
 /// stream of joint angles.
 ///
-/// The rep is only counted when the joint goes flexed (bottom) and then returns
-/// to extended (top). Requiring both halves stops half-reps and jitter from
-/// inflating the count.
+/// A rep only counts when the joint goes flexed (bottom) and then returns to
+/// extended (top), AND the round trip took at least `minRepSeconds`. Requiring
+/// both halves stops half-reps and jitter; requiring a minimum duration stops
+/// fast twitchy fake reps.
 final class RepCounter {
     private enum Phase { case extended, flexed }
 
     private let exercise: Exercise
     private var phase: Phase = .extended
+    private var flexedStartedAt: Double = 0
     private(set) var reps: Int = 0
 
     init(exercise: Exercise) {
@@ -23,20 +25,24 @@ final class RepCounter {
         reps = 0
     }
 
-    /// Feed one frame's angle (in degrees) at the tracked joint.
-    /// Returns true if this update completed a rep.
+    /// Feed one frame's angle (degrees) at the tracked joint, with a monotonic
+    /// timestamp in seconds. Returns true if this update completed a rep.
     @discardableResult
-    func update(angle: Double) -> Bool {
+    func update(angle: Double, at time: Double) -> Bool {
         switch phase {
         case .extended:
             if angle < exercise.flexedAngle {
                 phase = .flexed
+                flexedStartedAt = time
             }
         case .flexed:
             if angle > exercise.extendedAngle {
                 phase = .extended
-                reps += 1
-                return true
+                let elapsed = time - flexedStartedAt
+                if elapsed >= exercise.minRepSeconds {
+                    reps += 1
+                    return true
+                }
             }
         }
         return false

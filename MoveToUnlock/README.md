@@ -35,6 +35,9 @@ in Xcode on a Mac, so the steps below wire these files into a project.
 | `Models/Exercise.swift` | The three exercises and their joint/angle rules |
 | `Models/RepCounter.swift` | Rep state machine + joint-angle math |
 | `ScreenTime/ShieldManager.swift` | Applies/lifts the app block |
+| `ScreenTime/SelectionStore.swift` | Shares the blocked-app list with the extensions (App Group) |
+| `Extensions/DeviceActivityMonitorExtension.swift` | Re-locks on a schedule so the block survives a force-quit |
+| `Extensions/ShieldConfigurationExtension.swift` | Custom "do your reps" block screen |
 
 ---
 
@@ -68,20 +71,47 @@ in Xcode on a Mac, so the steps below wire these files into a project.
 
 ---
 
-## Making it more robust (production notes)
+## Adding the two extensions (makes the lock stick)
 
-The scaffold keeps everything inside the main app to stay readable. Two upgrades
-matter if you want it to hold up:
+The files in `Extensions/` are already written — you just create the targets and
+drop them in:
 
-- **Re-lock reliably.** Right now the unlock timer runs in-app; if you force-quit
-  the app the re-lock won't fire. The proper fix is a **DeviceActivityMonitor
-  app extension** that re-applies the shield on a schedule, sharing the app
-  selection through an **App Group**. Apple's sample "Screen Time API" project
-  shows the pattern.
-- **Custom block screen.** A **ShieldConfiguration extension** lets you replace
-  the default block screen with your own ("Do 10 squats to unlock 💪").
+1. **App Group** (shared storage both processes read):
+   - Main app target → Signing & Capabilities → **+ App Groups** → add
+     e.g. `group.com.yourname.movetounlock`.
+   - Put that exact string in `SelectionStore.appGroupID`.
+2. **Device Activity Monitor extension:** File → New → Target →
+   **Device Activity Monitor Extension**. Delete its stub file, add
+   `DeviceActivityMonitorExtension.swift` and `SelectionStore.swift` to that
+   target, and give the target the same App Group.
+3. **Shield Configuration extension:** File → New → Target →
+   **Shield Configuration Extension**. Same idea — add
+   `ShieldConfigurationExtension.swift` to it.
+
+With these in place the block re-asserts itself even if the app is killed, and
+tapping a locked app shows your custom "do your reps" screen.
 
 ---
+
+## Getting it onto your iPhone (the honest truth)
+
+A **custom camera/motion app cannot be built entirely on an iPhone** — Apple
+requires its build tools (Xcode), which only run on a Mac. There is no on-phone
+shortcut for *this* kind of app. Your realistic paths, easiest first:
+
+1. **Any Mac for ~30 minutes** — a WVU campus computer lab, a friend's laptop.
+   Plug your iPhone in with a cable, press Run, done. A **free Apple ID** installs
+   it on your own phone (re-run every 7 days); the $99/yr account makes it
+   permanent.
+2. **Rent a cloud Mac** (MacinCloud ~$1/hr) — build an installable file there.
+3. **Build with GitHub Actions (no Mac at all)** — its free macOS runners can
+   compile the app into an `.ipa`, which you then sideload with **AltStore** or
+   **Sideloadly** using your Apple ID. Zero Mac, but the signing setup is a
+   project in itself.
+
+An **iPad** with Apple's free **Swift Playgrounds** app can build/run SwiftUI on
+the iPad itself, but the Screen Time entitlement + extensions here are hard to
+set up there — good for prototyping the camera half only.
 
 ## Honest limitations
 
