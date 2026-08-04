@@ -8822,6 +8822,8 @@ if __name__ == '__main__':
                 "analyse in the file list, then run BBB again.")
             return
 
+        from PyQt5.QtWidgets import QProgressDialog
+
         # One display scale for every overlay, set by the brightest image, so
         # leak maps can be compared between images by eye. Uses each image's
         # 99th percentile (robust to hot pixels) and keeps the largest.
@@ -8855,7 +8857,6 @@ if __name__ == '__main__':
         if overlay_vmax:
             self.log("BBB: shared overlay scale — "
                      + ", ".join(f"{k} 0–{v:.0f}" for k, v in overlay_vmax.items()))
-        from PyQt5.QtWidgets import QProgressDialog
         progress = QProgressDialog("Running BBB analysis…", "Cancel", 0,
                                    max(len(targets), 1), self)
         progress.setWindowTitle("BBB Analysis")
