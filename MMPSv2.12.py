@@ -8659,6 +8659,7 @@ if __name__ == '__main__':
                             if channels.get(n, -1) >= 0]
         vessel_rows, cell_rows, n_imgs = [], [], 0
         bad_vessel_imgs = []   # images whose CD31 threshold looks implausible
+        skipped_imgs = []      # images that could not be analysed, with reason
         review_vessels = bool(channels.get('review_vessels', False))
         thr_scale = 1.0        # carried forward once the user accepts settings
         target_area_pct = None  # if set, the same target area rule for all images
@@ -8697,9 +8698,15 @@ if __name__ == '__main__':
                 cc = idata.get('color_image')
                 color = cc if (cc is not None and getattr(cc, 'ndim', 0) == 3) else None
             if color is None:
+                self.log(f"BBB: skipped {img_name} — could not read it as a "
+                         f"multi-channel image (no CD31/tracer channels).")
+                skipped_imgs.append((img_name, "not multi-channel"))
                 continue
             nch = color.shape[2]
             if not (0 <= cd31_i < nch):
+                self.log(f"BBB: skipped {img_name} — CD31 set to Channel "
+                         f"{cd31_i + 1} but this image has {nch} channel(s).")
+                skipped_imgs.append((img_name, f"CD31 ch{cd31_i + 1} > {nch} ch"))
                 continue
             ps = float(self._get_pixel_size(img_name))
             animal_id = idata.get('animal_id', '')
@@ -8948,6 +8955,14 @@ if __name__ == '__main__':
             f"Done: {n_imgs} images, {len(cell_rows)} microglia.\n"
             f"{merged_msg}\n"
             f"Leak overlays saved to bbb_overlays/ in:\n{out_dir}")
+        if skipped_imgs:
+            lines = "\n".join(f"  {n}  ({why})" for n, why in skipped_imgs[:12])
+            more = (f"\n  ...and {len(skipped_imgs) - 12} more"
+                    if len(skipped_imgs) > 12 else "")
+            QMessageBox.warning(
+                self, "Images skipped",
+                f"{len(skipped_imgs)} image(s) were not analysed:\n\n"
+                f"{lines}{more}\n\nCheck the CD31/tracer channel assignment.")
         if bad_vessel_imgs:
             worst = sorted(bad_vessel_imgs, key=lambda t: -t[1])[:10]
             lines = "\n".join(f"  {b}: {v * 100:.0f}% vessel area" for b, v in worst)
