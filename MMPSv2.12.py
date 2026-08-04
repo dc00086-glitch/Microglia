@@ -773,6 +773,18 @@ def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
 _VESSEL_TUBENESS_SIGMAS = (1, 2, 3, 4, 6)
 
 
+def _sigmas_for_width(max_width_px):
+    """Sato scales covering vessels up to ``max_width_px`` wide.
+
+    Sato responds to a tube of width w at sigma ~ w/2, so the scale set is built
+    up to half the widest vessel. Too small and wide vessels are only outlined
+    at their edges; too large and thin vessels are smeared into the background.
+    """
+    hi = max(1.0, float(max_width_px) / 2.0)
+    n = max(3, int(round(hi)))
+    return tuple(sorted({round(float(s), 2) for s in np.linspace(1.0, hi, n)}))
+
+
 def _vessel_response(cd31, use_tubeness=False, sigmas=_VESSEL_TUBENESS_SIGMAS):
     """Return (response, otsu_threshold) for the CD31 channel.
 
@@ -1061,8 +1073,6 @@ def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
 
     names = list(tracers.keys()) or ['tracer']
     vmask = vessel_mask > 0
@@ -1085,16 +1095,8 @@ def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None):
                 ax.contour(cm > 0, levels=[0.5], colors='lime', linewidths=0.6)
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label('%s intensity (a.u.)' % name)
-        ax.set_title('%s — leak map' % name)
+        ax.set_title(name)
         ax.axis('off')
-        ax.legend(
-            handles=[
-                Patch(facecolor=vessel_rgba, edgecolor='cyan',
-                      label='vessel (intravascular)'),
-                Line2D([0], [0], color='lime', lw=2, label='microglia'),
-            ],
-            loc='lower right', fontsize=8, framealpha=0.75)
-    fig.suptitle('Bright signal OUTSIDE the cyan vessels = tracer leak', y=0.99)
     fig.tight_layout()
     fig.savefig(path, dpi=110, bbox_inches='tight')
     plt.close(fig)
@@ -3019,6 +3021,26 @@ class VesselReviewDialog(QDialog):
         self.target_row.setLayout(trow)
         layout.addWidget(self.target_row)
 
+        # --- vessel geometry ---------------------------------------------
+        grow = QHBoxLayout()
+        grow.addWidget(QLabel("Widest vessel:"))
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(2, 60)
+        self.width_spin.setValue(12)
+        self.width_spin.setSuffix(" px")
+        self.width_spin.valueChanged.connect(self._width_changed)
+        grow.addWidget(self.width_spin)
+        grow.addWidget(QLabel("Close gaps:"))
+        self.close_spin = QSpinBox()
+        self.close_spin.setRange(0, 15)
+        self.close_spin.setValue(2)
+        self.close_spin.setSuffix(" px")
+        self.close_spin.valueChanged.connect(self._rethreshold)
+        grow.addWidget(self.close_spin)
+        grow.addWidget(QLabel("<i>raise to bridge beaded vessels</i>"))
+        grow.addStretch()
+        layout.addLayout(grow)
+
         # --- display scaling (does not affect the mask) -------------------
         drow = QHBoxLayout()
         drow.addWidget(QLabel("Display scale:"))
@@ -3055,10 +3077,18 @@ class VesselReviewDialog(QDialog):
         self._mode_changed()      # sets row visibility and does the first draw
 
     # -- computation ---------------------------------------------------
+    def _sigmas(self):
+        return _sigmas_for_width(self.width_spin.value())
+
+    def _width_changed(self):
+        # scale set changed -> the cached tubeness response is stale
+        self._cache.pop(True, None)
+        self._recompute()
+
     def _response(self):
         key = bool(self.tube_check.isChecked())
         if key not in self._cache:
-            self._cache[key] = _vessel_response(self.cd31, key)
+            self._cache[key] = _vessel_response(self.cd31, key, self._sigmas())
         return self._cache[key]
 
     def _recompute(self):
@@ -3083,7 +3113,8 @@ class VesselReviewDialog(QDialog):
             thr = _vessel_threshold_for_area(base, self.target_spin.value() / 100.0)
         else:
             thr = auto_thr * scale
-        self.mask = _vessel_mask_from_response(base, thr, self.ps)
+        self.mask = _vessel_mask_from_response(
+            base, thr, self.ps, close_radius_px=self.close_spin.value())
         frac = 100.0 * float(self.mask.mean())
         warn = "  ⚠ implausibly high" if frac > 20 else (
             "  ⚠ nothing found" if frac < 0.05 else "")
@@ -3124,6 +3155,8 @@ class VesselReviewDialog(QDialog):
         return {'use_tubeness': bool(self.tube_check.isChecked()),
                 'thr_scale': self.thr_slider.value() / 100.0,
                 'target_area_pct': self.target_spin.value() if target else None,
+                'max_width_px': self.width_spin.value(),
+                'close_radius_px': self.close_spin.value(),
                 'mask': self.mask,
                 'action': self.result_action}
 
