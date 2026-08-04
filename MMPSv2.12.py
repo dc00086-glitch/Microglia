@@ -882,23 +882,20 @@ def _remove_small_objects(mask, min_px):
 
 def _vessel_mask_from_response(base, thr, pixel_size_um,
                                min_object_um2=5.0, close_radius_px=2,
-                               min_object_px=None, fill_holes_px=0):
+                               fill_holes_um2=0.0):
     """Threshold a vessel response map and clean it up.
 
-    close -> fill small enclosed holes -> drop small specks. ``min_object_px``
-    overrides the µm²-based speck floor when given (pixels are what you actually
-    see when reviewing); ``fill_holes_px`` closes small interior gaps that the
-    morphological close is too small to bridge.
+    close -> fill small enclosed holes -> drop small specks. Both size limits
+    are real areas in µm², so the same setting means the same physical size on
+    images acquired at different pixel sizes.
     """
     vessels = base > thr
     if close_radius_px > 0:
         vessels = _binary_close_disk(vessels, close_radius_px)
-    if fill_holes_px:
-        vessels = _fill_small_holes(vessels, fill_holes_px)
-    if min_object_px is not None:
-        min_px = max(int(min_object_px), 1)
-    else:
-        min_px = max(int(min_object_um2 / (pixel_size_um ** 2)), 1)
+    px_area = max(float(pixel_size_um) ** 2, 1e-12)
+    if fill_holes_um2:
+        vessels = _fill_small_holes(vessels, int(fill_holes_um2 / px_area))
+    min_px = max(int(min_object_um2 / px_area), 1)
     return _remove_small_objects(vessels, min_px)
 
 
@@ -3024,8 +3021,7 @@ class VesselReviewDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
             "<b>Check the vessel outline before the leak metrics are computed.</b><br>"
-            "<i>Every BBB measure is relative to this mask. Cortical vessel area "
-            "is normally a few percent.</i>"))
+            "<i>Every BBB measure is relative to this mask.</i>"))
 
         self.preview = QLabel()
         self.preview.setAlignment(Qt.AlignCenter)
@@ -3106,18 +3102,18 @@ class VesselReviewDialog(QDialog):
         crow = QHBoxLayout()
         crow.addWidget(QLabel("Drop specks under:"))
         self.speck_spin = QSpinBox()
-        self.speck_spin.setRange(0, 5000)
+        self.speck_spin.setRange(0, 100000)
         self.speck_spin.setSingleStep(10)
         self.speck_spin.setValue(20)
-        self.speck_spin.setSuffix(" px")
+        self.speck_spin.setSuffix(" µm²")
         self.speck_spin.valueChanged.connect(self._rethreshold)
         crow.addWidget(self.speck_spin)
         crow.addWidget(QLabel("Fill holes under:"))
         self.hole_spin = QSpinBox()
-        self.hole_spin.setRange(0, 5000)
+        self.hole_spin.setRange(0, 100000)
         self.hole_spin.setSingleStep(10)
         self.hole_spin.setValue(20)
-        self.hole_spin.setSuffix(" px")
+        self.hole_spin.setSuffix(" µm²")
         self.hole_spin.valueChanged.connect(self._rethreshold)
         crow.addWidget(self.hole_spin)
         crow.addStretch()
@@ -3197,12 +3193,10 @@ class VesselReviewDialog(QDialog):
             thr = auto_thr * scale
         self.mask = _vessel_mask_from_response(
             base, thr, self.ps, close_radius_px=self.close_spin.value(),
-            min_object_px=self.speck_spin.value(),
-            fill_holes_px=self.hole_spin.value())
+            min_object_um2=self.speck_spin.value(),
+            fill_holes_um2=self.hole_spin.value())
         frac = 100.0 * float(self.mask.mean())
-        warn = "  ⚠ implausibly high" if frac > 20 else (
-            "  ⚠ nothing found" if frac < 0.05 else "")
-        self.stat_label.setText(f"Vessel area: {frac:.2f}%{warn}")
+        self.stat_label.setText(f"Vessel area: {frac:.2f}%")
         self._draw()
 
     # -- display -------------------------------------------------------
@@ -3253,8 +3247,8 @@ class VesselReviewDialog(QDialog):
                 'target_area_pct': self.target_spin.value() if target else None,
                 'max_width_px': self.width_spin.value(),
                 'close_radius_px': self.close_spin.value(),
-                'min_object_px': self.speck_spin.value(),
-                'fill_holes_px': self.hole_spin.value(),
+                'min_object_um2': self.speck_spin.value(),
+                'fill_holes_um2': self.hole_spin.value(),
                 'mask': self.mask,
                 'action': self.result_action}
 
@@ -8756,7 +8750,6 @@ if __name__ == '__main__':
                             for n in ('dextran', 'albumin')
                             if channels.get(n, -1) >= 0]
         vessel_rows, cell_rows, n_imgs = [], [], 0
-        bad_vessel_imgs = []   # images whose CD31 threshold looks implausible
         skipped_imgs = []      # images that could not be analysed, with reason
         review_vessels = bool(channels.get('review_vessels', False))
         thr_scale = 1.0        # carried forward once the user accepts settings
@@ -8846,17 +8839,6 @@ if __name__ == '__main__':
                     vessel_mask=reviewed_mask,
                     target_area_frac=(target_area_pct / 100.0
                                       if target_area_pct else None))
-                # Sanity check: cortical vessel area fraction is normally a few
-                # percent. A large value means the threshold caught background
-                # haze rather than vessels, which biases every leakage metric.
-                _vaf = vmetrics.get('vessel_area_fraction', 0.0)
-                if _vaf > 0.20:
-                    bad_vessel_imgs.append((img_base, _vaf))
-                    self.log(f"  ⚠️ {img_base}: vessel area {_vaf * 100:.0f}% — "
-                             f"implausibly high; CD31 threshold is catching "
-                             f"background, not vessels."
-                             + ("" if use_tube else " Try ticking 'Enhance "
-                                                    "vessels with tubeness'."))
                 # Save an Otsu-vs-tubeness vessel comparison so the choice is visible.
                 try:
                     prev_dir = os.path.join(out_dir, 'bbb_vessel_previews')
@@ -9061,20 +9043,6 @@ if __name__ == '__main__':
                 self, "Images skipped",
                 f"{len(skipped_imgs)} image(s) were not analysed:\n\n"
                 f"{lines}{more}\n\nCheck the CD31/tracer channel assignment.")
-        if bad_vessel_imgs:
-            worst = sorted(bad_vessel_imgs, key=lambda t: -t[1])[:10]
-            lines = "\n".join(f"  {b}: {v * 100:.0f}% vessel area" for b, v in worst)
-            more = (f"\n  ...and {len(bad_vessel_imgs) - 10} more"
-                    if len(bad_vessel_imgs) > 10 else "")
-            QMessageBox.warning(
-                self, "Check vessel segmentation",
-                f"{len(bad_vessel_imgs)} image(s) produced an implausibly large "
-                f"vessel area (cortical vasculature is normally a few percent):\n\n"
-                f"{lines}{more}\n\n"
-                f"The CD31 threshold is catching background haze rather than "
-                f"vessels, which biases every leakage metric. Compare the two "
-                f"panels in bbb_vessel_previews/ and re-run with "
-                f"'Enhance vessels with tubeness' ticked.")
 
     def _toggle_colocalization_mode(self, checked):
         """Toggle colocalization mode on/off from the Mode menu."""
