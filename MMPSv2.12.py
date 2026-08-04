@@ -8691,6 +8691,53 @@ if __name__ == '__main__':
 
         return script
 
+    def _resolve_output_dir(self, title="Analysis"):
+        """Return a writable output folder, asking the user if necessary.
+
+        Tries the configured output folder, then the folder holding the loaded
+        images, then prompts. Never falls back to os.getcwd(): a packaged macOS
+        .app runs with cwd = "/", which is read-only, so writes there fail with
+        "Read-only file system". Returns None if the user cancels.
+        """
+        def _writable(d):
+            if not d or not os.path.isdir(d):
+                return False
+            try:
+                p = os.path.join(d, '.mmps_write_test')
+                with open(p, 'w'):
+                    pass
+                os.remove(p)
+                return True
+            except Exception:
+                return False
+
+        if _writable(self.output_dir):
+            return self.output_dir
+        # Fall back to wherever the images live.
+        for idata in self.images.values():
+            rp = idata.get('raw_path')
+            if rp:
+                d = os.path.dirname(rp)
+                if _writable(d):
+                    self.output_dir = d
+                    self.log(f"Output folder not set — writing results to {d}")
+                    return d
+            break
+        # Ask.
+        QMessageBox.information(
+            self, title,
+            "Choose a folder to save the results in.\n\n"
+            "(No output folder is set, and the app's default location is not "
+            "writable.)")
+        d = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if d and _writable(d):
+            self.output_dir = d
+            return d
+        if d:
+            QMessageBox.warning(self, title,
+                                f"Cannot write to:\n{d}\n\nPick another folder.")
+        return None
+
     def _open_bbb_dialog(self):
         """Open the BBB analysis dialog; run on accept."""
         if not self.images:
@@ -8739,8 +8786,12 @@ if __name__ == '__main__':
         for every loaded image that has masks. Writes two CSVs to the output
         folder; reads only, never modifies existing data."""
         import csv as _csv
-        out_dir = self.output_dir or os.getcwd()
-        os.makedirs(out_dir, exist_ok=True)
+        # Resolve a WRITABLE output folder. A packaged .app launches with the
+        # working directory set to "/", so falling back to os.getcwd() tried to
+        # write to the read-only root volume.
+        out_dir = self._resolve_output_dir("BBB Analysis")
+        if not out_dir:
+            return
         cd31_i = channels.get('cd31', -1)
         # Named tracer list: [{'name': str, 'channel': int}, ...]. Back-compat:
         # accept the old flat dextran/albumin keys too.
