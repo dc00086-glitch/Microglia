@@ -8663,10 +8663,11 @@ if __name__ == '__main__':
         thr_scale = 1.0        # carried forward once the user accepts settings
         target_area_pct = None  # if set, the same target area rule for all images
 
-        # Process every image that has microglia defined — by generated mask OR
-        # by picked soma (so every microglia gets a leakage row, mask or not).
-        targets = [(nm, dat) for nm, dat in self.images.items()
-                   if dat.get('masks') or dat.get('somas')]
+        # Process EVERY loaded image. Vessel segmentation and tracer leakage are
+        # per-image measurements that don't need microglia — an image with no
+        # somas/masks still yields vessel + leakage rows (and still gets the
+        # manual CD31 review); it simply contributes no per-cell exposure rows.
+        targets = list(self.images.items())
         from PyQt5.QtWidgets import QProgressDialog
         progress = QProgressDialog("Running BBB analysis…", "Cancel", 0,
                                    max(len(targets), 1), self)
