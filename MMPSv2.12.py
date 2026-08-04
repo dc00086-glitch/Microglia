@@ -842,20 +842,64 @@ def _vessel_threshold_for_area(base, target_area_frac):
                                100.0 * (1.0 - f)))
 
 
+def _fill_small_holes(mask, max_hole_px):
+    """Fill enclosed background pockets of <= ``max_hole_px`` pixels.
+
+    Only holes fully surrounded by mask are filled — background components that
+    reach the image border are left alone, so the outside is never flooded.
+    """
+    if max_hole_px <= 0:
+        return mask
+    m = np.asarray(mask) > 0
+    inv = (~m).astype(np.uint8)
+    lab, n = ndimage.label(inv)
+    if n == 0:
+        return m
+    sizes = np.bincount(lab.ravel())
+    border = np.unique(np.concatenate([lab[0, :], lab[-1, :],
+                                       lab[:, 0], lab[:, -1]]))
+    small = np.flatnonzero(sizes <= int(max_hole_px))
+    small = small[small != 0]
+    fillable = np.setdiff1d(small, border)
+    if fillable.size:
+        m = m | np.isin(lab, fillable)
+    return m
+
+
+def _remove_small_objects(mask, min_px):
+    """Drop connected components smaller than ``min_px`` pixels."""
+    if min_px <= 1:
+        return np.asarray(mask) > 0
+    m = np.asarray(mask) > 0
+    lab, n = ndimage.label(m)
+    if not n:
+        return m
+    sizes = np.bincount(lab.ravel())
+    keep = np.where(sizes >= int(min_px))[0]
+    keep = keep[keep != 0]
+    return np.isin(lab, keep)
+
+
 def _vessel_mask_from_response(base, thr, pixel_size_um,
-                               min_object_um2=5.0, close_radius_px=2):
-    """Threshold a vessel response map and clean it up (close + despeckle)."""
+                               min_object_um2=5.0, close_radius_px=2,
+                               min_object_px=None, fill_holes_px=0):
+    """Threshold a vessel response map and clean it up.
+
+    close -> fill small enclosed holes -> drop small specks. ``min_object_px``
+    overrides the µm²-based speck floor when given (pixels are what you actually
+    see when reviewing); ``fill_holes_px`` closes small interior gaps that the
+    morphological close is too small to bridge.
+    """
     vessels = base > thr
     if close_radius_px > 0:
         vessels = _binary_close_disk(vessels, close_radius_px)
-    min_px = max(int(min_object_um2 / (pixel_size_um ** 2)), 1)
-    lab, n = ndimage.label(vessels)
-    if n:
-        sizes = np.bincount(lab.ravel())
-        keep = np.where(sizes >= min_px)[0]
-        keep = keep[keep != 0]
-        vessels = np.isin(lab, keep)
-    return vessels
+    if fill_holes_px:
+        vessels = _fill_small_holes(vessels, fill_holes_px)
+    if min_object_px is not None:
+        min_px = max(int(min_object_px), 1)
+    else:
+        min_px = max(int(min_object_um2 / (pixel_size_um ** 2)), 1)
+    return _remove_small_objects(vessels, min_px)
 
 
 def _vessel_binary(cd31, pixel_size_um, use_tubeness=False,
@@ -3059,6 +3103,26 @@ class VesselReviewDialog(QDialog):
         grow.addStretch()
         layout.addLayout(grow)
 
+        crow = QHBoxLayout()
+        crow.addWidget(QLabel("Drop specks under:"))
+        self.speck_spin = QSpinBox()
+        self.speck_spin.setRange(0, 5000)
+        self.speck_spin.setSingleStep(10)
+        self.speck_spin.setValue(20)
+        self.speck_spin.setSuffix(" px")
+        self.speck_spin.valueChanged.connect(self._rethreshold)
+        crow.addWidget(self.speck_spin)
+        crow.addWidget(QLabel("Fill holes under:"))
+        self.hole_spin = QSpinBox()
+        self.hole_spin.setRange(0, 5000)
+        self.hole_spin.setSingleStep(10)
+        self.hole_spin.setValue(20)
+        self.hole_spin.setSuffix(" px")
+        self.hole_spin.valueChanged.connect(self._rethreshold)
+        crow.addWidget(self.hole_spin)
+        crow.addStretch()
+        layout.addLayout(crow)
+
         # --- display scaling (does not affect the mask) -------------------
         drow = QHBoxLayout()
         drow.addWidget(QLabel("Display scale:"))
@@ -3132,7 +3196,9 @@ class VesselReviewDialog(QDialog):
         else:
             thr = auto_thr * scale
         self.mask = _vessel_mask_from_response(
-            base, thr, self.ps, close_radius_px=self.close_spin.value())
+            base, thr, self.ps, close_radius_px=self.close_spin.value(),
+            min_object_px=self.speck_spin.value(),
+            fill_holes_px=self.hole_spin.value())
         frac = 100.0 * float(self.mask.mean())
         warn = "  ⚠ implausibly high" if frac > 20 else (
             "  ⚠ nothing found" if frac < 0.05 else "")
@@ -3187,6 +3253,8 @@ class VesselReviewDialog(QDialog):
                 'target_area_pct': self.target_spin.value() if target else None,
                 'max_width_px': self.width_spin.value(),
                 'close_radius_px': self.close_spin.value(),
+                'min_object_px': self.speck_spin.value(),
+                'fill_holes_px': self.hole_spin.value(),
                 'mask': self.mask,
                 'action': self.result_action}
 
