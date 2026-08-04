@@ -1120,7 +1120,8 @@ def _load_bbb_image(path):
     return arr
 
 
-def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None):
+def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None,
+                      vmax_map=None):
     """Save, per tracer, a readable leak map.
 
     Each panel shows one tracer's intensity as a heatmap WITH a colorbar (so the
@@ -1140,7 +1141,10 @@ def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None):
                              squeeze=False)
     for ax, name in zip(axes[0], names):
         t = np.asarray(tracers.get(name), dtype=np.float64)
-        vmax = float(np.percentile(t, 99)) if t.size else 1.0
+        # Shared scale across images when supplied, so overlays are comparable.
+        vmax = (vmax_map or {}).get(name)
+        if not vmax:
+            vmax = float(np.percentile(t, 99)) if t.size else 1.0
         im = ax.imshow(t, cmap='inferno', vmin=0.0,
                        vmax=vmax if vmax > 0 else 1.0)
         # Vessel lumen as a translucent fill so intra- vs extravascular is clear.
@@ -8806,11 +8810,51 @@ if __name__ == '__main__':
         thr_scale = 1.0        # carried forward once the user accepts settings
         target_area_pct = None  # if set, the same target area rule for all images
 
-        # Process EVERY loaded image. Vessel segmentation and tracer leakage are
+        # Only the ticked images. Vessel segmentation and tracer leakage are
         # per-image measurements that don't need microglia — an image with no
         # somas/masks still yields vessel + leakage rows (and still gets the
         # manual CD31 review); it simply contributes no per-cell exposure rows.
-        targets = list(self.images.items())
+        targets = [(nm, d) for nm, d in self.images.items() if d.get('selected')]
+        if not targets:
+            QMessageBox.warning(
+                self, "BBB Analysis",
+                "No images are selected.\n\nTick the images you want to "
+                "analyse in the file list, then run BBB again.")
+            return
+
+        # One display scale for every overlay, set by the brightest image, so
+        # leak maps can be compared between images by eye. Uses each image's
+        # 99th percentile (robust to hot pixels) and keeps the largest.
+        overlay_vmax = {}
+        progress0 = QProgressDialog("Scaling tracers across images…", "Cancel",
+                                    0, max(len(targets), 1), self)
+        progress0.setWindowTitle("BBB Analysis")
+        progress0.setWindowModality(Qt.WindowModal)
+        progress0.setMinimumDuration(0)
+        for _i, (nm, dat) in enumerate(targets):
+            if progress0.wasCanceled():
+                break
+            progress0.setValue(_i)
+            QApplication.processEvents()
+            try:
+                rp = dat.get('raw_path')
+                col = _load_bbb_image(rp) if (rp and os.path.exists(rp)) else None
+                if col is None or getattr(col, 'ndim', 0) != 3:
+                    col = dat.get('color_image')
+                if col is None or getattr(col, 'ndim', 0) != 3:
+                    continue
+                for spec in tracer_specs:
+                    ti = spec.get('channel', -1)
+                    tname = spec.get('name') or 'tracer'
+                    if 0 <= ti < col.shape[2]:
+                        v = float(np.percentile(col[:, :, ti].astype(np.float64), 99))
+                        overlay_vmax[tname] = max(overlay_vmax.get(tname, 0.0), v)
+            except Exception:
+                continue
+        progress0.close()
+        if overlay_vmax:
+            self.log("BBB: shared overlay scale — "
+                     + ", ".join(f"{k} 0–{v:.0f}" for k, v in overlay_vmax.items()))
         from PyQt5.QtWidgets import QProgressDialog
         progress = QProgressDialog("Running BBB analysis…", "Cancel", 0,
                                    max(len(targets), 1), self)
@@ -9026,7 +9070,8 @@ if __name__ == '__main__':
                         _save_bbb_overlay(
                             os.path.join(ov_dir, img_base + '_bbb.png'),
                             vessel_mask, tracers,
-                            cell_masks=list(soma_masks.values()))
+                            cell_masks=list(soma_masks.values()),
+                            vmax_map=overlay_vmax)
                     except Exception as e:
                         self.log(f"BBB: overlay failed for {img_name}: {e}")
                 n_imgs += 1
