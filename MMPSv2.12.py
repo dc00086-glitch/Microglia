@@ -3011,7 +3011,8 @@ class VesselReviewDialog(QDialog):
     """
 
     def __init__(self, parent, cd31, pixel_size_um, img_name,
-                 use_tubeness=True, thr_scale=1.0, target_area_pct=None):
+                 use_tubeness=True, thr_scale=1.0, target_area_pct=None,
+                 color_img=None, disp_channels=None):
         super().__init__(parent)
         from PyQt5.QtWidgets import QSlider as _QS
         self.setWindowTitle(f"Review vessel segmentation — {img_name}")
@@ -3021,6 +3022,12 @@ class VesselReviewDialog(QDialog):
         self.result_action = 'skip'
         self._cache = {}          # use_tubeness -> (response, otsu_thr)
         self.mask = None
+        # Optional colour context: the full (H,W,C) image plus {channel: (r,g,b)}
+        # for the endothelial / tracer / microglia channels, so the outline is
+        # judged against the same colours as the main display.
+        self.color_img = color_img if (
+            color_img is not None and getattr(color_img, 'ndim', 0) == 3) else None
+        self.disp_channels = disp_channels or {}
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
@@ -3052,9 +3059,9 @@ class VesselReviewDialog(QDialog):
         layout.addLayout(mrow)
 
         srow = QHBoxLayout()
-        srow.addWidget(QLabel("Sensitivity:"))
+        srow.addWidget(QLabel("Brightness:"))
         self.thr_slider = _QS(Qt.Horizontal)
-        self.thr_slider.setRange(20, 300)          # 0.20x .. 3.00x the auto threshold
+        self.thr_slider.setRange(0, 200)           # 0.00x .. 2.00x the auto threshold
         self.thr_slider.setValue(int(round(float(thr_scale) * 100)))
         self.thr_slider.setTickPosition(_QS.TicksBelow)
         self.thr_slider.setTickInterval(20)
@@ -3088,7 +3095,7 @@ class VesselReviewDialog(QDialog):
         grow.addWidget(QLabel("Widest vessel:"))
         self.width_spin = QSpinBox()
         self.width_spin.setRange(2, 60)
-        self.width_spin.setValue(12)
+        self.width_spin.setValue(20)
         self.width_spin.setSuffix(" px")
         self.width_spin.valueChanged.connect(self._width_changed)
         grow.addWidget(self.width_spin)
@@ -3116,7 +3123,7 @@ class VesselReviewDialog(QDialog):
         self.hole_spin = QSpinBox()
         self.hole_spin.setRange(0, 100000)
         self.hole_spin.setSingleStep(10)
-        self.hole_spin.setValue(20)
+        self.hole_spin.setValue(100)
         self.hole_spin.setSuffix(" µm²")
         self.hole_spin.valueChanged.connect(self._rethreshold)
         crow.addWidget(self.hole_spin)
@@ -3214,16 +3221,35 @@ class VesselReviewDialog(QDialog):
         # display slider, so cache the greyscale base and rebuild it only when
         # that slider actually moves (not on every threshold change).
         if getattr(self, '_base_rgb_key', None) != up:
-            lo = getattr(self, '_disp_lo', None)
-            if lo is None:
-                lo = float(np.percentile(img, 1))
-                self._disp_lo = lo
-            hi = float(np.percentile(img, up))
-            if hi <= lo:
-                hi = lo + 1.0
-            g = np.clip((img - lo) / (hi - lo), 0, 1)
-            self._base_rgb = np.repeat(
-                (g * 255).astype(np.uint8)[:, :, None], 3, axis=2)
+            if self.color_img is not None and self.disp_channels:
+                # Additive colour composite of the assigned channels (CD31,
+                # tracers, microglia), each scaled to its own display range.
+                h0, w0 = self.color_img.shape[:2]
+                acc = np.zeros((h0, w0, 3), dtype=np.float32)
+                for ci, col in self.disp_channels.items():
+                    if not (0 <= ci < self.color_img.shape[2]):
+                        continue
+                    ch = self.color_img[:, :, ci].astype(np.float64)
+                    clo = float(np.percentile(ch, 1))
+                    chi = float(np.percentile(ch, up))
+                    if chi <= clo:
+                        chi = clo + 1.0
+                    gch = np.clip((ch - clo) / (chi - clo), 0, 1).astype(np.float32)
+                    for k in range(3):
+                        if col[k]:
+                            acc[:, :, k] += gch * (col[k] / 255.0)
+                self._base_rgb = (np.clip(acc, 0, 1) * 255).astype(np.uint8)
+            else:
+                lo = getattr(self, '_disp_lo', None)
+                if lo is None:
+                    lo = float(np.percentile(img, 1))
+                    self._disp_lo = lo
+                hi = float(np.percentile(img, up))
+                if hi <= lo:
+                    hi = lo + 1.0
+                g = np.clip((img - lo) / (hi - lo), 0, 1)
+                self._base_rgb = np.repeat(
+                    (g * 255).astype(np.uint8)[:, :, None], 3, axis=2)
             self._base_rgb_key = up
         rgb = self._base_rgb.copy()
         # outline the mask in cyan (cheap morphological gradient)
@@ -8907,10 +8933,21 @@ if __name__ == '__main__':
                 # accepted settings for all remaining images (or opted out).
                 if review_vessels:
                     progress.hide()
+                    # Colour context: endothelial (CD31), every assigned tracer
+                    # and the microglia channel, in their display colours.
+                    disp_ch = {}
+                    for _ci in ([cd31_i]
+                                + [sp.get('channel', -1) for sp in tracer_specs]
+                                + [channels.get('iba1', -1)]):
+                        if 0 <= _ci < nch and _ci not in disp_ch:
+                            disp_ch[_ci] = (self.channel_colors.get(_ci)
+                                            or _default_channel_color(_ci, nch))
                     dlg = VesselReviewDialog(self, cd31, ps, img_base,
                                              use_tubeness=use_tube,
                                              thr_scale=thr_scale,
-                                             target_area_pct=target_area_pct)
+                                             target_area_pct=target_area_pct,
+                                             color_img=color,
+                                             disp_channels=disp_ch)
                     dlg.exec_()
                     st = dlg.settings()
                     progress.show()
