@@ -3047,6 +3047,8 @@ class VesselReviewDialog(QDialog):
 
         # --- thresholding mode -------------------------------------------
         from PyQt5.QtWidgets import QComboBox, QDoubleSpinBox
+        layout.addWidget(QLabel("<b>Mask settings</b> "
+                                "<i>(these change the vessel mask)</i>"))
         mrow = QHBoxLayout()
         mrow.addWidget(QLabel("Threshold rule:"))
         self.mode_combo = QComboBox()
@@ -3059,7 +3061,7 @@ class VesselReviewDialog(QDialog):
         layout.addLayout(mrow)
 
         srow = QHBoxLayout()
-        srow.addWidget(QLabel("Brightness:"))
+        srow.addWidget(QLabel("Min intensity:"))
         self.thr_slider = _QS(Qt.Horizontal)
         self.thr_slider.setRange(0, 200)           # 0.00x .. 2.00x the auto threshold
         self.thr_slider.setValue(int(round(float(thr_scale) * 100)))
@@ -3130,9 +3132,13 @@ class VesselReviewDialog(QDialog):
         crow.addStretch()
         layout.addLayout(crow)
 
-        # --- display scaling (does not affect the mask) -------------------
+        # --- display only (never touches the mask) ------------------------
+        disp_group = QGroupBox("Display Adjustments (Visual Only)")
+        disp_layout = QVBoxLayout()
+        disp_layout.addWidget(QLabel(
+            "<i>These adjustments do NOT affect the mask or any measurement</i>"))
         drow = QHBoxLayout()
-        drow.addWidget(QLabel("Display scale:"))
+        drow.addWidget(QLabel("Brightness:"))
         self.disp_slider = _QS(Qt.Horizontal)
         self.disp_slider.setRange(50, 100)   # upper display percentile x10 -> 5.0..10.0
         self.disp_slider.setValue(99)
@@ -3141,10 +3147,9 @@ class VesselReviewDialog(QDialog):
         self.disp_label = QLabel("99.0%")
         self.disp_label.setFixedWidth(52)
         drow.addWidget(self.disp_label)
-        layout.addLayout(drow)
-        layout.addWidget(QLabel(
-            "<i>Brightness of the preview only — has no effect on the mask or "
-            "any measurement.</i>"))
+        disp_layout.addLayout(drow)
+        disp_group.setLayout(disp_layout)
+        layout.addWidget(disp_group)
 
         self.stat_label = QLabel("")
         self.stat_label.setStyleSheet("font-weight: bold;")
