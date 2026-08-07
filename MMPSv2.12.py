@@ -8872,12 +8872,15 @@ if __name__ == '__main__':
 
         from PyQt5.QtWidgets import QProgressDialog
 
-        # One display scale for every overlay, set by the brightest image, so
-        # leak maps can be compared between images by eye. Uses each image's
-        # 99th percentile (robust to hot pixels) and keeps the largest.
+        # Measure ONE display range for the overlay PNGs, set by the brightest
+        # image, so leak maps can be compared between images by eye. This only
+        # decides the colour-mapping limits used when drawing; the tracer arrays
+        # are read, never modified, and every CSV value comes from raw
+        # intensities. Uses each image's 99th percentile (robust to hot pixels).
         overlay_vmax = {}
-        progress0 = QProgressDialog("Scaling tracers across images…", "Cancel",
-                                    0, max(len(targets), 1), self)
+        progress0 = QProgressDialog(
+            "Measuring overlay display range (visual only)…", "Cancel",
+            0, max(len(targets), 1), self)
         progress0.setWindowTitle("BBB Analysis")
         progress0.setWindowModality(Qt.WindowModal)
         progress0.setMinimumDuration(0)
@@ -8903,7 +8906,8 @@ if __name__ == '__main__':
                 continue
         progress0.close()
         if overlay_vmax:
-            self.log("BBB: shared overlay scale — "
+            self.log("BBB: overlay display range (visual only; tracer values "
+                     "are not modified) — "
                      + ", ".join(f"{k} 0–{v:.0f}" for k, v in overlay_vmax.items()))
         progress = QProgressDialog("Running BBB analysis…", "Cancel", 0,
                                    max(len(targets), 1), self)
