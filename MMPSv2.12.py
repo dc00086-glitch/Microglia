@@ -781,8 +781,15 @@ def _sigmas_for_width(max_width_px):
     at their edges; too large and thin vessels are smeared into the background.
     """
     hi = max(1.0, float(max_width_px) / 2.0)
-    n = max(3, int(round(hi)))
-    return tuple(sorted({round(float(s), 2) for s in np.linspace(1.0, hi, n)}))
+    if hi <= 1.0:
+        return (1.0,)
+    # Log spacing with a bounded count: Sato cost scales with the number of
+    # scales, and vessel response varies with the ratio of sigmas rather than
+    # their difference, so ~6 geometric steps cover 1..hi as well as dozens of
+    # linear ones would (width 100 px would otherwise mean 50 convolutions).
+    n = int(min(6, max(3, round(np.log2(hi) * 2) + 1)))
+    return tuple(sorted({round(float(s), 2)
+                         for s in np.geomspace(1.0, hi, n)}))
 
 
 def _vessel_response(cd31, use_tubeness=False, sigmas=_VESSEL_TUBENESS_SIGMAS):
@@ -842,28 +849,6 @@ def _vessel_threshold_for_area(base, target_area_frac):
                                100.0 * (1.0 - f)))
 
 
-def _fill_small_holes(mask, max_hole_px):
-    """Fill enclosed background pockets of <= ``max_hole_px`` pixels.
-
-    Only holes fully surrounded by mask are filled — background components that
-    reach the image border are left alone, so the outside is never flooded.
-    """
-    if max_hole_px <= 0:
-        return mask
-    m = np.asarray(mask) > 0
-    inv = (~m).astype(np.uint8)
-    lab, n = ndimage.label(inv)
-    if n == 0:
-        return m
-    sizes = np.bincount(lab.ravel())
-    border = np.unique(np.concatenate([lab[0, :], lab[-1, :],
-                                       lab[:, 0], lab[:, -1]]))
-    small = np.flatnonzero(sizes <= int(max_hole_px))
-    small = small[small != 0]
-    fillable = np.setdiff1d(small, border)
-    if fillable.size:
-        m = m | np.isin(lab, fillable)
-    return m
 
 
 def _remove_small_objects(mask, min_px):
@@ -881,20 +866,17 @@ def _remove_small_objects(mask, min_px):
 
 
 def _vessel_mask_from_response(base, thr, pixel_size_um,
-                               min_object_um2=5.0, close_radius_px=2,
-                               fill_holes_um2=0.0):
+                               min_object_um2=5.0, close_radius_px=2):
     """Threshold a vessel response map and clean it up.
 
-    close -> fill small enclosed holes -> drop small specks. Both size limits
-    are real areas in µm², so the same setting means the same physical size on
-    images acquired at different pixel sizes.
+    close (bridges gaps, including small enclosed ones) -> drop small specks.
+    ``min_object_um2`` is a real area in µm², so the same setting means the same
+    physical size on images acquired at different pixel sizes.
     """
     vessels = base > thr
     if close_radius_px > 0:
         vessels = _binary_close_disk(vessels, close_radius_px)
     px_area = max(float(pixel_size_um) ** 2, 1e-12)
-    if fill_holes_um2:
-        vessels = _fill_small_holes(vessels, int(fill_holes_um2 / px_area))
     min_px = max(int(min_object_um2 / px_area), 1)
     return _remove_small_objects(vessels, min_px)
 
@@ -3096,8 +3078,8 @@ class VesselReviewDialog(QDialog):
         grow = QHBoxLayout()
         grow.addWidget(QLabel("Widest vessel:"))
         self.width_spin = QSpinBox()
-        self.width_spin.setRange(2, 60)
-        self.width_spin.setValue(20)
+        self.width_spin.setRange(2, 400)
+        self.width_spin.setValue(100)
         self.width_spin.setSuffix(" px")
         self.width_spin.valueChanged.connect(self._width_changed)
         grow.addWidget(self.width_spin)
@@ -3121,14 +3103,6 @@ class VesselReviewDialog(QDialog):
         self.speck_spin.setSuffix(" µm²")
         self.speck_spin.valueChanged.connect(self._rethreshold)
         crow.addWidget(self.speck_spin)
-        crow.addWidget(QLabel("Fill holes under:"))
-        self.hole_spin = QSpinBox()
-        self.hole_spin.setRange(0, 100000)
-        self.hole_spin.setSingleStep(10)
-        self.hole_spin.setValue(100)
-        self.hole_spin.setSuffix(" µm²")
-        self.hole_spin.valueChanged.connect(self._rethreshold)
-        crow.addWidget(self.hole_spin)
         crow.addStretch()
         layout.addLayout(crow)
 
@@ -3148,6 +3122,38 @@ class VesselReviewDialog(QDialog):
         self.disp_label.setFixedWidth(52)
         drow.addWidget(self.disp_label)
         disp_layout.addLayout(drow)
+
+        # Per-channel visibility + intensity, so e.g. the tracer can be dimmed
+        # or switched off to judge the CD31 outline. Visual only.
+        self.ch_enabled = {}
+        self.ch_gain = {}
+        for ci in sorted(self.disp_channels):
+            col = self.disp_channels[ci]
+            row = QHBoxLayout()
+            cb = QCheckBox(f"Ch {ci + 1}")
+            cb.setChecked(True)
+            cb.toggled.connect(self._redraw_base)
+            row.addWidget(cb)
+            swatch = QLabel("  ")
+            swatch.setFixedWidth(22)
+            swatch.setStyleSheet(
+                f"background-color: rgb({col[0]},{col[1]},{col[2]});"
+                f" border: 1px solid #888;")
+            row.addWidget(swatch)
+            sl = _QS(Qt.Horizontal)
+            sl.setRange(0, 300)          # 0 - 3.00x intensity
+            sl.setValue(100)
+            sl.valueChanged.connect(self._redraw_base)
+            row.addWidget(sl)
+            val = QLabel("1.00x")
+            val.setFixedWidth(46)
+            row.addWidget(val)
+            sl.valueChanged.connect(
+                lambda v, lb=val: lb.setText(f"{v / 100.0:.2f}x"))
+            disp_layout.addLayout(row)
+            self.ch_enabled[ci] = cb
+            self.ch_gain[ci] = sl
+
         disp_group.setLayout(disp_layout)
         layout.addWidget(disp_group)
 
@@ -3171,6 +3177,11 @@ class VesselReviewDialog(QDialog):
         self._mode_changed()      # sets row visibility and does the first draw
 
     # -- computation ---------------------------------------------------
+    def _redraw_base(self, *_a):
+        """Channel visibility/intensity changed — rebuild the composite only."""
+        self._base_rgb_key = None
+        self._draw()
+
     def _sigmas(self):
         return _sigmas_for_width(self.width_spin.value())
 
@@ -3209,8 +3220,7 @@ class VesselReviewDialog(QDialog):
             thr = auto_thr * scale
         self.mask = _vessel_mask_from_response(
             base, thr, self.ps, close_radius_px=self.close_spin.value(),
-            min_object_um2=self.speck_spin.value(),
-            fill_holes_um2=self.hole_spin.value())
+            min_object_um2=self.speck_spin.value())
         frac = 100.0 * float(self.mask.mean())
         self.stat_label.setText(f"Vessel area: {frac:.2f}%")
         self._draw()
@@ -3234,12 +3244,20 @@ class VesselReviewDialog(QDialog):
                 for ci, col in self.disp_channels.items():
                     if not (0 <= ci < self.color_img.shape[2]):
                         continue
+                    cb = self.ch_enabled.get(ci)
+                    if cb is not None and not cb.isChecked():
+                        continue                     # channel switched off
+                    sl = self.ch_gain.get(ci)
+                    gain = (sl.value() / 100.0) if sl is not None else 1.0
+                    if gain <= 0:
+                        continue
                     ch = self.color_img[:, :, ci].astype(np.float64)
                     clo = float(np.percentile(ch, 1))
                     chi = float(np.percentile(ch, up))
                     if chi <= clo:
                         chi = clo + 1.0
                     gch = np.clip((ch - clo) / (chi - clo), 0, 1).astype(np.float32)
+                    gch = gch * gain
                     for k in range(3):
                         if col[k]:
                             acc[:, :, k] += gch * (col[k] / 255.0)
@@ -3283,7 +3301,6 @@ class VesselReviewDialog(QDialog):
                 'max_width_px': self.width_spin.value(),
                 'close_radius_px': self.close_spin.value(),
                 'min_object_um2': self.speck_spin.value(),
-                'fill_holes_um2': self.hole_spin.value(),
                 'mask': self.mask,
                 'action': self.result_action}
 
@@ -8953,10 +8970,20 @@ if __name__ == '__main__':
                                              target_area_pct=target_area_pct,
                                              color_img=color,
                                              disp_channels=disp_ch)
-                    dlg.exec_()
+                    accepted = dlg.exec_() == QDialog.Accepted
                     st = dlg.settings()
                     progress.show()
                     QApplication.processEvents()
+                    # Closing the window (red X / Esc) aborts the whole run,
+                    # rather than quietly skipping just this image.
+                    if not accepted:
+                        self.log("BBB analysis cancelled — vessel review window "
+                                 "was closed.")
+                        progress.close()
+                        QMessageBox.information(
+                            self, "BBB Analysis",
+                            "BBB analysis cancelled.\n\nNo results were written.")
+                        return
                     if st['action'] == 'skip':
                         self.log(f"BBB: skipped {img_base} (vessel review)")
                         continue
