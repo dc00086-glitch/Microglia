@@ -2980,6 +2980,51 @@ class GrayscaleChannelDialog(QDialog):
         return ch1, ch2
 
 
+class _PaintableLabel(QLabel):
+    """QLabel that reports painted strokes back in IMAGE pixel coordinates.
+
+    The preview is drawn scaled and centred, so widget coordinates are mapped
+    through the displayed rectangle before being handed to the owner.
+    """
+
+    def __init__(self, owner):
+        super().__init__()
+        self._owner = owner
+        self._drawing = False
+        self.img_shape = None      # (H, W) of the array being displayed
+        self.disp_rect = None      # (x0, y0, w, h) of the pixmap inside the label
+
+    def _to_image(self, pos):
+        if not self.img_shape or not self.disp_rect:
+            return None
+        x0, y0, dw, dh = self.disp_rect
+        if dw <= 0 or dh <= 0:
+            return None
+        fx = (pos.x() - x0) / float(dw)
+        fy = (pos.y() - y0) / float(dh)
+        if not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
+            return None
+        h, w = self.img_shape
+        return int(fy * (h - 1)), int(fx * (w - 1))
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self._drawing = True
+            p = self._to_image(ev.pos())
+            if p:
+                self._owner.paint_at(*p)
+
+    def mouseMoveEvent(self, ev):
+        if self._drawing:
+            p = self._to_image(ev.pos())
+            if p:
+                self._owner.paint_at(*p)
+
+    def mouseReleaseEvent(self, ev):
+        self._drawing = False
+        self._owner.paint_finished()
+
+
 class VesselReviewDialog(QDialog):
     """Manually review / tune the CD31 vessel segmentation for one image.
 
@@ -3016,11 +3061,16 @@ class VesselReviewDialog(QDialog):
             "<b>Check the vessel outline before the leak metrics are computed.</b><br>"
             "<i>Every BBB measure is relative to this mask.</i>"))
 
-        self.preview = QLabel()
+        self.preview = _PaintableLabel(self)
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumSize(560, 420)
         self.preview.setStyleSheet("border: 1px solid #666;")
+        self.preview.img_shape = self.cd31.shape[:2]
         layout.addWidget(self.preview)
+
+        # Hand-drawn marks: where the user says vessels are (or aren't).
+        self.marks = np.zeros(self.cd31.shape[:2], dtype=bool)
+        self.erase_marks = np.zeros(self.cd31.shape[:2], dtype=bool)
 
         self.tube_check = QCheckBox("Enhance vessels with tubeness (Sato)")
         self.tube_check.setChecked(bool(use_tubeness))
@@ -3106,6 +3156,32 @@ class VesselReviewDialog(QDialog):
         crow.addStretch()
         layout.addLayout(crow)
 
+        # --- draw on the image to guide the segmentation ------------------
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("Draw:"))
+        self.draw_combo = QComboBox()
+        self.draw_combo.addItem("Off", "off")
+        self.draw_combo.addItem("Mark vessel (include)", "mark")
+        self.draw_combo.addItem("Erase (exclude)", "erase")
+        prow.addWidget(self.draw_combo)
+        prow.addWidget(QLabel("Brush:"))
+        self.brush_spin = QSpinBox()
+        self.brush_spin.setRange(1, 100)
+        self.brush_spin.setValue(12)
+        self.brush_spin.setSuffix(" px")
+        prow.addWidget(self.brush_spin)
+        self.only_marked_check = QCheckBox("Keep only marked vessels")
+        self.only_marked_check.setToolTip(
+            "Discard every structure you did not mark. Draw a stroke along each "
+            "vessel you want, then tick this to drop all the rest.")
+        self.only_marked_check.toggled.connect(self._rethreshold)
+        prow.addWidget(self.only_marked_check)
+        clear_btn = QPushButton("Clear marks")
+        clear_btn.clicked.connect(self._clear_marks)
+        prow.addWidget(clear_btn)
+        prow.addStretch()
+        layout.addLayout(prow)
+
         # --- display only (never touches the mask) ------------------------
         disp_group = QGroupBox("Display Adjustments (Visual Only)")
         disp_layout = QVBoxLayout()
@@ -3177,6 +3253,50 @@ class VesselReviewDialog(QDialog):
         self._mode_changed()      # sets row visibility and does the first draw
 
     # -- computation ---------------------------------------------------
+    # -- drawing -------------------------------------------------------
+    def paint_at(self, r, c):
+        """Stamp the brush at image pixel (r, c) into the active mark layer."""
+        mode = self.draw_combo.currentData()
+        if mode == 'off':
+            return
+        target = self.marks if mode == 'mark' else self.erase_marks
+        rad = int(self.brush_spin.value())
+        h, w = target.shape
+        r0, r1 = max(r - rad, 0), min(r + rad + 1, h)
+        c0, c1 = max(c - rad, 0), min(c + rad + 1, w)
+        if r1 <= r0 or c1 <= c0:
+            return
+        yy, xx = np.ogrid[r0:r1, c0:c1]
+        target[r0:r1, c0:c1] |= ((yy - r) ** 2 + (xx - c) ** 2) <= rad * rad
+        # the other layer gives way, so re-marking undoes an erase and vice versa
+        other = self.erase_marks if mode == 'mark' else self.marks
+        other[r0:r1, c0:c1] &= ~(((yy - r) ** 2 + (xx - c) ** 2) <= rad * rad)
+        self._rethreshold()
+
+    def paint_finished(self):
+        pass
+
+    def _clear_marks(self):
+        self.marks[:] = False
+        self.erase_marks[:] = False
+        self._rethreshold()
+
+    def _apply_marks(self, mask):
+        """Fold hand-drawn marks into a computed mask."""
+        m = np.asarray(mask) > 0
+        if self.only_marked_check.isChecked() and np.any(self.marks):
+            # keep only structures the user actually drew on
+            lab, n = ndimage.label(m)
+            if n:
+                keep = np.unique(lab[self.marks & m])
+                keep = keep[keep != 0]
+                m = np.isin(lab, keep) if keep.size else np.zeros_like(m)
+        if np.any(self.marks):
+            m = m | self.marks          # a marked vessel is always included
+        if np.any(self.erase_marks):
+            m = m & ~self.erase_marks   # erased areas always excluded
+        return m
+
     def _redraw_base(self, *_a):
         """Channel visibility/intensity changed — rebuild the composite only."""
         self._base_rgb_key = None
@@ -3221,6 +3341,7 @@ class VesselReviewDialog(QDialog):
         self.mask = _vessel_mask_from_response(
             base, thr, self.ps, close_radius_px=self.close_spin.value(),
             min_object_um2=self.speck_spin.value())
+        self.mask = self._apply_marks(self.mask)
         frac = 100.0 * float(self.mask.mean())
         self.stat_label.setText(f"Vessel area: {frac:.2f}%")
         self._draw()
@@ -3298,6 +3419,13 @@ class VesselReviewDialog(QDialog):
                     (g * 255).astype(np.uint8)[:, :, None], 3, axis=2)
             self._base_rgb_key = up
         rgb = self._base_rgb.copy()
+        # show hand-drawn marks faintly so it's clear what has been drawn
+        if np.any(self.marks):
+            rgb[self.marks] = (rgb[self.marks] * 0.55
+                               + np.array([255, 255, 0]) * 0.45).astype(np.uint8)
+        if np.any(self.erase_marks):
+            rgb[self.erase_marks] = (rgb[self.erase_marks] * 0.55
+                                     + np.array([255, 40, 40]) * 0.45).astype(np.uint8)
         # outline the mask in cyan (cheap morphological gradient)
         if self.mask is not None and np.any(self.mask):
             m = self.mask.astype(np.uint8)
@@ -3310,6 +3438,13 @@ class VesselReviewDialog(QDialog):
         pm = QPixmap.fromImage(qimg).scaled(
             self.preview.width(), self.preview.height(),
             Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # Where the scaled pixmap sits inside the (centred) label, so painted
+        # points can be mapped back to image pixels.
+        self.preview.img_shape = (h, w)
+        self.preview.disp_rect = (
+            (self.preview.width() - pm.width()) // 2,
+            (self.preview.height() - pm.height()) // 2,
+            pm.width(), pm.height())
         self.preview.setPixmap(pm)
 
     def _finish(self, action):
