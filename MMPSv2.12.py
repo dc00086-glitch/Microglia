@@ -3238,29 +3238,52 @@ class VesselReviewDialog(QDialog):
         if getattr(self, '_base_rgb_key', None) != up:
             if self.color_img is not None and self.disp_channels:
                 # Additive colour composite of the assigned channels (CD31,
-                # tracers, microglia), each scaled to its own display range.
+                # tracers, microglia). All channels share ONE intensity scale.
+                # Stretching each channel to its own percentile range makes a
+                # nearly-empty channel divide by a tiny number, which blows its
+                # noise floor up to full brightness — a sparse tracer channel
+                # would light up as a bright haze the moment it was switched on,
+                # and its appearance would shift when other settings changed.
+                # A shared scale keeps relative brightness honest: a dim channel
+                # looks dim, and its per-channel slider is there to lift it.
                 h0, w0 = self.color_img.shape[:2]
                 acc = np.zeros((h0, w0, 3), dtype=np.float32)
-                for ci, col in self.disp_channels.items():
+                shown = []
+                for ci in self.disp_channels:
                     if not (0 <= ci < self.color_img.shape[2]):
                         continue
                     cb = self.ch_enabled.get(ci)
                     if cb is not None and not cb.isChecked():
-                        continue                     # channel switched off
+                        continue
                     sl = self.ch_gain.get(ci)
                     gain = (sl.value() / 100.0) if sl is not None else 1.0
                     if gain <= 0:
                         continue
-                    ch = self.color_img[:, :, ci].astype(np.float64)
-                    clo = float(np.percentile(ch, 1))
-                    chi = float(np.percentile(ch, up))
-                    if chi <= clo:
-                        chi = clo + 1.0
-                    gch = np.clip((ch - clo) / (chi - clo), 0, 1).astype(np.float32)
-                    gch = gch * gain
-                    for k in range(3):
-                        if col[k]:
-                            acc[:, :, k] += gch * (col[k] / 255.0)
+                    shown.append((ci, gain))
+                if shown:
+                    # The scale spans EVERY assigned channel, not just the
+                    # visible ones, so switching a channel on or off never
+                    # changes how the others are rendered.
+                    key = ('scale', up)
+                    if getattr(self, '_scale_key', None) != key:
+                        allc = [self.color_img[:, :, ci].astype(np.float64)
+                                for ci in self.disp_channels
+                                if 0 <= ci < self.color_img.shape[2]]
+                        s_lo = min(float(np.percentile(c, 1)) for c in allc)
+                        s_hi = max(float(np.percentile(c, up)) for c in allc)
+                        if s_hi <= s_lo:
+                            s_hi = s_lo + 1.0
+                        self._scale_lo, self._scale_hi = s_lo, s_hi
+                        self._scale_key = key
+                    lo, hi = self._scale_lo, self._scale_hi
+                    for ci, gain in shown:
+                        ch = self.color_img[:, :, ci].astype(np.float64)
+                        gch = np.clip((ch - lo) / (hi - lo), 0, 1)
+                        gch = (gch * gain).astype(np.float32)
+                        col = self.disp_channels[ci]
+                        for k in range(3):
+                            if col[k]:
+                                acc[:, :, k] += gch * (col[k] / 255.0)
                 self._base_rgb = (np.clip(acc, 0, 1) * 255).astype(np.uint8)
             else:
                 lo = getattr(self, '_disp_lo', None)
