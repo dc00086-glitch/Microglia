@@ -2695,93 +2695,6 @@ class InteractiveImageLabel(QLabel):
             self.parent_widget.finish_polygon()
 
 
-class ChannelSelectDialog(QDialog):
-    """Dialog to select which channels to display"""
-    def __init__(self, parent=None, current_channels=None, channel_names=None, color_image=None):
-        super().__init__(parent)
-        self.setWindowTitle("Channel Display Settings")
-        self.setModal(True)
-
-        # Default channel settings - indexed by channel number
-        self.channels = current_channels or {0: True, 1: True, 2: True}
-        self.names = channel_names or {0: 'Channel 1', 1: 'Channel 2', 2: 'Channel 3'}
-
-        # Detect number of channels
-        self.num_channels = 3
-        if color_image is not None and color_image.ndim == 3:
-            self.num_channels = color_image.shape[2]  # show all channels (far-red etc.)
-
-        layout = QVBoxLayout(self)
-
-        # Instructions
-        instructions = QLabel("Select which channels to display:")
-        layout.addWidget(instructions)
-
-        # Channel checkboxes - simple numbered labels
-        self.ch_checks = []
-        for i in range(self.num_channels):
-            user_name = self.names.get(i, '')
-            label = f"Channel {i+1}"
-            if user_name and user_name != f'Channel {i+1}':
-                label += f": {user_name}"
-            check = QCheckBox(label)
-            check.setChecked(self.channels.get(i, True))
-            layout.addWidget(check)
-            self.ch_checks.append(check)
-
-        # Channel naming section
-        layout.addSpacing(10)
-        name_label = QLabel("Customize channel names:")
-        layout.addWidget(name_label)
-
-        name_form = QFormLayout()
-        self.name_inputs = []
-        for i in range(self.num_channels):
-            name_input = QLineEdit(self.names.get(i, ''))
-            name_form.addRow(f"Channel {i+1}:", name_input)
-            self.name_inputs.append(name_input)
-        layout.addLayout(name_form)
-
-        # Quick presets
-        layout.addSpacing(10)
-        preset_layout = QHBoxLayout()
-        all_btn = QPushButton("All")
-        all_btn.clicked.connect(self.select_all)
-        preset_layout.addWidget(all_btn)
-
-        for i in range(self.num_channels):
-            btn = QPushButton(f"Ch{i+1} Only")
-            btn.clicked.connect(lambda checked, idx=i: self.select_only(idx))
-            preset_layout.addWidget(btn)
-
-        layout.addLayout(preset_layout)
-
-        # OK/Cancel buttons
-        layout.addSpacing(10)
-        btn_layout = QHBoxLayout()
-        ok_btn = QPushButton("OK")
-        ok_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(ok_btn)
-        btn_layout.addWidget(cancel_btn)
-        layout.addLayout(btn_layout)
-
-    def select_all(self):
-        for check in self.ch_checks:
-            check.setChecked(True)
-
-    def select_only(self, ch_idx):
-        for i, check in enumerate(self.ch_checks):
-            check.setChecked(i == ch_idx)
-
-    def get_settings(self):
-        """Return the selected channel settings and names"""
-        channels = {i: check.isChecked() for i, check in enumerate(self.ch_checks)}
-        return {
-            'channels': channels,
-            'names': {i: inp.text() for i, inp in enumerate(self.name_inputs)}
-        }
 
 
 class CSVMergeDialog(QDialog):
@@ -4292,9 +4205,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
         display_btn_layout.addWidget(self.color_toggle_btn)
 
         # Channel selection button (only visible when color view is on)
+        # Channel settings now live in the Display Adjustments dialog; keep the
+        # button as a shortcut into it so existing muscle memory still works.
         self.channel_select_btn = QPushButton("Channel Display")
-        self.channel_select_btn.clicked.connect(self.open_channel_selector)
-        self.channel_select_btn.setToolTip("Select which color channels to display")
+        self.channel_select_btn.clicked.connect(self.open_display_adjustments)
+        self.channel_select_btn.setToolTip(
+            "Show/hide, name and colour channels (in Display Adjustments)")
         self.channel_select_btn.setVisible(False)  # Hidden until color view is on
         display_btn_layout.addWidget(self.channel_select_btn)
 
@@ -10677,7 +10593,7 @@ if __name__ == '__main__':
             gv_row.addStretch()
             layout.addLayout(gv_row)
 
-            channel_group = QGroupBox("Channel colour + brightness")
+            channel_group = QGroupBox("Channels — show/hide, name, colour, brightness")
             channel_layout = QVBoxLayout()
 
             def make_color_button(idx):
@@ -10707,9 +10623,34 @@ if __name__ == '__main__':
                     self.update_display()
                 return updater
 
+            def make_toggle(idx):
+                def toggled(on):
+                    self.display_channels[idx] = bool(on)
+                    active = [f"Ch{c + 1}" for c, a in
+                              sorted(self.display_channels.items()) if a]
+                    self.log(f"Channel display: {', '.join(active) or '(none)'}")
+                    self.update_display()
+                return toggled
+
+            def make_rename(idx):
+                def renamed(text):
+                    self.channel_names[idx] = text
+                return renamed
+
             for idx in range(int(nch)):
                 row = QHBoxLayout()
-                row.addWidget(QLabel(f"Ch {idx + 1}:"))
+                # show/hide this channel (was the separate Channel Display dialog)
+                cb = QCheckBox(f"Ch {idx + 1}")
+                cb.setChecked(bool(self.display_channels.get(idx, True)))
+                cb.setToolTip("Show or hide this channel")
+                cb.toggled.connect(make_toggle(idx))
+                row.addWidget(cb)
+                # optional channel name (also merged in from that dialog)
+                name_edit = QLineEdit(self.channel_names.get(idx, ''))
+                name_edit.setPlaceholderText(f"name (e.g. CD31)")
+                name_edit.setFixedWidth(110)
+                name_edit.textChanged.connect(make_rename(idx))
+                row.addWidget(name_edit)
                 row.addWidget(make_color_button(idx))
                 slider = QSlider(Qt.Horizontal)
                 slider.setRange(-100, 100)
@@ -10792,44 +10733,6 @@ if __name__ == '__main__':
 
         dialog.exec_()
 
-    def open_channel_selector(self):
-        """Open channel selection dialog to choose which channels to display"""
-        if not self.show_color_view:
-            QMessageBox.information(
-                self, "Channel Selection",
-                "Channel selection is only available in color view mode.\nPress C to toggle color view."
-            )
-            return
-
-        sample_color_img = None
-        if self.current_image_name and self.current_image_name in self.images:
-            img_data = self.images[self.current_image_name]
-            if 'color_image' in img_data:
-                sample_color_img = img_data['color_image']
-        if sample_color_img is None:
-            for img_data in self.images.values():
-                if 'color_image' in img_data:
-                    sample_color_img = img_data['color_image']
-                    break
-
-        dialog = ChannelSelectDialog(
-            self,
-            current_channels=self.display_channels,
-            channel_names=self.channel_names,
-            color_image=sample_color_img
-        )
-
-        if dialog.exec_() == QDialog.Accepted:
-            settings = dialog.get_settings()
-            self.display_channels = settings['channels']
-            self.channel_names = settings['names']
-
-            # Log the change
-            active_channels = [f"Ch{ch+1}" for ch, active in self.display_channels.items() if active]
-            self.log(f"Channel display: {', '.join(active_channels)}")
-
-            # Refresh the current display
-            self._refresh_color_display()
 
     def _refresh_color_display(self):
         """Refresh the display with current channel settings"""
