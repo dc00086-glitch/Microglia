@@ -4196,9 +4196,6 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Display adjustments buttons in a row
         display_btn_layout = QHBoxLayout()
-        display_adjust_btn = QPushButton("Display Adjustments")
-        display_adjust_btn.clicked.connect(self.open_display_adjustments)
-        display_btn_layout.addWidget(display_adjust_btn)
 
         # Color/Grayscale toggle button — color view is on by default.
         self.color_toggle_btn = QPushButton("Show Grayscale (C)")
@@ -4206,14 +4203,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.color_toggle_btn.setToolTip("Toggle between color and grayscale display")
         display_btn_layout.addWidget(self.color_toggle_btn)
 
-        # Channel selection button (only visible when color view is on)
-        # Channel settings now live in the Display Adjustments dialog; keep the
-        # button as a shortcut into it so existing muscle memory still works.
-        self.channel_select_btn = QPushButton("Channel Display")
+        # Single entry point for everything visual: channel show/hide, names,
+        # colours and per-channel brightness, plus global brightness/contrast.
+        # Always available — the global brightness and contrast controls apply
+        # in grayscale too, so it must not be tied to colour view.
+        self.channel_select_btn = QPushButton("Channel && Display Adjustments")
         self.channel_select_btn.clicked.connect(self.open_display_adjustments)
         self.channel_select_btn.setToolTip(
-            "Show/hide, name and colour channels (in Display Adjustments)")
-        self.channel_select_btn.setVisible(False)  # Hidden until color view is on
+            "Show/hide, name and colour channels; brightness and contrast")
         display_btn_layout.addWidget(self.channel_select_btn)
 
         # Measure tool button
@@ -9299,17 +9296,15 @@ if __name__ == '__main__':
             self.log("=" * 50)
             self.log("COLOCALIZATION MODE ENABLED")
             self.log("Images will be displayed in color")
-            self.log("Use 'Channel Display' button to select which channels to show")
+            self.log("Use 'Channel && Display Adjustments' to choose channels")
             self.log("Press C to toggle between color and grayscale")
             self.log("=" * 50)
             self.show_color_view = True
             self.color_toggle_btn.setText("Show Grayscale (C)")
-            self.channel_select_btn.setVisible(True)
         else:
             self.log("Colocalization mode disabled")
             self.show_color_view = False
             self.color_toggle_btn.setText("Show Color (C)")
-            self.channel_select_btn.setVisible(False)
 
         # Refresh display if an image is loaded
         if self.current_image_name:
@@ -9718,7 +9713,6 @@ if __name__ == '__main__':
             if self.colocalization_mode:
                 self.show_color_view = True
                 self.color_toggle_btn.setText("Show Grayscale (C)")
-                self.channel_select_btn.setVisible(True)
 
             # Ensure output dirs exist — if the saved path is unreachable
             # (e.g. session created on a different computer), ask the user
@@ -10878,10 +10872,8 @@ if __name__ == '__main__':
         self.show_color_view = not self.show_color_view
         if self.show_color_view:
             self.color_toggle_btn.setText("Show Grayscale (C)")
-            self.channel_select_btn.setVisible(True)
         else:
             self.color_toggle_btn.setText("Show Color (C)")
-            self.channel_select_btn.setVisible(False)
         # During soma picking, use the dedicated refresh to preserve picking state
         if self.processed_label.soma_mode:
             self._load_image_for_soma_picking()
@@ -11175,7 +11167,6 @@ if __name__ == '__main__':
         if self.colocalization_mode:
             self.show_color_view = True
             self.color_toggle_btn.setText("Show Grayscale (C)")
-            self.channel_select_btn.setVisible(True)
 
         # Include both lowercase and uppercase extensions for macOS compatibility
         exts = ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg',
