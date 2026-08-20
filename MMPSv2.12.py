@@ -11116,7 +11116,12 @@ if __name__ == '__main__':
         if img_max > img_min:
             adjusted = (adjusted - img_min) / (img_max - img_min) * 255.0
 
-        # Apply contrast first (multiply around midpoint)
+        # Apply contrast (expand/compress the spread around the image's own
+        # centre). The pivot must be the image mean, not a fixed 127.5: a
+        # fluorescence frame is mostly dark background, so with a 127.5 pivot
+        # nearly every pixel sits below it and negative contrast lifted the
+        # whole frame toward mid-grey — which read as "brighter" rather than
+        # "less contrast".
         contrast = self.contrast_value
         if contrast != 0:
             # Convert contrast from -100,100 to a multiplier
@@ -11126,7 +11131,7 @@ if __name__ == '__main__':
             else:
                 factor = 1.0 + (contrast / 100.0) * 0.9  # -0.9 to 0 (min 0.1x)
 
-            midpoint = 127.5
+            midpoint = float(adjusted.mean())
             adjusted = (adjusted - midpoint) * factor + midpoint
 
         # Apply brightness (simple addition)
@@ -11889,16 +11894,17 @@ if __name__ == '__main__':
             self.color_toggle_btn.setText("Show Color (C)")
             self.current_image_name = self.soma_picking_queue[0]
         else:
-            # Pass 1 or non-coloc: resume where we left off
-            if self.current_image_name and self.current_image_name in self.soma_picking_queue:
-                pass
-            else:
-                resume_name = None
-                for name in self.soma_picking_queue:
-                    if not self.images[name]['somas']:
-                        resume_name = name
-                        break
-                self.current_image_name = resume_name or self.soma_picking_queue[0]
+            # Start at the beginning of the selected images — or, if some have
+            # already been done, at the first one still without somas. Whatever
+            # image happens to be selected in the file list is a browsing
+            # choice, not a picking position, so it must not decide where the
+            # run starts.
+            resume_name = None
+            for name in self.soma_picking_queue:
+                if not self.images[name]['somas']:
+                    resume_name = name
+                    break
+            self.current_image_name = resume_name or self.soma_picking_queue[0]
 
         self.processed_label.soma_mode = True
         self.original_label.soma_mode = False
