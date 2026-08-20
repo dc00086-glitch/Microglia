@@ -10870,6 +10870,48 @@ if __name__ == '__main__':
                 self.original_label.set_image(orig_pixmap)
 
 
+    def _processed_gray_view(self, img_data):
+        """Processed-tab counterpart of _grayscale_view, so the Original and
+        Processed tabs always show the SAME channel(s).
+
+        The Original tab honours grayscale_view_mode and grayscale_channel; the
+        Processed tab used to always show img_data['processed'] (whichever
+        channel happened to be cleaned first), so the two tabs disagreed after
+        the process channel was changed or in merged mode. This resolves the
+        cleaned data for the same selection, falling back to the primary
+        processed image when a channel wasn't cleaned separately.
+        """
+        if img_data is None:
+            return None
+        primary = img_data.get('processed')
+        pchans = img_data.get('processed_channels') or {}
+        mode = getattr(self, 'grayscale_view_mode', 'process')
+
+        if mode != 'merged':
+            ch = self.grayscale_channel
+            if ch in pchans and pchans[ch] is not None:
+                return pchans[ch]
+            return primary
+
+        # Merged: combine every cleaned channel that is enabled for display,
+        # normalising each so one bright channel can't dominate.
+        parts = []
+        for ci, arr in pchans.items():
+            if arr is not None and self.display_channels.get(ci, True):
+                parts.append(np.asarray(arr, dtype=np.float64))
+        if primary is not None and self.display_channels.get(self.grayscale_channel, True) \
+                and self.grayscale_channel not in pchans:
+            parts.append(np.asarray(primary, dtype=np.float64))
+        if not parts:
+            return primary
+        acc = np.zeros(parts[0].shape, dtype=np.float64)
+        for ch in parts:
+            lo, hi = float(ch.min()), float(ch.max())
+            if hi > lo:
+                acc += (ch - lo) / (hi - lo)
+        acc /= max(len(parts), 1)
+        return (np.clip(acc, 0, 1) * 255).astype(np.uint8)
+
     def _grayscale_view(self, color_img):
         """2D array to show in grayscale view.
 
@@ -11330,14 +11372,21 @@ if __name__ == '__main__':
             self.images[img_name]['selected'] = is_checked
 
     def on_image_selected(self, item):
-        # During outlining, soma picking, or QA, don't switch images from file list clicks
-        if self.processed_label.polygon_mode or self.processed_label.soma_mode or self.mask_qa_active:
-            return
         img_name = item.data(Qt.UserRole)
         is_checked = item.checkState() == Qt.Checked
         self.images[img_name]['selected'] = is_checked
+        # Outlining and mask QA walk a fixed queue, so jumping images there
+        # would desync the queue from what is on screen.
+        if self.processed_label.polygon_mode or self.mask_qa_active:
+            self.log("Finish (or stop) the current outlining/QA run before "
+                     "switching images.")
+            return
         self.current_image_name = img_name
-        self._display_current_image()
+        if self.processed_label.soma_mode:
+            # Soma picking: jump to the clicked image and keep picking there.
+            self._load_image_for_soma_picking()
+        else:
+            self._display_current_image()
 
     def _display_current_image(self):
         if not self.current_image_name or self.current_image_name not in self.images:
@@ -11390,8 +11439,8 @@ if __name__ == '__main__':
                         adjusted_proc = self._apply_display_adjustments_color(img_data['color_image'])
                     pixmap_proc = self._array_to_pixmap_color(adjusted_proc)
                 else:
-                    # Always use the processed image for grayscale display
-                    gray_proc = img_data['processed']
+                    # Same channel selection as the Original tab
+                    gray_proc = self._processed_gray_view(img_data)
                     adjusted_proc = self._apply_display_adjustments(gray_proc)
                     pixmap_proc = self._array_to_pixmap(adjusted_proc, skip_rescale=True)
                 self.processed_label.set_image(pixmap_proc, centroids=img_data['somas'])
