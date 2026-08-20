@@ -2173,6 +2173,8 @@ class InteractiveImageLabel(QLabel):
         self.dragging_centroid_idx = None
         # Pixel intensity picker
         self.pixel_picker_mode = False
+        # Image name overlay (top-left, small) — UI only
+        self.name_text = None
         # Info text overlay (top-left corner)
         self.info_text = None
         # Info text overlay (top-right corner)
@@ -2316,6 +2318,31 @@ class InteractiveImageLabel(QLabel):
                     painter.drawRect(int(mx - tw / 2), int(my - 18), tw, 20)
                     painter.setPen(QColor(0, 0, 0))
                     painter.drawText(int(mx - tw / 2 + 4), int(my - 2), text)
+
+        # Image name overlay (top-left, small). Display only — drawn on the
+        # widget in paintEvent, never written into the image data or exports.
+        # Sits below info_text when that is present so they don't overlap.
+        if self.name_text:
+            font = painter.font()
+            font.setPointSize(9)
+            font.setBold(False)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(self.name_text) + 10
+            th = fm.height() + 4
+            ny = 8
+            if self.info_text:
+                f2 = painter.font()
+                f2.setPointSize(14)
+                f2.setBold(True)
+                painter.setFont(f2)
+                ny = 8 + painter.fontMetrics().height() + 8 + 4
+                painter.setFont(font)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 150))
+            painter.drawRect(8, ny, tw, th)
+            painter.setPen(QColor(220, 220, 220))
+            painter.drawText(13, ny + fm.ascent() + 2, self.name_text)
 
         # Info text overlay (top-left)
         if self.info_text:
@@ -11287,6 +11314,7 @@ if __name__ == '__main__':
     def _display_current_image(self):
         if not self.current_image_name or self.current_image_name not in self.images:
             return
+        self._set_image_name_overlay()
         try:
             img_data = self.images[self.current_image_name]
 
@@ -11870,6 +11898,22 @@ if __name__ == '__main__':
         self.log("Click 'Done with Current' when finished with this image")
         self.log("=" * 50)
 
+    def _set_image_name_overlay(self, img_name=None):
+        """Show the image name as a small top-left overlay on every tab.
+
+        Display only — drawn by the label's paintEvent, so it never appears in
+        exported masks, overlays or any measurement.
+        """
+        name = img_name or self.current_image_name
+        text = os.path.splitext(name)[0] if name else None
+        for lbl in (getattr(self, 'original_label', None),
+                    getattr(self, 'preview_label', None),
+                    getattr(self, 'processed_label', None),
+                    getattr(self, 'mask_label', None)):
+            if lbl is not None:
+                lbl.name_text = text
+                lbl.update()
+
     def _render_original_tab(self, img_data):
         """Draw the Original (and Preview) tab for img_data, independent of
         picking/QA state.
@@ -11917,6 +11961,7 @@ if __name__ == '__main__':
         if not self.current_image_name:
             return
         img_data = self.images[self.current_image_name]
+        self._set_image_name_overlay()
         # Keep the other tabs on the image the queue has advanced to.
         self._render_original_tab(img_data)
 
@@ -12825,6 +12870,7 @@ if __name__ == '__main__':
             self.polygon_points = []
             status = "MANUAL NEEDED"
 
+        self._set_image_name_overlay(img_name)
         self._render_original_tab(img_data)
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
@@ -12915,6 +12961,7 @@ if __name__ == '__main__':
 
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
+        self._set_image_name_overlay(img_name)
         self._render_original_tab(img_data)
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
