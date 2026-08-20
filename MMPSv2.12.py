@@ -3817,6 +3817,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # QLineEdit accepts the ShortcutOverride for printable keys.
         for _key, _slot, _attr in (
                 ('C', self.toggle_color_view, 'shortcut_color'),
+                ('O', self._show_original_tab, 'shortcut_original'),
                 ('U', self._reset_current_zoom, 'shortcut_zoom_reset'),
                 ('?', self.show_shortcut_help, 'shortcut_help'),
                 ('M', self.toggle_measure_mode, 'shortcut_measure'),
@@ -7164,6 +7165,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         always = [
             ("?", "Show this help"),
             ("C", "Toggle color / grayscale"),
+            ("O", "Show the Original tab"),
             ("U", "Reset zoom"),
             ("Z + Left-click", "Zoom in"),
             ("Z + Right-click", "Zoom out"),
@@ -11880,7 +11882,9 @@ if __name__ == '__main__':
             self.current_image_name = resume_name or self.soma_picking_queue[0]
 
         self.processed_label.soma_mode = True
-        self.original_label.soma_mode = False
+        # Clicking the Original tab adds somas too — both tabs show the same
+        # image at the same size, so a click maps to the same image pixel.
+        self.original_label.soma_mode = True
         self.preview_label.soma_mode = False
         self.mask_label.soma_mode = False
         self._load_image_for_soma_picking()
@@ -11897,6 +11901,18 @@ if __name__ == '__main__':
         self.log(f"Click somas on: {self.current_image_name}")
         self.log("Click 'Done with Current' when finished with this image")
         self.log("=" * 50)
+
+    def _show_original_tab(self):
+        """Jump to the Original tab (hotkey O).
+
+        During soma picking the Original tab accepts clicks too, so this is the
+        quick way to pick on the raw image; _load_image_for_soma_picking leaves
+        the tab alone while you are on it.
+        """
+        try:
+            self.tabs.setCurrentIndex(0)
+        except Exception:
+            pass
 
     def _set_image_name_overlay(self, img_name=None):
         """Show the image name as a small top-left overlay on every tab.
@@ -11995,7 +12011,10 @@ if __name__ == '__main__':
         else:
             self.processed_label.set_image(pixmap, centroids=img_data['somas'])
 
-        self.tabs.setCurrentIndex(2)
+        # Stay on the Original tab if that's where the user is working;
+        # otherwise show the Processed tab.
+        if self.tabs.currentIndex() != 0:
+            self.tabs.setCurrentIndex(2)
         current_idx = self.soma_picking_queue.index(
             self.current_image_name) if self.current_image_name in self.soma_picking_queue else -1
         pass_label = ""
@@ -12205,6 +12224,7 @@ if __name__ == '__main__':
 
         self.batch_mode = False
         self.processed_label.soma_mode = False
+        self.original_label.soma_mode = False
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.done_btn.setEnabled(False)
@@ -12396,6 +12416,7 @@ if __name__ == '__main__':
         self.polygon_points = []
         self.processed_label.polygon_mode = True
         self.processed_label.soma_mode = False
+        self.original_label.soma_mode = False
         self.processed_label.point_edit_mode = False
         self.processed_label.selected_point_idx = None
         self.processed_label.dragging_point = False
@@ -12774,6 +12795,7 @@ if __name__ == '__main__':
         self.batch_mode = True
         self.processed_label.polygon_mode = True
         self.processed_label.soma_mode = False
+        self.original_label.soma_mode = False
         self.processed_label.point_edit_mode = False
         self.processed_label.selected_point_idx = None
         self.processed_label.dragging_point = False
