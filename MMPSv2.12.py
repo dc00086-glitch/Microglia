@@ -3783,20 +3783,22 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.setGeometry(screen)
         self.showMaximized()  # Also maximize to be sure
 
-        # Global keyboard shortcuts (work regardless of focus)
-        self.shortcut_color = QShortcut(QKeySequence('C'), self)
-        self.shortcut_color.activated.connect(self.toggle_color_view)
-        self.shortcut_zoom_reset = QShortcut(QKeySequence('U'), self)
-        self.shortcut_zoom_reset.activated.connect(self._reset_current_zoom)
-        self.shortcut_help = QShortcut(QKeySequence('?'), self)
-        self.shortcut_help.setContext(Qt.ApplicationShortcut)
-        self.shortcut_help.activated.connect(self.show_shortcut_help)
-        self.shortcut_measure = QShortcut(QKeySequence('M'), self)
-        self.shortcut_measure.activated.connect(self.toggle_measure_mode)
-        self.shortcut_pixel_picker = QShortcut(QKeySequence('I'), self)
-        self.shortcut_pixel_picker.activated.connect(self.toggle_pixel_picker_mode)
-        self.shortcut_undo_qa = QShortcut(QKeySequence('B'), self)
-        self.shortcut_undo_qa.activated.connect(self.undo_last_qa)
+        # Global keyboard shortcuts. These need ApplicationShortcut context:
+        # with the default WindowShortcut the file list (a QListWidget) claims
+        # plain letters for its type-ahead search, so 'C' and friends did
+        # nothing whenever that list had focus. Text fields still win, because
+        # QLineEdit accepts the ShortcutOverride for printable keys.
+        for _key, _slot, _attr in (
+                ('C', self.toggle_color_view, 'shortcut_color'),
+                ('U', self._reset_current_zoom, 'shortcut_zoom_reset'),
+                ('?', self.show_shortcut_help, 'shortcut_help'),
+                ('M', self.toggle_measure_mode, 'shortcut_measure'),
+                ('I', self.toggle_pixel_picker_mode, 'shortcut_pixel_picker'),
+                ('B', self.undo_last_qa, 'shortcut_undo_qa')):
+            _sc = QShortcut(QKeySequence(_key), self)
+            _sc.setContext(Qt.ApplicationShortcut)
+            _sc.activated.connect(_slot)
+            setattr(self, _attr, _sc)
 
     def _create_left_panel(self):
         scroll = QScrollArea()
@@ -11877,10 +11879,55 @@ if __name__ == '__main__':
         self.log("Click 'Done with Current' when finished with this image")
         self.log("=" * 50)
 
+    def _render_original_tab(self, img_data):
+        """Draw the Original (and Preview) tab for img_data, independent of
+        picking/QA state.
+
+        Soma picking and outlining only refreshed the Processed tab, so the
+        other tabs kept showing whichever image was loaded before the queue
+        advanced. Every tab should show the image currently being worked on.
+        """
+        if img_data is None:
+            return
+        raw_img = img_data.get('color_image')
+        if raw_img is None:
+            rp = img_data.get('raw_path')
+            if not rp or not os.path.exists(rp):
+                return
+            try:
+                raw_img = load_tiff_image(rp)
+            except Exception:
+                return
+            if getattr(raw_img, 'ndim', 0) == 3:
+                img_data['color_image'] = raw_img
+                img_data['num_channels'] = raw_img.shape[2]
+        try:
+            if self.show_color_view and raw_img.ndim == 3:
+                pixmap = self._array_to_pixmap_color(
+                    self._apply_display_adjustments_color(raw_img))
+            else:
+                gray = (self._grayscale_view(raw_img)
+                        if raw_img.ndim == 3 else raw_img)
+                pixmap = self._array_to_pixmap(
+                    self._apply_display_adjustments(gray), skip_rescale=True)
+            self.original_label.set_image(pixmap,
+                                          centroids=img_data.get('somas'))
+        except Exception:
+            pass
+        prev = img_data.get('preview')
+        if prev is not None:
+            try:
+                self.preview_label.set_image(self._array_to_pixmap(
+                    self._apply_display_adjustments(prev), skip_rescale=True))
+            except Exception:
+                pass
+
     def _load_image_for_soma_picking(self):
         if not self.current_image_name:
             return
         img_data = self.images[self.current_image_name]
+        # Keep the other tabs on the image the queue has advanced to.
+        self._render_original_tab(img_data)
 
         # Show color or grayscale based on toggle, with display adjustments
         if self._color_display(img_data):
@@ -12787,6 +12834,7 @@ if __name__ == '__main__':
             self.polygon_points = []
             status = "MANUAL NEEDED"
 
+        self._render_original_tab(img_data)
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
         self.processed_label.zoom_to_point(soma[0], soma[1], zoom_level=self.qa_autozoom_spin.value())
@@ -12876,6 +12924,7 @@ if __name__ == '__main__':
 
         soma = img_data['somas'][soma_idx]
         soma_id = img_data['soma_ids'][soma_idx]
+        self._render_original_tab(img_data)
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
         self.processed_label.zoom_to_point(soma[0], soma[1], zoom_level=self.qa_autozoom_spin.value())
