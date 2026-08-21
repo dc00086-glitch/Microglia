@@ -3793,6 +3793,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Export menu
         export_menu = menu_bar.addMenu("Export")
+        coloc_counts_action = export_menu.addAction(
+            "Export Colocalization Counts (from picked somas)...")
+        coloc_counts_action.setToolTip(
+            "Per-image coloc vs single-channel cell counts straight from soma "
+            "picking — no masks or morphology needed")
+        coloc_counts_action.triggered.connect(self.export_coloc_counts)
         composite_action = export_menu.addAction("Export Figure Composites...")
         composite_action.setToolTip("Export publication-ready overlay images (processed + mask outline + scale bar)")
         composite_action.triggered.connect(self._export_figure_composites)
@@ -16730,6 +16736,88 @@ if __name__ == '__main__':
         layout.addLayout(button_layout)
 
         dialog.exec_()
+
+    def export_coloc_counts(self):
+        """Per-image colocalization counts straight from the picked somas.
+
+        Two-pass coloc soma picking tags every soma as 'coloc' or
+        'single_channel' in img_data['soma_groups'], which is all that is needed
+        to compare colocalization frequency between groups/timepoints. This
+        exports those counts directly, so no masks, QA or morphology run is
+        required.
+        """
+        import csv as _csv
+        picked = [(nm, d) for nm, d in self.images.items() if d.get('somas')]
+        if not picked:
+            QMessageBox.warning(self, "Colocalization Counts",
+                                "No somas have been picked yet.")
+            return
+
+        tagged = sum(1 for _, d in picked
+                     for g in (d.get('soma_groups') or []) if g)
+        if tagged == 0:
+            QMessageBox.warning(
+                self, "Colocalization Counts",
+                "These somas carry no colocalization tags.\n\n"
+                "Tags are assigned by the two-pass picking used in "
+                "Colocalization mode; somas picked outside it are untagged.")
+            return
+
+        # Fill in animal / treatment so the counts can be grouped.
+        if not self.collect_metadata_for_images():
+            return
+
+        out_dir = self._resolve_output_dir("Colocalization Counts")
+        if not out_dir:
+            return
+
+        rows = []
+        for img_name, d in sorted(picked):
+            groups = d.get('soma_groups') or []
+            somas = d.get('somas') or []
+            # somas picked before grouping existed have no entry
+            groups = list(groups) + [''] * max(0, len(somas) - len(groups))
+            n_coloc = sum(1 for g in groups if g == 'coloc')
+            n_single = sum(1 for g in groups if g == 'single_channel')
+            n_untagged = sum(1 for g in groups if not g)
+            total_tagged = n_coloc + n_single
+            rows.append({
+                'image_name': os.path.splitext(img_name)[0],
+                'animal_id': d.get('animal_id', ''),
+                'treatment': d.get('treatment', ''),
+                'total_somas': len(somas),
+                'coloc_cells': n_coloc,
+                'single_channel_cells': n_single,
+                'untagged_cells': n_untagged,
+                'percent_coloc': (round(100.0 * n_coloc / total_tagged, 2)
+                                  if total_tagged else ''),
+            })
+
+        path = os.path.join(out_dir, 'colocalization_counts.csv')
+        fields = ['image_name', 'animal_id', 'treatment', 'total_somas',
+                  'coloc_cells', 'single_channel_cells', 'untagged_cells',
+                  'percent_coloc']
+        try:
+            with open(path, 'w', newline='') as f:
+                w = _csv.DictWriter(f, fieldnames=fields)
+                w.writeheader()
+                w.writerows(rows)
+        except Exception as e:
+            QMessageBox.critical(self, "Colocalization Counts",
+                                 f"Could not write the file:\n{e}")
+            return
+
+        tot_c = sum(r['coloc_cells'] for r in rows)
+        tot_s = sum(r['single_channel_cells'] for r in rows)
+        pct = (100.0 * tot_c / (tot_c + tot_s)) if (tot_c + tot_s) else 0.0
+        self.log(f"Colocalization counts: {len(rows)} images, "
+                 f"{tot_c} coloc / {tot_s} single-channel ({pct:.1f}% coloc)")
+        self.log(f"  saved to {path}")
+        QMessageBox.information(
+            self, "Colocalization Counts",
+            f"{len(rows)} image(s) exported.\n\n"
+            f"Coloc: {tot_c}    Single-channel: {tot_s}    "
+            f"({pct:.1f}% coloc overall)\n\n{path}")
 
     def collect_metadata_for_images(self):
         """Collect AnimalID and Treatment for each processed image"""
