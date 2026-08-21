@@ -7700,6 +7700,8 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                 'selected': img_data['selected'],
                 'animal_id': img_data.get('animal_id', ''),
                 'treatment': img_data.get('treatment', ''),
+                'region': img_data.get('region', ''),
+                'timepoint': img_data.get('timepoint', ''),
                 'rolling_ball_radius': img_data.get('rolling_ball_radius', 50),
                 'pixel_size': img_data.get('pixel_size'),
                 'somas': [tuple(float(c) for c in s) for s in img_data.get('somas', [])],
@@ -9058,6 +9060,8 @@ if __name__ == '__main__':
             ps = float(self._get_pixel_size(img_name))
             animal_id = idata.get('animal_id', '')
             treatment = idata.get('treatment', '')
+            region = idata.get('region', '')
+            timepoint = idata.get('timepoint', '')
             try:
                 cd31 = color[:, :, cd31_i].astype(np.float64)
                 use_tube = bool(getattr(self, 'bbb_use_tubeness', False))
@@ -9125,7 +9129,8 @@ if __name__ == '__main__':
                 except Exception as e:
                     self.log(f"BBB: vessel preview failed for {img_name}: {e}")
                 row = {'image_name': os.path.splitext(img_name)[0],
-                       'animal_id': animal_id, 'treatment': treatment}
+                       'animal_id': animal_id, 'treatment': treatment,
+                       'region': region, 'timepoint': timepoint}
                 row.update(vmetrics)
                 tracers = {}
                 for spec in tracer_specs:
@@ -9239,7 +9244,8 @@ if __name__ == '__main__':
                         mk, vessel_mask, tracers, ps, dist_um=dist_um,
                         soma_mask=soma_region, cd31=cd31)
                     crow = {'image_name': img_base, 'animal_id': animal_id,
-                            'treatment': treatment, 'soma_id': sid,
+                            'treatment': treatment, 'region': region,
+                            'timepoint': timepoint, 'soma_id': sid,
                             'bbb_footprint': source}
                     crow.update(exp)
                     cell_rows.append(crow)
@@ -9283,7 +9289,7 @@ if __name__ == '__main__':
         # a standalone CSV if the morphology results aren't there yet.
         # animal_id/treatment are identity columns already in the morphology
         # master — keep them out of the merge so unmatched rows aren't wiped.
-        _skip_merge = ('image_name', 'soma_id', 'animal_id', 'treatment')
+        _skip_merge = ('image_name', 'soma_id', 'animal_id', 'treatment', 'region', 'timepoint')
         bbb_cols, merged_msg = [], ""
         for r in cell_rows:
             for k in r:
@@ -9903,6 +9909,8 @@ if __name__ == '__main__':
                     'selected': img_session.get('selected', False),
                     'animal_id': img_session.get('animal_id', ''),
                     'treatment': img_session.get('treatment', ''),
+                    'region': img_session.get('region', ''),
+                    'timepoint': img_session.get('timepoint', ''),
                     'pixel_size': img_session.get('pixel_size'),
                 }
                 img_dict['processed_channels'] = processed_channels
@@ -11229,6 +11237,8 @@ if __name__ == '__main__':
                 'selected': False,
                 'animal_id': '',
                 'treatment': '',
+                'region': '',
+                'timepoint': '',
                 'pixel_size': None,
             }
             img_dict['processed_channels'] = {}
@@ -16669,7 +16679,10 @@ if __name__ == '__main__':
 
         # Instructions
         info_label = QLabel(
-            "<b>Enter Animal ID and Treatment for each selected image:</b><br>"
+            "<b>Enter Animal ID, Treatment, Region and Timepoint for each image:</b><br>"
+            "Region (e.g. Cortex, Internal Capsule) and Timepoint (e.g. 1d, 3d, "
+            "7d, 28d) are optional and are written to the results CSVs so "
+            "groups can be compared by region and timepoint.<br>"
             "You can edit these values anytime before running 'Calculate All Parameters'"
         )
         info_label.setWordWrap(True)
@@ -16678,16 +16691,16 @@ if __name__ == '__main__':
         from PyQt5.QtWidgets import QScrollArea, QTableWidget, QTableWidgetItem, QHeaderView
 
         table = QTableWidget()
-        table.setColumnCount(3)
-        table.setHorizontalHeaderLabels(["Image Name", "Animal ID", "Treatment"])
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(
+            ["Image Name", "Animal ID", "Treatment", "Region", "Timepoint"])
         table.setRowCount(len(selected_images))
 
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.Interactive)
-        table.setColumnWidth(1, 200)
-        table.setColumnWidth(2, 200)
+        for _c in (1, 2, 3, 4):
+            header.setSectionResizeMode(_c, QHeaderView.Interactive)
+            table.setColumnWidth(_c, 150)
 
         # Populate table
         for row, img_name in enumerate(sorted(selected_images)):
@@ -16706,6 +16719,16 @@ if __name__ == '__main__':
             treatment_item.setPlaceholderText = "e.g., Control"
             table.setItem(row, 2, treatment_item)
 
+            # Region (editable, optional)
+            region_item = QTableWidgetItem(self.images[img_name].get('region', ''))
+            region_item.setPlaceholderText = "e.g., Cortex"
+            table.setItem(row, 3, region_item)
+
+            # Timepoint (editable, optional)
+            tp_item = QTableWidgetItem(self.images[img_name].get('timepoint', ''))
+            tp_item.setPlaceholderText = "e.g., 7d"
+            table.setItem(row, 4, tp_item)
+
         layout.addWidget(table)
 
         # Buttons
@@ -16721,8 +16744,12 @@ if __name__ == '__main__':
                 animal_id = table.item(row, 1).text().strip()
                 treatment = table.item(row, 2).text().strip()
 
+                region = table.item(row, 3).text().strip() if table.item(row, 3) else ''
+                timepoint = table.item(row, 4).text().strip() if table.item(row, 4) else ''
                 self.images[img_name]['animal_id'] = animal_id
                 self.images[img_name]['treatment'] = treatment
+                self.images[img_name]['region'] = region
+                self.images[img_name]['timepoint'] = timepoint
 
             self.log(f"✓ Labels saved for {table.rowCount()} images")
             dialog.accept()
@@ -16785,6 +16812,8 @@ if __name__ == '__main__':
                 'image_name': os.path.splitext(img_name)[0],
                 'animal_id': d.get('animal_id', ''),
                 'treatment': d.get('treatment', ''),
+                'region': d.get('region', ''),
+                'timepoint': d.get('timepoint', ''),
                 'total_somas': len(somas),
                 'coloc_cells': n_coloc,
                 'single_channel_cells': n_single,
@@ -16794,7 +16823,7 @@ if __name__ == '__main__':
             })
 
         path = os.path.join(out_dir, 'colocalization_counts.csv')
-        fields = ['image_name', 'animal_id', 'treatment', 'total_somas',
+        fields = ['image_name', 'animal_id', 'treatment', 'region', 'timepoint', 'total_somas',
                   'coloc_cells', 'single_channel_cells', 'untagged_cells',
                   'percent_coloc']
         try:
@@ -16914,9 +16943,13 @@ if __name__ == '__main__':
             if img_data:
                 result['animal_id'] = img_data.get('animal_id', '')
                 result['treatment'] = img_data.get('treatment', '')
+                result['region'] = img_data.get('region', '')
+                result['timepoint'] = img_data.get('timepoint', '')
             else:
                 result['animal_id'] = ''
                 result['treatment'] = ''
+                result['region'] = ''
+                result['timepoint'] = ''
 
         # Combined results file
         combined_path = os.path.join(self.output_dir, "combined_morphology_results.csv")
@@ -16926,7 +16959,7 @@ if __name__ == '__main__':
         for r in results:
             all_keys_set.update(r.keys())
         keys = list(all_keys_set)
-        for key in ['soma_id', 'image_name', 'animal_id', 'treatment', 'soma_idx', 'soma_group']:
+        for key in ['soma_id', 'image_name', 'animal_id', 'treatment', 'region', 'timepoint', 'soma_idx', 'soma_group']:
             if key in keys:
                 keys.remove(key)
 
@@ -16942,7 +16975,7 @@ if __name__ == '__main__':
         # Put them in the desired order: identifiers, morphology, colocalization
         # Only include soma_group column if any result has a non-empty group
         has_groups = any(r.get('soma_group', '') for r in results)
-        id_keys = ['image_name', 'animal_id', 'treatment']
+        id_keys = ['image_name', 'animal_id', 'treatment', 'region', 'timepoint']
         if has_groups:
             id_keys.append('soma_group')
         id_keys.extend(['soma_id', 'soma_idx'])
@@ -17031,7 +17064,9 @@ if __name__ == '__main__':
             img = r.get('image_name', '')
             if img not in by_image:
                 by_image[img] = {'results': [], 'animal_id': r.get('animal_id', ''),
-                                 'treatment': r.get('treatment', '')}
+                                 'treatment': r.get('treatment', ''),
+                                 'region': r.get('region', ''),
+                                 'timepoint': r.get('timepoint', '')}
             by_image[img]['results'].append(r)
 
         summary_rows = []
@@ -17057,6 +17092,8 @@ if __name__ == '__main__':
                 'image_name': img_name,
                 'animal_id': data['animal_id'],
                 'treatment': data['treatment'],
+                'region': data.get('region', ''),
+                'timepoint': data.get('timepoint', ''),
                 'total_cells': total_cells,
                 f'{ch1_name}_only': single_cells,
                 f'{ch2_name}+{ch1_name}': coloc_cells,
@@ -17067,7 +17104,7 @@ if __name__ == '__main__':
             return
 
         summary_path = os.path.join(self.output_dir, "colocalization_summary.csv")
-        fieldnames = ['image_name', 'animal_id', 'treatment', 'total_cells',
+        fieldnames = ['image_name', 'animal_id', 'treatment', 'region', 'timepoint', 'total_cells',
                       f'{ch1_name}_only', f'{ch2_name}+{ch1_name}', 'percent_coloc']
         with open(summary_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
