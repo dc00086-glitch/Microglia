@@ -2562,6 +2562,9 @@ class InteractiveImageLabel(QLabel):
         self.info_text = None
         # Info text overlay (top-right corner)
         self.info_text_right = None
+        # Info text overlay (bottom-left corner) — outline confidence
+        self.info_text_bottom = None
+        self.info_text_bottom_color = None
         # Paint fill mode
         self.paint_mode = False
         self.erase_mode = False
@@ -2757,6 +2760,23 @@ class InteractiveImageLabel(QLabel):
             painter.drawRect(rx, 8, tw, th)
             painter.setPen(QColor(255, 255, 255))
             painter.drawText(rx + 6, 8 + fm.ascent() + 4, self.info_text_right)
+
+        # Info text overlay (bottom-left) — how much the model trusts this
+        # outline. Colour-coded so it reads at a glance during review.
+        if self.info_text_bottom:
+            font = painter.font()
+            font.setPointSize(11)
+            font.setBold(True)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(self.info_text_bottom) + 12
+            th = fm.height() + 8
+            by = self.height() - th - 8
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 180))
+            painter.drawRect(8, by, tw, th)
+            painter.setPen(self.info_text_bottom_color or QColor(255, 255, 255))
+            painter.drawText(14, by + fm.ascent() + 4, self.info_text_bottom)
 
         if self.zoom_level != 1.0:
             y_offset = 5 if not self.info_text else 8 + painter.fontMetrics().height() + 16
@@ -13271,6 +13291,7 @@ if __name__ == '__main__':
 
         # Skip somas that already have saved outlines (from previous session)
         img_name_check, soma_idx_check = self.outlining_queue[review_idx]
+        self._show_ml_confidence(img_name_check, soma_idx_check)
         if self._soma_has_outline(img_name_check, soma_idx_check):
             # This soma is already outlined — advance to the next unoutlined one
             next_idx = self._find_next_unoutlined_idx(start_from=review_idx + 1)
@@ -13390,6 +13411,7 @@ if __name__ == '__main__':
         img_name, soma_idx = self.outlining_queue[queue_idx]
         self.current_image_name = img_name
         img_data = self.images[img_name]
+        self._show_ml_confidence(img_name, soma_idx)
 
         # Lazy-load processed image from disk if missing
         if img_data.get('processed') is None:
@@ -13805,9 +13827,19 @@ if __name__ == '__main__':
 
         points = _remove_branch_juts(points, soma)
 
+        try:
+            if self.auto_outline_method.currentText().startswith('Machine learning'):
+                _ml = get_ml_outliner()
+                if _ml is not None:
+                    self._record_ml_confidence(img_name, soma_idx,
+                                               _ml.last_confidence)
+        except Exception:
+            pass
+
         self.polygon_points = list(points)
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+        self._show_ml_confidence(img_name, soma_idx)
 
         self.processed_label.point_edit_mode = True
         self.processed_label.selected_point_idx = None
@@ -13957,6 +13989,47 @@ if __name__ == '__main__':
             ol['soma_idx'] == soma_idx and ol['soma_id'] == soma_id
             for ol in img_data['soma_outlines']
         )
+
+    def _record_ml_confidence(self, img_name, soma_idx, conf):
+        """Remember how much the model trusted one outline."""
+        if not hasattr(self, 'ml_confidence'):
+            self.ml_confidence = {}
+        if conf is None:
+            self.ml_confidence.pop((img_name, soma_idx), None)
+        else:
+            self.ml_confidence[(img_name, soma_idx)] = float(conf)
+
+    def _ml_confidence_label(self, img_name, soma_idx):
+        """(text, colour) for the bottom-left badge, or (None, None).
+
+        The wording is deliberately about REVIEW rather than correctness -- the
+        score says how stable the boundary is, which predicts accuracy well but
+        is not a promise about any individual cell.
+        """
+        conf = getattr(self, 'ml_confidence', {}).get((img_name, soma_idx))
+        if conf is None:
+            return None, None
+        ml = get_ml_outliner()
+        thr = ml.accept_threshold('top50') if ml is not None else None
+        if thr is not None and conf >= thr:
+            return f"Model confidence {conf:.2f} — high", QColor(120, 230, 140)
+        if thr is not None and conf >= thr * 0.75:
+            return f"Model confidence {conf:.2f} — check", QColor(245, 205, 90)
+        return f"Model confidence {conf:.2f} — low, check closely", QColor(245, 130, 120)
+
+    def _show_ml_confidence(self, img_name, soma_idx):
+        """Put the confidence badge on both image views, or clear it."""
+        text, colour = self._ml_confidence_label(img_name, soma_idx)
+        for lbl in (getattr(self, 'processed_label', None),
+                    getattr(self, 'original_label', None)):
+            if lbl is None:
+                continue
+            try:
+                lbl.info_text_bottom = text
+                lbl.info_text_bottom_color = colour
+                lbl.update()
+            except Exception:
+                pass
 
     def _store_outline(self, img_name, soma_idx, points, mask_shape=None):
         """Commit one soma outline: rasterise, record, export, tick checklist.
@@ -14120,6 +14193,7 @@ if __name__ == '__main__':
                 done += 1
                 if ml is not None:
                     conf = ml.last_confidence
+                    self._record_ml_confidence(img_name, soma_idx, conf)
                     if ml_threshold is None:
                         # "review all" -- every ML outline is queued, least
                         # confident first so attention goes where it is needed
