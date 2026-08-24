@@ -1943,6 +1943,483 @@ def get_ml_outliner(path=None):
         return None
 
 
+
+# ======================================================================
+# Machine-learning mask QA
+#
+# The QA screen's decision is one number per cell: the largest target area
+# whose mask is still clean. This scores every candidate area and decodes the
+# scores into that number, so the queue can be ordered worst-first and a size
+# pre-selected.
+#
+# The five helpers below are COPIED VERBATIM from train_mask_qa_model.py. The
+# forest was fitted on features produced by that exact code, so any divergence
+# here silently feeds it the wrong numbers and it degrades without erroring.
+# Keep them byte-identical; tools/test_mask_qa_parity.py fails the build if
+# they drift.
+# ======================================================================
+MASK_QA_FEATURES = [
+    'target_area_um2', 'r_eq_um', 'area_frac_of_max', 'area_over_soma',
+    'soma_area_um2', 'soma_solidity', 'soma_circularity', 'soma_contrast',
+    'dist_nn_um', 'nn_over_diameter', 'n_neighbours_in_disk',
+    'n_neighbours_2r', 'border_headroom', 'touches_border',
+    'own_frac_disk', 'own_frac_ann', 'fg_frac_disk', 'fg_frac_ann',
+    'fg_area_over_target', 'own_fg_area_over_target',
+    'int_disk_rel', 'int_ann_rel', 'int_drop',
+    'n_fg_components_disk', 'largest_fg_frac_disk',
+    'neighbours_within_25um', 'mean_dist_3_nearest_um',
+]
+
+def _mqa_polygon_mask(points, shape, offset=(0, 0)):
+    """Rasterise an (row, col) polygon with an even-odd scanline test.
+
+    Written out rather than delegated to cv2/skimage because this runs in two
+    places and both must produce the SAME pixels; two libraries' fill rules
+    differ by a pixel at the boundary, which is a percent of a small soma.
+    """
+    h, w = shape
+    m = np.zeros((h, w), dtype=bool)
+    if points is None or len(points) < 3:
+        return m
+    pts = np.asarray(points, dtype=np.float64)
+    ys = pts[:, 0] - offset[0]
+    xs = pts[:, 1] - offset[1]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    inside = np.zeros((h, w), dtype=bool)
+    n = len(pts)
+    for i in range(n):
+        j = (i + 1) % n
+        y1, x1, y2, x2 = ys[i], xs[i], ys[j], xs[j]
+        if y1 == y2:
+            continue
+        crosses = ((y1 > yy) != (y2 > yy))
+        xint = x1 + (yy - y1) * (x2 - x1) / (y2 - y1)
+        inside ^= crosses & (xx < xint)
+    return inside
+
+
+def _mqa_poly_area_perimeter(points):
+    """Shoelace area and perimeter of a polygon, in pixel units."""
+    p = np.asarray(points, dtype=np.float64)
+    y, x = p[:, 0], p[:, 1]
+    area = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    per = float(np.sum(np.hypot(np.diff(np.append(y, y[0])),
+                                np.diff(np.append(x, x[0])))))
+    return float(area), per
+
+
+def _mqa_convex_area(points):
+    """Convex-hull area of a polygon, for solidity. Falls back to its own area."""
+    try:
+        from scipy.spatial import ConvexHull
+        p = np.asarray(points, dtype=np.float64)
+        if len(p) < 3:
+            return None
+        return float(ConvexHull(p).volume)          # 2D "volume" is area
+    except Exception:
+        return None
+
+
+def _mqa_soma_feature_rows(gray, centroid, polygon, others, pixel_size_um, areas):
+    """Features for one cell at every candidate target area -> (n_areas, n_feat).
+
+    The reviewer is not judging the mask so much as the room the cell had: a
+    mask is rejected when the growth ran past the cell into a neighbour, a
+    vessel, or plain background. These measure that directly --
+
+      * `own_frac_*`   what share of the footprint is closer to THIS soma than
+                       to any other, i.e. how much of it is territory the cell
+                       can defend. This is the single feature that states "it
+                       bled into the neighbour".
+      * `fg_frac_*`    how much of the footprint is above this cell's own
+                       background, i.e. whether there is stain there at all.
+      * `int_drop`     brightness at the growth front relative to the middle;
+                       a front that has left the cell is dim.
+      * `n_fg_components_disk` fragmentation, the other common reject reason.
+
+    Everything is measured at the radius of a disk of the candidate area
+    (`r_eq`), which is where the mask boundary sits for a compact cell and is
+    close enough for a crowded one -- the point is to describe the neighbourhood
+    at that scale, not to predict the exact mask.
+
+    `others` are the OTHER soma centroids in the same image, (row, col) in image
+    coordinates. `areas` are candidate target areas in um^2, ascending.
+    """
+    px = float(pixel_size_um)
+    areas = [float(a) for a in areas]
+    a_max = max(areas) if areas else 1.0
+    r_max_px = np.sqrt(max(a_max, 1e-6) / np.pi) / px
+    half = int(np.ceil(r_max_px * 1.6)) + 2
+
+    H, W = gray.shape[:2]
+    cy, cx = float(centroid[0]), float(centroid[1])
+    y1, y2 = int(max(0, np.floor(cy) - half)), int(min(H, np.floor(cy) + half + 1))
+    x1, x2 = int(max(0, np.floor(cx) - half)), int(min(W, np.floor(cx) + half + 1))
+    p = gray[y1:y2, x1:x2].astype(np.float64)
+    if p.size == 0:
+        return np.zeros((len(areas), len(MASK_QA_FEATURES)), dtype=np.float32)
+
+    ly, lx = cy - y1, cx - x1
+    yy, xx = np.ogrid[:p.shape[0], :p.shape[1]]
+    rad_um = np.hypot(yy - ly, xx - lx) * px
+
+    # --- the cell itself -------------------------------------------------
+    soma = _mqa_polygon_mask(polygon, p.shape, offset=(y1, x1))
+    if not soma.any():
+        soma = rad_um <= max(px, 3.0 * px)
+    if polygon is not None and len(polygon) >= 3:
+        ar_px, per_px = _mqa_poly_area_perimeter(polygon)
+        soma_area_um2 = ar_px * px * px
+        hull = _mqa_convex_area(polygon)
+        solidity = float(ar_px / hull) if hull else 1.0
+        circ = float(4 * np.pi * ar_px / (per_px ** 2)) if per_px > 0 else 1.0
+    else:
+        soma_area_um2 = float(soma.sum()) * px * px
+        solidity, circ = 1.0, 1.0
+
+    # Background and this cell's own brightness. Both are LOCAL: staining and
+    # exposure differ between images, and a threshold in raw units would mean
+    # something different on each one.
+    bg = float(np.percentile(p, 20))
+    soma_level = float(np.median(p[soma])) if soma.any() else bg
+    span = max(soma_level - bg, 1e-6)
+    fg = p > (bg + 0.25 * span)
+    hi = float(np.percentile(p, 99.5))
+    contrast = float(span / max(hi - bg, 1e-6))
+
+    # --- the neighbours --------------------------------------------------
+    # `own` is this cell's Voronoi territory: pixels nearer to this soma than to
+    # any other. Mask growth in MMPS is competitive, so this is close to the
+    # boundary the growth itself will hit.
+    own = np.ones(p.shape, dtype=bool)
+    d_nn = np.inf
+    nb, all_d = [], []
+    for oc in (others or []):
+        oy, ox = float(oc[0]), float(oc[1])
+        d = np.hypot(oy - cy, ox - cx) * px
+        if d < 1e-6:                                   # this same soma
+            continue
+        d_nn = min(d_nn, d)
+        all_d.append(d)
+        if d < r_max_px * px * 3.0:                    # only ones that can matter
+            nb.append((oy - y1, ox - x1, d))
+    for (ny, nx, _d) in nb:
+        own &= (np.hypot(yy - ly, xx - lx) <= np.hypot(yy - ny, xx - nx))
+    if not np.isfinite(d_nn):
+        d_nn = float(max(H, W)) * px
+
+    d_border_um = min(cy, cx, H - 1 - cy, W - 1 - cx) * px
+    # Crowding, measured around THIS cell. An image-wide density would be one
+    # number per image, and a forest handed 20 images' worth of those learns to
+    # recognise the image and reproduce its habits -- which is the failure the
+    # by-image split exists to expose, so do not hand it the feature.
+    near = sorted(all_d)
+    n_25 = float(sum(1 for d in near if d <= 25.0))
+    d3 = float(np.mean(near[:3])) if near else float(max(H, W)) * px
+
+    rows = []
+    for a in areas:
+        r_eq = float(np.sqrt(max(a, 1e-6) / np.pi))
+        disk = rad_um <= r_eq
+        ann = (rad_um > r_eq * 0.85) & (rad_um <= r_eq * 1.15)
+        if not disk.any():
+            disk = rad_um <= px
+        if not ann.any():
+            ann = disk
+
+        fg_disk = fg & disk
+        n_fg = int(fg_disk.sum())
+        lab, ncomp = ndi.label(fg_disk)
+        if ncomp:
+            sizes = np.bincount(lab.ravel())[1:]
+            largest = float(sizes.max()) / max(n_fg, 1)
+        else:
+            largest = 0.0
+        int_disk = (float(p[disk].mean()) - bg) / span
+        int_ann = (float(p[ann].mean()) - bg) / span
+
+        rows.append([
+            a,
+            r_eq,
+            a / a_max,
+            a / max(soma_area_um2, 1e-6),
+            soma_area_um2,
+            solidity,
+            circ,
+            contrast,
+            d_nn,
+            d_nn / max(2.0 * r_eq, 1e-6),
+            float(sum(1 for (_y, _x, d) in nb if d <= r_eq)),
+            float(sum(1 for (_y, _x, d) in nb if d <= 2.0 * r_eq)),
+            d_border_um / max(r_eq, 1e-6),
+            float(d_border_um < r_eq),
+            float(own[disk].mean()),
+            float(own[ann].mean()),
+            float(fg_disk.sum()) / max(float(disk.sum()), 1.0),
+            float((fg & ann).sum()) / max(float(ann.sum()), 1.0),
+            (n_fg * px * px) / max(a, 1e-6),
+            (float((fg & own & disk).sum()) * px * px) / max(a, 1e-6),
+            int_disk,
+            int_ann,
+            int_ann / (abs(int_disk) + 1e-6),
+            float(ncomp),
+            largest,
+            n_25,
+            d3,
+        ])
+    return np.asarray(rows, dtype=np.float32)
+
+
+def _mqa_decode_cutoff(areas, probs, cut=0.5):
+    """-> (cutoff_um2, confidence). Longest run of approvals from the smallest.
+
+    The labels only ever take this shape, so the prediction is made to take it
+    too. Reading each probability independently would let the model propose
+    "approve 50, reject 100, approve 150", which the QA screen cannot express
+    and the user never chose.
+
+    Confidence is how decisively the boundary sits where it does: how far the
+    last approved and first rejected areas are from the cut. A cell whose
+    probabilities step cleanly from 0.9 to 0.1 scores near 1; one that drifts
+    across the cut scores near 0, and is exactly the cell worth looking at.
+    """
+    areas = list(areas)
+    probs = list(probs)
+    k = 0
+    while k < len(probs) and probs[k] >= cut:
+        k += 1
+    cutoff = areas[k - 1] if k else 0.0
+    below = probs[k - 1] if k else None            # last approved
+    above = probs[k] if k < len(probs) else None   # first rejected
+    parts = []
+    if below is not None:
+        parts.append(min(max((below - cut) / max(cut, 1e-6), 0.0), 1.0))
+    if above is not None:
+        parts.append(min(max((cut - above) / max(1.0 - cut, 1e-6), 0.0), 1.0))
+    conf = float(np.mean(parts)) if parts else 0.0
+    return float(cutoff), conf
+
+
+# ----------------------------------------------------------------------
+# Whole-object mask features, captured at generation time
+#
+# These describe the mask itself -- the obvious feature set, and the one the
+# model above deliberately does NOT use, because QA deletes a mask's TIFF the
+# moment it is rejected and so leaves only the approved class behind on disk.
+# Writing them here, while every candidate still exists in memory, is what makes
+# a whole-object model possible later. Nothing reads them yet.
+# ----------------------------------------------------------------------
+MASK_QA_OBJECT_FEATURES = [
+    'n_pixels', 'area_um2', 'area_over_target', 'solidity', 'circularity',
+    'extent', 'aspect', 'max_radius_um', 'mean_radius_um', 'radius_spread',
+    'n_components', 'largest_component_frac', 'n_holes', 'hole_area_frac',
+    'soma_area_frac', 'centroid_offset_um', 'touches_border',
+    'mean_int_in', 'mean_int_ring', 'in_over_ring',
+]
+
+
+def _mqa_object_features(mask, gray, soma_mask, pixel_size_um, target_area_um2,
+                         centroid=None):
+    """Whole-object measurements of one mask -> list matching the names above.
+
+    Cropped to the mask's bounding box first: a mask array is the size of the
+    whole image and measuring 30,000 of those at full size is minutes of work
+    for numbers that only concern a few thousand pixels.
+    """
+    px = float(pixel_size_um or 1.0)
+    m = mask > 0
+    n_px = int(m.sum())
+    if n_px == 0:
+        return [0.0] * len(MASK_QA_OBJECT_FEATURES)
+    ys, xs = np.nonzero(m)
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    H, W = m.shape
+    pad = 6
+    py1, py2 = max(0, y1 - pad), min(H, y2 + pad)
+    px1, px2 = max(0, x1 - pad), min(W, x2 + pad)
+    sub = m[py1:py2, px1:px2]
+    area_um2 = n_px * px * px
+
+    # shape
+    filled = ndi.binary_fill_holes(sub)
+    holes = int(filled.sum()) - int(sub.sum())
+    lab, ncomp = ndi.label(sub)
+    if ncomp:
+        sizes = np.bincount(lab.ravel())[1:]
+        largest = float(sizes.max()) / n_px
+    else:
+        largest = 0.0
+    bbox_h, bbox_w = (y2 - y1) * px, (x2 - x1) * px
+    extent = n_px / max(float((y2 - y1) * (x2 - x1)), 1.0)
+    aspect = max(bbox_h, bbox_w) / max(min(bbox_h, bbox_w), 1e-6)
+    hull = None
+    try:
+        from scipy.spatial import ConvexHull
+        pts = np.column_stack(np.nonzero(sub)).astype(np.float64)
+        if len(pts) >= 3:
+            hull = float(ConvexHull(pts).volume)
+    except Exception:
+        hull = None
+    solidity = float(n_px / hull) if hull else 1.0
+    # perimeter from the count of boundary pixels; good enough to separate a
+    # compact mask from one that has grown fingers down the processes
+    er = ndi.binary_erosion(sub, np.ones((3, 3), bool))
+    per_px = float(np.count_nonzero(sub & ~er))
+    circ = float(4 * np.pi * n_px / (per_px ** 2)) if per_px > 0 else 1.0
+
+    cy = float(ys.mean())
+    cx = float(xs.mean())
+    rad = np.hypot(ys - cy, xs - cx) * px
+    ref = centroid if centroid is not None else (cy, cx)
+    offset = float(np.hypot(cy - float(ref[0]), cx - float(ref[1])) * px)
+
+    soma_frac = 0.0
+    if soma_mask is not None:
+        sm = soma_mask > 0
+        if sm.shape == m.shape:
+            soma_frac = float((sm & m).sum()) / max(n_px, 1)
+
+    touches = float(y1 == 0 or x1 == 0 or y2 >= H or x2 >= W)
+
+    # intensity inside vs in a ring just outside: a mask that has grown past
+    # the cell has a ring as bright as its middle
+    mean_in = mean_ring = 0.0
+    if gray is not None and gray.shape[:2] == m.shape:
+        g = gray[py1:py2, px1:px2].astype(np.float64)
+        ring = ndi.binary_dilation(sub, np.ones((3, 3), bool), iterations=3) & ~sub
+        mean_in = float(g[sub].mean()) if sub.any() else 0.0
+        mean_ring = float(g[ring].mean()) if ring.any() else 0.0
+
+    return [
+        float(n_px), area_um2,
+        area_um2 / max(float(target_area_um2 or 1.0), 1e-6),
+        solidity, circ, extent, aspect,
+        float(rad.max()), float(rad.mean()),
+        float(rad.std() / max(rad.mean(), 1e-6)),
+        float(ncomp), largest,
+        float(holes), holes / max(float(n_px + holes), 1.0),
+        soma_frac, offset, touches,
+        mean_in, mean_ring, mean_in / max(mean_ring, 1e-6),
+    ]
+
+
+# ----------------------------------------------------------------------
+# Using the trained mask-QA model
+# ----------------------------------------------------------------------
+class _MLMaskQA:
+    """Wraps the trained forest so QA can propose one size per cell.
+
+    What it predicts is the CUTOFF -- the largest target area still clean --
+    because that is the decision the grid screen makes ("accept this size,
+    smaller approved, larger rejected"). The per-mask probabilities are decoded
+    into a prefix so the proposal always has a shape the screen can express.
+    """
+
+    def __init__(self, path):
+        import joblib
+        bundle = joblib.load(path)
+        self.model = bundle['model']
+        m = bundle.get('meta', {}) or {}
+        self.features = list(m.get('features') or MASK_QA_FEATURES)
+        self.base_features = list(m.get('base_features') or MASK_QA_FEATURES)
+        self.extra_features = list(m.get('extra_features') or [])
+        self.cut = float(m.get('cut') or 0.5)
+        self.step = float(m.get('step') or 50.0)
+        self.channel = m.get('channel')
+        self.image_kind = m.get('image') or 'processed'
+        self.conf_cal = m.get('conf_cal') or {}
+        self.heldout = m.get('heldout') or {}
+        self.path = path
+        # A model trained WITH whole-object columns needs those columns at
+        # prediction time too. QA has already freed the mask arrays by then, so
+        # rather than feed the forest a vector of zeros in their place -- which
+        # it would score confidently and wrongly -- such a model is refused.
+        self.unusable = ("trained with whole-object mask features, which this "
+                         "screen cannot supply") if self.extra_features else None
+
+    def accept_threshold(self, which='top50'):
+        """Confidence at or above which a proposal may be taken unreviewed.
+
+        Calibrated on held-out images at training time and carried in the model,
+        so it means the same thing on every batch. Taking the top half of
+        whatever is in front of you would accept half of any batch, however
+        badly the model did on it.
+        """
+        if not self.conf_cal.get('ranks', True):
+            return None
+        d = self.conf_cal.get(which) or {}
+        t = d.get('threshold')
+        return float(t) if t is not None else None
+
+    def describe(self):
+        parts = []
+        if self.heldout.get('exact') is not None:
+            parts.append(f"held-out exact {100 * self.heldout['exact']:.0f}%")
+        if self.heldout.get('within1') is not None:
+            parts.append(f"within one step {100 * self.heldout['within1']:.0f}%")
+        parts.append(f"on the {self.image_kind} image")
+        if self.channel:
+            parts.append(f"channel {self.channel}")
+        return ", ".join(parts)
+
+    def suggest(self, gray, centroid, polygon, others, pixel_size_um, areas):
+        """-> dict(cutoff, conf, areas, probs), or None."""
+        if self.unusable or gray is None or centroid is None or not areas:
+            return None
+        try:
+            areas = sorted(float(a) for a in areas)
+            rows = _mqa_soma_feature_rows(gray, centroid, polygon, others,
+                                          pixel_size_um, areas)
+            X = np.nan_to_num(np.asarray(rows, dtype=np.float64),
+                              nan=0.0, posinf=0.0, neginf=0.0)
+            probs = self.model.predict_proba(X)[:, 1]
+            cutoff, conf = _mqa_decode_cutoff(areas, list(probs), self.cut)
+            return dict(cutoff=cutoff, conf=conf, areas=areas,
+                        probs=[float(p) for p in probs])
+        except Exception as e:
+            print(f"Mask-QA model error: {e}")
+            return None
+
+
+_ML_MASK_QA = None
+_ML_MASK_QA_PATH = None
+
+
+def mask_qa_model_paths():
+    """Where a trained mask-QA model may live, nearest first."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [os.path.join(here, 'mask_qa_model.joblib')]
+    try:
+        cands.append(os.path.join(sys._MEIPASS, 'mask_qa_model.joblib'))
+    except Exception:
+        pass
+    cands += [os.path.expanduser('~/Downloads/mask_qa_model.joblib'),
+              os.path.expanduser('~/mask_qa_model.joblib')]
+    return cands
+
+
+def get_ml_mask_qa(path=None):
+    """Load the trained mask-QA model once and reuse it, or None."""
+    global _ML_MASK_QA, _ML_MASK_QA_PATH
+    if path is None:
+        for c in mask_qa_model_paths():
+            if os.path.exists(c):
+                path = c
+                break
+    if path is None or not os.path.exists(path):
+        return None
+    if _ML_MASK_QA is not None and _ML_MASK_QA_PATH == path:
+        return _ML_MASK_QA
+    try:
+        _ML_MASK_QA = _MLMaskQA(path)
+        _ML_MASK_QA_PATH = path
+        return _ML_MASK_QA
+    except Exception as e:
+        print(f"Could not load mask-QA model from {path}: {e}")
+        return None
+
+
 def auto_outline_soma_blob(image, centroid, sensitivity=50,
                            max_soma_radius_px=14, process_width_px=None):
     """Outline the SOMA only: a compact, locally-bright blob.
@@ -3959,6 +4436,9 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Border-touching cells auto-rejected during a generation run; reported
         # once when the run finishes instead of a popup per image.
         self._border_rejected_report = []
+        # {(image, soma_id): the mask-QA model's proposed size}, empty unless
+        # the model was used to order this review.
+        self._qa_suggestions = {}
         self.mask_qa_idx = 0
         self.mask_qa_active = False
         self.last_qa_decisions = []
@@ -14778,6 +15258,7 @@ if __name__ == '__main__':
                 # survive save/load even before QA approval
                 if self.masks_dir and os.path.isdir(self.masks_dir):
                     self._export_all_masks_to_disk(img_name, img_data['masks'])
+                    self._capture_mask_qa_features(img_name, img_data['masks'])
 
                 # Free mask arrays from RAM — they are now safely on disk
                 for mask_data in img_data['masks']:
@@ -15067,6 +15548,7 @@ if __name__ == '__main__':
         # Export all regenerated masks to disk
         if self.masks_dir and os.path.isdir(self.masks_dir):
             self._export_all_masks_to_disk(img_name, img_data['masks'])
+            self._capture_mask_qa_features(img_name, img_data['masks'])
 
         img_data['status'] = 'masks_generated'
         self._update_file_list_item(img_name)
@@ -15623,6 +16105,156 @@ if __name__ == '__main__':
             f"These cells are excluded from QA and analysis.")
         self._border_rejected_report = []
 
+    # ----------------------------------------------------------------
+    # Model-assisted QA
+    # ----------------------------------------------------------------
+    def _qa_model_suggestions(self):
+        """One proposed size per cell in the queue -> {(image, soma_id): dict}.
+
+        Images are loaded one at a time and released again; a study's images do
+        not fit in memory together. Returns {} if there is no usable model, and
+        says why in the log rather than failing silently.
+        """
+        ml = get_ml_mask_qa()
+        if ml is None:
+            return {}
+        if ml.unusable:
+            self.log(f"Mask-QA model ignored: {ml.unusable}")
+            return {}
+
+        by_image = {}
+        for i, flat in enumerate(self.all_masks_flat):
+            by_image.setdefault(flat['image_name'], []).append(i)
+
+        out = {}
+        self.log(f"Scoring the QA queue with the mask model ({ml.describe()})…")
+        for n, (img_name, indices) in enumerate(by_image.items(), 1):
+            gray = self._ensure_processed_loaded(img_name)
+            if gray is None:
+                continue
+            if gray.ndim > 2:
+                gray = ensure_grayscale(gray)
+            img_data = self.images.get(img_name, {}) or {}
+            outlines = {o.get('soma_id'): o
+                        for o in (img_data.get('soma_outlines') or [])}
+            centroids = [c for c in (img_data.get('somas') or []) if c]
+            px = self._get_pixel_size(img_name)
+
+            per_soma = {}
+            for i in indices:
+                md = self.all_masks_flat[i]['mask_data']
+                if md.get('duplicate'):
+                    continue
+                per_soma.setdefault(md.get('soma_id', ''), []).append(
+                    md.get('target_area_um2', 0))
+            for sid, areas in per_soma.items():
+                ol = outlines.get(sid)
+                if ol is None or not areas:
+                    continue
+                got = ml.suggest(gray, ol.get('centroid'),
+                                 ol.get('polygon_points'), centroids, px,
+                                 sorted(set(areas)))
+                if got:
+                    out[(img_name, sid)] = got
+            self.progress_status_label.setText(
+                f"Scoring masks: image {n}/{len(by_image)}")
+            QApplication.processEvents()
+        self.progress_status_label.setText("")
+        return out
+
+    def _offer_model_qa_ordering(self):
+        """Ask whether to use the trained model, then reorder the queue by it.
+
+        Least-confident-first: the cells the model is unsure about are the ones
+        a person is needed for, and putting them first means the review is
+        useful from its first minute rather than its last.
+        """
+        self._qa_suggestions = {}
+        ml = get_ml_mask_qa()
+        if ml is None or ml.unusable:
+            return
+        cal = ml.conf_cal.get('top50') or {}
+        detail = ""
+        if ml.heldout.get('exact') is not None:
+            detail = (f"On images it had never seen, its proposed size was "
+                      f"exactly right for "
+                      f"{100 * ml.heldout['exact']:.0f}% of cells and within "
+                      f"one step for {100 * ml.heldout.get('within1', 0):.0f}%."
+                      f"\n\n")
+        if QMessageBox.question(
+                self, "Model-Assisted QA",
+                f"Use the trained mask-QA model?\n\n{detail}"
+                f"It proposes a size for each cell and puts the cells it is "
+                f"least sure about first, so the ones that need you come up "
+                f"early. Nothing is approved for you — every cell is still "
+                f"reviewed and clicked.\n\n"
+                f"Scoring {len(self.all_masks_flat)} masks takes a moment.",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        sugg = self._qa_model_suggestions()
+        if not sugg:
+            self.log("No cells could be scored — queue order unchanged.")
+            return
+        self._qa_suggestions = sugg
+        self._reorder_qa_queue(
+            sorted(self._qa_soma_order,
+                   key=lambda k: (sugg[k]['conf'] if k in sugg else 1.1,
+                                  self._qa_soma_order_index.get(k, 0))))
+        scored = sum(1 for k in self._qa_soma_order if k in sugg)
+        self.log(f"Queue ordered least-confident-first: {scored} of "
+                 f"{len(self._qa_soma_order)} cells scored.")
+
+    def _reorder_qa_queue(self, new_soma_order):
+        """Rearrange the whole queue to a new cell order, indices and all.
+
+        `all_masks_flat` and `_qa_soma_order` have to stay consistent: the
+        sliding-window eviction decides what to drop from memory by comparing
+        positions in one against the review position in the other. Reordering
+        only one of them would evict masks that are about to be shown.
+        """
+        new_flat, new_index, new_order_index = [], {}, {}
+        for pos, key in enumerate(new_soma_order):
+            old_indices = self._qa_soma_mask_index.get(key, [])
+            new_index[key] = list(range(len(new_flat),
+                                        len(new_flat) + len(old_indices)))
+            new_flat.extend(self.all_masks_flat[i] for i in old_indices)
+            new_order_index[key] = pos
+        if len(new_flat) != len(self.all_masks_flat):
+            self.log("Queue reorder skipped — cell index is incomplete.")
+            return
+        self.all_masks_flat = new_flat
+        self._qa_soma_order = list(new_soma_order)
+        self._qa_soma_order_index = new_order_index
+        self._qa_soma_mask_index = new_index
+        self.mask_qa_idx = 0
+        for i, flat in enumerate(self.all_masks_flat):
+            if flat['mask_data'].get('approved') is None:
+                self.mask_qa_idx = i
+                break
+
+    def _mask_qa_badge(self, soma_key):
+        """(text, colour) for the confidence badge on a QA cell.
+
+        Worded about REVIEW rather than correctness: the score says how
+        decisively the model placed the boundary, which predicts accuracy well
+        but promises nothing about any one cell.
+        """
+        sug = getattr(self, '_qa_suggestions', {}).get(soma_key)
+        if not sug:
+            return None, None
+        ml = get_ml_mask_qa()
+        thr = ml.accept_threshold('top50') if ml is not None else None
+        conf, cut = sug['conf'], sug['cutoff']
+        size = f"{int(cut)} µm²" if cut else "reject all"
+        if thr is not None and conf >= thr:
+            return (f"Model suggests {size} — confidence {conf:.2f}, high",
+                    QColor(120, 230, 140))
+        if thr is not None and conf >= thr * 0.75:
+            return (f"Model suggests {size} — confidence {conf:.2f}, check",
+                    QColor(245, 205, 90))
+        return (f"Model suggests {size} — confidence {conf:.2f}, look closely",
+                QColor(245, 130, 120))
+
     def start_batch_qa(self):
         # Flatten all masks from all images
         self.all_masks_flat = []
@@ -15739,6 +16371,8 @@ if __name__ == '__main__':
             return
 
         self._qa_use_grid = (mode_result == 1)
+
+        self._offer_model_qa_ordering()
 
         self.approve_mask_btn.setEnabled(True)
         self.reject_mask_btn.setEnabled(True)
@@ -16283,6 +16917,74 @@ if __name__ == '__main__':
         except Exception as e:
             self.log(f"   ❌ Failed to export {mask_filename}: {e}")
 
+    def _capture_mask_qa_features(self, img_name, masks):
+        """Measure every candidate mask before QA gets a chance to delete some.
+
+        QA removes a rejected mask's TIFF immediately, so once a session is
+        finished the only masks left on disk are the approved ones -- in the 28d
+        session, 14,552 survivors and 18,536 gone. Whole-object features
+        computed from what survives are the positive class and nothing else,
+        which is why the model that ships here measures the neighbourhood
+        instead. Writing the numbers now, while every candidate still exists,
+        is what makes a whole-object model possible later.
+
+        Nothing reads this file yet. It is data capture, and it costs one pass
+        over masks that are already in memory.
+        """
+        if not self.masks_dir or not os.path.isdir(self.masks_dir):
+            return
+        try:
+            gray = self._ensure_processed_loaded(img_name)
+            if gray is not None and gray.ndim > 2:
+                gray = ensure_grayscale(gray)
+            px = self._get_pixel_size(img_name)
+            img_data = self.images.get(img_name, {}) or {}
+            outlines = {o.get('soma_id'): o
+                        for o in (img_data.get('soma_outlines') or [])}
+            rows = []
+            for md in masks:
+                mask = md.get('mask')
+                if mask is None:
+                    continue
+                sid = md.get('soma_id', '')
+                ol = outlines.get(sid) or {}
+                vals = _mqa_object_features(mask, gray, ol.get('outline'), px,
+                                            md.get('target_area_um2', 0),
+                                            ol.get('centroid'))
+                # flag_ columns are decisions, not measurements: border_rejected
+                # predicts the label perfectly and would be pure leakage. The
+                # trainer skips anything named flag_*; keep that prefix.
+                rows.append([img_name, sid, int(md.get('target_area_um2', 0))]
+                            + ["%.6g" % v for v in vals]
+                            + [int(bool(md.get('duplicate'))),
+                               int(bool(md.get('border_rejected')))])
+            if not rows:
+                return
+            header = (['image', 'soma_id', 'target_area_um2']
+                      + list(MASK_QA_OBJECT_FEATURES)
+                      + ['flag_duplicate', 'flag_border_rejected'])
+            path = os.path.join(self.masks_dir, 'mask_qa_features.csv')
+            # Regenerating an image's masks replaces its rows rather than
+            # appending a second, contradictory copy of them.
+            keep = []
+            if os.path.exists(path):
+                import csv as _csv
+                with open(path, newline='') as fh:
+                    rd = _csv.reader(fh)
+                    old_header = next(rd, None)
+                    if old_header == header:
+                        keep = [r for r in rd if r and r[0] != img_name]
+            import csv as _csv
+            with open(path, 'w', newline='') as fh:
+                wr = _csv.writer(fh)
+                wr.writerow(header)
+                wr.writerows(keep)
+                wr.writerows(rows)
+            self.log(f"   📊 Recorded QA features for {len(rows)} masks")
+        except Exception as e:
+            # Never let data capture stop a mask-generation run.
+            self.log(f"   ⚠️ Could not record mask QA features: {e}")
+
     def _export_all_masks_to_disk(self, img_name, masks):
         """Export all masks for an image to disk (for session persistence).
 
@@ -16788,8 +17490,19 @@ if __name__ == '__main__':
         header.setStyleSheet("font-size: 14px; padding: 5px;")
         grid_main_layout.addWidget(header)
 
-        hint = QLabel("Double-click = accept this size (smaller approved, larger rejected). "
-                      "Right-click = reject this size and larger. R = reject all.")
+        # The model's proposal for this cell, if the queue was scored. It is
+        # only ever a highlight -- nothing is clicked on the user's behalf.
+        suggestion = getattr(self, '_qa_suggestions', {}).get(soma_key)
+        hint_text = ("Double-click = accept this size (smaller approved, larger "
+                     "rejected). Right-click = reject this size and larger. "
+                     "R = reject all.")
+        if suggestion:
+            sz = (f"{int(suggestion['cutoff'])} µm²" if suggestion['cutoff']
+                  else "no size — reject all")
+            hint_text += (f"  ·  Model suggests {sz} "
+                          f"(confidence {suggestion['conf']:.2f}), outlined in "
+                          f"blue.")
+        hint = QLabel(hint_text)
         hint.setStyleSheet("color: gray; padding-bottom: 8px;")
         hint.setWordWrap(True)
         grid_main_layout.addWidget(hint)
@@ -16955,6 +17668,11 @@ if __name__ == '__main__':
                 border = "3px solid #4CAF50"
             elif approved is False:
                 border = "3px solid #F44336"
+            elif (suggestion and suggestion['cutoff']
+                  and abs(target_area - suggestion['cutoff']) < 1e-6):
+                # dashed, and only on unreviewed masks: a proposal must never
+                # be mistaken for a decision already made
+                border = "3px dashed #29B6F6"
             else:
                 border = "2px solid gray"
             thumb_label.setStyleSheet(f"border: {border}; background: black;")
@@ -17036,6 +17754,16 @@ if __name__ == '__main__':
 
         self.original_label.info_text = f"{soma_id}"
         self.original_label.info_text_right = os.path.splitext(img_name)[0]
+        badge, badge_colour = self._mask_qa_badge(soma_key)
+        for lbl in (getattr(self, 'processed_label', None), self.original_label):
+            if lbl is None:
+                continue
+            try:
+                lbl.info_text_bottom = badge
+                lbl.info_text_bottom_color = badge_colour
+                lbl.update()
+            except Exception:
+                pass
         self.original_label._update_display()
 
     def _on_grid_thumb_right_click(self, event, thumb_label):
