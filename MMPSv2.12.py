@@ -872,7 +872,7 @@ def _detect_disconnected_fragments(processed_img, cells, pixel_size_um,
     """Competitive disconnected-fragment (dystrophy) analysis for one image.
 
     ``cells`` is a list of dicts, one per soma, with keys ``soma_id``,
-    ``centroid`` (row, col in full-image pixels), ``mask`` (that cell\'s grown
+    ``centroid`` (row, col in full-image pixels), ``mask`` (that cell's grown
     mask) and optionally ``soma_mask`` and ``search_radius_um``.
 
     A fragment is IBA1 material separated from every cell by more than
@@ -886,7 +886,9 @@ def _detect_disconnected_fragments(processed_img, cells, pixel_size_um,
     a chain of small gaps stays one cell. What remains is awarded
     first-come-first-serve to the nearest competing cell -- the equal-speed
     limit of the race in ``create_competitive_masks`` -- then gated on size and
-    on the awarding cell\'s search radius.
+    on the awarding cell's search radius. That radius is a hard limit on the
+    search region and its whole interior is searched: a fragment counts if any
+    part of it falls inside the disk, at any distance from the soma.
 
     Returns ``{soma_id: metrics}``.
     """
@@ -997,7 +999,7 @@ def _detect_disconnected_fragments(processed_img, cells, pixel_size_um,
         if area_px == 0 or area_px > max_area_px:
             continue
         if np.any(soma_any[sl] & sub):
-            continue  # a whole soma is another cell, not this one\'s debris
+            continue  # a whole soma is another cell, not this one's debris
 
         prop = measure.regionprops(sub.astype(np.uint8))[0]
         try:
@@ -1009,7 +1011,6 @@ def _detect_disconnected_fragments(processed_img, cells, pixel_size_um,
 
         ys, xs = np.nonzero(sub)
         y0, x0 = sl[0].start, sl[1].start
-        gy, gx = ys.mean() + y0, xs.mean() + x0
 
         sep_sub = sep[sl][sub]
         k = int(np.argmin(sep_sub))
@@ -1018,10 +1019,16 @@ def _detect_disconnected_fragments(processed_img, cells, pixel_size_um,
         if own < 0:
             continue
 
-        d_cent = np.hypot(centroids[:, 0] - gy, centroids[:, 1] - gx)
-        in_disk = d_cent <= np.asarray(radii_px)
+        # The disk is the limit of the search, not a test on the fragment's
+        # middle: anything reaching inside it has been found, and is then
+        # measured whole. max_fragment_area_um2 caps how far a claimed fragment
+        # can stick out past the boundary.
+        dy = (ys + y0)[:, None] - centroids[None, :, 0]
+        dx = (xs + x0)[:, None] - centroids[None, :, 1]
+        d_near = np.sqrt(dy * dy + dx * dx).min(axis=0)
+        in_disk = d_near <= np.asarray(radii_px)
         if not in_disk[own]:
-            continue  # the winner of the race cannot claim it that far out
+            continue  # the winner of the race cannot reach it
 
         per_cell[own].append({
             'area_um2': area_px * px ** 2,
@@ -1032,7 +1039,7 @@ def _detect_disconnected_fragments(processed_img, cells, pixel_size_um,
         if int(in_disk.sum()) > 1:
             n_contested[own] += 1
         if return_debug:
-            debug.append({'centroid': (gy, gx), 'owner': own,
+            debug.append({'centroid': (ys.mean() + y0, xs.mean() + x0), 'owner': own,
                           'area_um2': area_px * px ** 2, 'distance_um': sep_um})
 
     for i, c in enumerate(cells):
