@@ -281,7 +281,8 @@ def patch_around(img, r, c, half):
 # ----------------------------------------------------------------------
 # training set
 # ----------------------------------------------------------------------
-def build_dataset(pairs, half, per_soma=600, verbose_every=100, channel=None):
+def build_dataset(pairs, half, per_soma=600, verbose_every=100, channel=None,
+                  use_click=False):
     X, y, groups = [], [], []
     cache_path, cache_img = None, None
     for i, (mp, ip, r, c, tp) in enumerate(pairs):
@@ -296,7 +297,15 @@ def build_dataset(pairs, half, per_soma=600, verbose_every=100, channel=None):
             ys, xs = np.nonzero(mask)
             if len(ys) < 20:
                 continue
-            cr, cc = int(ys.mean()), int(xs.mean())      # true centroid of the outline
+            # Centre the patch the same way scoring and MMPS will. Training on
+            # the outline's centroid while predicting from the recorded click
+            # makes every centre-anchored feature mean something different at
+            # the two ends -- the clicks here sit up to ~80% of a soma radius
+            # away from the centroid, which is far too big a shift to absorb.
+            if use_click:
+                cr, cc = int(r), int(c)
+            else:
+                cr, cc = int(ys.mean()), int(xs.mean())
             patch, y1, x1 = patch_around(img, cr, cc, half)
             mpatch = mask[y1:y1 + patch.shape[0], x1:x1 + patch.shape[1]]
             if patch.size == 0 or mpatch.sum() < 20:
@@ -521,7 +530,8 @@ def main():
           f"(held out entirely)\n")
 
     print("Extracting features…")
-    X, y, _ = build_dataset(train_pairs, half, a.per_soma, channel=a.channel)
+    X, y, _ = build_dataset(train_pairs, half, a.per_soma, channel=a.channel,
+                            use_click=a.use_click)
     if X is None:
         sys.exit("No usable training data — do the soma masks match the image sizes?")
     print(f"  {X.shape[0]:,} pixels x {X.shape[1]} features\n")
