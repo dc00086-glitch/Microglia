@@ -1937,6 +1937,20 @@ def get_ml_outliner(path=None):
     try:
         _ML_OUTLINER = _MLSomaOutliner(path)
         _ML_OUTLINER_PATH = path
+        # Say which file was loaded and whether it can auto-accept. Several
+        # copies of the model tend to exist at once -- beside the script, inside
+        # the bundle, in Downloads -- and without this the only symptom of
+        # loading the wrong one is a missing button.
+        cal = _ML_OUTLINER.conf_cal or {}
+        print(f"ML soma model loaded: {path}")
+        if cal.get('top50'):
+            print(f"  calibrated — auto-accept available "
+                  f"(threshold {cal['top50'].get('threshold'):.3f}, "
+                  f"purity {100 * cal['top50'].get('purity', 0):.0f}%)")
+        else:
+            print("  NO confidence calibration in this file — auto-accept will "
+                  "be unavailable, review-all only.")
+            print("  Retrain with the current train_soma_model.py to add it.")
         return _ML_OUTLINER
     except Exception as e:
         print(f"Could not load ML soma model from {path}: {e}")
@@ -12773,6 +12787,8 @@ if __name__ == '__main__':
             ml_btn.clicked.connect(lambda: dialog.done(4))
             ml_btn.setStyleSheet("border: 2px solid #FF9800; font-weight: bold;")
             _d = (_ml.conf_cal or {}).get('top50') or {}
+            if not _d:
+                ml_btn.setText("Machine Learning - Trained model (review all)")
             _tip = ("Outlines with a model trained on the soma outlines you have "
                     "already accepted.\nEach outline gets a confidence score; you "
                     "choose whether to review them all\nor accept the confident "
