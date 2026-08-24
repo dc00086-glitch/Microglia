@@ -4094,6 +4094,13 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.auto_outline_btn.setToolTip("Auto-detect outline for current soma")
         outline_btn_layout.addWidget(self.auto_outline_btn)
 
+        self.auto_outline_all_btn = QPushButton("Auto All")
+        self.auto_outline_all_btn.clicked.connect(self.auto_outline_all_somas)
+        self.auto_outline_all_btn.setEnabled(False)
+        self.auto_outline_all_btn.setToolTip(
+            "Auto-outline every remaining soma; failures are left for manual work")
+        outline_btn_layout.addWidget(self.auto_outline_all_btn)
+
         self.manual_draw_btn = QPushButton("Manual")
         self.manual_draw_btn.clicked.connect(self.start_manual_outline)
         self.manual_draw_btn.setEnabled(False)
@@ -12488,6 +12495,7 @@ if __name__ == '__main__':
         self._load_soma_for_outlining(start_idx)
 
         self.auto_outline_btn.setEnabled(True)
+        self.auto_outline_all_btn.setEnabled(True)
         self.manual_draw_btn.setEnabled(True)
         self.accept_outline_btn.setEnabled(False)
         self.skip_soma_btn.setEnabled(True)
@@ -12921,6 +12929,7 @@ if __name__ == '__main__':
         )
 
         self.auto_outline_btn.setEnabled(True)
+        self.auto_outline_all_btn.setEnabled(True)
         self.manual_draw_btn.setEnabled(True)
         self.accept_outline_btn.setEnabled(len(self.polygon_points) >= 3)
         self.skip_soma_btn.setEnabled(True)
@@ -13114,33 +13123,15 @@ if __name__ == '__main__':
             except Exception:
                 QMessageBox.warning(self, "Error", "Cannot determine image dimensions for mask.")
                 return
-        mask = self._polygon_to_mask(self.polygon_points, mask_shape)
+        soma_area_um2 = self._store_outline(img_name, soma_idx,
+                                            self.polygon_points, mask_shape)
+        if soma_area_um2 is None:
+            return
         soma_id = img_data['soma_ids'][soma_idx]
-
-        pixel_size = self._get_pixel_size(img_name)
-        soma_area_um2 = np.sum(mask) * (pixel_size ** 2)
-
-        img_data['soma_outlines'].append({
-            'soma_idx': soma_idx,
-            'soma_id': soma_id,
-            'centroid': img_data['somas'][soma_idx],
-            'outline': mask,
-            'polygon_points': self.polygon_points.copy(),
-            'soma_area_um2': soma_area_um2
-        })
-
-        # Export soma outline to file
-        self._export_soma_outline(img_name, soma_id, mask, pixel_size, soma_area_um2)
-
         self.log(f"✓ {soma_id} approved (soma area: {soma_area_um2:.1f} µm²)")
         self.polygon_points = []
 
         self._update_outline_progress()
-
-        cl_path = self._get_checklist_path('soma_checklist.csv')
-        if cl_path and os.path.exists(cl_path):
-            checklist_key = f"{img_name}_{soma_id}"
-            self._update_checklist_row(cl_path, 0, checklist_key, 1, 1)
 
         # Auto-save after each outline
         self._auto_save()
@@ -13522,6 +13513,139 @@ if __name__ == '__main__':
             for ol in img_data['soma_outlines']
         )
 
+    def _store_outline(self, img_name, soma_idx, points, mask_shape=None):
+        """Commit one soma outline: rasterise, record, export, tick checklist.
+
+        Shared by manual accept and batch auto-outlining so both produce
+        identical results. Returns the soma area in µm², or None on failure.
+        """
+        img_data = self.images.get(img_name)
+        if img_data is None or len(points) < 3:
+            return None
+        if mask_shape is None:
+            outline_img = self._get_image_for_outlining(img_data)
+            if outline_img is not None:
+                mask_shape = outline_img.shape[:2]
+            elif img_data.get('processed') is not None:
+                mask_shape = img_data['processed'].shape[:2]
+            else:
+                try:
+                    mask_shape = load_tiff_image(img_data['raw_path']).shape[:2]
+                except Exception:
+                    return None
+        mask = self._polygon_to_mask(points, mask_shape)
+        soma_id = img_data['soma_ids'][soma_idx]
+        pixel_size = self._get_pixel_size(img_name)
+        soma_area_um2 = float(np.sum(mask) * (pixel_size ** 2))
+
+        img_data['soma_outlines'].append({
+            'soma_idx': soma_idx,
+            'soma_id': soma_id,
+            'centroid': img_data['somas'][soma_idx],
+            'outline': mask,
+            'polygon_points': list(points),
+            'soma_area_um2': soma_area_um2,
+        })
+        self._export_soma_outline(img_name, soma_id, mask, pixel_size,
+                                  soma_area_um2)
+        cl_path = self._get_checklist_path('soma_checklist.csv')
+        if cl_path and os.path.exists(cl_path):
+            self._update_checklist_row(cl_path, 0, f"{img_name}_{soma_id}", 1, 1)
+        return soma_area_um2
+
+    def auto_outline_all_somas(self):
+        """Auto-outline every soma still waiting in the queue.
+
+        Runs the same detector the per-soma "Auto" button uses, so results are
+        identical — it just doesn't stop for confirmation on each one. Somas the
+        detector fails on are left un-outlined for manual work, and the queue is
+        parked on the first of them afterwards.
+        """
+        if not getattr(self, 'outlining_queue', None):
+            QMessageBox.warning(self, "Auto-Outline All",
+                                "No somas in the outlining queue.")
+            return
+        pending = [(qi, self.outlining_queue[qi])
+                   for qi in range(len(self.outlining_queue))
+                   if not self._soma_has_outline(*self.outlining_queue[qi])]
+        if not pending:
+            QMessageBox.information(self, "Auto-Outline All",
+                                    "Every soma already has an outline.")
+            return
+        if QMessageBox.question(
+                self, "Auto-Outline All",
+                f"Auto-outline {len(pending)} soma(s)?\n\n"
+                f"Each is outlined with the current method and sensitivity. "
+                f"Any the detector fails on are left for manual outlining, and "
+                f"you can redo individual outlines afterwards.",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        method = self._get_auto_outline_method()
+        sensitivity = self._auto_outline_sensitivity_value
+        from PyQt5.QtWidgets import QProgressDialog
+        progress = QProgressDialog("Auto-outlining somas…", "Cancel",
+                                   0, len(pending), self)
+        progress.setWindowTitle("Auto-Outline All")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        done, failed = 0, []
+        for n, (qi, (img_name, soma_idx)) in enumerate(pending):
+            if progress.wasCanceled():
+                break
+            progress.setValue(n)
+            QApplication.processEvents()
+            img_data = self.images.get(img_name)
+            if img_data is None:
+                continue
+            soma_id = img_data['soma_ids'][soma_idx]
+            progress.setLabelText(f"{soma_id}  ({n + 1}/{len(pending)})")
+            outline_img = self._get_image_for_outlining(img_data)
+            if outline_img is None:
+                failed.append(soma_id)
+                continue
+            soma = img_data['somas'][soma_idx]
+            try:
+                points = method(outline_img, soma, sensitivity)
+            except Exception:
+                points = None
+            if points is None or len(points) < 3:
+                failed.append(soma_id)
+                continue
+            try:
+                points = _remove_branch_juts(points, soma)
+            except Exception:
+                pass
+            if self._store_outline(img_name, soma_idx, list(points)) is None:
+                failed.append(soma_id)
+            else:
+                done += 1
+        progress.close()
+
+        self.polygon_points = []
+        self._update_outline_progress()
+        self._auto_save()
+        self.log(f"Auto-outline: {done} outlined, {len(failed)} need manual work")
+        if failed:
+            self.log("  manual: " + ", ".join(failed[:20])
+                     + (" ..." if len(failed) > 20 else ""))
+
+        nxt = self._find_next_unoutlined_idx(start_from=0)
+        QMessageBox.information(
+            self, "Auto-Outline All",
+            f"Outlined {done} soma(s).\n"
+            + (f"{len(failed)} could not be outlined automatically and are "
+               f"waiting for manual outlining."
+               if failed else "All somas are outlined."))
+        if nxt is not None:
+            if getattr(self, 'review_mode', False):
+                self._load_review_soma(nxt)
+            else:
+                self._load_soma_for_outlining(nxt)
+        else:
+            self._finish_outlining()
+
     def _find_next_unoutlined_idx(self, start_from=0):
         """Find the first queue entry that doesn't have an outline yet."""
         for qi in range(start_from, len(self.outlining_queue)):
@@ -13552,6 +13676,7 @@ if __name__ == '__main__':
         self.redo_outline_btn.setEnabled(False)  # Disable redo button when outlining complete
 
         self.auto_outline_btn.setEnabled(False)
+        self.auto_outline_all_btn.setEnabled(False)
         self.manual_draw_btn.setEnabled(False)
         self.accept_outline_btn.setEnabled(False)
         self.skip_soma_btn.setEnabled(False)
