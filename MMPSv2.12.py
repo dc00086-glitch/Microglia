@@ -12764,6 +12764,34 @@ if __name__ == '__main__':
                             "Competitive growth prevents overlap between somas.")
         layout.addWidget(dapi_btn)
 
+        # Trained model. Only offered when one is actually present, with the
+        # reason stated when it is not -- a disabled button with no explanation
+        # is worse than no button.
+        _ml = get_ml_outliner()
+        ml_btn = QPushButton("Machine Learning - Trained on your accepted outlines")
+        if _ml is not None:
+            ml_btn.clicked.connect(lambda: dialog.done(4))
+            ml_btn.setStyleSheet("border: 2px solid #FF9800; font-weight: bold;")
+            _d = (_ml.conf_cal or {}).get('top50') or {}
+            _tip = ("Outlines with a model trained on the soma outlines you have "
+                    "already accepted.\nEach outline gets a confidence score; you "
+                    "choose whether to review them all\nor accept the confident "
+                    "ones and review the rest.")
+            if _d.get('purity') is not None:
+                _tip += (f"\n\nOn held-out images, {100 * _d['purity']:.0f}% of "
+                         f"outlines above the auto-accept\nthreshold were good "
+                         f"(about {100 * _d.get('covers', 0):.0f}% of cells).")
+            ml_btn.setToolTip(_tip)
+            layout.addWidget(ml_btn)
+        else:
+            ml_btn.setEnabled(False)
+            ml_btn.setToolTip("No trained model found.")
+            layout.addWidget(ml_btn)
+            _hint = QLabel("<i>No soma_model.joblib found — train one with "
+                           "train_soma_model.py and put it beside MMPS.</i>")
+            _hint.setWordWrap(True)
+            layout.addWidget(_hint)
+
         # Auto settings (soma-blob detector). Sensitivity shifts the threshold;
         # soma radius sizes the search window, the core used to sample the
         # soma's peak brightness, AND the max-size rejection ceiling — it is
@@ -12856,7 +12884,15 @@ if __name__ == '__main__':
         if result == 0:
             return  # Cancelled
 
-        self.auto_outline_method.setCurrentIndex(0)  # Always soma blob
+        # Pick the detector the chosen button implies. This used to force soma
+        # blob unconditionally, which made every other combo entry unreachable.
+        _want = 'Machine learning' if result == 4 else 'Soma blob'
+        for _i in range(self.auto_outline_method.count()):
+            if self.auto_outline_method.itemText(_i).startswith(_want):
+                self.auto_outline_method.setCurrentIndex(_i)
+                break
+        else:
+            self.auto_outline_method.setCurrentIndex(0)
         self._auto_outline_sensitivity_value = sens_spin.value()
         self.soma_max_radius_um = radius_spin.value()
         self._dapi_channel = dapi_ch_combo.currentData()
@@ -12911,6 +12947,9 @@ if __name__ == '__main__':
         elif result == 3:
             # DAPI-seeded mode — generate outlines, then review
             self._run_dapi_seeded_outlining()
+        elif result == 4:
+            # Trained model — same batch path, with the confidence policy
+            self._run_ml_outline_all()
         else:
             # Auto mode - outline all, then review
             self._run_auto_outline_all()
@@ -12936,6 +12975,135 @@ if __name__ == '__main__':
         self.log("Click to add points, right-click to complete")
         self.log("Press Enter or [Accept] to save and move to next")
         self.log("=" * 50)
+
+    def _run_ml_outline_all(self):
+        """Outline every queued soma with the trained model, then review.
+
+        Differs from the other detectors in one way: each outline carries a
+        confidence, so the user can accept the confident ones unreviewed. The
+        threshold is an absolute value calibrated on held-out cells at training
+        time and stored in the model -- ranking this batch and taking its top
+        half would accept half of any batch however badly it went.
+        """
+        ml = get_ml_outliner()
+        if ml is None:
+            QMessageBox.warning(self, "Machine Learning",
+                                "No trained model is available.")
+            return
+
+        thr = ml.accept_threshold('top50')
+        cal = (ml.conf_cal or {}).get('top50') or {}
+        box = QMessageBox(self)
+        box.setWindowTitle("Machine-Learning Outlining")
+        if thr is None:
+            box.setText("This model carries no confidence calibration, so every "
+                        "outline will be queued for review.")
+            box.addButton("Review all outlines", QMessageBox.AcceptRole)
+        else:
+            box.setText(
+                f"Outline with the trained model?\n\n"
+                f"Each outline gets a confidence score. On held-out images "
+                f"{100 * cal.get('purity', 0):.0f}% of the outlines above the "
+                f"auto-accept threshold were good, and they were about "
+                f"{100 * cal.get('covers', 0):.0f}% of all cells.\n\n"
+                f"Reviewing everything takes longer but nothing is accepted "
+                f"unseen.")
+            box.addButton("Review all outlines", QMessageBox.AcceptRole)
+            box.addButton("Auto-accept confident, review the rest",
+                          QMessageBox.YesRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        label = clicked.text() if clicked else "Cancel"
+        if label == "Cancel":
+            return
+        ml_threshold = thr if label.startswith("Auto-accept") else None
+
+        px = self._get_pixel_size(self.current_image_name)
+        self.log("=" * 50)
+        self.log("🤖 MACHINE-LEARNING OUTLINING")
+        self.log(f"Model: {ml.describe()}")
+        self.log(f"Policy: " + ("auto-accept confident, review the rest"
+                                if ml_threshold is not None else "review all"))
+        self.log("=" * 50)
+
+        from PyQt5.QtWidgets import QProgressDialog
+        todo = [(i, k) for i, k in enumerate(self.outlining_queue)
+                if not self._soma_has_outline(*k)]
+        progress = QProgressDialog("Outlining with the trained model…", "Cancel",
+                                   0, len(todo), self)
+        progress.setWindowTitle("Machine-Learning Outlining")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        self.auto_outlined_points = {}
+        self.failed_auto_outlines = []
+        needs_review, auto_ok, done = [], 0, 0
+
+        for n, (qi, (img_name, soma_idx)) in enumerate(todo):
+            if progress.wasCanceled():
+                break
+            progress.setValue(n)
+            QApplication.processEvents()
+            img_data = self.images.get(img_name)
+            if img_data is None:
+                continue
+            soma_id = img_data['soma_ids'][soma_idx]
+            progress.setLabelText(f"{soma_id}  ({n + 1}/{len(todo)})")
+            outline_img = self._get_image_for_outlining(img_data)
+            if outline_img is None:
+                self.failed_auto_outlines.append(qi)
+                continue
+            soma = img_data['somas'][soma_idx]
+            px_here = self._get_pixel_size(img_name) or px
+            points, conf = ml.outline(outline_img, soma, px_here)
+            if points is None or len(points) < 3:
+                self.failed_auto_outlines.append(qi)
+                continue
+            try:
+                points = _remove_branch_juts(points, soma)
+            except Exception:
+                pass
+            if self._store_outline(img_name, soma_idx, list(points)) is None:
+                self.failed_auto_outlines.append(qi)
+                continue
+            done += 1
+            self._record_ml_confidence(img_name, soma_idx, conf)
+            c = -1.0 if conf is None else conf
+            if ml_threshold is not None and c >= ml_threshold:
+                auto_ok += 1
+            else:
+                needs_review.append((qi, c))
+        progress.close()
+
+        needs_review.sort(key=lambda t: t[1])      # least confident first
+        self.polygon_points = []
+        self._update_outline_progress()
+        self._auto_save()
+        self.log(f"Model: {done} outlined, {auto_ok} accepted on confidence, "
+                 f"{len(needs_review)} queued for review, "
+                 f"{len(self.failed_auto_outlines)} failed")
+
+        msg = [f"Outlined {done} soma(s)."]
+        if ml_threshold is not None:
+            msg.append(f"{auto_ok} were confident enough to accept unreviewed.")
+        msg.append(f"{len(needs_review)} queued for review, least confident "
+                   f"first.")
+        if self.failed_auto_outlines:
+            msg.append(f"{len(self.failed_auto_outlines)} could not be outlined "
+                       f"and need manual work.")
+        QMessageBox.information(self, "Machine-Learning Outlining",
+                                "\n".join(msg))
+
+        self.review_mode = True
+        if needs_review:
+            self._load_review_soma(needs_review[0][0])
+            return
+        nxt = self._find_next_unoutlined_idx(start_from=0)
+        if nxt is not None:
+            self._load_soma_for_outlining(nxt)
+        else:
+            self._finish_outlining()
 
     def _run_auto_outline_all(self):
         """Run auto-outline on all somas, then start review mode"""
