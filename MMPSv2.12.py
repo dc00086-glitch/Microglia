@@ -765,6 +765,281 @@ def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
 
 
 # ============================================================================
+# DYSTROPHY: DISCONNECTED-FRAGMENT ANALYSIS
+# Cytoplasmic fragmentation is the end stage of microglial dystrophy: pieces of
+# process detach from the arbor and sit near the cell. These functions find that
+# detached IBA1 material and award it to a cell, using the same competitive
+# first-come-first-serve race the masks are grown with.
+# ============================================================================
+
+# Fragment gating, agreed with DC. Change these to retune the metric.
+DYSTROPHY_GAP_UM = 1.5                    # background width that counts as a break
+DYSTROPHY_MIN_FRAGMENT_EXTENT_UM = 1.0    # below this it is noise, not cytoplasm
+DYSTROPHY_MAX_FRAGMENT_AREA_UM2 = 35.0    # above this it is another cell or debris
+DYSTROPHY_MIN_SEARCH_RADIUS_UM = 10.0     # floor so a retracted cell still gets a disk
+# WARNING: 1.0 is DC's specified value, but avg_centroid_distance measures the
+# arbor itself -- on real cells it came out at 13.7 um where the mask reached
+# 18.0 um, so the disk is smaller than the cell and cannot see anything detached
+# beyond it. In tools/dystrophy_sweep.py, 0 of 3 cells registered a fragment at
+# 1.0 with fragments planted from 14 um out; they appear from 1.25 upward.
+# Raise this before reading the fragment columns as biology.
+DYSTROPHY_SEARCH_RADIUS_SCALE = 1.0       # search radius = avg_centroid_distance x this
+
+_FRAGMENT_KEYS = (
+    'n_fragments', 'fragment_area_um2', 'fragment_perimeter_um',
+    'mean_fragment_area_um2', 'mean_fragment_feret_um',
+    'mean_fragment_distance_um', 'fragmentation_index',
+    'n_fragments_contested', 'frag_search_radius_um',
+)
+
+
+def _empty_fragment_params():
+    """Zeroed fragment columns, so every row carries them even when the pass
+    could not run (no processed image on disk, no soma outlines)."""
+    params = {k: 0 for k in _FRAGMENT_KEYS}
+    params['frag_gap_um'] = DYSTROPHY_GAP_UM
+    params['frag_threshold'] = 0
+    return params
+
+
+def _avg_centroid_distance_um(mask, pixel_size_um):
+    """Mean distance from the mask centroid to its four extremity pixels, in um.
+
+    Replicates the ``avg_centroid_distance`` computation in
+    ``MorphologyCalculator._calculate_simple_descriptors`` so the fragment
+    search radius is exactly that CSV column, as specified.
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return 0.0
+    centroid = coords.mean(axis=0)
+    extremities = np.array([
+        coords[coords[:, 0].argmin()], coords[coords[:, 0].argmax()],
+        coords[coords[:, 1].argmin()], coords[coords[:, 1].argmax()],
+    ])
+    d = np.sqrt(np.sum((extremities - centroid) ** 2, axis=1))
+    return float(d.mean()) * pixel_size_um
+
+
+def _dystrophy_signal_threshold(processed_img):
+    """Intensity above which IBA1 counts as cell material (Otsu on positive px).
+
+    Deliberately NOT the mask-growing floor, which is a percent of the image
+    max and therefore moves when one bright artifact rescales an image. Otsu is
+    referenced to the image's own two-population structure instead. The value
+    used is written to the CSV so a run can be audited.
+    """
+    from skimage.filters import threshold_otsu
+    pos = processed_img[processed_img > 0]
+    if pos.size == 0:
+        return 0.0
+    try:
+        return float(threshold_otsu(pos))
+    except Exception:
+        return float(pos.mean())
+
+
+def _detect_disconnected_fragments(processed_img, cells, pixel_size_um,
+                                   gap_um=None, min_fragment_extent_um=None,
+                                   max_fragment_area_um2=None,
+                                   min_search_radius_um=None,
+                                   search_radius_scale=None,
+                                   threshold=None, max_bridge_rounds=6,
+                                   return_debug=False):
+    """Competitive disconnected-fragment (dystrophy) analysis for one image.
+
+    ``cells`` is a list of dicts, one per soma, with keys ``soma_id``,
+    ``centroid`` (row, col in full-image pixels), ``mask`` (that cell\'s grown
+    mask) and optionally ``soma_mask`` and ``search_radius_um``.
+
+    A fragment is IBA1 material separated from every cell by more than
+    ``gap_um`` of background. Attachment is judged on the THRESHOLDED IMAGE,
+    never on the mask: MMPS masks stop at an area budget, so process material
+    the budget never reached is still attached and must not be counted as
+    fragmentation (that error would score the healthiest, most ramified cells
+    as the most dystrophic).
+
+    Breaks narrower than ``gap_um`` are bridged back into the cell, iterating so
+    a chain of small gaps stays one cell. What remains is awarded
+    first-come-first-serve to the nearest competing cell -- the equal-speed
+    limit of the race in ``create_competitive_masks`` -- then gated on size and
+    on the awarding cell\'s search radius.
+
+    Returns ``{soma_id: metrics}``.
+    """
+    # Resolved at call time, not bound as defaults, so editing the DYSTROPHY_*
+    # constants above actually retunes the metric.
+    if gap_um is None:
+        gap_um = DYSTROPHY_GAP_UM
+    if min_fragment_extent_um is None:
+        min_fragment_extent_um = DYSTROPHY_MIN_FRAGMENT_EXTENT_UM
+    if max_fragment_area_um2 is None:
+        max_fragment_area_um2 = DYSTROPHY_MAX_FRAGMENT_AREA_UM2
+    if min_search_radius_um is None:
+        min_search_radius_um = DYSTROPHY_MIN_SEARCH_RADIUS_UM
+    if search_radius_scale is None:
+        search_radius_scale = DYSTROPHY_SEARCH_RADIUS_SCALE
+
+    h, w = processed_img.shape
+    px = float(pixel_size_um)
+    if threshold is None:
+        threshold = _dystrophy_signal_threshold(processed_img)
+    gap_px = gap_um / px
+    max_area_px = max_fragment_area_um2 / (px ** 2)
+    struct8 = np.ones((3, 3), dtype=int)
+
+    signal = processed_img >= threshold
+    lab, _ = ndimage.label(signal, structure=struct8)
+
+    # Cell material, labelled 1..N. Where masks overlap the earlier cell keeps
+    # the pixel, so the labelling is deterministic.
+    seed = np.zeros((h, w), dtype=np.int32)
+    for i, c in enumerate(cells):
+        m = np.asarray(c['mask']) > 0
+        seed[m & (seed == 0)] = i + 1
+        sm = c.get('soma_mask')
+        if sm is not None and np.shape(sm) == (h, w):
+            sm = np.asarray(sm) > 0
+            seed[sm & (seed == 0)] = i + 1
+
+    results = {c['soma_id']: _empty_fragment_params() for c in cells}
+    if not np.any(seed):
+        return (results, []) if return_debug else results
+
+    # Attached = every signal component a cell touches, plus the masks
+    # themselves (a mask pixel can sit below the fragment threshold).
+    attached_labels = set(np.unique(lab[seed > 0])) - {0}
+    attached = (seed > 0)
+    if attached_labels:
+        attached |= np.isin(lab, np.fromiter(attached_labels, dtype=np.int32))
+
+    # Bridge sub-gap breaks back into the cell. Separation is the width of the
+    # background between two objects, which is the EDT distance minus one.
+    for _ in range(max_bridge_rounds):
+        cand_labels = np.setdiff1d(np.unique(lab[~attached]), [0])
+        if cand_labels.size == 0:
+            break
+        dist = ndimage.distance_transform_edt(~attached)
+        cand = np.where(attached, 0, lab)
+        mins = np.atleast_1d(np.asarray(
+            ndimage.minimum(dist, cand, index=cand_labels), dtype=float))
+        bridged = cand_labels[(mins - 1.0) < gap_px]
+        if bridged.size == 0:
+            break
+        attached |= np.isin(lab, bridged)
+
+    # Final separation field, and the ownership race: every pixel is won by the
+    # nearest cell material, first come first serve.
+    sep = ndimage.distance_transform_edt(~attached)
+    _, (oy, ox) = ndimage.distance_transform_edt(seed == 0, return_indices=True)
+    owner = seed[oy, ox]
+
+    radii_px = []
+    for c in cells:
+        r = c.get('search_radius_um')
+        if r is None:
+            r = _avg_centroid_distance_um(np.asarray(c['mask']) > 0, px)
+        radii_px.append(max(float(r) * search_radius_scale, min_search_radius_um) / px)
+
+    centroids = np.array([c['centroid'] for c in cells], dtype=float)
+
+    # Attached material each cell owns inside its own disk: the denominator of
+    # the fragmentation index. Owned attached material, not the area-capped
+    # mask, so a truncated mask cannot inflate the index.
+    rr, cc = np.indices((h, w))
+    attached_area_px = np.zeros(len(cells), dtype=float)
+    for i in range(len(cells)):
+        disk_i = (((rr - centroids[i, 0]) ** 2
+                   + (cc - centroids[i, 1]) ** 2) <= radii_px[i] ** 2)
+        attached_area_px[i] = float(np.count_nonzero(
+            attached & (owner == i + 1) & disk_i))
+
+    soma_any = np.zeros((h, w), dtype=bool)
+    for c in cells:
+        sm = c.get('soma_mask')
+        if sm is not None and np.shape(sm) == (h, w):
+            soma_any |= (np.asarray(sm) > 0)
+
+    per_cell = {i: [] for i in range(len(cells))}
+    n_contested = np.zeros(len(cells), dtype=int)
+    debug = []
+
+    free = np.where(attached, 0, lab)
+    for lidx, sl in enumerate(ndimage.find_objects(free)):
+        if sl is None:
+            continue
+        sub = (free[sl] == lidx + 1)
+        area_px = int(sub.sum())
+        if area_px == 0 or area_px > max_area_px:
+            continue
+        if np.any(soma_any[sl] & sub):
+            continue  # a whole soma is another cell, not this one\'s debris
+
+        prop = measure.regionprops(sub.astype(np.uint8))[0]
+        try:
+            feret_px = float(prop.feret_diameter_max)
+        except Exception:
+            feret_px = float(prop.major_axis_length)
+        if feret_px * px < min_fragment_extent_um:
+            continue
+
+        ys, xs = np.nonzero(sub)
+        y0, x0 = sl[0].start, sl[1].start
+        gy, gx = ys.mean() + y0, xs.mean() + x0
+
+        sep_sub = sep[sl][sub]
+        k = int(np.argmin(sep_sub))
+        sep_um = max(0.0, (float(sep_sub[k]) - 1.0) * px)
+        own = int(owner[int(ys[k]) + y0, int(xs[k]) + x0]) - 1
+        if own < 0:
+            continue
+
+        d_cent = np.hypot(centroids[:, 0] - gy, centroids[:, 1] - gx)
+        in_disk = d_cent <= np.asarray(radii_px)
+        if not in_disk[own]:
+            continue  # the winner of the race cannot claim it that far out
+
+        per_cell[own].append({
+            'area_um2': area_px * px ** 2,
+            'perimeter_um': float(prop.perimeter) * px,
+            'feret_um': feret_px * px,
+            'distance_um': sep_um,
+        })
+        if int(in_disk.sum()) > 1:
+            n_contested[own] += 1
+        if return_debug:
+            debug.append({'centroid': (gy, gx), 'owner': own,
+                          'area_um2': area_px * px ** 2, 'distance_um': sep_um})
+
+    for i, c in enumerate(cells):
+        frags = per_cell[i]
+        p = _empty_fragment_params()
+        p['frag_search_radius_um'] = round(radii_px[i] * px, 4)
+        p['frag_gap_um'] = gap_um
+        p['frag_threshold'] = round(float(threshold), 4)
+        if frags:
+            areas = np.array([f['area_um2'] for f in frags])
+            p['n_fragments'] = len(frags)
+            p['fragment_area_um2'] = round(float(areas.sum()), 4)
+            p['fragment_perimeter_um'] = round(
+                float(sum(f['perimeter_um'] for f in frags)), 4)
+            p['mean_fragment_area_um2'] = round(float(areas.mean()), 4)
+            p['mean_fragment_feret_um'] = round(
+                float(np.mean([f['feret_um'] for f in frags])), 4)
+            p['mean_fragment_distance_um'] = round(
+                float(np.mean([f['distance_um'] for f in frags])), 4)
+            p['n_fragments_contested'] = int(n_contested[i])
+        cell_area = attached_area_px[i] * px ** 2
+        denom = cell_area + p['fragment_area_um2']
+        p['fragmentation_index'] = round(
+            p['fragment_area_um2'] / denom, 4) if denom > 0 else 0
+        results[c['soma_id']] = p
+
+    return (results, debug) if return_debug else results
+
+
+
+# ============================================================================
 # BLOOD-BRAIN-BARRIER (BBB) ANALYSIS ENGINE
 # Vessel segmentation (CD31), tracer extravasation/leakage (intravascular
 # dextran / far-red albumin), and per-microglia leakage exposure. Pure
@@ -2234,7 +2509,8 @@ class MorphologyCalculationThread(QThread):
     finished = pyqtSignal(list)  # list of results
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, approved_masks, pixel_size, use_imagej, images, output_dir=None, pixel_size_map=None, masks_dir=None, soma_group_map=None, processed_dir=None):
+    def __init__(self, approved_masks, pixel_size, use_imagej, images, output_dir=None, pixel_size_map=None, masks_dir=None, soma_group_map=None, processed_dir=None,
+                 branch_boost_on=False):
         super().__init__()
         self.approved_masks = approved_masks
         self.pixel_size = pixel_size
@@ -2242,9 +2518,116 @@ class MorphologyCalculationThread(QThread):
         self.images = images
         self.output_dir = output_dir
         self.processed_dir = processed_dir
+        # Branch Boost bridges faint gaps on purpose, which is exactly the signal
+        # the dystrophy pass measures. Recorded per row so a run cannot be
+        # misread later.
+        self.branch_boost_on = bool(branch_boost_on)
         self.pixel_size_map = pixel_size_map or {}
         self.masks_dir = masks_dir
         self.soma_group_map = soma_group_map or {}
+
+    def _load_processed(self, img_name, img_data):
+        """The processed image for one image, from memory or from disk."""
+        processed_img = img_data.get('processed')
+        if processed_img is not None:
+            return processed_img
+        name_stem = os.path.splitext(img_name)[0]
+        for search_dir in [self.processed_dir, self.output_dir]:
+            if not search_dir:
+                continue
+            processed_path = os.path.join(search_dir, f"{name_stem}_processed.tif")
+            if os.path.exists(processed_path):
+                processed_img = safe_tiff_read(processed_path)
+                img_data['processed'] = processed_img
+                return processed_img
+        return None
+
+    def _fragment_pass(self, somas_dir):
+        """Competitive dystrophy analysis, one image at a time.
+
+        Fragments are awarded between cells, so this cannot be done per mask --
+        every soma in an image has to race at once. Runs once per (image, soma)
+        on that soma's largest area target, since the search radius is a
+        property of the cell rather than of a mask's area budget; the result is
+        attached to every area row for that soma so fragment counts stay
+        comparable across targets.
+
+        Returns ``{(image_basename, soma_id): params}``.
+        """
+        by_image = {}
+        for flat in self.approved_masks:
+            md = flat['mask_data']
+            img_name = flat['image_name']
+            area = md.get('target_area_um2', md.get('area_um2', 0)) or 0
+            cur = by_image.setdefault(img_name, {})
+            prev = cur.get(md['soma_id'])
+            if prev is None or area > prev[0]:
+                cur[md['soma_id']] = (area, md['soma_idx'])
+
+        out = {}
+        for n_done, (img_name, somas) in enumerate(sorted(by_image.items())):
+            img_basename = os.path.splitext(img_name)[0]
+            img_data = self.images.get(img_name)
+            if img_data is None:
+                continue
+            processed_img = self._load_processed(img_name, img_data)
+            if processed_img is None:
+                continue
+            processed_img = ensure_grayscale(processed_img)
+
+            img_pixel_size = self.pixel_size_map.get(img_name, self.pixel_size)
+            if isinstance(img_pixel_size, (list, tuple)):
+                px = math.sqrt(img_pixel_size[0] * img_pixel_size[1])
+            else:
+                px = img_pixel_size
+
+            cells = []
+            for soma_id, (area_um2, soma_idx) in sorted(somas.items()):
+                mask_arr = None
+                if self.masks_dir:
+                    mask_path = os.path.join(
+                        self.masks_dir, _mask_tif_name(img_basename, soma_id, area_um2))
+                    if os.path.exists(mask_path):
+                        mask_arr = safe_tiff_read(mask_path) > 0
+                if mask_arr is None or mask_arr.shape != processed_img.shape:
+                    continue
+                soma_arr = None
+                if somas_dir:
+                    soma_path = os.path.join(
+                        somas_dir, f"{img_basename}_{soma_id}_soma.tif")
+                    if os.path.exists(soma_path):
+                        try:
+                            soma_arr = safe_tiff_read(soma_path) > 0
+                        except Exception:
+                            soma_arr = None
+                if soma_arr is not None and soma_arr.shape != processed_img.shape:
+                    soma_arr = None
+                try:
+                    centroid = img_data['somas'][soma_idx]
+                except (KeyError, IndexError, TypeError):
+                    continue
+                cells.append({
+                    'soma_id': soma_id,
+                    'centroid': (centroid[0], centroid[1]),  # somas are (row, col)
+                    'mask': mask_arr,
+                    'soma_mask': soma_arr,
+                    'search_radius_um': _avg_centroid_distance_um(mask_arr, px),
+                })
+
+            if not cells:
+                continue
+            try:
+                per_soma = _detect_disconnected_fragments(processed_img, cells, px)
+            except Exception as e:
+                print(f"  Dystrophy pass failed on {img_basename}: {e}")
+                continue
+            for soma_id, params in per_soma.items():
+                out[(img_basename, soma_id)] = params
+
+            self.progress.emit(
+                int((n_done + 1) / max(len(by_image), 1) * 100),
+                f"Dystrophy pass ({n_done + 1}/{len(by_image)} images)")
+        return out
 
     def run(self):
         import sys
@@ -2300,6 +2683,20 @@ class MorphologyCalculationThread(QThread):
             calculator_cache = {}
             soma_mask_cache = {}
             somas_dir = os.path.join(self.output_dir, "somas") if self.output_dir else None
+
+            # Dystrophy runs per image (fragments are contested between cells),
+            # so it happens up front and is merged into the per-mask rows below.
+            if self.branch_boost_on:
+                msg = ("WARNING: Branch Boost is on. It bridges faint gaps by design, "
+                       "which suppresses the fragmentation the dystrophy columns "
+                       "measure. Re-run with it off before interpreting them.")
+                print(f"  {msg}")
+                self.progress.emit(0, "Dystrophy: Branch Boost is on - see log")
+            try:
+                fragment_params = self._fragment_pass(somas_dir)
+            except Exception as e:
+                print(f"  Dystrophy pass skipped: {e}")
+                fragment_params = {}
             for i in serial_indices:
                 flat_data = self.approved_masks[i]
                 mask_data = flat_data['mask_data']
@@ -2372,6 +2769,9 @@ class MorphologyCalculationThread(QThread):
                 params['soma_idx'] = meta[2]
                 params['target_area_um2'] = meta[3]
                 params['soma_group'] = self.soma_group_map.get((meta[0], meta[1]), '')
+                params.update(fragment_params.get((meta[0], meta[1]),
+                                                  _empty_fragment_params()))
+                params['frag_branch_boost'] = int(self.branch_boost_on)
                 all_results[i] = params
                 mask_data['mask'] = None
 
@@ -17213,7 +17613,9 @@ if __name__ == '__main__':
                 approved_masks, pixel_size, use_imagej=False, images=self.images,
                 output_dir=self.output_dir, pixel_size_map=pixel_size_map,
                 masks_dir=self.masks_dir, soma_group_map=soma_group_map,
-                processed_dir=getattr(self, 'processed_dir', None)
+                processed_dir=getattr(self, 'processed_dir', None),
+                branch_boost_on=(self.branch_boost_check.isChecked()
+                                 and self.branch_boost_slider.value() > 0)
             )
 
             self.morph_thread.progress.connect(self._on_morph_progress)

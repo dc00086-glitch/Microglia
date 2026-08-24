@@ -80,3 +80,22 @@ actually holds the far-red tracer.
 * **Embedded script templates** (~2,800 lines of ImageJ/Python/R held as string
   literals) could move to bundled files — needs a PyInstaller build test since
   it changes how the `.app` bundles data.
+
+---
+
+## Dystrophy fragment analysis — follow-ups
+
+* **The default search radius is blind.** `DYSTROPHY_SEARCH_RADIUS_SCALE = 1.0`
+  makes the search disk equal to `avg_centroid_distance`, which measures the
+  arbor itself — on the repo's sample cells that is 13.7 µm where the mask
+  reaches 18.0 µm, so the disk does not even cover the cell. With fragments
+  planted from 14 µm out, `tools/dystrophy_sweep.py` finds 0 of 3 cells at 1.0
+  and 2 of 3 from 1.25 upward. Pick a scale from real data before the fragment
+  columns are used for anything.
+* **Cluster script has no fragment columns.** `_build_spread_analysis_script`
+  works from `masks/` + `somas/` only; fragment detection needs the intensity
+  image, so the generated SLURM script would need a `processed/` folder and a
+  copy of the detector. In-app morphology has the columns; batch exports do not.
+* **`mask_metadata.csv` writes `soma_x, soma_y` from `img_data['somas']`,
+  which holds (row, col).** Pre-existing: the two columns are swapped. Not
+  touched here because downstream matching may already rely on it.
