@@ -132,17 +132,44 @@ def find_pairs(root, timepoints, limit=None):
     return pairs
 
 
-def load_gray(path):
-    """Load an image as 2D float. Max-projects Z, takes the brightest channel."""
+def describe_channels(path):
+    """Report an image's channel layout so the right one can be named."""
+    a = np.squeeze(np.asarray(tifffile.imread(path)))
+    out = [f"    {os.path.basename(path)}", f"    shape {a.shape}  dtype {a.dtype}"]
+    if a.ndim == 3 and a.shape[int(np.argmin(a.shape))] <= 8:
+        b = np.moveaxis(a, int(np.argmin(a.shape)), -1)
+        for i in range(b.shape[2]):
+            ch = b[:, :, i].astype(np.float64)
+            out.append(f"    channel {i + 1}: mean {ch.mean():8.2f}   "
+                       f"max {ch.max():7.0f}   above-zero {100 * (ch > 0).mean():5.1f}%")
+    else:
+        out.append("    single channel")
+    return "\n".join(out)
+
+
+def load_gray(path, channel=None):
+    """Load an image as 2D float, keeping only the stain we are training on.
+
+    `channel` is 1-based. Leaving it None falls back to whichever channel carries
+    the most total signal, which is only a guess -- if the microglia stain is not
+    the brightest channel that silently trains the model on the wrong structure,
+    so name the channel explicitly whenever the images are multi-channel.
+    """
     a = np.squeeze(np.asarray(tifffile.imread(path)))
     if a.ndim == 3:
         # channel axis = the small one; otherwise treat as a stack
         ax = int(np.argmin(a.shape))
         if a.shape[ax] <= 8:
             a = np.moveaxis(a, ax, -1)
-            # pick the channel with the most signal (the stained one)
-            sums = [a[:, :, i].astype(np.float64).sum() for i in range(a.shape[2])]
-            a = a[:, :, int(np.argmax(sums))]
+            if channel is not None:
+                if not 1 <= channel <= a.shape[2]:
+                    raise ValueError(f"--channel {channel} but this image has "
+                                     f"{a.shape[2]} channels")
+                a = a[:, :, channel - 1]
+            else:
+                sums = [a[:, :, i].astype(np.float64).sum()
+                        for i in range(a.shape[2])]
+                a = a[:, :, int(np.argmax(sums))]
         else:
             a = a.max(axis=0)
     while a.ndim > 2:
@@ -254,13 +281,13 @@ def patch_around(img, r, c, half):
 # ----------------------------------------------------------------------
 # training set
 # ----------------------------------------------------------------------
-def build_dataset(pairs, half, per_soma=600, verbose_every=100):
+def build_dataset(pairs, half, per_soma=600, verbose_every=100, channel=None):
     X, y, groups = [], [], []
     cache_path, cache_img = None, None
     for i, (mp, ip, r, c, tp) in enumerate(pairs):
         try:
             if ip != cache_path:
-                cache_img = load_gray(ip)
+                cache_img = load_gray(ip, channel)
                 cache_path = ip
             img = cache_img
             mask = np.squeeze(np.asarray(tifffile.imread(mp))) > 0
@@ -358,7 +385,8 @@ def predict_mask(clf, img, r, c, half, prob_cut=0.5, open_r=0, mode='cc'):
     return out, prob, (y1, x1)
 
 
-def sweep_eval(clf, pairs, half, combos, use_click=False, verbose_every=200):
+def sweep_eval(clf, pairs, half, combos, use_click=False, verbose_every=200,
+               channel=None):
     """Score every (mode, open_r, cut) combination in ONE pass over the somas.
 
     The forest runs once per soma; each combination then costs only a threshold
@@ -373,7 +401,7 @@ def sweep_eval(clf, pairs, half, combos, use_click=False, verbose_every=200):
     for n, (mp, ip, r, c, tp) in enumerate(pairs):
         try:
             if ip != cache_path:
-                cache_img = load_gray(ip)
+                cache_img = load_gray(ip, channel)
                 cache_path = ip
             img = cache_img
             truth_full = np.squeeze(np.asarray(tifffile.imread(mp))) > 0
@@ -427,6 +455,9 @@ def main():
     ap.add_argument('--trees', type=int, default=300)
     ap.add_argument('--min-leaf', type=int, default=2,
                     help='min samples per leaf; lower = more capacity')
+    ap.add_argument('--channel', type=int, default=None,
+                    help='1-based channel holding the microglia stain; without '
+                         'it the brightest channel is guessed')
     ap.add_argument('--max-samples', type=int, default=400_000,
                     help='rows each tree is grown on; caps forest memory')
     ap.add_argument('--mem-budget-gb', type=float, default=3.0,
@@ -446,6 +477,14 @@ def main():
         sys.exit("No soma/image pairs found — check --root and the folder names.")
     print(f"\n{len(pairs)} soma/image pairs\n")
 
+    print("Channel layout of the first image:")
+    print(describe_channels(pairs[0][1]))
+    if a.channel:
+        print(f"    -> training on channel {a.channel}\n")
+    else:
+        print("    -> no --channel given; guessing the brightest channel. If the "
+              "microglia\n       stain is not the brightest, pass --channel N.\n")
+
     # split by IMAGE so no image appears in both train and test
     imgs = np.array([p[1] for p in pairs])
     gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=0)
@@ -457,7 +496,7 @@ def main():
           f"(held out entirely)\n")
 
     print("Extracting features…")
-    X, y, _ = build_dataset(train_pairs, half, a.per_soma)
+    X, y, _ = build_dataset(train_pairs, half, a.per_soma, channel=a.channel)
     if X is None:
         sys.exit("No usable training data — do the soma masks match the image sizes?")
     print(f"  {X.shape[0]:,} pixels x {X.shape[1]} features\n")
@@ -488,7 +527,8 @@ def main():
     cuts = (0.35, 0.45, 0.5, 0.55, 0.65)
     combos = ([('cc', o, c) for o in open_radii for c in cuts]
               + [('radial', 0, c) for c in cuts])
-    res = sweep_eval(clf, test_pairs, half, combos, use_click=a.use_click)
+    res = sweep_eval(clf, test_pairs, half, combos, use_click=a.use_click,
+                     channel=a.channel)
     best = None
     for key in combos:
         mode, orad, cut = key
@@ -518,8 +558,8 @@ def main():
         rng = np.random.RandomState(1)
         sub = [train_pairs[i] for i in
                sorted(rng.permutation(len(train_pairs))[:len(test_pairs)])]
-        tr_ious = sweep_eval(clf, sub, half, [key],
-                             use_click=a.use_click, verbose_every=0)[key][0]
+        tr_ious = sweep_eval(clf, sub, half, [key], use_click=a.use_click,
+                             verbose_every=0, channel=a.channel)[key][0]
         if len(tr_ious):
             tr_med = float(np.median(tr_ious))
             print(f"\nDiagnostic  train-image median IoU {tr_med:.3f}   "
@@ -534,7 +574,7 @@ def main():
                 print("  Train and test agree -> the model is learning what it "
                       "can; remaining error is boundary ambiguity.")
 
-    meta = dict(pixel_size_um=a.pixel_size, soma_radius_um=a.soma_radius_um,
+    meta = dict(channel=a.channel, pixel_size_um=a.pixel_size, soma_radius_um=a.soma_radius_um,
                 half=half, scales=FEATURE_SCALES,
                 prob_cut=(best[0] if best else 0.5),
                 open_r=(best[2] if best else 0),
