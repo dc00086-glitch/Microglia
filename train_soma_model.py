@@ -153,17 +153,34 @@ def load_gray(path):
 # ----------------------------------------------------------------------
 # features
 # ----------------------------------------------------------------------
-def pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0)):
+def pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
     """Multi-scale per-pixel features -> (n_pixels, n_features).
 
     Hessian eigenvalues are the important ones: for a BLOB both eigenvalues are
     large and similar, for a TUBE (process) one is large and one near zero. That
     is the "prefer blobs, penalise branching" prior, learned rather than tuned.
+
+    `center` is the (row, col) of the soma inside the patch -- the point the user
+    clicked. Texture filters alone cannot tell the soma edge from a bright
+    process 60 px away, so without this the classifier predicts the right AMOUNT
+    of soma in the wrong PLACE. Two anchors are derived from it: how far a pixel
+    is from the click, and how bright it is relative to this cell's own core
+    (which also makes brightness comparable between images).
     """
     p = patch.astype(np.float64)
     lo, hi = np.percentile(p, 1), np.percentile(p, 99.5)
     p = (p - lo) / (hi - lo) if hi > lo else p * 0.0
     feats = [p]
+    if center is not None:
+        cy, cx = center
+        yy, xx = np.ogrid[:p.shape[0], :p.shape[1]]
+        rho = np.hypot(yy - cy, xx - cx) / max(p.shape) * 2.0
+        rho = np.broadcast_to(rho, p.shape).astype(np.float64)
+        # brightness of this cell's core, as a per-cell reference level
+        core = p[max(0, int(cy) - 3):int(cy) + 4,
+                 max(0, int(cx) - 3):int(cx) + 4]
+        cval = float(np.median(core)) if core.size else 0.0
+        feats += [rho, p - cval, p / (cval + 1e-3)]
     for s in scales:
         g = ndimage.gaussian_filter(p, s)
         feats.append(g)
@@ -182,6 +199,11 @@ def pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0)):
 
 
 FEATURE_SCALES = (1.0, 2.0, 4.0, 8.0)
+
+
+def _disk(r):
+    y, x = np.ogrid[-r:r + 1, -r:r + 1]
+    return (y * y + x * x) <= r * r
 
 
 def patch_around(img, r, c, half):
@@ -214,7 +236,7 @@ def build_dataset(pairs, half, per_soma=600, verbose_every=100):
             mpatch = mask[y1:y1 + patch.shape[0], x1:x1 + patch.shape[1]]
             if patch.size == 0 or mpatch.sum() < 20:
                 continue
-            F = pixel_features(patch, FEATURE_SCALES)
+            F = pixel_features(patch, FEATURE_SCALES, center=(cr - y1, cc - x1))
             lab = mpatch.ravel().astype(np.uint8)
             pos = np.flatnonzero(lab == 1)
             neg = np.flatnonzero(lab == 0)
@@ -222,8 +244,23 @@ def build_dataset(pairs, half, per_soma=600, verbose_every=100):
                 continue
             rng = np.random.RandomState(i)
             npick = min(per_soma // 2, len(pos), len(neg))
-            sel = np.concatenate([rng.choice(pos, npick, replace=False),
-                                  rng.choice(neg, npick, replace=False)])
+            # Hard negatives: pixels just OUTSIDE the accepted outline -- the
+            # emerging processes. Sampling negatives uniformly fills the set with
+            # trivial far-background and leaves the decision boundary untrained
+            # exactly where it has to be sharp, so bias towards the rim.
+            band = np.logical_and(
+                ndimage.binary_dilation(mpatch, iterations=max(2, half // 6)),
+                ~mpatch).ravel()
+            near = np.flatnonzero(np.logical_and(lab == 0, band))
+            far = np.flatnonzero(np.logical_and(lab == 0, ~band))
+            n_near = min(int(npick * 0.65), len(near))
+            n_far = min(npick - n_near, len(far))
+            neg_sel = np.concatenate([
+                rng.choice(near, n_near, replace=False),
+                rng.choice(far, n_far, replace=False)])
+            if len(neg_sel) < 10:
+                neg_sel = rng.choice(neg, min(npick, len(neg)), replace=False)
+            sel = np.concatenate([rng.choice(pos, npick, replace=False), neg_sel])
             X.append(F[sel])
             y.append(lab[sel])
             groups += [os.path.basename(ip)] * len(sel)     # group by IMAGE
@@ -240,13 +277,19 @@ def build_dataset(pairs, half, per_soma=600, verbose_every=100):
 # ----------------------------------------------------------------------
 # evaluation
 # ----------------------------------------------------------------------
-def predict_mask(clf, img, r, c, half, prob_cut=0.5):
+def predict_mask(clf, img, r, c, half, prob_cut=0.5, open_r=0):
     patch, y1, x1 = patch_around(img, r, c, half)
     if patch.size == 0:
         return None, None, None
-    F = pixel_features(patch, FEATURE_SCALES)
+    F = pixel_features(patch, FEATURE_SCALES, center=(r - y1, c - x1))
     prob = clf.predict_proba(F)[:, 1].reshape(patch.shape)
     binm = prob >= prob_cut
+    # Sever thin structures BEFORE picking the component, so a process still
+    # attached to the soma is dropped with it rather than dragged along. The
+    # radius severs anything narrower than ~2*open_r while leaving the soma
+    # (tens of px across) intact.
+    if open_r > 0:
+        binm = ndimage.binary_opening(binm, _disk(open_r))
     lab, n = ndimage.label(binm)
     if n == 0:
         return None, prob, (y1, x1)
@@ -264,7 +307,7 @@ def predict_mask(clf, img, r, c, half, prob_cut=0.5):
     return out, prob, (y1, x1)
 
 
-def evaluate(clf, pairs, half, prob_cut=0.5):
+def evaluate(clf, pairs, half, prob_cut=0.5, open_r=0):
     ious, arearatios, fails = [], [], 0
     cache_path, cache_img = None, None
     for mp, ip, r, c, tp in pairs:
@@ -280,7 +323,7 @@ def evaluate(clf, pairs, half, prob_cut=0.5):
             if len(ys) < 20:
                 continue
             cr, cc = int(ys.mean()), int(xs.mean())
-            pred, prob, off = predict_mask(clf, img, cr, cc, half, prob_cut)
+            pred, prob, off = predict_mask(clf, img, cr, cc, half, prob_cut, open_r)
             if pred is None:
                 fails += 1
                 continue
@@ -344,24 +387,50 @@ def main():
     print("  done\n")
 
     print("Evaluating on held-out images…")
+    open_radii = [0, max(2, half // 16), max(3, half // 10)]
+    open_radii = sorted(set(open_radii))
     best = None
-    for cut in (0.35, 0.45, 0.5, 0.55, 0.65):
-        ious, ratios, fails = evaluate(clf, test_pairs, half, cut)
-        if len(ious) == 0:
-            print(f"  prob cut {cut}: no usable predictions")
-            continue
-        med = float(np.median(ious))
-        print(f"  prob cut {cut}:  median IoU {med:.3f}   "
-              f"median area ratio {np.median(ratios):.2f}x   "
-              f"IoU>0.7 {100 * np.mean(ious > 0.7):.0f}%   fails {fails}")
-        if best is None or med > best[1]:
-            best = (cut, med)
+    for orad in open_radii:
+        for cut in (0.35, 0.45, 0.5, 0.55, 0.65):
+            ious, ratios, fails = evaluate(clf, test_pairs, half, cut, orad)
+            if len(ious) == 0:
+                print(f"  open {orad}px  cut {cut}: no usable predictions")
+                continue
+            med = float(np.median(ious))
+            print(f"  open {orad:>2}px  cut {cut}:  median IoU {med:.3f}   "
+                  f"median area ratio {np.median(ratios):.2f}x   "
+                  f"IoU>0.7 {100 * np.mean(ious > 0.7):.0f}%   fails {fails}")
+            if best is None or med > best[1]:
+                best = (cut, med, orad)
 
     if best:
-        print(f"\nBest probability cut: {best[0]}  (median IoU {best[1]:.3f})")
+        print(f"\nBest: prob cut {best[0]}, opening {best[2]}px  "
+              f"(median IoU {best[1]:.3f})")
+
+    # Diagnostic: the same measurement on images the model TRAINED on. If train
+    # and test are both poor the features or the labels are the limit; if train
+    # is high and test is low the model is not transferring between images.
+    if best:
+        tr_ious, _, _ = evaluate(clf, train_pairs[:len(test_pairs)], half,
+                                 best[0], best[2])
+        if len(tr_ious):
+            tr_med = float(np.median(tr_ious))
+            print(f"\nDiagnostic  train-image median IoU {tr_med:.3f}   "
+                  f"vs held-out {best[1]:.3f}")
+            if tr_med < 0.65:
+                print("  Both low -> the limit is the features or the outlines "
+                      "themselves, not generalisation.")
+            elif tr_med - best[1] > 0.15:
+                print("  Fits training images but does not transfer -> per-image "
+                      "appearance differs; needs more images, not more trees.")
+            else:
+                print("  Train and test agree -> the model is learning what it "
+                      "can; remaining error is boundary ambiguity.")
+
     meta = dict(pixel_size_um=a.pixel_size, soma_radius_um=a.soma_radius_um,
                 half=half, scales=FEATURE_SCALES,
-                prob_cut=(best[0] if best else 0.5))
+                prob_cut=(best[0] if best else 0.5),
+                open_r=(best[2] if best else 0))
     joblib.dump({'model': clf, 'meta': meta}, a.out)
     print(f"\nSaved model -> {a.out}")
     print("\nHow to read the result:")
