@@ -36,6 +36,7 @@ The saved model is what MMPS will load for auto-outlining.
 import os
 import re
 import sys
+import hashlib
 import glob
 import argparse
 import numpy as np
@@ -600,6 +601,11 @@ def main():
     ap.add_argument('--out', default='soma_model.joblib')
     a = ap.parse_args()
 
+    try:
+        _fp = hashlib.md5(open(__file__, 'rb').read()).hexdigest()[:8]
+        print(f"script fingerprint: {_fp}")
+    except Exception:
+        pass
     global FEATURE_SCALES
     if a.scales:
         FEATURE_SCALES = tuple(a.scales)
