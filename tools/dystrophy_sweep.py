@@ -49,6 +49,7 @@ def load_detector(mmps_path):
     """Exec just the dystrophy functions out of MMPSv2.12.py (no PyQt needed)."""
     tree = ast.parse(open(mmps_path).read())
     want_fn = {'_empty_fragment_params', '_avg_centroid_distance_um',
+               '_soma_radius_um', '_fragment_search_radius_um',
                '_dystrophy_signal_threshold', '_detect_disconnected_fragments'}
     want_const = {'DYSTROPHY_GAP_UM', 'DYSTROPHY_MIN_FRAGMENT_EXTENT_UM',
                   'DYSTROPHY_MAX_FRAGMENT_AREA_UM2', 'DYSTROPHY_MIN_SEARCH_RADIUS_UM',
@@ -118,7 +119,8 @@ def build_cells(ns, output_dir, image, somas, pixel_size, shape):
             centroid = (ys.mean(), xs.mean())
         cells.append({'soma_id': soma_id, 'centroid': centroid, 'mask': mask,
                       'soma_mask': soma,
-                      'search_radius_um': ns['_avg_centroid_distance_um'](mask, pixel_size)})
+                      'search_radius_um': ns['_fragment_search_radius_um'](
+                          mask, soma, pixel_size)})
     return cells
 
 
@@ -219,9 +221,9 @@ def main():
         print(f"  {v['label']:<18} {rho(b_idx, idx):>16.3f} {rho(b_n, n):>12.3f} "
               f"{n.mean():>12.2f} {int((n > 0).sum()):>9}/{len(n)}")
 
-    print("\nIf the baseline row shows 'cells with >0' near zero, the search radius is "
-          "\n  too small to see anything outside the arbor - raise "
-          "DYSTROPHY_SEARCH_RADIUS_SCALE.")
+    print("\nSearch radius is (avg_centroid_distance + soma_radius) x scale. If the "
+          "\n  baseline row shows 'cells with >0' near zero, the disk is still inside "
+          "\n  the arbor - raise DYSTROPHY_SEARCH_RADIUS_SCALE.")
 
 
 if __name__ == '__main__':

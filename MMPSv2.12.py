@@ -777,13 +777,10 @@ DYSTROPHY_GAP_UM = 1.5                    # background width that counts as a br
 DYSTROPHY_MIN_FRAGMENT_EXTENT_UM = 1.0    # below this it is noise, not cytoplasm
 DYSTROPHY_MAX_FRAGMENT_AREA_UM2 = 35.0    # above this it is another cell or debris
 DYSTROPHY_MIN_SEARCH_RADIUS_UM = 10.0     # floor so a retracted cell still gets a disk
-# WARNING: 1.0 is DC's specified value, but avg_centroid_distance measures the
-# arbor itself -- on real cells it came out at 13.7 um where the mask reached
-# 18.0 um, so the disk is smaller than the cell and cannot see anything detached
-# beyond it. In tools/dystrophy_sweep.py, 0 of 3 cells registered a fragment at
-# 1.0 with fragments planted from 14 um out; they appear from 1.25 upward.
-# Raise this before reading the fragment columns as biology.
-DYSTROPHY_SEARCH_RADIUS_SCALE = 1.0       # search radius = avg_centroid_distance x this
+# Multiplies (avg_centroid_distance + soma_radius). 1.0 clears the arbor on the
+# sample cells, but a retracted dystrophic cell shrinks its own disk, so check
+# with tools/dystrophy_sweep.py on real data before trusting the columns.
+DYSTROPHY_SEARCH_RADIUS_SCALE = 1.0       # search radius = (avg_centroid_distance + soma_radius) x this
 
 _FRAGMENT_KEYS = (
     'n_fragments', 'fragment_area_um2', 'fragment_perimeter_um',
@@ -806,8 +803,9 @@ def _avg_centroid_distance_um(mask, pixel_size_um):
     """Mean distance from the mask centroid to its four extremity pixels, in um.
 
     Replicates the ``avg_centroid_distance`` computation in
-    ``MorphologyCalculator._calculate_simple_descriptors`` so the fragment
-    search radius is exactly that CSV column, as specified.
+    ``MorphologyCalculator._calculate_simple_descriptors``, so it is exactly
+    that CSV column. ``_fragment_search_radius_um`` builds the search radius
+    from it.
     """
     coords = np.argwhere(mask)
     if coords.size == 0:
@@ -819,6 +817,31 @@ def _avg_centroid_distance_um(mask, pixel_size_um):
     ])
     d = np.sqrt(np.sum((extremities - centroid) ** 2, axis=1))
     return float(d.mean()) * pixel_size_um
+
+
+def _soma_radius_um(soma_mask, pixel_size_um):
+    """Equivalent-circle radius of the traced soma outline, in um.
+
+    Same convention as ``_detect_bulbous_endings``: sqrt(area / pi).
+    """
+    if soma_mask is None:
+        return 0.0
+    n = int(np.count_nonzero(soma_mask))
+    if n == 0:
+        return 0.0
+    return float(np.sqrt(n / np.pi)) * pixel_size_um
+
+
+def _fragment_search_radius_um(mask, soma_mask, pixel_size_um):
+    """Search radius for one cell: avg_centroid_distance + soma radius.
+
+    ``avg_centroid_distance`` is measured from the MASK centroid while the
+    search disk is centred on the SOMA, so on its own it falls short of the
+    arbor. Adding the soma radius puts the disk edge out past the cell instead
+    of inside it.
+    """
+    return (_avg_centroid_distance_um(mask, pixel_size_um)
+            + _soma_radius_um(soma_mask, pixel_size_um))
 
 
 def _dystrophy_signal_threshold(processed_img):
@@ -938,7 +961,8 @@ def _detect_disconnected_fragments(processed_img, cells, pixel_size_um,
     for c in cells:
         r = c.get('search_radius_um')
         if r is None:
-            r = _avg_centroid_distance_um(np.asarray(c['mask']) > 0, px)
+            r = _fragment_search_radius_um(np.asarray(c['mask']) > 0,
+                                           c.get('soma_mask'), px)
         radii_px.append(max(float(r) * search_radius_scale, min_search_radius_um) / px)
 
     centroids = np.array([c['centroid'] for c in cells], dtype=float)
@@ -2611,7 +2635,7 @@ class MorphologyCalculationThread(QThread):
                     'centroid': (centroid[0], centroid[1]),  # somas are (row, col)
                     'mask': mask_arr,
                     'soma_mask': soma_arr,
-                    'search_radius_um': _avg_centroid_distance_um(mask_arr, px),
+                    'search_radius_um': _fragment_search_radius_um(mask_arr, soma_arr, px),
                 })
 
             if not cells:

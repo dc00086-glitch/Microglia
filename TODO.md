@@ -85,13 +85,16 @@ actually holds the far-red tracer.
 
 ## Dystrophy fragment analysis — follow-ups
 
-* **The default search radius is blind.** `DYSTROPHY_SEARCH_RADIUS_SCALE = 1.0`
-  makes the search disk equal to `avg_centroid_distance`, which measures the
-  arbor itself — on the repo's sample cells that is 13.7 µm where the mask
-  reaches 18.0 µm, so the disk does not even cover the cell. With fragments
-  planted from 14 µm out, `tools/dystrophy_sweep.py` finds 0 of 3 cells at 1.0
-  and 2 of 3 from 1.25 upward. Pick a scale from real data before the fragment
-  columns are used for anything.
+* **The search radius still ends about where the cell ends.** It is now
+  `(avg_centroid_distance + soma_radius) x DYSTROPHY_SEARCH_RADIUS_SCALE`,
+  which fixed the disk being *inside* the arbor, but on the repo's sample
+  cells it lands at 13.8 / 17.7 / 18.4 µm against masks reaching 16.5 / 18.0 /
+  27.8 µm — so it searches a thin shell, not a margin around the cell.
+  `avg_centroid_distance` averages four extremity points, so for an asymmetric
+  arbor it falls well short of maximum reach (18.4 vs 27.8 µm on
+  `soma_452_379`). With fragments planted from 14 µm out, the sweep recovers
+  1-2 of 7 per cell at scale 1.0 and most of them by 2.0. Pick the scale from
+  real data before the fragment columns are used for anything.
 * **Cluster script has no fragment columns.** `_build_spread_analysis_script`
   works from `masks/` + `somas/` only; fragment detection needs the intensity
   image, so the generated SLURM script would need a `processed/` folder and a
