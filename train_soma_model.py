@@ -489,7 +489,8 @@ def _pick_stability(areas, fine):
     return int(np.argmin(rel))
 
 
-def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None):
+def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None,
+                global_cut=0.5):
     """Best IoU each cell could reach if its OWN threshold were chosen for it.
 
     A single global cut has to serve every cell. If cells disagree about where
@@ -502,7 +503,7 @@ def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None):
     """
     fine = np.arange(0.15, 0.91, 0.05)
     best_iou, best_cut = [], []
-    rules = {'stability': [], 'otsu': []}
+    rules = {'global': [], 'stability': [], 'otsu': []}
     conf = []
     cache_path, cache_img = None, None
     for mp, ip, r, c, tp in pairs:
@@ -550,6 +551,12 @@ def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None):
                 u = np.logical_or(lo, hi).sum()
                 conf.append(np.logical_and(lo, hi).sum() / u if u else 0.0)
 
+            # IoU at the single cut the app will actually use. The calibration
+            # has to describe that, not whichever rule scored best here, or the
+            # purity quoted in the app describes something it does not do.
+            gi = int(np.argmin(np.abs(fine - global_cut)))
+            rules['global'].append(per[gi])
+
             # per-cell rules that need no ground truth
             i = _pick_stability(areas, fine)
             rules['stability'].append(per[i] if i is not None else 0.0)
@@ -595,6 +602,9 @@ def main():
     ap.add_argument('--use-click', action='store_true',
                     help='centre patches on the recorded click instead of the '
                          'ground-truth centroid (matches how MMPS will run)')
+    ap.add_argument('--size-tolerance', type=float, default=0.01,
+                    help='held-out IoU worth trading for a smaller model; the '
+                         'smallest forest within this of the best is kept')
     ap.add_argument('--load-model',
                     help='score an existing .joblib instead of training, so a '
                          'threshold rule can be tried without a full retrain')
@@ -732,10 +742,21 @@ def main():
         print(f"  leaf {leaf}: held-out {best[1]:.3f}  train {tr_med:.3f}  "
               f"gap {tr_med - best[1]:+.3f}  IoU>0.7 {100 * best[4]:.0f}%  "
               f"{nodes * 80 / 1e6:.0f} MB\n")
-        if overall is None or best[1] > overall['iou']:
-            overall = dict(clf=clf, leaf=leaf, iou=best[1], train=tr_med,
-                           cut=best[0], open_r=best[2], mode=best[3],
-                           hit=best[4], nodes=nodes)
+        cand = dict(clf=clf, leaf=leaf, iou=best[1], train=tr_med,
+                    cut=best[0], open_r=best[2], mode=best[3],
+                    hit=best[4], nodes=nodes)
+        # Prefer the SMALLER forest when the larger one is not meaningfully
+        # better: the model ships inside the app, and a few thousandths of IoU
+        # is not worth several hundred MB.
+        if overall is None:
+            overall = cand
+        elif cand['iou'] > overall['iou'] + a.size_tolerance:
+            overall = cand
+        elif (cand['iou'] > overall['iou'] - a.size_tolerance
+              and cand['nodes'] < overall['nodes']):
+            print(f"  keeping leaf {leaf}: within {a.size_tolerance} IoU of the "
+                  f"best and {overall['nodes'] / max(cand['nodes'], 1):.1f}x smaller")
+            overall = cand
 
     if overall is None:
         sys.exit("Nothing evaluated successfully.")
@@ -765,7 +786,7 @@ def main():
     conf_cal = {}
     o_iou, o_cut, rule_res, conf = oracle_eval(
         overall['clf'], test_pairs, half, overall['mode'], overall['open_r'],
-        use_click=a.use_click, channel=a.channel)
+        use_click=a.use_click, channel=a.channel, global_cut=overall['cut'])
     if len(o_iou):
         print(f"  per-cell-best median IoU {np.median(o_iou):.3f}   "
               f"IoU>0.7 {100 * np.mean(o_iou > 0.7):.0f}%")
@@ -776,6 +797,8 @@ def main():
         print(f"  {'global cut':12s} {overall['iou']:11.3f} "
               f"{100 * overall['hit']:8.0f}%   (what you have now)")
         for nm, v in sorted(rule_res.items()):
+            if nm == 'global':
+                continue
             if len(v):
                 print(f"  {nm:12s} {np.median(v):11.3f} "
                       f"{100 * np.mean(v > 0.7):8.0f}%")
@@ -783,9 +806,7 @@ def main():
               f"{100 * np.mean(o_iou > 0.7):8.0f}%   (needs the answer; a bound)")
         # Does confidence predict correctness? If it does, the acceptable cells
         # can be separated from the rest before anyone looks at them.
-        best_rule = max(rule_res.items(),
-                        key=lambda kv: np.mean(kv[1] > 0.7) if len(kv[1]) else -1)
-        rname, riou = best_rule
+        rname, riou = 'global cut', rule_res.get('global', np.array([]))
         if len(conf) == len(riou) and len(conf) >= 8:
             order = np.argsort(-conf)
             print(f"\n  Confidence triage (cells sorted by boundary sharpness, "
