@@ -458,10 +458,9 @@ def main():
     ap.add_argument('--channel', type=int, default=None,
                     help='1-based channel holding the microglia stain; without '
                          'it the brightest channel is guessed')
-    ap.add_argument('--max-samples', type=int, default=400_000,
-                    help='rows each tree is grown on; caps forest memory')
-    ap.add_argument('--mem-budget-gb', type=float, default=3.0,
-                    help='approximate ceiling for the stored forest')
+    ap.add_argument('--max-samples', type=int, default=None,
+                    help='cap rows per tree; only needed if the fit runs out of '
+                         'memory (real trees are far smaller than worst case)')
     ap.add_argument('--use-click', action='store_true',
                     help='centre patches on the recorded click instead of the '
                          'ground-truth centroid (matches how MMPS will run)')
@@ -501,26 +500,20 @@ def main():
         sys.exit("No usable training data — do the soma masks match the image sizes?")
     print(f"  {X.shape[0]:,} pixels x {X.shape[1]} features\n")
 
-    # A forest stores every node it grows. With millions of training rows a leaf
-    # size of 2 produces trees with millions of nodes each, which at 300 trees
-    # runs to tens of GB and dies partway through -- after all the feature work.
-    # Cap the rows each tree sees and scale the leaf size with the data.
-    max_samples = min(a.max_samples, X.shape[0])
-    leaf = a.min_leaf
-    est_gb = a.trees * (2 * max_samples / leaf) * 80 / 1e9
-    if est_gb > a.mem_budget_gb:
-        leaf = int(np.ceil(2 * max_samples * 80 * a.trees / (a.mem_budget_gb * 1e9)))
-        print(f"  leaf size {a.min_leaf} -> {leaf} to stay near "
-              f"{a.mem_budget_gb} GB (was projecting {est_gb:.0f} GB)")
-    print(f"Training random forest ({a.trees} trees, {max_samples:,} rows/tree, "
-          f"leaf {leaf})…")
-    clf = RandomForestClassifier(n_estimators=a.trees, min_samples_leaf=leaf,
-                                 max_samples=(max_samples if max_samples < X.shape[0]
-                                              else None),
-                                 bootstrap=True, n_jobs=-1, random_state=0,
+    max_samples = (min(a.max_samples, X.shape[0]) if a.max_samples else None)
+    print(f"Training random forest ({a.trees} trees, leaf {a.min_leaf}"
+          + (f", {max_samples:,} rows/tree" if max_samples else "") + ")…")
+    clf = RandomForestClassifier(n_estimators=a.trees, min_samples_leaf=a.min_leaf,
+                                 max_samples=max_samples, bootstrap=True,
+                                 n_jobs=-1, random_state=0,
                                  class_weight='balanced')
     clf.fit(X, y)
-    print("  done\n")
+    # Report what the forest actually cost, rather than predicting it -- node
+    # counts depend on how separable the data turns out to be, and a worst-case
+    # bound overstates them badly.
+    nodes = sum(t.tree_.node_count for t in clf.estimators_)
+    print(f"  done — {nodes:,} nodes, roughly {nodes * 80 / 1e9:.2f} GB in memory")
+    print(f"  (if a larger run ever runs out of memory, pass --max-samples)\n")
 
     print("Evaluating on held-out images…")
     open_radii = sorted(set([0, max(2, half // 16), max(3, half // 10)]))
