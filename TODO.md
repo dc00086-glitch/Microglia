@@ -90,9 +90,20 @@ is the one thing that cannot be done away from the acquisition drive: fitting it
 on the real images and seeing whether the numbers are good enough to use.
 
 ```
-python3 train_mask_qa_model.py --session MaskQAComplete.mmps_session
-# if the drive is mounted somewhere else than it was when the session was saved:
-#   --root-map "/Volumes/Expansion=/wherever/it/is"
+# 1. can the masks QA deleted be rebuilt faithfully? (answers itself)
+python3 regen_masks_for_training.py --session MaskQAComplete.mmps_session \
+    --verify-only --settings-search
+
+# 2. if yes, write features for every candidate, negatives included
+python3 regen_masks_for_training.py --session MaskQAComplete.mmps_session \
+    --settings-search --out mask_qa_features.csv
+
+# 3. train (--features-csv is optional; without it, no mask measurements)
+python3 train_mask_qa_model.py --session MaskQAComplete.mmps_session \
+    --features-csv mask_qa_features.csv
+
+# add to any of them, if the drive is mounted somewhere else than when the
+# session was saved:  --root-map "/Volumes/Expansion=/wherever/it/is"
 ```
 Then put `mask_qa_model.joblib` next to `MMPSv2.12.py` (or in `~/Downloads`) and
 MMPS offers it at the start of QA. The trainer prints how to read its own output.
@@ -108,25 +119,52 @@ threshold, not a binary and not a free ranking. The model scores every candidate
 the scores into a prefix, so a proposal always has a shape the screen can
 express.
 
-### Why the mask pixels are not features
+### The masks QA deleted can be rebuilt  *(DC's idea — it works)*
 **MMPS deletes a rejected mask's TIFF during QA** (`_delete_rejected_mask_tiff`).
 In the 28d session that leaves 14,552 approved masks on disk and 18,536 rejected
-ones gone. So the ~25 whole-object shape features this was scoped around cannot
-be computed for the negative class from any finished session — training on what survives would
-be the positive class and nothing else.
+ones gone, so whole-object shape features could only ever be computed for the
+positive class.
 
-The features used instead are measured on what does survive: the image, the
-accepted soma outline, where the other somas are, and the candidate area. They
-describe the room a cell had rather than the mask that resulted, which is also
-what the reviewer is judging — a mask is rejected because the growth ran past
-the cell into a neighbour, a vessel, or background.
+But mask growth is deterministic, and everything it needs survives: the
+processed image is on disk as `<image>_processed.tif`, and the outlines and
+settings are in the session. So the deleted masks can be regenerated, and
+`mask_qa_state` says what was decided about each one.
 
-`_capture_mask_qa_features` now writes `mask_qa_features.csv` beside the masks at
-generation time, while every candidate still exists, so a whole-object model
-becomes possible later; `--features-csv` joins it on. Nothing reads it yet.
-Columns named `flag_*` (duplicate, border-rejected) are decisions rather than
-measurements and the trainer never feeds them to the forest — `flag_border_rejected`
-predicts the label exactly.
+The surviving approved masks are what makes this trustworthy. They are not
+needed for their labels — the session already has those — they are needed as
+**proof**: regenerate one, compare it to the TIFF still on disk, and you have
+tested the rebuild directly. 14,552 of them is a lot of proof.
+`regen_masks_for_training.py` does exactly that and refuses to write features
+unless the match rate clears `--min-match`.
+
+It does not reimplement anything: it lifts MMPS's own `_create_competitive_masks`,
+`_grow_masks_for_soma`, `_build_watershed_territory_map` and `_polygon_to_mask`
+out of `MMPSv2.12.py` by source and runs those, so there is no second copy to
+keep in step. Verified deterministic across runs, and on synthetic data the
+rebuild is pixel-identical for every surviving mask.
+
+Two things fall out of it:
+* **the `duplicate` flag comes back.** Version-2 sessions do not record which
+  masks MMPS auto-rejected as duplicates, and those are a rule rather than a
+  judgement — the first trap this was scoped with. The rebuild recomputes them,
+  the CSV carries them as `flag_duplicate`, and the trainer excludes them.
+* **the settings can be recovered.** A version-2 session predates MMPS storing
+  the smoothing and circular-constraint settings. `--settings-search` tries the
+  plausible values and keeps whichever reproduces the survivors.
+
+Feature columns named `flag_*` are decisions rather than measurements and are
+never fed to the forest — `flag_border_rejected` predicts the label exactly.
+
+MMPS measures the same features itself when a whole-object model is loaded: at
+the start of a review every candidate is still on disk, since generation writes
+them all and QA only deletes one when it is rejected. A cell whose masks cannot
+all be measured is skipped rather than scored on a guess.
+
+### The other feature set, which needs nothing
+The features that do not need the masks at all are still there and still the
+default: image, accepted soma outline, where the other somas are, candidate
+area. They describe the room a cell had rather than the mask that resulted. A
+model can use either set or both.
 
 ### A third trap, checked
 `Approve All Remaining` marks every unreviewed mask approved in one click, and
@@ -167,9 +205,13 @@ step and should wait for numbers from the real run.
 
 ### Files
 * `train_mask_qa_model.py` — sessions to model, with the honest report
+* `regen_masks_for_training.py` — rebuild the masks QA deleted, check the
+  rebuild against the survivors, write features for every candidate
 * `tools/mask_qa_label_check.py` — what is in the labels, without the drive
 * `tools/test_mask_qa_model.py` — end to end on synthetic data, and checks
   MMPS's inference reproduces the trainer's exactly
+* `tools/test_mask_regen.py` — deletes masks the way QA does, rebuilds them,
+  and trains on the negatives; checks MMPS can run the resulting model
 * `tools/test_mask_qa_parity.py` — fails if the app's copy of the feature code
   drifts from the trainer's
 * `tools/sync_mask_qa_code.py` — re-copies it, so it does not have to be done by
@@ -180,5 +222,8 @@ step and should wait for numbers from the real run.
   is worth showing, or only the queue ordering is.
 * If it works on 28d, add the other timepoints — the by-image split needs images
   more than it needs cells, and 20 is thin.
-* A whole-object model, once `mask_qa_features.csv` has accumulated over a few
-  generation runs.
+* Run `regen_masks_for_training.py --verify-only --settings-search` on the drive
+  first. If the survivors come back pixel-identical, train with
+  `--features-csv` and the whole-object features are in play with real
+  negatives; if they do not, the settings or the app's growth have moved and
+  that needs finding before anything is trained.

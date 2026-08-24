@@ -2332,11 +2332,18 @@ class _MLMaskQA:
         self.heldout = m.get('heldout') or {}
         self.path = path
         # A model trained WITH whole-object columns needs those columns at
-        # prediction time too. QA has already freed the mask arrays by then, so
-        # rather than feed the forest a vector of zeros in their place -- which
-        # it would score confidently and wrongly -- such a model is refused.
-        self.unusable = ("trained with whole-object mask features, which this "
-                         "screen cannot supply") if self.extra_features else None
+        # prediction time too. They can be measured here -- generation writes
+        # every candidate to disk and QA only deletes one when it is rejected,
+        # so at the start of a review every mask a cell still needs is there.
+        # What cannot be done is guess: a model whose columns are not the ones
+        # this app knows how to measure is refused rather than fed a vector of
+        # zeros it would score confidently and wrongly.
+        self.needs_masks = bool(self.extra_features)
+        self.unusable = None
+        if self.needs_masks and self.extra_features != list(
+                MASK_QA_OBJECT_FEATURES):
+            self.unusable = ("trained on a different set of whole-object mask "
+                             "features than this version measures")
 
     def accept_threshold(self, which='top50'):
         """Confidence at or above which a proposal may be taken unreviewed.
@@ -2359,18 +2366,36 @@ class _MLMaskQA:
         if self.heldout.get('within1') is not None:
             parts.append(f"within one step {100 * self.heldout['within1']:.0f}%")
         parts.append(f"on the {self.image_kind} image")
+        if self.needs_masks:
+            parts.append("measures the masks themselves")
         if self.channel:
             parts.append(f"channel {self.channel}")
         return ", ".join(parts)
 
-    def suggest(self, gray, centroid, polygon, others, pixel_size_um, areas):
-        """-> dict(cutoff, conf, areas, probs), or None."""
+    def suggest(self, gray, centroid, polygon, others, pixel_size_um, areas,
+                object_features=None):
+        """-> dict(cutoff, conf, areas, probs), or None.
+
+        `object_features` is {target_area: [values]} measured on the candidate
+        masks, and is required exactly when the model was trained with them.
+        A cell missing any of them is skipped rather than scored on a guess.
+        """
         if self.unusable or gray is None or centroid is None or not areas:
             return None
         try:
             areas = sorted(float(a) for a in areas)
             rows = _mqa_soma_feature_rows(gray, centroid, polygon, others,
                                           pixel_size_um, areas)
+            if self.needs_masks:
+                extra = []
+                for a in areas:
+                    vals = (object_features or {}).get(a)
+                    if vals is None or len(vals) != len(self.extra_features):
+                        return None
+                    extra.append(vals)
+                rows = np.concatenate(
+                    [np.asarray(rows, dtype=np.float64),
+                     np.asarray(extra, dtype=np.float64)], axis=1)
             X = np.nan_to_num(np.asarray(rows, dtype=np.float64),
                               nan=0.0, posinf=0.0, neginf=0.0)
             probs = self.model.predict_proba(X)[:, 1]
@@ -16127,6 +16152,7 @@ if __name__ == '__main__':
             by_image.setdefault(flat['image_name'], []).append(i)
 
         out = {}
+        unmeasured = 0
         self.log(f"Scoring the QA queue with the mask model ({ml.describe()})…")
         for n, (img_name, indices) in enumerate(by_image.items(), 1):
             gray = self._ensure_processed_loaded(img_name)
@@ -16145,21 +16171,62 @@ if __name__ == '__main__':
                 md = self.all_masks_flat[i]['mask_data']
                 if md.get('duplicate'):
                     continue
-                per_soma.setdefault(md.get('soma_id', ''), []).append(
-                    md.get('target_area_um2', 0))
-            for sid, areas in per_soma.items():
+                per_soma.setdefault(md.get('soma_id', ''), []).append(md)
+            for sid, mds in per_soma.items():
                 ol = outlines.get(sid)
-                if ol is None or not areas:
+                if ol is None or not mds:
                     continue
+                areas = sorted({float(md.get('target_area_um2', 0))
+                                for md in mds})
+                obj = None
+                if ml.needs_masks:
+                    obj = self._measure_qa_masks(img_name, mds, gray, px,
+                                                 ol)
+                    if obj is None:
+                        unmeasured += 1
+                        continue
                 got = ml.suggest(gray, ol.get('centroid'),
                                  ol.get('polygon_points'), centroids, px,
-                                 sorted(set(areas)))
+                                 areas, object_features=obj)
                 if got:
                     out[(img_name, sid)] = got
             self.progress_status_label.setText(
                 f"Scoring masks: image {n}/{len(by_image)}")
             QApplication.processEvents()
         self.progress_status_label.setText("")
+        if unmeasured:
+            self.log(f"  {unmeasured} cell(s) skipped: some of their masks are "
+                     f"no longer on disk to measure.")
+        return out
+
+    def _measure_qa_masks(self, img_name, mask_datas, gray, pixel_size, outline):
+        """Whole-object measurements of one cell's candidate masks.
+
+        -> {target_area: [values]}, or None if any candidate could not be read.
+        Partial is not good enough: a model trained on these columns has no
+        sensible answer for a cell whose masks are half missing, and inventing
+        one is how a confident wrong proposal gets made.
+
+        Mask arrays are dropped again afterwards. Holding a whole study's masks
+        in memory to score them would defeat the sliding window QA relies on.
+        """
+        soma_mask = outline.get('outline')
+        pts = outline.get('polygon_points')
+        out = {}
+        for md in mask_datas:
+            had = md.get('mask') is not None
+            if not had and not self._reload_mask_from_disk(md, img_name):
+                return None
+            mask = md.get('mask')
+            if mask is None:
+                return None
+            if soma_mask is None and pts and len(pts) >= 3:
+                soma_mask = self._polygon_to_mask(pts, mask.shape[:2])
+            out[float(md.get('target_area_um2', 0))] = _mqa_object_features(
+                mask, gray, soma_mask, pixel_size,
+                md.get('target_area_um2', 0), outline.get('centroid'))
+            if not had:
+                md['mask'] = None
         return out
 
     def _offer_model_qa_ordering(self):
@@ -16922,14 +16989,15 @@ if __name__ == '__main__':
 
         QA removes a rejected mask's TIFF immediately, so once a session is
         finished the only masks left on disk are the approved ones -- in the 28d
-        session, 14,552 survivors and 18,536 gone. Whole-object features
-        computed from what survives are the positive class and nothing else,
-        which is why the model that ships here measures the neighbourhood
-        instead. Writing the numbers now, while every candidate still exists,
-        is what makes a whole-object model possible later.
+        session, 14,552 survivors and 18,536 gone. Measuring them now, while
+        every candidate still exists, means a model trained on these features
+        never has to rely on getting them back.
 
-        Nothing reads this file yet. It is data capture, and it costs one pass
-        over masks that are already in memory.
+        They CAN be got back -- regen_masks_for_training.py rebuilds the
+        deleted masks from the session and checks the rebuild against the
+        survivors -- but that depends on the settings being recoverable and on
+        the app's growth not having moved since. This file costs one pass over
+        masks that are already in memory and removes the dependency.
         """
         if not self.masks_dir or not os.path.isdir(self.masks_dir):
             return

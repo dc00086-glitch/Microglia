@@ -150,8 +150,17 @@ def _cutoff_from_qa(entries):
     return cutoff, areas, labels
 
 
-def read_session(path, mappings):
-    """-> list of per-image dicts with everything needed to build features."""
+def read_session(path, mappings, dup_keys=frozenset()):
+    """-> list of per-image dicts with everything needed to build features.
+
+    `dup_keys` are (image, soma_id, area) triples MMPS auto-rejected as
+    duplicates -- several target areas that produced pixel-identical masks once
+    growth could not expand further. They are a rule, not a judgement: training
+    on them teaches the model something it does not need and inflates the score
+    with free correct answers. Sessions written before MMPS recorded the flag do
+    not say which masks these were, so the flag comes from
+    regen_masks_for_training.py's rebuild instead.
+    """
     with open(path) as fh:
         sess = json.load(fh)
     px = sess.get('pixel_size')
@@ -167,6 +176,10 @@ def read_session(path, mappings):
         outlines = {o.get('soma_id'): o for o in (img.get('soma_outlines') or [])}
         per_soma = {}
         for e in qa:
+            area = e.get('area_um2', e.get('target_area_um2'))
+            if area is not None and (img_name, e.get('soma_id'),
+                                     float(area)) in dup_keys:
+                continue
             per_soma.setdefault(e.get('soma_id'), []).append(e)
         somas = []
         for sid, entries in per_soma.items():
@@ -496,7 +509,7 @@ def read_features_csv(paths):
     these after the model was scoped, so any session older than that has none,
     and the model must work without them.
     """
-    table, cols = {}, []
+    table, cols, dups = {}, [], set()
     for path in paths or []:
         with open(path, newline='') as fh:
             rd = csv.DictReader(fh)
@@ -519,7 +532,10 @@ def read_features_csv(paths):
                 except (KeyError, ValueError):
                     continue
                 table[k] = [float(row[c] or 0.0) for c in cols]
-    return table, cols
+                if str(row.get('flag_duplicate', '')).strip() in ('1', 'True',
+                                                                  'true'):
+                    dups.add(k)
+    return table, cols, dups
 
 
 def build_dataset(records, prefer='processed', channel=None, limit=None,
@@ -738,11 +754,18 @@ def main():
     sessions = find_sessions(a.session, a.session_root)
     if not sessions:
         sys.exit("No .mmps_session files given. Use --session or --session-root.")
+
+    feat_table, feat_cols, dup_keys = read_features_csv(a.features_csv)
+    if feat_cols:
+        print(f"Whole-object features: {len(feat_cols)} columns, "
+              f"{len(feat_table):,} masks, {len(dup_keys):,} of them "
+              f"auto-rejected duplicates (excluded)\n")
+
     print(f"Sessions ({len(sessions)}):")
     records = []
     for sp in sessions:
         try:
-            recs = read_session(sp, mappings)
+            recs = read_session(sp, mappings, dup_keys)
         except Exception as e:
             print(f"  {os.path.basename(sp)}: unreadable ({e}) — skipped")
             continue
@@ -761,9 +784,13 @@ def main():
             sess = json.load(open(sp))
         except Exception:
             continue
-        for img in (sess.get('images') or {}).values():
+        for name, img in (sess.get('images') or {}).items():
             per = {}
             for e in (img.get('mask_qa_state') or []):
+                ar = e.get('area_um2', e.get('target_area_um2'))
+                if ar is not None and (name, e.get('soma_id'),
+                                       float(ar)) in dup_keys:
+                    continue
                 per.setdefault(e.get('soma_id'), []).append(e)
             total_qa += len(per)
             kept += sum(1 for v in per.values() if _cutoff_from_qa(v))
@@ -793,11 +820,6 @@ def main():
         print(f"  --drop-saturated: {kept_now:,} cells left")
         if not records:
             sys.exit("Nothing left after --drop-saturated.")
-
-    feat_table, feat_cols = read_features_csv(a.features_csv)
-    if feat_cols:
-        print(f"Whole-object features: {len(feat_cols)} columns, "
-              f"{len(feat_table):,} masks")
 
     print("\nBuilding features…")
     X, y, groups, meta = build_dataset(records, a.image, a.channel, a.limit,
