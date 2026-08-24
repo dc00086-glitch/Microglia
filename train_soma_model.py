@@ -502,6 +502,7 @@ def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None):
     fine = np.arange(0.15, 0.91, 0.05)
     best_iou, best_cut = [], []
     rules = {'stability': [], 'otsu': []}
+    conf = []
     cache_path, cache_img = None, None
     for mp, ip, r, c, tp in pairs:
         try:
@@ -536,6 +537,18 @@ def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None):
             best_iou.append(per.max())
             best_cut.append(float(fine[int(per.argmax())]))
 
+            # Confidence, from the map alone: how much the region changes
+            # between a loose and a strict cut. A sharp boundary barely moves;
+            # a diffuse one balloons. This needs no ground truth, so it can sort
+            # cells into auto-accept and review at outlining time.
+            lo = mask_from_prob(prob, ctr, 0.35, open_r, mode)
+            hi = mask_from_prob(prob, ctr, 0.65, open_r, mode)
+            if lo is None or hi is None:
+                conf.append(0.0)
+            else:
+                u = np.logical_or(lo, hi).sum()
+                conf.append(np.logical_and(lo, hi).sum() / u if u else 0.0)
+
             # per-cell rules that need no ground truth
             i = _pick_stability(areas, fine)
             rules['stability'].append(per[i] if i is not None else 0.0)
@@ -550,7 +563,7 @@ def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None):
         except Exception:
             continue
     return (np.array(best_iou), np.array(best_cut),
-            {k: np.array(v) for k, v in rules.items()})
+            {k: np.array(v) for k, v in rules.items()}, np.array(conf))
 
 
 # ----------------------------------------------------------------------
@@ -743,9 +756,9 @@ def main():
               "remaining error is boundary ambiguity.")
 
     print("\nPer-cell ceiling (each cell scored at its own best threshold)…")
-    o_iou, o_cut, rule_res = oracle_eval(overall['clf'], test_pairs, half,
-                                         overall['mode'], overall['open_r'],
-                                         use_click=a.use_click, channel=a.channel)
+    o_iou, o_cut, rule_res, conf = oracle_eval(
+        overall['clf'], test_pairs, half, overall['mode'], overall['open_r'],
+        use_click=a.use_click, channel=a.channel)
     if len(o_iou):
         print(f"  per-cell-best median IoU {np.median(o_iou):.3f}   "
               f"IoU>0.7 {100 * np.mean(o_iou > 0.7):.0f}%")
@@ -761,6 +774,25 @@ def main():
                       f"{100 * np.mean(v > 0.7):8.0f}%")
         print(f"  {'per-cell best':12s} {np.median(o_iou):11.3f} "
               f"{100 * np.mean(o_iou > 0.7):8.0f}%   (needs the answer; a bound)")
+        # Does confidence predict correctness? If it does, the acceptable cells
+        # can be separated from the rest before anyone looks at them.
+        best_rule = max(rule_res.items(),
+                        key=lambda kv: np.mean(kv[1] > 0.7) if len(kv[1]) else -1)
+        rname, riou = best_rule
+        if len(conf) == len(riou) and len(conf) >= 8:
+            order = np.argsort(-conf)
+            print(f"\n  Confidence triage (cells sorted by boundary sharpness, "
+                  f"{rname} rule):")
+            q = len(order) // 4
+            for k in range(4):
+                sl = order[k * q:(k + 1) * q] if k < 3 else order[3 * q:]
+                print(f"    {['most', '2nd', '3rd', 'least'][k]:>5s} confident "
+                      f"quarter: median IoU {np.median(riou[sl]):.3f}   "
+                      f"IoU>0.7 {100 * np.mean(riou[sl] > 0.7):3.0f}%")
+            for frac in (0.3, 0.5):
+                sl = order[:int(len(order) * frac)]
+                print(f"    auto-accept the top {100 * frac:.0f}%: "
+                      f"{100 * np.mean(riou[sl] > 0.7):3.0f}% of those are good")
         lift = float(np.median(o_iou)) - overall['iou']
         if lift > 0.06:
             print(f"  +{lift:.3f} over the single global cut -> cells disagree "
@@ -791,12 +823,17 @@ def main():
     if mb > 200:
         print("  That is large to ship inside the MMPS app; a bigger --min-leaf "
               "trades a little accuracy for a much smaller file.")
-    print("\nHow to read the result:")
-    print("  median IoU > 0.80  excellent — automate with spot checks")
-    print("  0.70 - 0.80        good — automate, review flagged low-confidence cells")
-    print("  0.55 - 0.70        marginal — usable only with review of every cell")
-    print("  < 0.55             do not automate; the outlines are too inconsistent")
-    print("                     or the images lack the necessary signal")
+    print("\nHow to read the result, for a propose-and-review workflow:")
+    print("  In review, a good proposal is accepted in a second or two; a bad one")
+    print("  is rejected and drawn by hand, costing barely more than drawing it")
+    print("  would have. So the break-even acceptance rate is only a few percent,")
+    print("  and IoU>0.7 is roughly the fraction of somas that need no work.")
+    print("    IoU>0.7 above 60%   most of the outlining is done for you")
+    print("    30 - 60%            still saves a third to a half of the time")
+    print("    under 10%           not worth the review step")
+    print("  Confidence triage matters more than the average: if the confident")
+    print("  cells are reliably good, those can be accepted in bulk and only the")
+    print("  rest looked at individually.")
 
 
 if __name__ == '__main__':
