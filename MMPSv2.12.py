@@ -1655,6 +1655,88 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
 
 
 
+def auto_outline_soma_blob(image, centroid, sensitivity=50,
+                           max_soma_radius_px=14):
+    """Outline the SOMA only: a compact, locally-bright blob.
+
+    The threshold/watershed/hybrid detectors threshold a large region and take
+    whichever contour contains the click. In real tissue the processes connect
+    neighbouring cells, so that contour is the whole cell network — measured on
+    a dense synthetic field they returned outlines 8-37x larger than the soma.
+
+    This works at soma scale instead:
+      * crop a window a few soma-radii wide
+      * threshold between the LOCAL background and the soma's own peak, so the
+        cut sits above the (dimmer) processes
+      * morphologically OPEN with a disk wider than a process, which severs the
+        thin process connections while leaving the soma intact
+      * keep the connected component under the click, and reject anything too
+        large to be a soma
+
+    ``sensitivity`` shifts the cut: higher = lower threshold = larger outline.
+    Returns (row, col) polygon points, or None.
+    """
+    try:
+        img = np.asarray(image, dtype=np.float64)
+        if img.ndim > 2:
+            img = img[:, :, 0]
+        h, w = img.shape[:2]
+        cy, cx = int(centroid[0]), int(centroid[1])
+        rad_px = max(3, int(max_soma_radius_px))
+        R = int(rad_px * 2.5)
+        y1, y2 = max(0, cy - R), min(h, cy + R)
+        x1, x2 = max(0, cx - R), min(w, cx + R)
+        region = img[y1:y2, x1:x2]
+        if region.size == 0:
+            return None
+        ly, lx = cy - y1, cx - x1
+
+        core_r = max(3, rad_px // 2)
+        core = region[max(0, ly - core_r):ly + core_r + 1,
+                      max(0, lx - core_r):lx + core_r + 1]
+        if core.size == 0:
+            return None
+        peak = float(np.percentile(core, 90))
+        bg = float(np.percentile(region, 25))
+        if peak <= bg:
+            return None
+        frac = 0.35 + (50.0 - sensitivity) / 100.0 * 0.30
+        thr = bg + (peak - bg) * max(0.05, min(0.95, frac))
+
+        binm = (region > thr).astype(np.uint8)
+        ksz = max(3, (rad_px // 2) | 1)          # odd, ~half a soma radius
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+        binm = cv2.morphologyEx(binm, cv2.MORPH_OPEN, kernel)
+
+        lab, n = ndimage.label(binm)
+        if n == 0:
+            return None
+        comp_id = lab[ly, lx]
+        if comp_id == 0:                          # click landed just outside
+            ys, xs = np.nonzero(lab)
+            if not len(ys):
+                return None
+            i = int(np.argmin((ys - ly) ** 2 + (xs - lx) ** 2))
+            comp_id = lab[ys[i], xs[i]]
+        comp = (lab == comp_id).astype(np.uint8)
+        if comp.sum() > np.pi * (rad_px * 1.6) ** 2:
+            return None                           # too big to be one soma
+
+        contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        best = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(best) < 20:
+            return None
+        approx = _simplify_contour(best)
+        pts = [(int(p[0][1]) + y1, int(p[0][0]) + x1) for p in approx]
+        return pts if len(pts) >= MIN_OUTLINE_POINTS else None
+    except Exception as e:
+        print(f"Auto-outline soma-blob error: {e}")
+        return None
+
+
 def auto_outline_hybrid(image, centroid, sensitivity=50, region_size=200):
     """
     Hybrid approach: Runs threshold and watershed, picks the best result
@@ -4057,10 +4139,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Hidden auto-outline settings (store state but not shown in panel)
         # Auto-outline is locked to Hybrid method only.
         self.auto_outline_method = QComboBox()
-        self.auto_outline_method.addItems(["Threshold", "Region Grow", "Watershed", "Active Contour", "Hybrid"])
-        self.auto_outline_method.setCurrentIndex(4)  # Hybrid
+        self.auto_outline_method.addItems(["Soma blob (recommended)", "Threshold", "Region Grow", "Watershed", "Hybrid"])
+        self.auto_outline_method.setCurrentIndex(0)  # Soma blob
         self.auto_outline_method.setVisible(False)
-        self._auto_outline_sensitivity_value = 0.01
+        self._auto_outline_sensitivity_value = 50
 
         # Outline controls container - shown only during active outlining
         self.outline_controls_widget = QWidget()
@@ -12428,7 +12510,7 @@ if __name__ == '__main__':
         if result == 0:
             return  # Cancelled
 
-        self.auto_outline_method.setCurrentIndex(4)  # Always Hybrid
+        self.auto_outline_method.setCurrentIndex(0)  # Always soma blob
         self._auto_outline_sensitivity_value = sens_spin.value()
         self._dapi_channel = dapi_ch_combo.currentData()
         self._signal_channel = signal_ch_combo.currentData()
@@ -13294,8 +13376,28 @@ if __name__ == '__main__':
                 self._load_soma_for_outlining(next_idx)
 
     def _get_auto_outline_method(self):
-        """Get the auto-outline method function. Locked to Hybrid."""
-        return auto_outline_hybrid
+        """Auto-outline detector, bound to the current soma-size setting.
+
+        Defaults to the soma-blob detector: the older threshold/watershed/hybrid
+        detectors outline the connected cell network rather than the soma in
+        real tissue. The old methods stay selectable from the method combo.
+        """
+        name = ''
+        try:
+            name = self.auto_outline_method.currentText()
+        except Exception:
+            pass
+        if name in ('Threshold', 'Region Grow'):
+            return auto_outline_threshold
+        if name == 'Watershed':
+            return auto_outline_watershed
+        if name == 'Hybrid':
+            return auto_outline_hybrid
+        # Default: soma-scale blob detection, sized from the soma radius setting
+        px = max(float(self._get_pixel_size() or 0.316), 1e-6)
+        rad_px = max(3, int(round(getattr(self, 'soma_max_radius_um', 8.0) / px)))
+        return lambda image, centroid, sensitivity: auto_outline_soma_blob(
+            image, centroid, sensitivity, max_soma_radius_px=rad_px)
 
     def _get_image_for_outlining(self, img_data):
         """Get the appropriate grayscale image for auto-outlining"""
