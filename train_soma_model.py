@@ -451,6 +451,43 @@ def sweep_eval(clf, pairs, half, combos, use_click=False, verbose_every=200,
     return {k: (np.array(v[0]), np.array(v[1]), v[2]) for k, v in acc.items()}
 
 
+def _otsu(v):
+    """Otsu split of a 1-D array, on a 256-bin histogram."""
+    h, edges = np.histogram(v, bins=256, range=(0.0, 1.0))
+    h = h.astype(np.float64)
+    w0 = np.cumsum(h)
+    w1 = w0[-1] - w0
+    mids = (edges[:-1] + edges[1:]) / 2
+    m0 = np.cumsum(h * mids)
+    mt = m0[-1]
+    with np.errstate(invalid='ignore', divide='ignore'):
+        between = (mt * w0 / w0[-1] - m0) ** 2 / (w0 * w1)
+    between[~np.isfinite(between)] = -1
+    return float(mids[int(np.argmax(between))])
+
+
+def _pick_stability(areas, fine):
+    """Most stable region: the cut where the area changes least.
+
+    A soma sits in the probability map as a plateau -- across some span of cuts
+    the region barely grows or shrinks, then collapses once the cut eats into
+    the processes. That plateau is the boundary the outline was drawn at, and
+    where it sits differs per cell, which is exactly what one global cut cannot
+    follow.
+    """
+    a = np.asarray(areas, dtype=np.float64)
+    ok = a > 0
+    if ok.sum() < 3:
+        return None
+    rel = np.full(len(a), np.inf)
+    for i in range(1, len(a) - 1):
+        if a[i] > 0:
+            rel[i] = abs(a[i - 1] - a[i + 1]) / a[i]
+    if not np.isfinite(rel).any():
+        return None
+    return int(np.argmin(rel))
+
+
 def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None):
     """Best IoU each cell could reach if its OWN threshold were chosen for it.
 
@@ -463,7 +500,8 @@ def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None):
     threshold is the problem; no gap means the map itself is the limit.
     """
     fine = np.arange(0.15, 0.91, 0.05)
-    best_iou, best_cut, fixed = [], [], []
+    best_iou, best_cut = [], []
+    rules = {'stability': [], 'otsu': []}
     cache_path, cache_img = None, None
     for mp, ip, r, c, tp in pairs:
         try:
@@ -484,20 +522,35 @@ def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None):
             F = pixel_features(patch, FEATURE_SCALES, center=ctr)
             prob = clf.predict_proba(F)[:, 1].reshape(patch.shape)
             truth = truth_full[y1:y1 + patch.shape[0], x1:x1 + patch.shape[1]]
-            per = []
+            per, areas = [], []
             for cut in fine:
                 pred = mask_from_prob(prob, ctr, float(cut), open_r, mode)
                 if pred is None:
                     per.append(0.0)
+                    areas.append(0)
                     continue
                 u = np.logical_or(pred, truth).sum()
                 per.append(np.logical_and(pred, truth).sum() / u if u else 0.0)
+                areas.append(int(pred.sum()))
             per = np.array(per)
             best_iou.append(per.max())
             best_cut.append(float(fine[int(per.argmax())]))
+
+            # per-cell rules that need no ground truth
+            i = _pick_stability(areas, fine)
+            rules['stability'].append(per[i] if i is not None else 0.0)
+            t = _otsu(prob.ravel())
+            pred = mask_from_prob(prob, ctr, t, open_r, mode)
+            if pred is None:
+                rules['otsu'].append(0.0)
+            else:
+                u = np.logical_or(pred, truth).sum()
+                rules['otsu'].append(
+                    np.logical_and(pred, truth).sum() / u if u else 0.0)
         except Exception:
             continue
-    return np.array(best_iou), np.array(best_cut)
+    return (np.array(best_iou), np.array(best_cut),
+            {k: np.array(v) for k, v in rules.items()})
 
 
 # ----------------------------------------------------------------------
@@ -528,11 +581,14 @@ def main():
     ap.add_argument('--use-click', action='store_true',
                     help='centre patches on the recorded click instead of the '
                          'ground-truth centroid (matches how MMPS will run)')
+    ap.add_argument('--load-model',
+                    help='score an existing .joblib instead of training, so a '
+                         'threshold rule can be tried without a full retrain')
     ap.add_argument('--out', default='soma_model.joblib')
     a = ap.parse_args()
 
+    global FEATURE_SCALES
     if a.scales:
-        global FEATURE_SCALES
         FEATURE_SCALES = tuple(a.scales)
     print(f"feature scales: {FEATURE_SCALES}  "
           f"({1 + 3 + 6 * len(FEATURE_SCALES)} features per pixel)")
@@ -578,12 +634,25 @@ def main():
     print(f"test : {len(test_pairs)} somas from {len(set(imgs[te_idx]))} images "
           f"(held out entirely)\n")
 
-    print("Extracting features…")
-    X, y, _ = build_dataset(train_pairs, half, a.per_soma, channel=a.channel,
-                            use_click=a.use_click)
-    if X is None:
-        sys.exit("No usable training data — do the soma masks match the image sizes?")
-    print(f"  {X.shape[0]:,} pixels x {X.shape[1]} features\n")
+    if a.load_model:
+        # Scoring an existing forest: the threshold rules are applied after the
+        # forest runs, so trying a new one does not need the model rebuilt.
+        print(f"Loading {a.load_model} (skipping training)…")
+        _b = joblib.load(a.load_model)
+        _m = _b.get('meta', {})
+        if _m.get('scales'):
+            FEATURE_SCALES = tuple(_m['scales'])
+        print(f"  scales {FEATURE_SCALES}, channel {_m.get('channel')}, "
+              f"cut {_m.get('prob_cut')}, mode {_m.get('mode')}\n")
+        X = None
+    else:
+        print("Extracting features…")
+        X, y, _ = build_dataset(train_pairs, half, a.per_soma, channel=a.channel,
+                                use_click=a.use_click)
+        if X is None:
+            sys.exit("No usable training data — do the soma masks match the "
+                     "image sizes?")
+        print(f"  {X.shape[0]:,} pixels x {X.shape[1]} features\n")
 
     max_samples = (min(a.max_samples, X.shape[0]) if a.max_samples else None)
     open_radii = sorted(set([0, max(2, half // 16), max(3, half // 10)]))
@@ -600,14 +669,18 @@ def main():
     # several leaf sizes and report accuracy against size, so the trade is
     # visible instead of assumed.
     overall = None
-    for leaf in a.min_leaf:
-        print(f"Training random forest ({a.trees} trees, leaf {leaf}"
-              + (f", {max_samples:,} rows/tree" if max_samples else "") + ")…")
-        clf = RandomForestClassifier(n_estimators=a.trees, min_samples_leaf=leaf,
-                                     max_samples=max_samples, bootstrap=True,
-                                     n_jobs=-1, random_state=0,
-                                     class_weight='balanced')
-        clf.fit(X, y)
+    for leaf in ([None] if a.load_model else a.min_leaf):
+        if a.load_model:
+            clf = _b['model']
+        else:
+            print(f"Training random forest ({a.trees} trees, leaf {leaf}"
+                  + (f", {max_samples:,} rows/tree" if max_samples else "") + ")…")
+            clf = RandomForestClassifier(n_estimators=a.trees,
+                                         min_samples_leaf=leaf,
+                                         max_samples=max_samples, bootstrap=True,
+                                         n_jobs=-1, random_state=0,
+                                         class_weight='balanced')
+            clf.fit(X, y)
         # Measure the forest rather than predicting it -- node counts depend on
         # how separable the data turns out to be.
         nodes = sum(t.tree_.node_count for t in clf.estimators_)
@@ -670,15 +743,24 @@ def main():
               "remaining error is boundary ambiguity.")
 
     print("\nPer-cell ceiling (each cell scored at its own best threshold)…")
-    o_iou, o_cut = oracle_eval(overall['clf'], test_pairs, half,
-                               overall['mode'], overall['open_r'],
-                               use_click=a.use_click, channel=a.channel)
+    o_iou, o_cut, rule_res = oracle_eval(overall['clf'], test_pairs, half,
+                                         overall['mode'], overall['open_r'],
+                                         use_click=a.use_click, channel=a.channel)
     if len(o_iou):
         print(f"  per-cell-best median IoU {np.median(o_iou):.3f}   "
               f"IoU>0.7 {100 * np.mean(o_iou > 0.7):.0f}%")
         print(f"  best threshold per cell: median {np.median(o_cut):.2f}, "
               f"10th-90th pct {np.percentile(o_cut, 10):.2f}-"
               f"{np.percentile(o_cut, 90):.2f}")
+        print(f"\n  {'rule':12s} {'median IoU':>11s} {'IoU>0.7':>9s}")
+        print(f"  {'global cut':12s} {overall['iou']:11.3f} "
+              f"{100 * overall['hit']:8.0f}%   (what you have now)")
+        for nm, v in sorted(rule_res.items()):
+            if len(v):
+                print(f"  {nm:12s} {np.median(v):11.3f} "
+                      f"{100 * np.mean(v > 0.7):8.0f}%")
+        print(f"  {'per-cell best':12s} {np.median(o_iou):11.3f} "
+              f"{100 * np.mean(o_iou > 0.7):8.0f}%   (needs the answer; a bound)")
         lift = float(np.median(o_iou)) - overall['iou']
         if lift > 0.06:
             print(f"  +{lift:.3f} over the single global cut -> cells disagree "
@@ -695,6 +777,9 @@ def main():
                 soma_radius_um=a.soma_radius_um, half=half,
                 scales=FEATURE_SCALES, prob_cut=overall['cut'],
                 open_r=overall['open_r'], mode=overall['mode'])
+    if a.load_model:
+        print("\n(--load-model: nothing re-saved)")
+        return
     try:
         joblib.dump({'model': overall['clf'], 'meta': meta}, a.out, compress=3)
     except OSError as e:
