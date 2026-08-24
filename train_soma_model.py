@@ -455,6 +455,10 @@ def main():
     ap.add_argument('--trees', type=int, default=300)
     ap.add_argument('--min-leaf', type=int, default=2,
                     help='min samples per leaf; lower = more capacity')
+    ap.add_argument('--scales', type=float, nargs='*', default=None,
+                    help='filter sizes in px (default 1 2 4 8). Nothing in the '
+                         'default set spans a whole soma (~40 px radius), so '
+                         '"--scales 1 2 4 8 16 24" is worth testing')
     ap.add_argument('--channel', type=int, default=None,
                     help='1-based channel holding the microglia stain; without '
                          'it the brightest channel is guessed')
@@ -467,6 +471,11 @@ def main():
     ap.add_argument('--out', default='soma_model.joblib')
     a = ap.parse_args()
 
+    if a.scales:
+        global FEATURE_SCALES
+        FEATURE_SCALES = tuple(a.scales)
+    print(f"feature scales: {FEATURE_SCALES}  "
+          f"({1 + 3 + 6 * len(FEATURE_SCALES)} features per pixel)")
     half = max(16, int(round(a.soma_radius_um / a.pixel_size)))
     print(f"patch half-width: {half} px  ({a.soma_radius_um} µm at {a.pixel_size} µm/px)\n")
 
