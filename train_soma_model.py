@@ -315,15 +315,16 @@ def build_dataset(pairs, half, per_soma=600, verbose_every=100):
 # ----------------------------------------------------------------------
 # evaluation
 # ----------------------------------------------------------------------
-def predict_mask(clf, img, r, c, half, prob_cut=0.5, open_r=0, mode='cc'):
-    patch, y1, x1 = patch_around(img, r, c, half)
-    if patch.size == 0:
-        return None, None, None
-    F = pixel_features(patch, FEATURE_SCALES, center=(r - y1, c - x1))
-    prob = clf.predict_proba(F)[:, 1].reshape(patch.shape)
+def mask_from_prob(prob, center, prob_cut=0.5, open_r=0, mode='cc'):
+    """Turn a probability map into a single soma mask.
+
+    Split out from predict_mask because the probability map depends on neither
+    the cut nor the mode: the sweep computes it once per soma and calls this for
+    every combination, instead of re-running the forest 20 times per cell.
+    """
+    ly, lx = center
     if mode == 'radial':
-        out = radial_contour(prob, (r - y1, c - x1), prob_cut)
-        return out, prob, (y1, x1)
+        return radial_contour(prob, (ly, lx), prob_cut)
     binm = prob >= prob_cut
     # Sever thin structures BEFORE picking the component, so a process still
     # attached to the soma is dropped with it rather than dragged along. The
@@ -333,25 +334,43 @@ def predict_mask(clf, img, r, c, half, prob_cut=0.5, open_r=0, mode='cc'):
         binm = ndimage.binary_opening(binm, _disk(open_r))
     lab, n = ndimage.label(binm)
     if n == 0:
-        return None, prob, (y1, x1)
-    ly, lx = r - y1, c - x1
-    ly = min(max(ly, 0), patch.shape[0] - 1)
-    lx = min(max(lx, 0), patch.shape[1] - 1)
+        return None
+    ly = min(max(int(ly), 0), prob.shape[0] - 1)
+    lx = min(max(int(lx), 0), prob.shape[1] - 1)
     cid = lab[ly, lx]
     if cid == 0:                                   # click just outside — nearest
         ys, xs = np.nonzero(lab)
         if not len(ys):
-            return None, prob, (y1, x1)
+            return None
         i = int(np.argmin((ys - ly) ** 2 + (xs - lx) ** 2))
         cid = lab[ys[i], xs[i]]
-    out = ndimage.binary_fill_holes(lab == cid)
+    return ndimage.binary_fill_holes(lab == cid)
+
+
+def predict_mask(clf, img, r, c, half, prob_cut=0.5, open_r=0, mode='cc'):
+    """Outline one soma. This is the entry point MMPS will call."""
+    patch, y1, x1 = patch_around(img, r, c, half)
+    if patch.size == 0:
+        return None, None, None
+    F = pixel_features(patch, FEATURE_SCALES, center=(r - y1, c - x1))
+    prob = clf.predict_proba(F)[:, 1].reshape(patch.shape)
+    out = mask_from_prob(prob, (r - y1, c - x1), prob_cut, open_r, mode)
     return out, prob, (y1, x1)
 
 
-def evaluate(clf, pairs, half, prob_cut=0.5, open_r=0, mode='cc'):
-    ious, arearatios, fails = [], [], 0
+def sweep_eval(clf, pairs, half, combos, use_click=False, verbose_every=200):
+    """Score every (mode, open_r, cut) combination in ONE pass over the somas.
+
+    The forest runs once per soma; each combination then costs only a threshold
+    and a little morphology. Scoring them separately re-ran the forest for every
+    combination -- 20x the work for identical probability maps.
+
+    use_click centres the patch on the filename's click coordinates instead of
+    the ground-truth centroid, which is what MMPS actually has at outlining time.
+    """
+    acc = {k: [[], [], 0] for k in combos}
     cache_path, cache_img = None, None
-    for mp, ip, r, c, tp in pairs:
+    for n, (mp, ip, r, c, tp) in enumerate(pairs):
         try:
             if ip != cache_path:
                 cache_img = load_gray(ip)
@@ -363,23 +382,36 @@ def evaluate(clf, pairs, half, prob_cut=0.5, open_r=0, mode='cc'):
             ys, xs = np.nonzero(truth_full)
             if len(ys) < 20:
                 continue
-            cr, cc = int(ys.mean()), int(xs.mean())
-            pred, prob, off = predict_mask(clf, img, cr, cc, half, prob_cut, open_r, mode)
-            if pred is None:
-                fails += 1
+            if use_click:
+                cr, cc = int(r), int(c)
+            else:
+                cr, cc = int(ys.mean()), int(xs.mean())
+            patch, y1, x1 = patch_around(img, cr, cc, half)
+            if patch.size == 0:
                 continue
-            y1, x1 = off
-            truth = truth_full[y1:y1 + pred.shape[0], x1:x1 + pred.shape[1]]
-            inter = np.logical_and(pred, truth).sum()
-            union = np.logical_or(pred, truth).sum()
-            if union == 0:
-                fails += 1
-                continue
-            ious.append(inter / union)
-            arearatios.append(pred.sum() / max(truth.sum(), 1))
+            ctr = (cr - y1, cc - x1)
+            F = pixel_features(patch, FEATURE_SCALES, center=ctr)
+            prob = clf.predict_proba(F)[:, 1].reshape(patch.shape)
+            truth = truth_full[y1:y1 + patch.shape[0], x1:x1 + patch.shape[1]]
+            for key in combos:
+                mode, orad, cut = key
+                pred = mask_from_prob(prob, ctr, cut, orad, mode)
+                if pred is None:
+                    acc[key][2] += 1
+                    continue
+                inter = np.logical_and(pred, truth).sum()
+                union = np.logical_or(pred, truth).sum()
+                if union == 0:
+                    acc[key][2] += 1
+                    continue
+                acc[key][0].append(inter / union)
+                acc[key][1].append(pred.sum() / max(truth.sum(), 1))
         except Exception:
-            fails += 1
-    return np.array(ious), np.array(arearatios), fails
+            for key in combos:
+                acc[key][2] += 1
+        if verbose_every and (n + 1) % verbose_every == 0:
+            print(f"    {n + 1}/{len(pairs)} somas scored")
+    return {k: (np.array(v[0]), np.array(v[1]), v[2]) for k, v in acc.items()}
 
 
 # ----------------------------------------------------------------------
@@ -395,6 +427,13 @@ def main():
     ap.add_argument('--trees', type=int, default=300)
     ap.add_argument('--min-leaf', type=int, default=2,
                     help='min samples per leaf; lower = more capacity')
+    ap.add_argument('--max-samples', type=int, default=400_000,
+                    help='rows each tree is grown on; caps forest memory')
+    ap.add_argument('--mem-budget-gb', type=float, default=3.0,
+                    help='approximate ceiling for the stored forest')
+    ap.add_argument('--use-click', action='store_true',
+                    help='centre patches on the recorded click instead of the '
+                         'ground-truth centroid (matches how MMPS will run)')
     ap.add_argument('--out', default='soma_model.joblib')
     a = ap.parse_args()
 
@@ -423,33 +462,51 @@ def main():
         sys.exit("No usable training data — do the soma masks match the image sizes?")
     print(f"  {X.shape[0]:,} pixels x {X.shape[1]} features\n")
 
-    print(f"Training random forest ({a.trees} trees)…")
-    clf = RandomForestClassifier(n_estimators=a.trees, min_samples_leaf=a.min_leaf,
-                                 n_jobs=-1, random_state=0, class_weight='balanced')
+    # A forest stores every node it grows. With millions of training rows a leaf
+    # size of 2 produces trees with millions of nodes each, which at 300 trees
+    # runs to tens of GB and dies partway through -- after all the feature work.
+    # Cap the rows each tree sees and scale the leaf size with the data.
+    max_samples = min(a.max_samples, X.shape[0])
+    leaf = a.min_leaf
+    est_gb = a.trees * (2 * max_samples / leaf) * 80 / 1e9
+    if est_gb > a.mem_budget_gb:
+        leaf = int(np.ceil(2 * max_samples * 80 * a.trees / (a.mem_budget_gb * 1e9)))
+        print(f"  leaf size {a.min_leaf} -> {leaf} to stay near "
+              f"{a.mem_budget_gb} GB (was projecting {est_gb:.0f} GB)")
+    print(f"Training random forest ({a.trees} trees, {max_samples:,} rows/tree, "
+          f"leaf {leaf})…")
+    clf = RandomForestClassifier(n_estimators=a.trees, min_samples_leaf=leaf,
+                                 max_samples=(max_samples if max_samples < X.shape[0]
+                                              else None),
+                                 bootstrap=True, n_jobs=-1, random_state=0,
+                                 class_weight='balanced')
     clf.fit(X, y)
     print("  done\n")
 
     print("Evaluating on held-out images…")
     open_radii = sorted(set([0, max(2, half // 16), max(3, half // 10)]))
+    cuts = (0.35, 0.45, 0.5, 0.55, 0.65)
+    combos = ([('cc', o, c) for o in open_radii for c in cuts]
+              + [('radial', 0, c) for c in cuts])
+    res = sweep_eval(clf, test_pairs, half, combos, use_click=a.use_click)
     best = None
-    trials = [('cc', o) for o in open_radii] + [('radial', 0)]
-    for mode, orad in trials:
-        for cut in (0.35, 0.45, 0.5, 0.55, 0.65):
-            ious, ratios, fails = evaluate(clf, test_pairs, half, cut, orad, mode)
-            tag = 'radial   ' if mode == 'radial' else f'open {orad:>2}px'
-            if len(ious) == 0:
-                print(f"  {tag}  cut {cut}: no usable predictions")
-                continue
-            med = float(np.median(ious))
-            print(f"  {tag}  cut {cut}:  median IoU {med:.3f}   "
-                  f"median area ratio {np.median(ratios):.2f}x   "
-                  f"IoU>0.7 {100 * np.mean(ious > 0.7):.0f}%   fails {fails}")
-            if best is None or med > best[1]:
-                best = (cut, med, orad, mode)
+    for key in combos:
+        mode, orad, cut = key
+        ious, ratios, fails = res[key]
+        tag = 'radial   ' if mode == 'radial' else f'open {orad:>2}px'
+        if len(ious) == 0:
+            print(f"  {tag}  cut {cut}: no usable predictions")
+            continue
+        med = float(np.median(ious))
+        print(f"  {tag}  cut {cut}:  median IoU {med:.3f}   "
+              f"median area ratio {np.median(ratios):.2f}x   "
+              f"IoU>0.7 {100 * np.mean(ious > 0.7):.0f}%   fails {fails}")
+        if best is None or med > best[1]:
+            best = (cut, med, orad, mode)
 
     if best:
         print(f"\nBest: prob cut {best[0]}, "
-              + (f"radial contour" if best[3] == 'radial'
+              + ("radial contour" if best[3] == 'radial'
                  else f"opening {best[2]}px")
               + f"  (median IoU {best[1]:.3f})")
 
@@ -457,8 +514,12 @@ def main():
     # and test are both poor the features or the labels are the limit; if train
     # is high and test is low the model is not transferring between images.
     if best:
-        tr_ious, _, _ = evaluate(clf, train_pairs[:len(test_pairs)], half,
-                                 best[0], best[2], best[3])
+        key = (best[3], best[2], best[0])
+        rng = np.random.RandomState(1)
+        sub = [train_pairs[i] for i in
+               sorted(rng.permutation(len(train_pairs))[:len(test_pairs)])]
+        tr_ious = sweep_eval(clf, sub, half, [key],
+                             use_click=a.use_click, verbose_every=0)[key][0]
         if len(tr_ious):
             tr_med = float(np.median(tr_ious))
             print(f"\nDiagnostic  train-image median IoU {tr_med:.3f}   "
