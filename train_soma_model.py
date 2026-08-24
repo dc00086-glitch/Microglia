@@ -493,7 +493,22 @@ def main():
         print(f"    -> training on channel {a.channel}\n")
     else:
         print("    -> no --channel given; guessing the brightest channel. If the "
-              "microglia\n       stain is not the brightest, pass --channel N.\n")
+              "microglia\n       stain is not the brightest, pass --channel N.")
+        try:
+            _a = np.squeeze(np.asarray(tifffile.imread(pairs[0][1])))
+            if _a.ndim == 3 and _a.shape[int(np.argmin(_a.shape))] <= 8:
+                _b = np.moveaxis(_a, int(np.argmin(_a.shape)), -1)
+                _s = sorted((_b[:, :, i].astype(np.float64).sum(), i + 1)
+                            for i in range(_b.shape[2]))[::-1]
+                if len(_s) > 1 and _s[0][0] < 1.25 * _s[1][0]:
+                    print(f"       WARNING channels {_s[0][1]} and {_s[1][1]} are "
+                          f"within {100 * (_s[0][0] / _s[1][0] - 1):.0f}% of each "
+                          f"other.\n       The guess can land on a different "
+                          f"channel from one image to the next, which trains the\n"
+                          f"       model on inconsistent stains. Pass --channel.")
+        except Exception:
+            pass
+        print()
 
     # split by IMAGE so no image appears in both train and test
     imgs = np.array([p[1] for p in pairs])
