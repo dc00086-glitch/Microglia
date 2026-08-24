@@ -451,6 +451,55 @@ def sweep_eval(clf, pairs, half, combos, use_click=False, verbose_every=200,
     return {k: (np.array(v[0]), np.array(v[1]), v[2]) for k, v in acc.items()}
 
 
+def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None):
+    """Best IoU each cell could reach if its OWN threshold were chosen for it.
+
+    A single global cut has to serve every cell. If cells disagree about where
+    their boundary sits in probability terms, that one cut is wrong for most of
+    them and the score understates what the probability map actually knows. This
+    scores each cell at its own best cut, which is not achievable in practice --
+    it needs the right answer to pick the cut -- but it bounds what per-cell
+    calibration could buy. A large gap means the map locates the soma and the
+    threshold is the problem; no gap means the map itself is the limit.
+    """
+    fine = np.arange(0.15, 0.91, 0.05)
+    best_iou, best_cut, fixed = [], [], []
+    cache_path, cache_img = None, None
+    for mp, ip, r, c, tp in pairs:
+        try:
+            if ip != cache_path:
+                cache_img = load_gray(ip, channel)
+                cache_path = ip
+            truth_full = np.squeeze(np.asarray(tifffile.imread(mp))) > 0
+            if truth_full.shape != cache_img.shape:
+                continue
+            ys, xs = np.nonzero(truth_full)
+            if len(ys) < 20:
+                continue
+            cr, cc = (int(r), int(c)) if use_click else (int(ys.mean()), int(xs.mean()))
+            patch, y1, x1 = patch_around(cache_img, cr, cc, half)
+            if patch.size == 0:
+                continue
+            ctr = (cr - y1, cc - x1)
+            F = pixel_features(patch, FEATURE_SCALES, center=ctr)
+            prob = clf.predict_proba(F)[:, 1].reshape(patch.shape)
+            truth = truth_full[y1:y1 + patch.shape[0], x1:x1 + patch.shape[1]]
+            per = []
+            for cut in fine:
+                pred = mask_from_prob(prob, ctr, float(cut), open_r, mode)
+                if pred is None:
+                    per.append(0.0)
+                    continue
+                u = np.logical_or(pred, truth).sum()
+                per.append(np.logical_and(pred, truth).sum() / u if u else 0.0)
+            per = np.array(per)
+            best_iou.append(per.max())
+            best_cut.append(float(fine[int(per.argmax())]))
+        except Exception:
+            continue
+    return np.array(best_iou), np.array(best_cut)
+
+
 # ----------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -619,6 +668,28 @@ def main():
     else:
         print("  Train and test agree -> the model is learning what it can; "
               "remaining error is boundary ambiguity.")
+
+    print("\nPer-cell ceiling (each cell scored at its own best threshold)…")
+    o_iou, o_cut = oracle_eval(overall['clf'], test_pairs, half,
+                               overall['mode'], overall['open_r'],
+                               use_click=a.use_click, channel=a.channel)
+    if len(o_iou):
+        print(f"  per-cell-best median IoU {np.median(o_iou):.3f}   "
+              f"IoU>0.7 {100 * np.mean(o_iou > 0.7):.0f}%")
+        print(f"  best threshold per cell: median {np.median(o_cut):.2f}, "
+              f"10th-90th pct {np.percentile(o_cut, 10):.2f}-"
+              f"{np.percentile(o_cut, 90):.2f}")
+        lift = float(np.median(o_iou)) - overall['iou']
+        if lift > 0.06:
+            print(f"  +{lift:.3f} over the single global cut -> cells disagree "
+                  f"about where their boundary sits.")
+            print("  Calibrating a threshold per cell is a real lever worth "
+                  "building.")
+        else:
+            print(f"  only +{lift:.3f} over the single global cut -> the "
+                  f"probability map itself is the limit,")
+            print("  not the threshold. Better thresholding will not rescue "
+                  "this.")
 
     meta = dict(channel=a.channel, pixel_size_um=a.pixel_size,
                 soma_radius_um=a.soma_radius_um, half=half,
