@@ -12439,16 +12439,37 @@ if __name__ == '__main__':
                             "Competitive growth prevents overlap between somas.")
         layout.addWidget(dapi_btn)
 
-        # Auto settings — method is locked to Hybrid, only sensitivity adjustable
+        # Auto settings (soma-blob detector). Sensitivity shifts the threshold;
+        # soma radius sizes the search window, the core used to sample the
+        # soma's peak brightness, AND the max-size rejection ceiling — it is
+        # the more consequential of the two and was previously not editable
+        # anywhere (hardcoded to 8.0 um), so a mis-sized default silently
+        # capped or under-sized every auto outline.
         from PyQt5.QtWidgets import QDoubleSpinBox
+        layout.addWidget(QLabel("<b>Auto settings:</b>"))
         settings_layout = QHBoxLayout()
-        settings_layout.addWidget(QLabel("Auto sens:"))
+        settings_layout.addWidget(QLabel("Sensitivity:"))
         sens_spin = QDoubleSpinBox()
         sens_spin.setRange(0.01, 90.0)
         sens_spin.setDecimals(2)
         sens_spin.setSingleStep(1.0)
         sens_spin.setValue(self._auto_outline_sensitivity_value)
+        sens_spin.setToolTip(
+            "Higher = lower intensity cut = more inclusive/larger outline.\n"
+            "Lower = stricter cut = smaller/tighter outline.")
         settings_layout.addWidget(sens_spin)
+        settings_layout.addWidget(QLabel("  Max soma radius:"))
+        radius_spin = QDoubleSpinBox()
+        radius_spin.setRange(1.0, 40.0)
+        radius_spin.setDecimals(1)
+        radius_spin.setSingleStep(0.5)
+        radius_spin.setSuffix(" µm")
+        radius_spin.setValue(getattr(self, 'soma_max_radius_um', 8.0))
+        radius_spin.setToolTip(
+            "Measure a real soma with the M tool and enter its radius here.\n"
+            "Too small: real somas get truncated or rejected as 'too big'.\n"
+            "Too large: the search window pulls in neighbouring cells/processes.")
+        settings_layout.addWidget(radius_spin)
         layout.addLayout(settings_layout)
 
         # DAPI settings
@@ -12512,6 +12533,7 @@ if __name__ == '__main__':
 
         self.auto_outline_method.setCurrentIndex(0)  # Always soma blob
         self._auto_outline_sensitivity_value = sens_spin.value()
+        self.soma_max_radius_um = radius_spin.value()
         self._dapi_channel = dapi_ch_combo.currentData()
         self._signal_channel = signal_ch_combo.currentData()
         self._dapi_intensity_floor = dapi_intensity_spin.value()
