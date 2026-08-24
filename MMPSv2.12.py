@@ -13080,15 +13080,22 @@ if __name__ == '__main__':
                 points = _remove_branch_juts(points, soma)
             except Exception:
                 pass
-            if self._store_outline(img_name, soma_idx, list(points)) is None:
-                self.failed_auto_outlines.append(qi)
-                continue
             done += 1
             self._record_ml_confidence(img_name, soma_idx, conf)
             c = -1.0 if conf is None else conf
             if ml_threshold is not None and c >= ml_threshold:
+                # Accepted without review, so commit it now.
+                if self._store_outline(img_name, soma_idx, list(points)) is None:
+                    self.failed_auto_outlines.append(qi)
+                    done -= 1
+                    continue
                 auto_ok += 1
             else:
+                # Hold as a CANDIDATE. Committing here would mark the soma
+                # outlined, and review skips anything already outlined -- so
+                # every outline would be saved unseen and there would be nothing
+                # left to review.
+                self.auto_outlined_points[qi] = list(points)
                 needs_review.append((qi, c))
         progress.close()
 
@@ -13111,10 +13118,13 @@ if __name__ == '__main__':
         QMessageBox.information(self, "Machine-Learning Outlining",
                                 "\n".join(msg))
 
-        self.review_mode = True
         if needs_review:
-            self._load_review_soma(needs_review[0][0])
+            # Review least-confident first: that ordering is the point of having
+            # a confidence at all.
+            self._ml_review_order = [qi for qi, _ in needs_review]
+            self._start_review_mode()
             return
+        self._ml_review_order = None
         nxt = self._find_next_unoutlined_idx(start_from=0)
         if nxt is not None:
             self._load_soma_for_outlining(nxt)
@@ -13448,8 +13458,17 @@ if __name__ == '__main__':
             label.measure_pt2 = None
         self.measure_mode = False
 
-        # Find the first soma that actually needs review (skip already-outlined)
-        start_idx = self._find_next_unoutlined_idx(0)
+        # Find the first soma that actually needs review (skip already-outlined).
+        # With a model-supplied order, take the least confident first.
+        order = getattr(self, '_ml_review_order', None)
+        start_idx = None
+        if order:
+            for qi in order:
+                if not self._soma_has_outline(*self.outlining_queue[qi]):
+                    start_idx = qi
+                    break
+        if start_idx is None:
+            start_idx = self._find_next_unoutlined_idx(0)
         if start_idx is None:
             # All somas already outlined — nothing to review
             self._finish_review_mode()
@@ -13555,6 +13574,7 @@ if __name__ == '__main__':
 
     def _finish_review_mode(self):
         """Finish review mode and complete outlining"""
+        self._clear_ml_review_order()
         self.review_mode = False
         self._finish_outlining()
 
@@ -14448,8 +14468,31 @@ if __name__ == '__main__':
         else:
             self._finish_outlining()
 
+    def _clear_ml_review_order(self):
+        """Drop any model-supplied review ordering."""
+        self._ml_review_order = None
+
     def _find_next_unoutlined_idx(self, start_from=0):
-        """Find the first queue entry that doesn't have an outline yet."""
+        """Find the next queue entry that doesn't have an outline yet.
+
+        When the model has supplied a review order, walk that instead of queue
+        position: the ordering puts the least confident outlines first, which is
+        the whole reason for scoring them. Falls back to queue order once that
+        list is exhausted, so nothing is stranded.
+        """
+        order = getattr(self, '_ml_review_order', None)
+        if order:
+            seen_start = start_from <= 0
+            for qi in order:
+                if not seen_start:
+                    # honour start_from as "resume after this one"
+                    if qi >= start_from:
+                        seen_start = True
+                    else:
+                        continue
+                if qi < len(self.outlining_queue) and not self._soma_has_outline(
+                        *self.outlining_queue[qi]):
+                    return qi
         for qi in range(start_from, len(self.outlining_queue)):
             img_name, soma_idx = self.outlining_queue[qi]
             if not self._soma_has_outline(img_name, soma_idx):
@@ -14468,6 +14511,7 @@ if __name__ == '__main__':
         self.progress_bar.setVisible(True)
 
     def _finish_outlining(self):
+        self._clear_ml_review_order()
         self.progress_bar.setVisible(False)
         self.progress_bar.setFormat("%p%")  # Reset to default format
         self.outline_controls_widget.setVisible(False)
