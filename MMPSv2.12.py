@@ -1656,22 +1656,27 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
 
 
 def auto_outline_soma_blob(image, centroid, sensitivity=50,
-                           max_soma_radius_px=14):
+                           max_soma_radius_px=14, process_width_px=None):
     """Outline the SOMA only: a compact, locally-bright blob.
 
-    The threshold/watershed/hybrid detectors threshold a large region and take
+    The threshold/watershed/hybrid detectors threshold a large region and keep
     whichever contour contains the click. In real tissue the processes connect
     neighbouring cells, so that contour is the whole cell network — measured on
     a dense synthetic field they returned outlines 8-37x larger than the soma.
 
     This works at soma scale instead:
-      * crop a window a few soma-radii wide
-      * threshold between the LOCAL background and the soma's own peak, so the
-        cut sits above the (dimmer) processes
-      * morphologically OPEN with a disk wider than a process, which severs the
-        thin process connections while leaving the soma intact
+      * crop a window ~2 soma radii wide
+      * sample the soma's peak from a SMALL core (~1 um) so the value is the
+        soma itself, not an average over processes and background
+      * threshold between the local background and that peak
+      * morphologically OPEN with a disk sized to PROCESS width, which severs
+        the thin process connections while leaving the soma intact
       * keep the connected component under the click, and reject anything too
         large to be a soma
+
+    Scales are physical: the opening kernel follows process width, NOT soma
+    radius. Deriving it from the radius made the kernel ~39 px on 0.1 um/px
+    data, which erodes the soma itself.
 
     ``sensitivity`` shifts the cut: higher = lower threshold = larger outline.
     Returns (row, col) polygon points, or None.
@@ -1683,7 +1688,7 @@ def auto_outline_soma_blob(image, centroid, sensitivity=50,
         h, w = img.shape[:2]
         cy, cx = int(centroid[0]), int(centroid[1])
         rad_px = max(3, int(max_soma_radius_px))
-        R = int(rad_px * 2.5)
+        R = int(rad_px * 2.0)
         y1, y2 = max(0, cy - R), min(h, cy + R)
         x1, x2 = max(0, cx - R), min(w, cx + R)
         region = img[y1:y2, x1:x2]
@@ -1691,20 +1696,28 @@ def auto_outline_soma_blob(image, centroid, sensitivity=50,
             return None
         ly, lx = cy - y1, cx - x1
 
-        core_r = max(3, rad_px // 2)
+        # Peak from a small core: a large core averages in processes/background
+        # and drags the peak down, which inflates the outline.
+        core_r = max(2, rad_px // 6)
         core = region[max(0, ly - core_r):ly + core_r + 1,
                       max(0, lx - core_r):lx + core_r + 1]
         if core.size == 0:
             return None
         peak = float(np.percentile(core, 90))
         bg = float(np.percentile(region, 25))
-        if peak <= bg:
+        if peak <= bg + 1e-9:
             return None
-        frac = 0.35 + (50.0 - sensitivity) / 100.0 * 0.30
+
+        # Cut as a fraction of the local dynamic range. Centred on 0.55, which
+        # a sweep on dim diffuse cells put at the accuracy optimum; the old
+        # mapping spanned only 0.23-0.50 and so could never reach it.
+        frac = 0.55 + (50.0 - float(sensitivity)) / 100.0 * 0.50
         thr = bg + (peak - bg) * max(0.05, min(0.95, frac))
 
         binm = (region > thr).astype(np.uint8)
-        ksz = max(3, (rad_px // 2) | 1)          # odd, ~half a soma radius
+        pw = process_width_px if process_width_px else max(3, rad_px // 4)
+        ksz = max(3, int(round(pw * 1.6)) | 1)
+        ksz = min(ksz, max(3, rad_px | 1))        # never wider than the soma
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
         binm = cv2.morphologyEx(binm, cv2.MORPH_OPEN, kernel)
 
@@ -1727,7 +1740,7 @@ def auto_outline_soma_blob(image, centroid, sensitivity=50,
         if not contours:
             return None
         best = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(best) < 20:
+        if cv2.contourArea(best) < 10:
             return None
         approx = _simplify_contour(best)
         pts = [(int(p[0][1]) + y1, int(p[0][0]) + x1) for p in approx]
@@ -3711,6 +3724,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_max_volume = 5000
         self.soma_intensity_tolerance = 30
         self.soma_max_radius_um = 8.0
+        self.process_width_um = 1.2   # typical microglial process width
         self.init_ui()
 
     def keyPressEvent(self, event):
@@ -13415,11 +13429,16 @@ if __name__ == '__main__':
             return auto_outline_watershed
         if name == 'Hybrid':
             return auto_outline_hybrid
-        # Default: soma-scale blob detection, sized from the soma radius setting
-        px = max(float(self._get_pixel_size() or 0.316), 1e-6)
+        # Default: soma-scale blob detection. Use the CURRENT image's pixel
+        # size — calling _get_pixel_size() with no name returns the global
+        # setting and ignores any per-image calibration, which silently
+        # mis-sizes every scale in the detector.
+        px = max(float(self._get_pixel_size(self.current_image_name) or 0.316), 1e-6)
         rad_px = max(3, int(round(getattr(self, 'soma_max_radius_um', 8.0) / px)))
+        proc_px = max(2, int(round(getattr(self, 'process_width_um', 1.2) / px)))
         return lambda image, centroid, sensitivity: auto_outline_soma_blob(
-            image, centroid, sensitivity, max_soma_radius_px=rad_px)
+            image, centroid, sensitivity, max_soma_radius_px=rad_px,
+            process_width_px=proc_px)
 
     def _get_image_for_outlining(self, img_data):
         """Get the appropriate grayscale image for auto-outlining"""
