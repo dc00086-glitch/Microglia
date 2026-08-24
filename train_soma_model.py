@@ -762,6 +762,7 @@ def main():
               "remaining error is boundary ambiguity.")
 
     print("\nPer-cell ceiling (each cell scored at its own best threshold)…")
+    conf_cal = {}
     o_iou, o_cut, rule_res, conf = oracle_eval(
         overall['clf'], test_pairs, half, overall['mode'], overall['open_r'],
         use_click=a.use_click, channel=a.channel)
@@ -795,10 +796,21 @@ def main():
                 print(f"    {['most', '2nd', '3rd', 'least'][k]:>5s} confident "
                       f"quarter: median IoU {np.median(riou[sl]):.3f}   "
                       f"IoU>0.7 {100 * np.mean(riou[sl] > 0.7):3.0f}%")
+            # Calibrate an ABSOLUTE cut-off. Ranking a batch and taking its top
+            # half would auto-accept half of any batch however bad it is, so the
+            # threshold has to be a confidence value carried with the model.
             for frac in (0.3, 0.5):
                 sl = order[:int(len(order) * frac)]
-                print(f"    auto-accept the top {100 * frac:.0f}%: "
+                thr = float(np.quantile(conf, 1.0 - frac))
+                keep = conf >= thr
+                print(f"    auto-accept the top {100 * frac:.0f}% "
+                      f"(confidence >= {thr:.3f}): "
                       f"{100 * np.mean(riou[sl] > 0.7):3.0f}% of those are good")
+                conf_cal[f'top{int(frac * 100)}'] = dict(
+                    threshold=thr,
+                    purity=float(np.mean(riou[keep] > 0.7)) if keep.any() else 0.0,
+                    covers=float(np.mean(keep)))
+            conf_cal['rule'] = rname
         lift = float(np.median(o_iou)) - overall['iou']
         if lift > 0.06:
             print(f"  +{lift:.3f} over the single global cut -> cells disagree "
@@ -812,6 +824,7 @@ def main():
                   "this.")
 
     meta = dict(channel=a.channel, pixel_size_um=a.pixel_size,
+                conf_cal=conf_cal,
                 soma_radius_um=a.soma_radius_um, half=half,
                 scales=FEATURE_SCALES, prob_cut=overall['cut'],
                 open_r=overall['open_r'], mode=overall['mode'])

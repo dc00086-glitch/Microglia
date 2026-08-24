@@ -1655,6 +1655,294 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
 
 
 
+# ======================================================================
+# Machine-learning soma outlining
+#
+# These five helpers are COPIED VERBATIM from train_soma_model.py. The forest
+# was fitted on features produced by that exact code, so any divergence here
+# silently feeds it the wrong numbers and it degrades without erroring. Keep
+# them byte-identical; tools/test_ml_parity.py fails the build if they drift.
+# ======================================================================
+from scipy import ndimage as ndi
+
+def _ml_pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
+    """Multi-scale per-pixel features -> (n_pixels, n_features).
+
+    Hessian eigenvalues are the important ones: for a BLOB both eigenvalues are
+    large and similar, for a TUBE (process) one is large and one near zero. That
+    is the "prefer blobs, penalise branching" prior, learned rather than tuned.
+
+    `center` is the (row, col) of the soma inside the patch -- the point the user
+    clicked. Texture filters alone cannot tell the soma edge from a bright
+    process 60 px away, so without this the classifier predicts the right AMOUNT
+    of soma in the wrong PLACE. Two anchors are derived from it: how far a pixel
+    is from the click, and how bright it is relative to this cell's own core
+    (which also makes brightness comparable between images).
+    """
+    p = patch.astype(np.float64)
+    lo, hi = np.percentile(p, 1), np.percentile(p, 99.5)
+    p = (p - lo) / (hi - lo) if hi > lo else p * 0.0
+    feats = [p]
+    if center is not None:
+        cy, cx = center
+        yy, xx = np.ogrid[:p.shape[0], :p.shape[1]]
+        rho = np.hypot(yy - cy, xx - cx) / max(p.shape) * 2.0
+        rho = np.broadcast_to(rho, p.shape).astype(np.float64)
+        # brightness of this cell's core, as a per-cell reference level
+        core = p[max(0, int(cy) - 3):int(cy) + 4,
+                 max(0, int(cx) - 3):int(cx) + 4]
+        cval = float(np.median(core)) if core.size else 0.0
+        feats += [rho, p - cval, p / (cval + 1e-3)]
+    for s in scales:
+        g = ndi.gaussian_filter(p, s)
+        feats.append(g)
+        gy, gx = np.gradient(g)
+        feats.append(np.hypot(gy, gx))                       # edge strength
+        gyy = ndi.gaussian_filter(p, s, order=[2, 0])
+        gxx = ndi.gaussian_filter(p, s, order=[0, 2])
+        gxy = ndi.gaussian_filter(p, s, order=[1, 1])
+        tr = gxx + gyy
+        det = gxx * gyy - gxy * gxy
+        disc = np.sqrt(np.maximum((tr / 2.0) ** 2 - det, 0))
+        l1, l2 = tr / 2.0 + disc, tr / 2.0 - disc            # Hessian eigenvalues
+        feats += [l1, l2, np.abs(l1) - np.abs(l2)]           # blob vs tube
+        feats.append(g - ndi.gaussian_filter(p, s * 2))  # difference of gaussians
+    return np.stack([f.ravel() for f in feats], axis=1).astype(np.float32)
+
+
+FEATURE_SCALES = (1.0, 2.0, 4.0, 8.0)
+
+
+def _ml_radial_contour(prob, center, cut, n_angles=180, smooth=9):
+    """Turn a probability map into a smooth star-convex outline around `center`.
+
+    A hand-drawn soma outline is a smooth closed contour; a pixel classifier
+    emits ragged, speckled output. Thresholding it therefore loses several
+    pixels of boundary accuracy for reasons that have nothing to do with how
+    well the model located the soma. This casts a ray at each angle, takes the
+    first crossing below `cut` as the boundary, median-filters the resulting
+    radius profile circularly, and fills the polygon -- which enforces exactly
+    the properties the accepted outlines have: one blob, no holes, no spurs,
+    smooth edge.
+    """
+    cy, cx = float(center[0]), float(center[1])
+    H, W = prob.shape
+    R = int(max(H, W))
+    rs = np.arange(0.0, R, 0.5)
+    ang = np.linspace(0.0, 2 * np.pi, n_angles, endpoint=False)
+    yy = cy + rs[None, :] * np.sin(ang)[:, None]
+    xx = cx + rs[None, :] * np.cos(ang)[:, None]
+    samp = ndi.map_coordinates(prob, [yy.ravel(), xx.ravel()],
+                                   order=1, mode='constant', cval=0.0)
+    samp = samp.reshape(n_angles, len(rs))
+    inside = samp >= cut
+    # first radius at which the ray leaves the soma
+    leaves = np.argmin(inside, axis=1)
+    leaves[inside.all(axis=1)] = len(rs) - 1
+    bnd = rs[leaves]
+    if smooth > 1:
+        bnd = ndi.median_filter(bnd, size=smooth, mode='wrap')
+    if not np.any(bnd > 0):
+        return None
+    gy, gx = np.ogrid[:H, :W]
+    a = np.arctan2(gy - cy, gx - cx) % (2 * np.pi)
+    idx = np.minimum((a / (2 * np.pi) * n_angles).astype(int), n_angles - 1)
+    rad = np.hypot(gy - cy, gx - cx)
+    return rad <= bnd[idx]
+
+
+def _ml_disk(r):
+    y, x = np.ogrid[-r:r + 1, -r:r + 1]
+    return (y * y + x * x) <= r * r
+
+
+def _ml_patch_around(img, r, c, half):
+    h, w = img.shape[:2]
+    y1, y2 = max(0, r - half), min(h, r + half)
+    x1, x2 = max(0, c - half), min(w, c + half)
+    return img[y1:y2, x1:x2], y1, x1
+
+
+def _ml_mask_from_prob(prob, center, prob_cut=0.5, open_r=0, mode='cc'):
+    """Turn a probability map into a single soma mask.
+
+    Split out from predict_mask because the probability map depends on neither
+    the cut nor the mode: the sweep computes it once per soma and calls this for
+    every combination, instead of re-running the forest 20 times per cell.
+    """
+    ly, lx = center
+    if mode == 'radial':
+        return _ml_radial_contour(prob, (ly, lx), prob_cut)
+    binm = prob >= prob_cut
+    # Sever thin structures BEFORE picking the component, so a process still
+    # attached to the soma is dropped with it rather than dragged along. The
+    # radius severs anything narrower than ~2*open_r while leaving the soma
+    # (tens of px across) intact.
+    if open_r > 0:
+        binm = ndi.binary_opening(binm, _ml_disk(open_r))
+    lab, n = ndi.label(binm)
+    if n == 0:
+        return None
+    ly = min(max(int(ly), 0), prob.shape[0] - 1)
+    lx = min(max(int(lx), 0), prob.shape[1] - 1)
+    cid = lab[ly, lx]
+    if cid == 0:                                   # click just outside — nearest
+        ys, xs = np.nonzero(lab)
+        if not len(ys):
+            return None
+        i = int(np.argmin((ys - ly) ** 2 + (xs - lx) ** 2))
+        cid = lab[ys[i], xs[i]]
+    return ndi.binary_fill_holes(lab == cid)
+
+
+class _MLSomaOutliner:
+    """Wraps the trained forest so it can be used like the other detectors.
+
+    Scale matters: the forest was fitted at one pixel size, and every filter
+    width in the feature set is in pixels. An image at a different calibration
+    is cropped over the same PHYSICAL area and resampled to the training patch
+    size, so the model always sees a soma at the scale it was trained on.
+    """
+
+    def __init__(self, path):
+        import joblib
+        bundle = joblib.load(path)
+        self.model = bundle['model']
+        m = bundle.get('meta', {}) or {}
+        self.scales = tuple(m.get('scales') or (1.0, 2.0, 4.0, 8.0))
+        self.half = int(m.get('half') or 76)
+        self.prob_cut = float(m.get('prob_cut') or 0.5)
+        self.open_r = int(m.get('open_r') or 0)
+        self.mode = m.get('mode') or 'cc'
+        self.train_px = float(m.get('pixel_size_um') or 0.1046)
+        self.channel = m.get('channel')
+        self.conf_cal = m.get('conf_cal') or {}
+        self.path = path
+        self.last_confidence = None
+
+    def accept_threshold(self, which='top50'):
+        """Confidence at or above which a cell may be accepted unreviewed.
+
+        Calibrated on held-out cells at training time and carried in the model,
+        so it means the same thing on every image. Ranking the somas of one
+        batch and taking its top half would accept half of any batch, however
+        bad, which is not the same thing at all.
+        """
+        d = self.conf_cal.get(which) or {}
+        t = d.get('threshold')
+        return float(t) if t is not None else None
+
+    def describe(self):
+        parts = [f"scales {len(self.scales)}", f"cut {self.prob_cut}",
+                 f"{self.mode}"]
+        if self.channel:
+            parts.append(f"channel {self.channel}")
+        d = self.conf_cal.get('top50') or {}
+        if d.get('purity') is not None:
+            parts.append(f"top50 purity {100 * d['purity']:.0f}%")
+        return ", ".join(parts)
+
+    def _probability_map(self, image, centroid, pixel_size_um):
+        cy, cx = int(round(centroid[0])), int(round(centroid[1]))
+        img = image
+        if img.ndim > 2:
+            img = img[:, :, 0]
+        px = float(pixel_size_um or self.train_px)
+        # same physical window the model was trained on
+        half_img = max(8, int(round(self.half * self.train_px / max(px, 1e-6))))
+        patch, y1, x1 = _ml_patch_around(img.astype(np.float64), cy, cx, half_img)
+        if patch.size == 0 or min(patch.shape[:2]) < 8:
+            return None
+        side = 2 * self.half
+        work = cv2.resize(patch, (side, side), interpolation=cv2.INTER_LINEAR)
+        ctr = ((cy - y1) * side / patch.shape[0],
+               (cx - x1) * side / patch.shape[1])
+        F = _ml_pixel_features(work, self.scales, center=ctr)
+        prob = self.model.predict_proba(F)[:, 1].reshape(work.shape)
+        return prob, ctr, (y1, x1), patch.shape
+
+    def outline(self, image, centroid, pixel_size_um=None):
+        """-> (points, confidence). points are (row, col) in image coordinates."""
+        self.last_confidence = None
+        try:
+            got = self._probability_map(image, centroid, pixel_size_um)
+            if got is None:
+                return None, None
+            prob, ctr, (y1, x1), pshape = got
+            mask = _ml_mask_from_prob(prob, ctr, self.prob_cut, self.open_r,
+                                      self.mode)
+            if mask is None or not mask.any():
+                return None, None
+
+            # Confidence with no ground truth: how much the outline moves
+            # between a loose and a strict cut. A sharp boundary barely shifts;
+            # a diffuse one balloons.
+            lo = _ml_mask_from_prob(prob, ctr, 0.35, self.open_r, self.mode)
+            hi = _ml_mask_from_prob(prob, ctr, 0.65, self.open_r, self.mode)
+            conf = 0.0
+            if lo is not None and hi is not None:
+                u = np.logical_or(lo, hi).sum()
+                if u:
+                    conf = float(np.logical_and(lo, hi).sum()) / float(u)
+            self.last_confidence = conf
+
+            back = cv2.resize(mask.astype(np.uint8), (pshape[1], pshape[0]),
+                              interpolation=cv2.INTER_NEAREST)
+            contours, _ = cv2.findContours(back, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return None, conf
+            best = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(best) < 10:
+                return None, conf
+            approx = _simplify_contour(best)
+            pts = [(int(p[0][1]) + y1, int(p[0][0]) + x1) for p in approx]
+            if len(pts) < MIN_OUTLINE_POINTS:
+                return None, conf
+            return pts, conf
+        except Exception as e:
+            print(f"ML outline error: {e}")
+            return None, None
+
+
+_ML_OUTLINER = None
+_ML_OUTLINER_PATH = None
+
+
+def ml_model_paths():
+    """Where a trained model may live, nearest first."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [os.path.join(here, 'soma_model.joblib')]
+    try:
+        cands.append(os.path.join(sys._MEIPASS, 'soma_model.joblib'))
+    except Exception:
+        pass
+    cands += [os.path.expanduser('~/Downloads/soma_model.joblib'),
+              os.path.expanduser('~/soma_model.joblib')]
+    return cands
+
+
+def get_ml_outliner(path=None):
+    """Load the trained model once and reuse it. Returns None if unavailable."""
+    global _ML_OUTLINER, _ML_OUTLINER_PATH
+    if path is None:
+        for c in ml_model_paths():
+            if os.path.exists(c):
+                path = c
+                break
+    if path is None or not os.path.exists(path):
+        return None
+    if _ML_OUTLINER is not None and _ML_OUTLINER_PATH == path:
+        return _ML_OUTLINER
+    try:
+        _ML_OUTLINER = _MLSomaOutliner(path)
+        _ML_OUTLINER_PATH = path
+        return _ML_OUTLINER
+    except Exception as e:
+        print(f"Could not load ML soma model from {path}: {e}")
+        return None
+
+
 def auto_outline_soma_blob(image, centroid, sensitivity=50,
                            max_soma_radius_px=14, process_width_px=None):
     """Outline the SOMA only: a compact, locally-bright blob.
@@ -4153,7 +4441,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Hidden auto-outline settings (store state but not shown in panel)
         # Auto-outline is locked to Hybrid method only.
         self.auto_outline_method = QComboBox()
-        self.auto_outline_method.addItems(["Soma blob (recommended)", "Threshold", "Region Grow", "Watershed", "Hybrid"])
+        self.auto_outline_method.addItems(["Soma blob (recommended)",
+                                          "Machine learning (trained model)",
+                                          "Threshold", "Region Grow", "Watershed",
+                                          "Hybrid"])
         self.auto_outline_method.setCurrentIndex(0)  # Soma blob
         self.auto_outline_method.setVisible(False)
         self._auto_outline_sensitivity_value = 50
@@ -13423,6 +13714,17 @@ if __name__ == '__main__':
             name = self.auto_outline_method.currentText()
         except Exception:
             pass
+        if name.startswith('Machine learning'):
+            ml = get_ml_outliner()
+            if ml is None:
+                self.log("No trained soma model found — falling back to the "
+                         "soma-blob detector. Train one with "
+                         "train_soma_model.py and put soma_model.joblib next "
+                         "to MMPS.")
+            else:
+                px_ml = self._get_pixel_size(self.current_image_name)
+                return lambda image, centroid, sensitivity: (
+                    ml.outline(image, centroid, px_ml)[0])
         if name in ('Threshold', 'Region Grow'):
             return auto_outline_threshold
         if name == 'Watershed':
@@ -13715,7 +14017,13 @@ if __name__ == '__main__':
             QMessageBox.information(self, "Auto-Outline All",
                                     "Every soma already has an outline.")
             return
-        if QMessageBox.question(
+        _is_ml = False
+        try:
+            _is_ml = self.auto_outline_method.currentText().startswith(
+                'Machine learning') and get_ml_outliner() is not None
+        except Exception:
+            pass
+        if not _is_ml and QMessageBox.question(
                 self, "Auto-Outline All",
                 f"Auto-outline {len(pending)} soma(s)?\n\n"
                 f"Each is outlined with the current method and sensitivity. "
@@ -13723,6 +14031,50 @@ if __name__ == '__main__':
                 f"you can redo individual outlines afterwards.",
                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
+
+        # With the trained model every outline carries a confidence, so the
+        # user can either accept the confident ones unreviewed or review the
+        # lot. The threshold is an absolute value calibrated at training time
+        # and carried in the model -- ranking this batch and taking its top half
+        # would accept half of any batch however badly it went.
+        ml = None
+        ml_threshold = None
+        try:
+            if self.auto_outline_method.currentText().startswith('Machine learning'):
+                ml = get_ml_outliner()
+        except Exception:
+            ml = None
+        if ml is not None:
+            thr = ml.accept_threshold('top50')
+            cal = (ml.conf_cal.get('top50') or {})
+            box = QMessageBox(self)
+            box.setWindowTitle("Machine-Learning Outlining")
+            if thr is None:
+                box.setText(f"Outline {len(pending)} soma(s) with the trained "
+                            f"model?\n\nThis model carries no confidence "
+                            f"calibration, so every outline will be queued for "
+                            f"review.")
+                box.addButton("Review all", QMessageBox.AcceptRole)
+            else:
+                box.setText(
+                    f"Outline {len(pending)} soma(s) with the trained model?\n\n"
+                    f"Each outline gets a confidence score. On held-out data, "
+                    f"{100 * cal.get('purity', 0):.0f}% of the outlines above "
+                    f"the auto-accept threshold were good, and they were about "
+                    f"{100 * cal.get('covers', 0):.0f}% of all cells.\n\n"
+                    f"Reviewing everything costs more time but nothing is "
+                    f"accepted unseen.")
+                box.addButton("Review all outlines", QMessageBox.AcceptRole)
+                box.addButton("Auto-accept confident, review the rest",
+                              QMessageBox.YesRole)
+            box.addButton("Cancel", QMessageBox.RejectRole)
+            box.exec_()
+            clicked = box.clickedButton()
+            label = clicked.text() if clicked else "Cancel"
+            if label == "Cancel":
+                return
+            if label.startswith("Auto-accept"):
+                ml_threshold = thr
 
         method = self._get_auto_outline_method()
         sensitivity = self._auto_outline_sensitivity_value
@@ -13734,6 +14086,8 @@ if __name__ == '__main__':
         progress.setMinimumDuration(0)
 
         done, failed = 0, []
+        needs_review = []          # (img_name, soma_idx, confidence)
+        auto_ok = 0
         for n, (qi, (img_name, soma_idx)) in enumerate(pending):
             if progress.wasCanceled():
                 break
@@ -13764,17 +14118,64 @@ if __name__ == '__main__':
                 failed.append(soma_id)
             else:
                 done += 1
+                if ml is not None:
+                    conf = ml.last_confidence
+                    if ml_threshold is None:
+                        # "review all" -- every ML outline is queued, least
+                        # confident first so attention goes where it is needed
+                        needs_review.append((img_name, soma_idx,
+                                             -1.0 if conf is None else conf))
+                    elif conf is None or conf < ml_threshold:
+                        needs_review.append((img_name, soma_idx,
+                                             -1.0 if conf is None else conf))
+                    else:
+                        auto_ok += 1
         progress.close()
 
         self.polygon_points = []
         self._update_outline_progress()
         self._auto_save()
         self.log(f"Auto-outline: {done} outlined, {len(failed)} need manual work")
+        if ml is not None:
+            needs_review.sort(key=lambda t: t[2])      # least confident first
+            self._ml_review_queue = [(a, b) for a, b, _ in needs_review]
+            self.log(f"  model: {auto_ok} accepted on confidence, "
+                     f"{len(needs_review)} queued for review "
+                     f"({ml.describe()})")
         if failed:
             self.log("  manual: " + ", ".join(failed[:20])
                      + (" ..." if len(failed) > 20 else ""))
 
         nxt = self._find_next_unoutlined_idx(start_from=0)
+        if ml is not None:
+            msg = [f"Outlined {done} soma(s)."]
+            if ml_threshold is not None:
+                msg.append(f"{auto_ok} were confident enough to accept "
+                           f"unreviewed.")
+            msg.append(f"{len(needs_review)} queued for review, least "
+                       f"confident first.")
+            if failed:
+                msg.append(f"{len(failed)} could not be outlined and need "
+                           f"manual work.")
+            QMessageBox.information(self, "Machine-Learning Outlining",
+                                    "\n".join(msg))
+            if needs_review:
+                first = needs_review[0][:2]
+                for qi2, key in enumerate(self.outlining_queue):
+                    if tuple(key) == first:
+                        if getattr(self, 'review_mode', False):
+                            self._load_review_soma(qi2)
+                        else:
+                            self._load_soma_for_outlining(qi2)
+                        return
+            if nxt is not None:
+                if getattr(self, 'review_mode', False):
+                    self._load_review_soma(nxt)
+                else:
+                    self._load_soma_for_outlining(nxt)
+            else:
+                self._finish_outlining()
+            return
         QMessageBox.information(
             self, "Auto-Outline All",
             f"Outlined {done} soma(s).\n"

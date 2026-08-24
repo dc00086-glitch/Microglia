@@ -30,12 +30,33 @@ if os.path.isfile(ICON):
 elif os.path.isfile('MMPS.icns'):
     datas.append(('MMPS.icns', '.'))
 
+# Bundle the trained soma model when one is sitting beside the script. Without
+# it the machine-learning outline method is simply unavailable and MMPS falls
+# back to the soma-blob detector, so its absence is not fatal.
+if os.path.isfile('soma_model.joblib'):
+    datas.append(('soma_model.joblib', '.'))
+    print('spec: bundling soma_model.joblib')
+else:
+    print('spec: no soma_model.joblib found — ML outlining will be unavailable')
+
 a = Analysis(
     [SCRIPT],
     pathex=[],
     binaries=[],
     datas=datas,
     hiddenimports=[
+        # trained soma-outlining model
+        'joblib',
+        'sklearn',
+        'sklearn.ensemble',
+        'sklearn.ensemble._forest',
+        'sklearn.tree',
+        'sklearn.tree._tree',
+        'sklearn.utils._typedefs',
+        'sklearn.utils._heap',
+        'sklearn.utils._sorting',
+        'sklearn.utils._vector_sentinel',
+        'sklearn.neighbors._partition_nodes',
         'PIL',
         'PIL.Image',
         'PIL.TiffImagePlugin',
