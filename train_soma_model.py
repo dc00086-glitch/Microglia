@@ -201,6 +201,44 @@ def pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
 FEATURE_SCALES = (1.0, 2.0, 4.0, 8.0)
 
 
+def radial_contour(prob, center, cut, n_angles=180, smooth=9):
+    """Turn a probability map into a smooth star-convex outline around `center`.
+
+    A hand-drawn soma outline is a smooth closed contour; a pixel classifier
+    emits ragged, speckled output. Thresholding it therefore loses several
+    pixels of boundary accuracy for reasons that have nothing to do with how
+    well the model located the soma. This casts a ray at each angle, takes the
+    first crossing below `cut` as the boundary, median-filters the resulting
+    radius profile circularly, and fills the polygon -- which enforces exactly
+    the properties the accepted outlines have: one blob, no holes, no spurs,
+    smooth edge.
+    """
+    cy, cx = float(center[0]), float(center[1])
+    H, W = prob.shape
+    R = int(max(H, W))
+    rs = np.arange(0.0, R, 0.5)
+    ang = np.linspace(0.0, 2 * np.pi, n_angles, endpoint=False)
+    yy = cy + rs[None, :] * np.sin(ang)[:, None]
+    xx = cx + rs[None, :] * np.cos(ang)[:, None]
+    samp = ndimage.map_coordinates(prob, [yy.ravel(), xx.ravel()],
+                                   order=1, mode='constant', cval=0.0)
+    samp = samp.reshape(n_angles, len(rs))
+    inside = samp >= cut
+    # first radius at which the ray leaves the soma
+    leaves = np.argmin(inside, axis=1)
+    leaves[inside.all(axis=1)] = len(rs) - 1
+    bnd = rs[leaves]
+    if smooth > 1:
+        bnd = ndimage.median_filter(bnd, size=smooth, mode='wrap')
+    if not np.any(bnd > 0):
+        return None
+    gy, gx = np.ogrid[:H, :W]
+    a = np.arctan2(gy - cy, gx - cx) % (2 * np.pi)
+    idx = np.minimum((a / (2 * np.pi) * n_angles).astype(int), n_angles - 1)
+    rad = np.hypot(gy - cy, gx - cx)
+    return rad <= bnd[idx]
+
+
 def _disk(r):
     y, x = np.ogrid[-r:r + 1, -r:r + 1]
     return (y * y + x * x) <= r * r
@@ -277,12 +315,15 @@ def build_dataset(pairs, half, per_soma=600, verbose_every=100):
 # ----------------------------------------------------------------------
 # evaluation
 # ----------------------------------------------------------------------
-def predict_mask(clf, img, r, c, half, prob_cut=0.5, open_r=0):
+def predict_mask(clf, img, r, c, half, prob_cut=0.5, open_r=0, mode='cc'):
     patch, y1, x1 = patch_around(img, r, c, half)
     if patch.size == 0:
         return None, None, None
     F = pixel_features(patch, FEATURE_SCALES, center=(r - y1, c - x1))
     prob = clf.predict_proba(F)[:, 1].reshape(patch.shape)
+    if mode == 'radial':
+        out = radial_contour(prob, (r - y1, c - x1), prob_cut)
+        return out, prob, (y1, x1)
     binm = prob >= prob_cut
     # Sever thin structures BEFORE picking the component, so a process still
     # attached to the soma is dropped with it rather than dragged along. The
@@ -307,7 +348,7 @@ def predict_mask(clf, img, r, c, half, prob_cut=0.5, open_r=0):
     return out, prob, (y1, x1)
 
 
-def evaluate(clf, pairs, half, prob_cut=0.5, open_r=0):
+def evaluate(clf, pairs, half, prob_cut=0.5, open_r=0, mode='cc'):
     ious, arearatios, fails = [], [], 0
     cache_path, cache_img = None, None
     for mp, ip, r, c, tp in pairs:
@@ -323,7 +364,7 @@ def evaluate(clf, pairs, half, prob_cut=0.5, open_r=0):
             if len(ys) < 20:
                 continue
             cr, cc = int(ys.mean()), int(xs.mean())
-            pred, prob, off = predict_mask(clf, img, cr, cc, half, prob_cut, open_r)
+            pred, prob, off = predict_mask(clf, img, cr, cc, half, prob_cut, open_r, mode)
             if pred is None:
                 fails += 1
                 continue
@@ -351,7 +392,9 @@ def main():
                     help='half-width of the analysis patch, in µm')
     ap.add_argument('--limit', type=int, default=None, help='use at most N somas')
     ap.add_argument('--per-soma', type=int, default=600, help='pixels sampled per soma')
-    ap.add_argument('--trees', type=int, default=200)
+    ap.add_argument('--trees', type=int, default=300)
+    ap.add_argument('--min-leaf', type=int, default=2,
+                    help='min samples per leaf; lower = more capacity')
     ap.add_argument('--out', default='soma_model.joblib')
     a = ap.parse_args()
 
@@ -381,38 +424,41 @@ def main():
     print(f"  {X.shape[0]:,} pixels x {X.shape[1]} features\n")
 
     print(f"Training random forest ({a.trees} trees)…")
-    clf = RandomForestClassifier(n_estimators=a.trees, min_samples_leaf=4,
+    clf = RandomForestClassifier(n_estimators=a.trees, min_samples_leaf=a.min_leaf,
                                  n_jobs=-1, random_state=0, class_weight='balanced')
     clf.fit(X, y)
     print("  done\n")
 
     print("Evaluating on held-out images…")
-    open_radii = [0, max(2, half // 16), max(3, half // 10)]
-    open_radii = sorted(set(open_radii))
+    open_radii = sorted(set([0, max(2, half // 16), max(3, half // 10)]))
     best = None
-    for orad in open_radii:
+    trials = [('cc', o) for o in open_radii] + [('radial', 0)]
+    for mode, orad in trials:
         for cut in (0.35, 0.45, 0.5, 0.55, 0.65):
-            ious, ratios, fails = evaluate(clf, test_pairs, half, cut, orad)
+            ious, ratios, fails = evaluate(clf, test_pairs, half, cut, orad, mode)
+            tag = 'radial   ' if mode == 'radial' else f'open {orad:>2}px'
             if len(ious) == 0:
-                print(f"  open {orad}px  cut {cut}: no usable predictions")
+                print(f"  {tag}  cut {cut}: no usable predictions")
                 continue
             med = float(np.median(ious))
-            print(f"  open {orad:>2}px  cut {cut}:  median IoU {med:.3f}   "
+            print(f"  {tag}  cut {cut}:  median IoU {med:.3f}   "
                   f"median area ratio {np.median(ratios):.2f}x   "
                   f"IoU>0.7 {100 * np.mean(ious > 0.7):.0f}%   fails {fails}")
             if best is None or med > best[1]:
-                best = (cut, med, orad)
+                best = (cut, med, orad, mode)
 
     if best:
-        print(f"\nBest: prob cut {best[0]}, opening {best[2]}px  "
-              f"(median IoU {best[1]:.3f})")
+        print(f"\nBest: prob cut {best[0]}, "
+              + (f"radial contour" if best[3] == 'radial'
+                 else f"opening {best[2]}px")
+              + f"  (median IoU {best[1]:.3f})")
 
     # Diagnostic: the same measurement on images the model TRAINED on. If train
     # and test are both poor the features or the labels are the limit; if train
     # is high and test is low the model is not transferring between images.
     if best:
         tr_ious, _, _ = evaluate(clf, train_pairs[:len(test_pairs)], half,
-                                 best[0], best[2])
+                                 best[0], best[2], best[3])
         if len(tr_ious):
             tr_med = float(np.median(tr_ious))
             print(f"\nDiagnostic  train-image median IoU {tr_med:.3f}   "
@@ -430,7 +476,8 @@ def main():
     meta = dict(pixel_size_um=a.pixel_size, soma_radius_um=a.soma_radius_um,
                 half=half, scales=FEATURE_SCALES,
                 prob_cut=(best[0] if best else 0.5),
-                open_r=(best[2] if best else 0))
+                open_r=(best[2] if best else 0),
+                mode=(best[3] if best else 'cc'))
     joblib.dump({'model': clf, 'meta': meta}, a.out)
     print(f"\nSaved model -> {a.out}")
     print("\nHow to read the result:")
