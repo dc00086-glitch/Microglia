@@ -453,8 +453,10 @@ def main():
     ap.add_argument('--limit', type=int, default=None, help='use at most N somas')
     ap.add_argument('--per-soma', type=int, default=600, help='pixels sampled per soma')
     ap.add_argument('--trees', type=int, default=300)
-    ap.add_argument('--min-leaf', type=int, default=2,
-                    help='min samples per leaf; lower = more capacity')
+    ap.add_argument('--min-leaf', type=int, nargs='*', default=[2, 20, 100],
+                    help='leaf sizes to try; larger = smaller, more general '
+                         'model. Several values trains one forest each and '
+                         'reports accuracy against size')
     ap.add_argument('--scales', type=float, nargs='*', default=None,
                     help='filter sizes in px (default 1 2 4 8). Nothing in the '
                          'default set spans a whole soma (~40 px radius), so '
@@ -510,79 +512,104 @@ def main():
     print(f"  {X.shape[0]:,} pixels x {X.shape[1]} features\n")
 
     max_samples = (min(a.max_samples, X.shape[0]) if a.max_samples else None)
-    print(f"Training random forest ({a.trees} trees, leaf {a.min_leaf}"
-          + (f", {max_samples:,} rows/tree" if max_samples else "") + ")…")
-    clf = RandomForestClassifier(n_estimators=a.trees, min_samples_leaf=a.min_leaf,
-                                 max_samples=max_samples, bootstrap=True,
-                                 n_jobs=-1, random_state=0,
-                                 class_weight='balanced')
-    clf.fit(X, y)
-    # Report what the forest actually cost, rather than predicting it -- node
-    # counts depend on how separable the data turns out to be, and a worst-case
-    # bound overstates them badly.
-    nodes = sum(t.tree_.node_count for t in clf.estimators_)
-    print(f"  done — {nodes:,} nodes, roughly {nodes * 80 / 1e9:.2f} GB in memory")
-    print(f"  (if a larger run ever runs out of memory, pass --max-samples)\n")
-
-    print("Evaluating on held-out images…")
     open_radii = sorted(set([0, max(2, half // 16), max(3, half // 10)]))
     cuts = (0.35, 0.45, 0.5, 0.55, 0.65)
     combos = ([('cc', o, c) for o in open_radii for c in cuts]
               + [('radial', 0, c) for c in cuts])
-    res = sweep_eval(clf, test_pairs, half, combos, use_click=a.use_click,
-                     channel=a.channel)
-    best = None
-    for key in combos:
-        mode, orad, cut = key
-        ious, ratios, fails = res[key]
-        tag = 'radial   ' if mode == 'radial' else f'open {orad:>2}px'
-        if len(ious) == 0:
-            print(f"  {tag}  cut {cut}: no usable predictions")
+    rng = np.random.RandomState(1)
+    train_sub = [train_pairs[i] for i in
+                 sorted(rng.permutation(len(train_pairs))[:len(test_pairs)])]
+
+    # A leaf size of 2 on millions of rows lets each tree memorise individual
+    # images: it drives the training score up, leaves the held-out score flat,
+    # and produces a forest far too large to ship inside the app. Train at
+    # several leaf sizes and report accuracy against size, so the trade is
+    # visible instead of assumed.
+    overall = None
+    for leaf in a.min_leaf:
+        print(f"Training random forest ({a.trees} trees, leaf {leaf}"
+              + (f", {max_samples:,} rows/tree" if max_samples else "") + ")…")
+        clf = RandomForestClassifier(n_estimators=a.trees, min_samples_leaf=leaf,
+                                     max_samples=max_samples, bootstrap=True,
+                                     n_jobs=-1, random_state=0,
+                                     class_weight='balanced')
+        clf.fit(X, y)
+        # Measure the forest rather than predicting it -- node counts depend on
+        # how separable the data turns out to be.
+        nodes = sum(t.tree_.node_count for t in clf.estimators_)
+        print(f"  {nodes:,} nodes, about {nodes * 80 / 1e6:.0f} MB uncompressed")
+
+        res = sweep_eval(clf, test_pairs, half, combos, use_click=a.use_click,
+                         channel=a.channel)
+        best = None
+        for key in combos:
+            mode, orad, cut = key
+            ious, ratios, fails = res[key]
+            tag = 'radial   ' if mode == 'radial' else f'open {orad:>2}px'
+            if len(ious) == 0:
+                print(f"  {tag}  cut {cut}: no usable predictions")
+                continue
+            med = float(np.median(ious))
+            print(f"  {tag}  cut {cut}:  median IoU {med:.3f}   "
+                  f"median area ratio {np.median(ratios):.2f}x   "
+                  f"IoU>0.7 {100 * np.mean(ious > 0.7):.0f}%   fails {fails}")
+            if best is None or med > best[1]:
+                best = (cut, med, orad, mode, float(np.mean(ious > 0.7)))
+        if best is None:
+            print("  no usable predictions at this leaf size\n")
             continue
-        med = float(np.median(ious))
-        print(f"  {tag}  cut {cut}:  median IoU {med:.3f}   "
-              f"median area ratio {np.median(ratios):.2f}x   "
-              f"IoU>0.7 {100 * np.mean(ious > 0.7):.0f}%   fails {fails}")
-        if best is None or med > best[1]:
-            best = (cut, med, orad, mode)
 
-    if best:
-        print(f"\nBest: prob cut {best[0]}, "
-              + ("radial contour" if best[3] == 'radial'
-                 else f"opening {best[2]}px")
-              + f"  (median IoU {best[1]:.3f})")
-
-    # Diagnostic: the same measurement on images the model TRAINED on. If train
-    # and test are both poor the features or the labels are the limit; if train
-    # is high and test is low the model is not transferring between images.
-    if best:
         key = (best[3], best[2], best[0])
-        rng = np.random.RandomState(1)
-        sub = [train_pairs[i] for i in
-               sorted(rng.permutation(len(train_pairs))[:len(test_pairs)])]
-        tr_ious = sweep_eval(clf, sub, half, [key], use_click=a.use_click,
-                             verbose_every=0, channel=a.channel)[key][0]
-        if len(tr_ious):
-            tr_med = float(np.median(tr_ious))
-            print(f"\nDiagnostic  train-image median IoU {tr_med:.3f}   "
-                  f"vs held-out {best[1]:.3f}")
-            if tr_med < 0.65:
-                print("  Both low -> the limit is the features or the outlines "
-                      "themselves, not generalisation.")
-            elif tr_med - best[1] > 0.15:
-                print("  Fits training images but does not transfer -> per-image "
-                      "appearance differs; needs more images, not more trees.")
-            else:
-                print("  Train and test agree -> the model is learning what it "
-                      "can; remaining error is boundary ambiguity.")
+        tr = sweep_eval(clf, train_sub, half, [key], use_click=a.use_click,
+                        verbose_every=0, channel=a.channel)[key][0]
+        tr_med = float(np.median(tr)) if len(tr) else float('nan')
+        print(f"  leaf {leaf}: held-out {best[1]:.3f}  train {tr_med:.3f}  "
+              f"gap {tr_med - best[1]:+.3f}  IoU>0.7 {100 * best[4]:.0f}%  "
+              f"{nodes * 80 / 1e6:.0f} MB\n")
+        if overall is None or best[1] > overall['iou']:
+            overall = dict(clf=clf, leaf=leaf, iou=best[1], train=tr_med,
+                           cut=best[0], open_r=best[2], mode=best[3],
+                           hit=best[4], nodes=nodes)
 
-    meta = dict(channel=a.channel, pixel_size_um=a.pixel_size, soma_radius_um=a.soma_radius_um,
-                half=half, scales=FEATURE_SCALES,
-                prob_cut=(best[0] if best else 0.5),
-                open_r=(best[2] if best else 0),
-                mode=(best[3] if best else 'cc'))
-    joblib.dump({'model': clf, 'meta': meta}, a.out)
-    print(f"\nSaved model -> {a.out}")
+    if overall is None:
+        sys.exit("Nothing evaluated successfully.")
+
+    print(f"Best: leaf {overall['leaf']}, prob cut {overall['cut']}, "
+          + ("radial contour" if overall['mode'] == 'radial'
+             else f"opening {overall['open_r']}px")
+          + f"  (median IoU {overall['iou']:.3f}, "
+            f"IoU>0.7 {100 * overall['hit']:.0f}%)")
+
+    gap = overall['train'] - overall['iou']
+    print(f"\nDiagnostic  train-image median IoU {overall['train']:.3f}   "
+          f"vs held-out {overall['iou']:.3f}")
+    if overall['train'] < 0.65:
+        print("  Both low -> the limit is the features or the outlines "
+              "themselves, not generalisation.")
+    elif gap > 0.10:
+        print("  Fits training images but does not transfer -> the model is "
+              "learning per-image appearance.")
+        print("  More outlines will not help; the features have to be made "
+              "invariant to how each image looks.")
+    else:
+        print("  Train and test agree -> the model is learning what it can; "
+              "remaining error is boundary ambiguity.")
+
+    meta = dict(channel=a.channel, pixel_size_um=a.pixel_size,
+                soma_radius_um=a.soma_radius_um, half=half,
+                scales=FEATURE_SCALES, prob_cut=overall['cut'],
+                open_r=overall['open_r'], mode=overall['mode'])
+    try:
+        joblib.dump({'model': overall['clf'], 'meta': meta}, a.out, compress=3)
+    except OSError as e:
+        sys.exit(f"\nCould not write {a.out}: {e}\n"
+                 f"The forest holds {overall['nodes']:,} nodes. Free some disk "
+                 f"space, or retrain with a larger --min-leaf to shrink it.")
+    mb = os.path.getsize(a.out) / 1e6
+    print(f"\nSaved model -> {a.out}  ({mb:.0f} MB compressed)")
+    if mb > 200:
+        print("  That is large to ship inside the MMPS app; a bigger --min-leaf "
+              "trades a little accuracy for a much smaller file.")
     print("\nHow to read the result:")
     print("  median IoU > 0.80  excellent — automate with spot checks")
     print("  0.70 - 0.80        good — automate, review flagged low-confidence cells")
