@@ -644,7 +644,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--root', required=True, help='folder containing the 1d/3d/7d/28d subfolders')
     ap.add_argument('--timepoints', nargs='*', default=['1d', '3d', '7d', '28d'])
-    ap.add_argument('--image-subdir', default='Image Directory',
+    ap.add_argument('--image-subdir', default=None,
                     help="folder under each timepoint holding the images the "
                          "outlines were drawn on. Use the PROCESSED images if "
                          "that is what you outline on in MMPS -- the model "
@@ -694,6 +694,25 @@ def main():
         print(f"script fingerprint: {_fp}")
     except Exception:
         pass
+
+    # Scoring an existing model: take its own settings unless overridden. A
+    # model fitted on raw pixels scored against processed images (or the other
+    # way round) produces a number that describes neither, which makes
+    # comparing two models actively misleading.
+    _bundle = None
+    if a.load_model:
+        _bundle = joblib.load(a.load_model)
+        _bm = _bundle.get('meta', {}) or {}
+        if a.image_subdir is None and _bm.get('image_subdir'):
+            a.image_subdir = _bm['image_subdir']
+            print(f"using the model's own images: {a.image_subdir}")
+        if a.channel is None and _bm.get('channel'):
+            a.channel = _bm['channel']
+            print(f"using the model's own channel: {a.channel}")
+        if not a.scales and _bm.get('scales'):
+            a.scales = list(_bm['scales'])
+    if a.image_subdir is None:
+        a.image_subdir = 'Image Directory'
     global FEATURE_SCALES
     if a.scales:
         FEATURE_SCALES = tuple(a.scales)
@@ -746,11 +765,12 @@ def main():
         # Scoring an existing forest: the threshold rules are applied after the
         # forest runs, so trying a new one does not need the model rebuilt.
         print(f"Loading {a.load_model} (skipping training)…")
-        _b = joblib.load(a.load_model)
+        _b = _bundle if _bundle is not None else joblib.load(a.load_model)
         _m = _b.get('meta', {})
         if _m.get('scales'):
             FEATURE_SCALES = tuple(_m['scales'])
-        print(f"  scales {FEATURE_SCALES}, channel {_m.get('channel')}, "
+        print(f"  trained on {_m.get('trained_on', '?')} images, "
+              f"channel {_m.get('channel')}, scales {len(FEATURE_SCALES)}, "
               f"cut {_m.get('prob_cut')}, mode {_m.get('mode')}\n")
         X = None
     else:
