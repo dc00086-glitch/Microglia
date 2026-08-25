@@ -13863,6 +13863,15 @@ if __name__ == '__main__':
                 (i - 1 if i > queue_idx else i)
                 for i in self.failed_auto_outlines if i != queue_idx
             ]
+        # The model's least-confident-first ordering is queue indices too, so it
+        # shifts with everything else. Leaving it stale sends review to the
+        # wrong cells, because _find_next_unoutlined_idx follows it.
+        _order = getattr(self, '_ml_review_order', None)
+        if _order:
+            self._ml_review_order = [
+                (i - 1 if i > queue_idx else i)
+                for i in _order if i != queue_idx
+            ]
 
         self.log(f"✗ Deleted {soma_id} from {img_name}")
         self.polygon_points = []
@@ -13871,24 +13880,27 @@ if __name__ == '__main__':
         self._update_outline_progress()
         self._auto_save()
 
-        # Move to next soma (queue_idx now points to what was the next entry)
+        # Move to next soma (queue_idx now points to what was the next entry).
+        # In review the next soma usually has a proposed outline waiting;
+        # _load_soma_for_outlining does not read those, so going through it
+        # opens the cell blank and the proposal looks lost.
+        def _go(idx):
+            if getattr(self, 'review_mode', False):
+                self._load_review_soma(idx)
+            else:
+                self._load_soma_for_outlining(idx)
+
         if not self.outlining_queue:
             self._finish_outlining()
-        elif queue_idx >= len(self.outlining_queue):
-            # Was the last one — check if all done
-            next_idx = self._find_next_unoutlined_idx(start_from=0)
-            if next_idx is None:
-                self._finish_outlining()
-            else:
-                self._load_soma_for_outlining(next_idx)
         else:
-            next_idx = self._find_next_unoutlined_idx(start_from=queue_idx)
-            if next_idx is None:
+            start = 0 if queue_idx >= len(self.outlining_queue) else queue_idx
+            next_idx = self._find_next_unoutlined_idx(start_from=start)
+            if next_idx is None and start != 0:
                 next_idx = self._find_next_unoutlined_idx(start_from=0)
             if next_idx is None:
                 self._finish_outlining()
             else:
-                self._load_soma_for_outlining(next_idx)
+                _go(next_idx)
 
     def _get_auto_outline_method(self):
         """Auto-outline detector, bound to the current soma-size setting.
