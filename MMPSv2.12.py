@@ -4196,6 +4196,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
         per_image_px_action = advanced_menu.addAction("Set Per-Image Pixel Size...")
         per_image_px_action.setToolTip("Override pixel size for individual images")
         per_image_px_action.triggered.connect(self._set_per_image_pixel_size)
+        clear_outlines_action = advanced_menu.addAction("Clear Soma Outlines...")
+        clear_outlines_action.setToolTip(
+            "Delete the outlines for a range of somas so they can be redone")
+        clear_outlines_action.triggered.connect(self._clear_soma_outlines_dialog)
 
         # Cluster menu
         cluster_menu = menu_bar.addMenu("Cluster")
@@ -14467,6 +14471,152 @@ if __name__ == '__main__':
                 self._load_soma_for_outlining(nxt)
         else:
             self._finish_outlining()
+
+    def _clear_soma_outlines_dialog(self):
+        """Delete outlines for a range of queue positions so they can be redone.
+
+        Positions are 1-based and match the "N/M already done" counts shown when
+        outlining starts, so a run that outlined somas 334 onward is cleared by
+        entering 334 to the end.
+        """
+        if not getattr(self, 'outlining_queue', None):
+            QMessageBox.warning(self, "Clear Soma Outlines",
+                                "No soma queue is loaded. Open a session first.")
+            return
+        total = len(self.outlining_queue)
+        outlined = [qi for qi in range(total)
+                    if self._soma_has_outline(*self.outlining_queue[qi])]
+        if not outlined:
+            QMessageBox.information(self, "Clear Soma Outlines",
+                                    "No somas currently have outlines.")
+            return
+
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QSpinBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Clear Soma Outlines")
+        lay = QVBoxLayout()
+        lay.addWidget(QLabel(
+            f"<b>{len(outlined)} of {total} somas have outlines.</b><br><br>"
+            f"Delete outlines for somas in this range (1-based, inclusive).<br>"
+            f"Their soma TIFFs are deleted too, so they can be outlined again."))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("From:"))
+        from_spin = QSpinBox()
+        from_spin.setRange(1, total)
+        from_spin.setValue(1)
+        row.addWidget(from_spin)
+        row.addWidget(QLabel("  To:"))
+        to_spin = QSpinBox()
+        to_spin.setRange(1, total)
+        to_spin.setValue(total)
+        row.addWidget(to_spin)
+        lay.addLayout(row)
+
+        preview = QLabel("")
+        preview.setWordWrap(True)
+        lay.addWidget(preview)
+
+        def _refresh():
+            a, b = from_spin.value(), to_spin.value()
+            if a > b:
+                preview.setText("<i>'From' is after 'To' — nothing selected.</i>")
+                return
+            n = sum(1 for qi in range(a - 1, b)
+                    if self._soma_has_outline(*self.outlining_queue[qi]))
+            preview.setText(f"<b>{n}</b> outline(s) in that range would be "
+                            f"deleted. {len(outlined) - n} would be kept.")
+        from_spin.valueChanged.connect(_refresh)
+        to_spin.valueChanged.connect(_refresh)
+        _refresh()
+
+        btns = QHBoxLayout()
+        del_btn = QPushButton("Delete outlines in range")
+        del_btn.setStyleSheet("border: 2px solid #E53935; font-weight: bold;")
+        del_btn.clicked.connect(lambda: dlg.done(1))
+        btns.addWidget(del_btn)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(lambda: dlg.done(0))
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+        dlg.setLayout(lay)
+        dlg.setMinimumWidth(430)
+        if dlg.exec_() != 1:
+            return
+
+        a, b = from_spin.value(), to_spin.value()
+        if a > b:
+            return
+        targets = [qi for qi in range(a - 1, b)
+                   if self._soma_has_outline(*self.outlining_queue[qi])]
+        if not targets:
+            QMessageBox.information(self, "Clear Soma Outlines",
+                                    "No outlines in that range.")
+            return
+        if QMessageBox.question(
+                self, "Clear Soma Outlines",
+                f"Delete {len(targets)} outline(s) for somas {a}-{b}?\n\n"
+                f"This cannot be undone from inside MMPS. Reload your session "
+                f"file if you need them back.",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        removed = self._clear_outlines_for(targets)
+        self._clear_ml_review_order()
+        self._update_outline_progress()
+        self._auto_save()
+        self.log(f"Cleared {removed} soma outline(s) for queue positions "
+                 f"{a}-{b}")
+        QMessageBox.information(
+            self, "Clear Soma Outlines",
+            f"Deleted {removed} outline(s).\n\nThose somas are back in the "
+            f"queue and can be outlined again.")
+
+    def _clear_outlines_for(self, queue_indices):
+        """Remove stored outlines, their exported TIFFs, and checklist ticks."""
+        removed = 0
+        by_image = {}
+        for qi in queue_indices:
+            img_name, soma_idx = self.outlining_queue[qi]
+            by_image.setdefault(img_name, set()).add(soma_idx)
+        for img_name, idxs in by_image.items():
+            img_data = self.images.get(img_name)
+            if img_data is None:
+                continue
+            kept = []
+            for entry in img_data.get('soma_outlines', []):
+                if entry.get('soma_idx') in idxs:
+                    removed += 1
+                    soma_id = entry.get('soma_id', '')
+                    # delete the exported TIFF so a rerun does not find stale
+                    # files and so downstream steps cannot pick them up
+                    try:
+                        if getattr(self, 'somas_dir', None):
+                            base = os.path.splitext(img_name)[0]
+                            fp = os.path.join(self.somas_dir,
+                                              f"{base}_{soma_id}_soma.tif")
+                            if os.path.exists(fp):
+                                os.remove(fp)
+                    except Exception as e:
+                        self.log(f"   could not delete soma TIFF for "
+                                 f"{soma_id}: {e}")
+                    try:
+                        cl = self._get_checklist_path('soma_checklist.csv')
+                        if cl and os.path.exists(cl):
+                            self._update_checklist_row(
+                                cl, 0, f"{img_name}_{soma_id}", 1, 0)
+                    except Exception:
+                        pass
+                    if hasattr(self, 'ml_confidence'):
+                        self.ml_confidence.pop(
+                            (img_name, entry.get('soma_idx')), None)
+                else:
+                    kept.append(entry)
+            img_data['soma_outlines'] = kept
+        # candidates held in memory for these positions are stale too
+        for qi in queue_indices:
+            if hasattr(self, 'auto_outlined_points'):
+                self.auto_outlined_points.pop(qi, None)
+        return removed
 
     def _clear_ml_review_order(self):
         """Drop any model-supplied review ordering."""
