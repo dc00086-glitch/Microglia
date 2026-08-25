@@ -1819,6 +1819,10 @@ class _MLSomaOutliner:
         self.conf_cal = m.get('conf_cal') or {}
         self.path = path
         self.last_confidence = None
+        # Shifts the probability cut. The cut IS the size dial: a lower cut
+        # keeps more marginal pixels and grows the outline, a higher one
+        # tightens it. Held separately so the calibrated value stays visible.
+        self.size_bias = 0.0
 
     def accept_threshold(self, which='top50'):
         """Confidence at or above which a cell may be accepted unreviewed.
@@ -1869,8 +1873,8 @@ class _MLSomaOutliner:
             if got is None:
                 return None, None
             prob, ctr, (y1, x1), pshape = got
-            mask = _ml_mask_from_prob(prob, ctr, self.prob_cut, self.open_r,
-                                      self.mode)
+            cut = float(np.clip(self.prob_cut - self.size_bias, 0.05, 0.95))
+            mask = _ml_mask_from_prob(prob, ctr, cut, self.open_r, self.mode)
             if mask is None or not mask.any():
                 return None, None
 
@@ -13032,11 +13036,35 @@ if __name__ == '__main__':
             box.addButton("Auto-accept confident, review the rest",
                           QMessageBox.YesRole)
         box.addButton("Cancel", QMessageBox.RejectRole)
+
+        # Outline size dial. Held-out area ratio at the calibrated cut is about
+        # 1.1x, so if outlines look small on your images something differs from
+        # validation -- but this lets you correct it now rather than retrain.
+        from PyQt5.QtWidgets import QDoubleSpinBox
+        size_spin = QDoubleSpinBox()
+        size_spin.setRange(-0.30, 0.30)
+        size_spin.setSingleStep(0.05)
+        size_spin.setDecimals(2)
+        size_spin.setValue(getattr(ml, 'size_bias', 0.0))
+        size_spin.setPrefix("Outline size  ")
+        size_spin.setToolTip(
+            "0 uses the threshold calibrated during training.\n"
+            "Positive = larger outlines, negative = smaller.\n"
+            "0.05 is a small nudge; 0.15 is a big one.")
+        try:
+            box.layout().addWidget(size_spin, 1, 2)
+        except Exception:
+            pass
+
         box.exec_()
         clicked = box.clickedButton()
         label = clicked.text() if clicked else "Cancel"
         if label == "Cancel":
             return
+        ml.size_bias = float(size_spin.value())
+        if ml.size_bias:
+            self.log(f"Outline size bias {ml.size_bias:+.2f} "
+                     f"(effective cut {ml.prob_cut - ml.size_bias:.2f})")
         ml_threshold = thr if label.startswith("Auto-accept") else None
 
         px = self._get_pixel_size(self.current_image_name)
@@ -13070,7 +13098,7 @@ if __name__ == '__main__':
                 continue
             soma_id = img_data['soma_ids'][soma_idx]
             progress.setLabelText(f"{soma_id}  ({n + 1}/{len(todo)})")
-            outline_img = self._get_image_for_outlining(img_data)
+            outline_img = self._get_image_for_ml(img_data, ml)
             if outline_img is None:
                 self.failed_auto_outlines.append(qi)
                 continue
@@ -13946,6 +13974,14 @@ if __name__ == '__main__':
             pass
         if name.startswith('Machine learning'):
             ml = get_ml_outliner()
+            if ml is not None:
+                # feed the raw channel, not the processed image
+                _img_data = self.images.get(self.current_image_name) or {}
+                _raw = self._get_image_for_ml(_img_data, ml)
+                px_ml = self._get_pixel_size(self.current_image_name)
+                return lambda image, centroid, sensitivity: (
+                    ml.outline(_raw if _raw is not None else image,
+                               centroid, px_ml)[0])
             if ml is None:
                 self.log("No trained soma model found — falling back to the "
                          "soma-blob detector. Train one with "
@@ -13971,6 +14007,49 @@ if __name__ == '__main__':
         return lambda image, centroid, sensitivity: auto_outline_soma_blob(
             image, centroid, sensitivity, max_soma_radius_px=rad_px,
             process_width_px=proc_px)
+
+    def _get_image_for_ml(self, img_data, ml):
+        """Give the model the same kind of image it was trained on.
+
+        Training read the RAW image and took one channel. The ordinary
+        outlining path hands back img_data['processed'], which has rolling-ball
+        background subtraction and any denoising applied. That darkens the
+        diffuse edge of a soma, so a model fitted on raw pixels reads the edge
+        as background and stops short -- outlines come out systematically small
+        while still following the right boundary. Prefer the raw channel, and
+        say so when falling back.
+        """
+        want_ch = getattr(ml, 'channel', None)
+        idx = (int(want_ch) - 1) if want_ch else None
+        raw_path = img_data.get('raw_path')
+        if raw_path and os.path.exists(raw_path):
+            try:
+                raw = load_tiff_image(raw_path)
+                if raw is not None:
+                    raw = np.squeeze(np.asarray(raw))
+                    if raw.ndim == 2:
+                        return raw
+                    if raw.ndim == 3:
+                        ax = int(np.argmin(raw.shape))
+                        if raw.shape[ax] <= 8:
+                            raw = np.moveaxis(raw, ax, -1)
+                            if idx is not None and 0 <= idx < raw.shape[2]:
+                                return raw[:, :, idx]
+                            return raw[:, :, 0]
+                        return raw.max(axis=0)
+            except Exception as e:
+                self.log(f"   ML: could not read raw image ({e})")
+        color = img_data.get('color_image')
+        if color is not None:
+            c = np.asarray(color)
+            if c.ndim == 3 and idx is not None and 0 <= idx < c.shape[2]:
+                return c[:, :, idx]
+        if not getattr(self, '_ml_raw_warned', False):
+            self._ml_raw_warned = True
+            self.log("   ⚠ ML: no raw image available — using the PROCESSED "
+                     "image instead. The model was trained on raw pixels, so "
+                     "outlines will run small.")
+        return self._get_image_for_outlining(img_data)
 
     def _get_image_for_outlining(self, img_data):
         """Get the appropriate grayscale image for auto-outlining"""
