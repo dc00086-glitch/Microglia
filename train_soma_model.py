@@ -654,6 +654,10 @@ def main():
     ap.add_argument('--size-tolerance', type=float, default=0.01,
                     help='held-out IoU worth trading for a smaller model; the '
                          'smallest forest within this of the best is kept')
+    ap.add_argument('--allow-tiny', action='store_true',
+                    help='save even when trained on very few somas (normally '
+                         'refused, so a --limit smoke test cannot overwrite a '
+                         'real model)')
     ap.add_argument('--load-model',
                     help='score an existing .joblib instead of training, so a '
                          'threshold rule can be tried without a full retrain')
@@ -905,6 +909,16 @@ def main():
                 open_r=overall['open_r'], mode=overall['mode'])
     if a.load_model:
         print("\n(--load-model: nothing re-saved)")
+        return
+    # A --limit smoke test trains on a handful of somas and its numbers mean
+    # nothing, but it would still overwrite a real model with the same default
+    # filename. Refuse unless asked.
+    if len(train_pairs) < 50 and not a.allow_tiny:
+        print(f"\nNOT SAVING: only {len(train_pairs)} training somas.")
+        print(f"  Numbers from a run this small are noise, and saving would "
+              f"overwrite\n  {a.out} with a model fitted to almost nothing.")
+        print(f"  Drop --limit for a real run, or pass --allow-tiny to save "
+              f"anyway.")
         return
     try:
         joblib.dump({'model': overall['clf'], 'meta': meta}, a.out, compress=3)
