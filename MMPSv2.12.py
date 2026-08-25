@@ -1816,6 +1816,9 @@ class _MLSomaOutliner:
         self.mode = m.get('mode') or 'cc'
         self.train_px = float(m.get('pixel_size_um') or 0.1046)
         self.channel = m.get('channel')
+        # Which images the forest was fitted on. The app must hand it the same
+        # kind at use, or it reads a boundary that is not there.
+        self.trained_on = m.get('trained_on') or 'raw'
         self.conf_cal = m.get('conf_cal') or {}
         self.path = path
         self.last_confidence = None
@@ -1838,7 +1841,7 @@ class _MLSomaOutliner:
 
     def describe(self):
         parts = [f"scales {len(self.scales)}", f"cut {self.prob_cut}",
-                 f"{self.mode}"]
+                 f"{self.mode}", f"trained on {self.trained_on}"]
         if self.channel:
             parts.append(f"channel {self.channel}")
         d = self.conf_cal.get('top50') or {}
@@ -1947,6 +1950,9 @@ def get_ml_outliner(path=None):
         # loading the wrong one is a missing button.
         cal = _ML_OUTLINER.conf_cal or {}
         print(f"ML soma model loaded: {path}")
+        print(f"  trained on {_ML_OUTLINER.trained_on} images"
+              + (f", channel {_ML_OUTLINER.channel}"
+                 if _ML_OUTLINER.channel else ""))
         if cal.get('top50'):
             print(f"  calibrated — auto-accept available "
                   f"(threshold {cal['top50'].get('threshold'):.3f}, "
@@ -14021,6 +14027,20 @@ if __name__ == '__main__':
         """
         want_ch = getattr(ml, 'channel', None)
         idx = (int(want_ch) - 1) if want_ch else None
+
+        # A model fitted on MMPS-processed images wants the processed image --
+        # that is what its labels were drawn on and what it learned to read.
+        if getattr(ml, 'trained_on', 'raw') == 'processed':
+            proc = img_data.get('processed')
+            if proc is not None:
+                return proc
+            if not getattr(self, '_ml_proc_warned', False):
+                self._ml_proc_warned = True
+                self.log("   ⚠ ML: model expects the PROCESSED image but none "
+                         "is loaded — process the images first, or outlines "
+                         "will be wrong.")
+            return self._get_image_for_outlining(img_data)
+
         raw_path = img_data.get('raw_path')
         if raw_path and os.path.exists(raw_path):
             try:

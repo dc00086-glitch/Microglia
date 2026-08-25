@@ -77,17 +77,25 @@ def _prefix_match(norm_index, key):
     return hits[0] if len(hits) == 1 else None
 
 
-def find_pairs(root, timepoints, limit=None):
+def find_pairs(root, timepoints, limit=None, image_subdir='Image Directory'):
     """Yield (mask_path, image_path, row, col, timepoint)."""
     pairs = []
     for tp in timepoints:
         somas_dir = os.path.join(root, tp, 'Output', 'somas')
-        img_dir = os.path.join(root, tp, 'Image Directory')
+        img_dir = os.path.join(root, tp, image_subdir)
         if not os.path.isdir(somas_dir):
             print(f"  [{tp}] no somas folder at {somas_dir} — skipped")
             continue
         if not os.path.isdir(img_dir):
-            print(f"  [{tp}] no Image Directory at {img_dir} — skipped")
+            print(f"  [{tp}] no '{image_subdir}' folder at {img_dir}")
+            try:
+                subs = sorted(d for d in os.listdir(os.path.join(root, tp))
+                              if os.path.isdir(os.path.join(root, tp, d)))
+                if subs:
+                    print(f"        folders here: {subs}")
+                    print(f"        pass one with --image-subdir")
+            except Exception:
+                pass
             continue
         # Index the image folder once. MMPS sanitises the image name when it
         # writes a mask (spaces and punctuation become underscores), so an exact
@@ -579,6 +587,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--root', required=True, help='folder containing the 1d/3d/7d/28d subfolders')
     ap.add_argument('--timepoints', nargs='*', default=['1d', '3d', '7d', '28d'])
+    ap.add_argument('--image-subdir', default='Image Directory',
+                    help="folder under each timepoint holding the images the "
+                         "outlines were drawn on. Use the PROCESSED images if "
+                         "that is what you outline on in MMPS -- the model "
+                         "should see the same pixels at training and at use.")
     ap.add_argument('--pixel-size', type=float, default=0.1046, help='µm/px')
     ap.add_argument('--soma-radius-um', type=float, default=8.0,
                     help='half-width of the analysis patch, in µm')
@@ -625,11 +638,12 @@ def main():
     print(f"patch half-width: {half} px  ({a.soma_radius_um} µm at {a.pixel_size} µm/px)\n")
 
     print("Pairing accepted somas with images…")
-    pairs = find_pairs(a.root, a.timepoints, a.limit)
+    pairs = find_pairs(a.root, a.timepoints, a.limit, a.image_subdir)
     if not pairs:
         sys.exit("No soma/image pairs found — check --root and the folder names.")
     print(f"\n{len(pairs)} soma/image pairs\n")
 
+    print(f"images from: <timepoint>/{a.image_subdir}")
     print("Channel layout of the first image:")
     print(describe_channels(pairs[0][1]))
     if a.channel:
@@ -845,6 +859,10 @@ def main():
                   "this.")
 
     meta = dict(channel=a.channel, pixel_size_um=a.pixel_size,
+                image_subdir=a.image_subdir,
+                trained_on=('processed'
+                            if 'process' in a.image_subdir.lower()
+                            else 'raw'),
                 conf_cal=conf_cal,
                 soma_radius_um=a.soma_radius_um, half=half,
                 scales=FEATURE_SCALES, prob_cut=overall['cut'],
