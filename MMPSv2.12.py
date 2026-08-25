@@ -13056,9 +13056,29 @@ if __name__ == '__main__':
         size_spin.setToolTip(
             "0 uses the threshold calibrated during training.\n"
             "Positive = larger outlines, negative = smaller.\n"
-            "0.05 is a small nudge; 0.15 is a big one.")
+            "About 6-8% soma area per 0.05. Beyond +/-0.15 the outlines stop\n"
+            "behaving: too low and they merge with neighbours, too high and\n"
+            "the contour starts failing outright.")
+        # Show what the number actually does. "+0.10" means nothing on its own;
+        # the threshold it produces is the thing being changed.
+        size_note = QLabel("")
+        def _size_note():
+            b = size_spin.value()
+            cut = min(max(ml.prob_cut - b, 0.05), 0.95)
+            if abs(b) < 1e-9:
+                size_note.setText(f"<i>threshold {cut:.2f} — as calibrated</i>")
+            else:
+                word = "larger" if b > 0 else "smaller"
+                warn = ("  <b>— beyond the tested range</b>"
+                        if abs(b) > 0.15 else "")
+                size_note.setText(
+                    f"<i>threshold {ml.prob_cut:.2f} &rarr; {cut:.2f}, "
+                    f"roughly {abs(b) / 0.05 * 7:.0f}% {word}{warn}</i>")
+        size_spin.valueChanged.connect(lambda _: _size_note())
+        _size_note()
         try:
             box.layout().addWidget(size_spin, 1, 2)
+            box.layout().addWidget(size_note, 2, 2)
         except Exception:
             pass
 
