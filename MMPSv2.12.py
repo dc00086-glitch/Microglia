@@ -1849,21 +1849,21 @@ def get_ml_outliner(path=None):
         # the bundle, in Downloads -- and without this the only symptom of
         # loading the wrong one is a missing button.
         cal = _ML_OUTLINER.conf_cal or {}
-        print(f"ML soma model loaded: {path}")
-        print(f"  trained on {_ML_OUTLINER.trained_on} images"
-              + (f", channel {_ML_OUTLINER.channel}"
-                 if _ML_OUTLINER.channel else ""))
+        _ml_note(f"ML soma model loaded: {os.path.basename(path)}")
+        _ml_note(f"  trained on {_ML_OUTLINER.trained_on} images"
+                 + (f", channel {_ML_OUTLINER.channel}"
+                    if _ML_OUTLINER.channel else ""))
         if cal.get('top50'):
-            print(f"  calibrated — auto-accept available "
-                  f"(threshold {cal['top50'].get('threshold'):.3f}, "
-                  f"purity {100 * cal['top50'].get('purity', 0):.0f}%)")
+            _ml_note(f"  calibrated — auto-accept available "
+                     f"(threshold {cal['top50'].get('threshold'):.3f}, "
+                     f"purity {100 * cal['top50'].get('purity', 0):.0f}%)")
         else:
-            print("  NO confidence calibration in this file — auto-accept will "
-                  "be unavailable, review-all only.")
-            print("  Retrain with the current train_soma_model.py to add it.")
+            _ml_note("  NO confidence calibration in this file — auto-accept "
+                     "will be unavailable, review-all only.")
+            _ml_note("  Retrain with the current train_soma_model.py to add it.")
         return _ML_OUTLINER
     except Exception as e:
-        print(f"Could not load ML soma model from {path}: {e}")
+        _ml_note(f"Could not load ML soma model from {path}: {e}")
         return None
 
 
@@ -12696,6 +12696,8 @@ if __name__ == '__main__':
         # reason stated when it is not -- a disabled button with no explanation
         # is worse than no button.
         _ml = get_ml_outliner()
+        for _m in drain_ml_messages():
+            self.log(_m)
         ml_btn = QPushButton("Machine Learning - Trained on your accepted outlines")
         if _ml is not None:
             ml_btn.clicked.connect(lambda: dialog.done(4))
@@ -12916,6 +12918,8 @@ if __name__ == '__main__':
         half would accept half of any batch however badly it went.
         """
         ml = get_ml_outliner()
+        for _m in drain_ml_messages():
+            self.log(_m)
         if ml is None:
             QMessageBox.warning(self, "Machine Learning",
                                 "No trained model is available.")
