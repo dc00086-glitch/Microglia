@@ -13552,7 +13552,7 @@ if __name__ == '__main__':
 
         # Skip somas that already have saved outlines (from previous session)
         img_name_check, soma_idx_check = self.outlining_queue[review_idx]
-        self._show_ml_confidence(img_name_check, soma_idx_check)
+        self._show_ml_confidence(img_name_check, soma_idx_check, review_idx)
         if self._soma_has_outline(img_name_check, soma_idx_check):
             # This soma is already outlined — advance to the next unoutlined one
             next_idx = self._find_next_unoutlined_idx(start_from=review_idx + 1)
@@ -13673,7 +13673,7 @@ if __name__ == '__main__':
         img_name, soma_idx = self.outlining_queue[queue_idx]
         self.current_image_name = img_name
         img_data = self.images[img_name]
-        self._show_ml_confidence(img_name, soma_idx)
+        self._show_ml_confidence(img_name, soma_idx, queue_idx)
 
         # Lazy-load processed image from disk if missing
         if img_data.get('processed') is None:
@@ -14166,7 +14166,7 @@ if __name__ == '__main__':
         self.polygon_points = list(points)
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
-        self._show_ml_confidence(img_name, soma_idx)
+        self._show_ml_confidence(img_name, soma_idx, force=True)
 
         self.processed_label.point_edit_mode = True
         self.processed_label.selected_point_idx = None
@@ -14344,9 +14344,33 @@ if __name__ == '__main__':
             return f"Model confidence {conf:.2f} — check", QColor(245, 205, 90)
         return f"Model confidence {conf:.2f} — low, check closely", QColor(245, 130, 120)
 
-    def _show_ml_confidence(self, img_name, soma_idx):
-        """Put the confidence badge on both image views, or clear it."""
-        text, colour = self._ml_confidence_label(img_name, soma_idx)
+    def _show_ml_confidence(self, img_name, soma_idx, queue_idx=None,
+                            force=False):
+        """Put the confidence badge on both image views, or clear it.
+
+        Only shown when there is an outline for it to describe -- either one
+        already stored, or a model candidate waiting to be reviewed. The manual
+        outlining path opens a soma with an empty canvas, and a confidence score
+        floating over nothing reads as a missing outline rather than as a score
+        for an outline that was never drawn here.
+        """
+        # force covers the case where an outline was just produced and is on
+        # screen but not yet stored or queued as a candidate.
+        has = force or self._soma_has_outline(img_name, soma_idx)
+        if not has:
+            cands = getattr(self, 'auto_outlined_points', None) or {}
+            if queue_idx is not None:
+                has = queue_idx in cands
+            else:
+                q = getattr(self, 'outlining_queue', None) or []
+                for qi in cands:
+                    if qi < len(q) and tuple(q[qi]) == (img_name, soma_idx):
+                        has = True
+                        break
+        if not has:
+            text, colour = None, None
+        else:
+            text, colour = self._ml_confidence_label(img_name, soma_idx)
         for lbl in (getattr(self, 'processed_label', None),
                     getattr(self, 'original_label', None)):
             if lbl is None:
