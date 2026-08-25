@@ -56,6 +56,10 @@ try:
 except ImportError:
     sys.exit("Missing scikit-learn.  pip install scikit-learn joblib")
 
+# Auxiliary per-channel exports sit beside the real processed image as
+# <name>_processed_ch2.tif. They are the same field in another stain, so
+# indexing them makes every base ambiguous and nothing matches.
+CH_SUFFIX_RE = re.compile(r'_ch\d+$', re.I)
 MASK_RE = re.compile(r'^(?P<base>.+)_soma_(?P<r>\d+)_(?P<c>\d+)_soma\.tiff?$', re.I)
 IMG_EXTS = ('.tif', '.tiff', '.TIF', '.TIFF')
 
@@ -77,9 +81,44 @@ def _prefix_match(norm_index, key):
     return hits[0] if len(hits) == 1 else None
 
 
+def _index_images(img_dir):
+    """Map lookup keys -> image path for one folder."""
+    index, norm_index = {}, {}
+    for p in glob.glob(os.path.join(img_dir, '*')):
+        bn = os.path.basename(p)
+        if bn.startswith('._') or not bn.lower().endswith(('.tif', '.tiff')):
+            continue
+        stem = os.path.splitext(bn)[0]
+        if CH_SUFFIX_RE.search(stem):
+            continue
+        index.setdefault(stem.lower(), p)
+        norm_index.setdefault(_norm(stem), p)
+    return index, norm_index
+
+
+def _lookup(base, index, norm_index):
+    """Find the image for a mask base, tolerating the _processed suffix."""
+    for cand in (base, base + '_processed'):
+        hit = index.get(cand.lower()) or norm_index.get(_norm(cand))
+        if hit:
+            return hit
+    return _prefix_match(norm_index, _norm(base))
+
+
 def find_pairs(root, timepoints, limit=None, image_subdir='Image Directory'):
     """Yield (mask_path, image_path, row, col, timepoint)."""
     pairs = []
+    # Processed output does not always land under its own timepoint -- sessions
+    # sharing an output folder scatter it. Index every timepoint's folder up
+    # front so a mask can still find its image in a sibling folder.
+    all_index, all_norm = {}, {}
+    for tp in timepoints:
+        i, n = _index_images(os.path.join(root, tp, image_subdir))
+        for k, v in i.items():
+            all_index.setdefault(k, v)
+        for k, v in n.items():
+            all_norm.setdefault(k, v)
+
     for tp in timepoints:
         somas_dir = os.path.join(root, tp, 'Output', 'somas')
         img_dir = os.path.join(root, tp, image_subdir)
@@ -97,18 +136,11 @@ def find_pairs(root, timepoints, limit=None, image_subdir='Image Directory'):
             except Exception:
                 pass
             continue
-        # Index the image folder once. MMPS sanitises the image name when it
-        # writes a mask (spaces and punctuation become underscores), so an exact
-        # stem match often fails on real data -- index a normalised key too.
-        index, norm_index = {}, {}
-        for p in glob.glob(os.path.join(img_dir, '*')):
-            bn = os.path.basename(p)
-            if bn.startswith('._') or not bn.lower().endswith(('.tif', '.tiff')):
-                continue
-            stem = os.path.splitext(bn)[0]
-            index.setdefault(stem.lower(), p)
-            norm_index.setdefault(_norm(stem), p)
-        found = missing = 0
+        # MMPS sanitises the image name when it writes a mask (spaces and
+        # punctuation become underscores), so an exact stem match often fails --
+        # index a normalised key too.
+        index, norm_index = _index_images(img_dir)
+        found = missing = elsewhere = 0
         unmatched = []
         for mp in sorted(glob.glob(os.path.join(somas_dir, '*_soma.tif*'))):
             name = os.path.basename(mp)
@@ -118,9 +150,11 @@ def find_pairs(root, timepoints, limit=None, image_subdir='Image Directory'):
             if not m:
                 continue
             base = m.group('base')
-            ip = (index.get(base.lower())
-                  or norm_index.get(_norm(base))
-                  or _prefix_match(norm_index, _norm(base)))
+            ip = _lookup(base, index, norm_index)
+            if ip is None:
+                ip = _lookup(base, all_index, all_norm)
+                if ip is not None:
+                    elsewhere += 1
             if ip is None:
                 missing += 1
                 if len(unmatched) < 3:
@@ -129,10 +163,12 @@ def find_pairs(root, timepoints, limit=None, image_subdir='Image Directory'):
             pairs.append((mp, ip, int(m.group('r')), int(m.group('c')), tp))
             found += 1
         print(f"  [{tp}] {found} somas paired"
+              + (f" ({elsewhere} matched in another timepoint's folder)"
+                 if elsewhere else "")
               + (f", {missing} had no matching image" if missing else ""))
         if missing and not found:
             print(f"        no image matched, e.g. {unmatched!r}")
-            print(f"        Image Directory holds: "
+            print(f"        this folder holds: "
                   f"{sorted(os.path.basename(p) for p in index.values())[:3]!r}")
     if limit:
         rng = np.random.RandomState(0)
