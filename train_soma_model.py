@@ -972,4 +972,12 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # The forest fits across a pool of worker processes. Unwinding that
+        # pool normally on SIGINT can hang, or take the shell with it, so leave
+        # immediately and let the workers be reaped rather than negotiating a
+        # tidy shutdown nobody is waiting for.
+        print("\ninterrupted — nothing saved", flush=True)
+        os._exit(130)
