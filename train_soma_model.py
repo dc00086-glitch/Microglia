@@ -222,10 +222,44 @@ def load_gray(path, channel=None):
     return a.astype(np.float64)
 
 
+def load_channels(path, channels):
+    """Load specific 1-based channels from an image as a list of 2D arrays."""
+    if not channels:
+        return []
+    a = np.squeeze(np.asarray(tifffile.imread(path)))
+    if a.ndim != 3:
+        return []
+    ax = int(np.argmin(a.shape))
+    if a.shape[ax] > 8:
+        return []
+    a = np.moveaxis(a, ax, -1)
+    out = []
+    for c in channels:
+        if 1 <= c <= a.shape[2]:
+            out.append(a[:, :, c - 1].astype(np.float64))
+    return out
+
+
 # ----------------------------------------------------------------------
 # features
 # ----------------------------------------------------------------------
-def pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
+def _otsu(v):
+    """Otsu split of a 1-D array, on a 256-bin histogram."""
+    h, edges = np.histogram(v, bins=256, range=(0.0, 1.0))
+    h = h.astype(np.float64)
+    w0 = np.cumsum(h)
+    w1 = w0[-1] - w0
+    mids = (edges[:-1] + edges[1:]) / 2
+    m0 = np.cumsum(h * mids)
+    mt = m0[-1]
+    with np.errstate(invalid='ignore', divide='ignore'):
+        between = (mt * w0 / w0[-1] - m0) ** 2 / (w0 * w1)
+    between[~np.isfinite(between)] = -1
+    return float(mids[int(np.argmax(between))])
+
+
+def pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None,
+                   extra=None):
     """Multi-scale per-pixel features -> (n_pixels, n_features).
 
     Hessian eigenvalues are the important ones: for a BLOB both eigenvalues are
@@ -253,6 +287,35 @@ def pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
                  max(0, int(cx) - 3):int(cx) + 4]
         cval = float(np.median(core)) if core.size else 0.0
         feats += [rho, p - cval, p / (cval + 1e-3)]
+    if extra:
+        # Other stains, as features rather than as a seed. Seeding from DAPI
+        # has to ASSIGN a nucleus to a soma, and picking the wrong one among
+        # many is a hard error. Here the forest just receives how bright the
+        # stain is and how far the nearest positive structure sits, and learns
+        # from the accepted outlines how much that is worth -- a nearby wrong
+        # nucleus becomes a weak signal it can discount.
+        for ch in extra:
+            e = np.asarray(ch, dtype=np.float64)
+            elo, ehi = np.percentile(e, 1), np.percentile(e, 99.5)
+            e = (e - elo) / (ehi - elo) if ehi > elo else e * 0.0
+            for s in scales:
+                feats.append(ndimage.gaussian_filter(e, s))
+            # distance to the stained structure: soma pixels sit on or beside a
+            # nucleus, process pixels are far from every nucleus, and no nucleus
+            # has to be matched to any particular cell for that to hold
+            thr = _otsu(np.clip(e, 0.0, 1.0).ravel())
+            pos = e >= thr
+            if pos.any():
+                d = ndimage.distance_transform_edt(~pos)
+            else:
+                d = np.full(e.shape, float(max(e.shape)), dtype=np.float64)
+            feats.append(d / float(max(e.shape)))
+            if center is not None:
+                ecore = e[max(0, int(center[0]) - 3):int(center[0]) + 4,
+                          max(0, int(center[1]) - 3):int(center[1]) + 4]
+                feats.append(e - (float(np.median(ecore)) if ecore.size else 0.0))
+            else:
+                feats.append(e * 0.0)
     for s in scales:
         g = ndimage.gaussian_filter(p, s)
         feats.append(g)
@@ -340,13 +403,14 @@ def patch_around(img, r, c, half):
 # training set
 # ----------------------------------------------------------------------
 def build_dataset(pairs, half, per_soma=600, verbose_every=100, channel=None,
-                  use_click=False):
+                  use_click=False, extra_channels=None):
     X, y, groups = [], [], []
-    cache_path, cache_img = None, None
+    cache_path, cache_img, cache_extra = None, None, []
     for i, (mp, ip, r, c, tp) in enumerate(pairs):
         try:
             if ip != cache_path:
                 cache_img = load_gray(ip, channel)
+                cache_extra = load_channels(ip, extra_channels)
                 cache_path = ip
             img = cache_img
             mask = np.squeeze(np.asarray(tifffile.imread(mp))) > 0
@@ -368,7 +432,10 @@ def build_dataset(pairs, half, per_soma=600, verbose_every=100, channel=None,
             mpatch = mask[y1:y1 + patch.shape[0], x1:x1 + patch.shape[1]]
             if patch.size == 0 or mpatch.sum() < 20:
                 continue
-            F = pixel_features(patch, FEATURE_SCALES, center=(cr - y1, cc - x1))
+            F = pixel_features(
+                patch, FEATURE_SCALES, center=(cr - y1, cc - x1),
+                extra=[e[y1:y1 + patch.shape[0], x1:x1 + patch.shape[1]]
+                       for e in cache_extra])
             lab = mpatch.ravel().astype(np.uint8)
             pos = np.flatnonzero(lab == 1)
             neg = np.flatnonzero(lab == 0)
@@ -461,7 +528,7 @@ def predict_mask(clf, img, r, c, half, prob_cut=0.5, open_r=0, mode='cc'):
 
 
 def sweep_eval(clf, pairs, half, combos, use_click=False, verbose_every=200,
-               channel=None):
+               channel=None, extra_channels=None):
     """Score every (mode, open_r, cut) combination in ONE pass over the somas.
 
     The forest runs once per soma; each combination then costs only a threshold
@@ -472,11 +539,12 @@ def sweep_eval(clf, pairs, half, combos, use_click=False, verbose_every=200,
     the ground-truth centroid, which is what MMPS actually has at outlining time.
     """
     acc = {k: [[], [], 0] for k in combos}
-    cache_path, cache_img = None, None
+    cache_path, cache_img, cache_extra = None, None, []
     for n, (mp, ip, r, c, tp) in enumerate(pairs):
         try:
             if ip != cache_path:
                 cache_img = load_gray(ip, channel)
+                cache_extra = load_channels(ip, extra_channels)
                 cache_path = ip
             img = cache_img
             truth_full = np.squeeze(np.asarray(tifffile.imread(mp))) > 0
@@ -493,7 +561,10 @@ def sweep_eval(clf, pairs, half, combos, use_click=False, verbose_every=200,
             if patch.size == 0:
                 continue
             ctr = (cr - y1, cc - x1)
-            F = pixel_features(patch, FEATURE_SCALES, center=ctr)
+            F = pixel_features(
+                patch, FEATURE_SCALES, center=ctr,
+                extra=[e[y1:y1 + patch.shape[0], x1:x1 + patch.shape[1]]
+                       for e in cache_extra])
             prob = clf.predict_proba(F)[:, 1].reshape(patch.shape)
             truth = truth_full[y1:y1 + patch.shape[0], x1:x1 + patch.shape[1]]
             for key in combos:
@@ -515,21 +586,6 @@ def sweep_eval(clf, pairs, half, combos, use_click=False, verbose_every=200,
         if verbose_every and (n + 1) % verbose_every == 0:
             print(f"    {n + 1}/{len(pairs)} somas scored")
     return {k: (np.array(v[0]), np.array(v[1]), v[2]) for k, v in acc.items()}
-
-
-def _otsu(v):
-    """Otsu split of a 1-D array, on a 256-bin histogram."""
-    h, edges = np.histogram(v, bins=256, range=(0.0, 1.0))
-    h = h.astype(np.float64)
-    w0 = np.cumsum(h)
-    w1 = w0[-1] - w0
-    mids = (edges[:-1] + edges[1:]) / 2
-    m0 = np.cumsum(h * mids)
-    mt = m0[-1]
-    with np.errstate(invalid='ignore', divide='ignore'):
-        between = (mt * w0 / w0[-1] - m0) ** 2 / (w0 * w1)
-    between[~np.isfinite(between)] = -1
-    return float(mids[int(np.argmax(between))])
 
 
 def _pick_stability(areas, fine):
@@ -555,7 +611,7 @@ def _pick_stability(areas, fine):
 
 
 def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None,
-                global_cut=0.5):
+                global_cut=0.5, extra_channels=None):
     """Best IoU each cell could reach if its OWN threshold were chosen for it.
 
     A single global cut has to serve every cell. If cells disagree about where
@@ -570,11 +626,12 @@ def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None,
     best_iou, best_cut = [], []
     rules = {'global': [], 'stability': [], 'otsu': []}
     conf = []
-    cache_path, cache_img = None, None
+    cache_path, cache_img, cache_extra = None, None, []
     for mp, ip, r, c, tp in pairs:
         try:
             if ip != cache_path:
                 cache_img = load_gray(ip, channel)
+                cache_extra = load_channels(ip, extra_channels)
                 cache_path = ip
             truth_full = np.squeeze(np.asarray(tifffile.imread(mp))) > 0
             if truth_full.shape != cache_img.shape:
@@ -587,7 +644,10 @@ def oracle_eval(clf, pairs, half, mode, open_r, use_click=False, channel=None,
             if patch.size == 0:
                 continue
             ctr = (cr - y1, cc - x1)
-            F = pixel_features(patch, FEATURE_SCALES, center=ctr)
+            F = pixel_features(
+                patch, FEATURE_SCALES, center=ctr,
+                extra=[e[y1:y1 + patch.shape[0], x1:x1 + patch.shape[1]]
+                       for e in cache_extra])
             prob = clf.predict_proba(F)[:, 1].reshape(patch.shape)
             truth = truth_full[y1:y1 + patch.shape[0], x1:x1 + patch.shape[1]]
             per, areas = [], []
@@ -675,6 +735,12 @@ def main():
     ap.add_argument('--size-tolerance', type=float, default=0.01,
                     help='held-out IoU worth trading for a smaller model; the '
                          'smallest forest within this of the best is kept')
+    ap.add_argument('--extra-channels', type=int, nargs='*', default=None,
+                    help='1-based channels to add as EXTRA features, e.g. '
+                         '"--extra-channels 3" for DAPI, or "2 3" for the rest '
+                         'of the colour. Each adds its own multi-scale '
+                         'intensity, distance to the stained structure, and '
+                         'brightness relative to the cell core.')
     ap.add_argument('--harmonics', type=int, nargs='*', default=[2, 4, 6],
                     help='shape priors to try: keep only this many harmonics '
                          'of the radius profile. 2 is the round-to-rod family, '
@@ -711,13 +777,20 @@ def main():
             print(f"using the model's own channel: {a.channel}")
         if not a.scales and _bm.get('scales'):
             a.scales = list(_bm['scales'])
+        if a.extra_channels is None and _bm.get('extra_channels'):
+            a.extra_channels = list(_bm['extra_channels'])
+            print(f"using the model's extra channels: {a.extra_channels}")
     if a.image_subdir is None:
         a.image_subdir = 'Image Directory'
     global FEATURE_SCALES
     if a.scales:
         FEATURE_SCALES = tuple(a.scales)
+    _nx = len(a.extra_channels or [])
     print(f"feature scales: {FEATURE_SCALES}  "
-          f"({1 + 3 + 6 * len(FEATURE_SCALES)} features per pixel)")
+          f"({1 + 3 + 6 * len(FEATURE_SCALES) + _nx * (len(FEATURE_SCALES) + 2)}"
+          f" features per pixel"
+          + (f", incl. {_nx} extra channel(s) {a.extra_channels}" if _nx else "")
+          + ")")
     half = max(16, int(round(a.soma_radius_um / a.pixel_size)))
     print(f"patch half-width: {half} px  ({a.soma_radius_um} µm at {a.pixel_size} µm/px)\n")
 
@@ -775,8 +848,9 @@ def main():
         X = None
     else:
         print("Extracting features…")
-        X, y, _ = build_dataset(train_pairs, half, a.per_soma, channel=a.channel,
-                                use_click=a.use_click)
+        X, y, _ = build_dataset(train_pairs, half, a.per_soma,
+                                channel=a.channel, use_click=a.use_click,
+                                extra_channels=a.extra_channels)
         if X is None:
             sys.exit("No usable training data — do the soma masks match the "
                      "image sizes?")
@@ -816,7 +890,8 @@ def main():
         print(f"  {nodes:,} nodes, about {nodes * 80 / 1e6:.0f} MB uncompressed")
 
         res = sweep_eval(clf, test_pairs, half, combos, use_click=a.use_click,
-                         channel=a.channel)
+                         channel=a.channel,
+                         extra_channels=a.extra_channels)
         best = None
         for key in combos:
             mode, orad, cut = key
@@ -838,7 +913,8 @@ def main():
 
         key = (best[3], best[2], best[0])
         tr = sweep_eval(clf, train_sub, half, [key], use_click=a.use_click,
-                        verbose_every=0, channel=a.channel)[key][0]
+                        verbose_every=0, channel=a.channel,
+                        extra_channels=a.extra_channels)[key][0]
         tr_med = float(np.median(tr)) if len(tr) else float('nan')
         print(f"  leaf {leaf}: held-out {best[1]:.3f}  train {tr_med:.3f}  "
               f"gap {tr_med - best[1]:+.3f}  IoU>0.7 {100 * best[4]:.0f}%  "
@@ -887,7 +963,8 @@ def main():
     conf_cal = {}
     o_iou, o_cut, rule_res, conf = oracle_eval(
         overall['clf'], test_pairs, half, overall['mode'], overall['open_r'],
-        use_click=a.use_click, channel=a.channel, global_cut=overall['cut'])
+        use_click=a.use_click, channel=a.channel, global_cut=overall['cut'],
+        extra_channels=a.extra_channels)
     if len(o_iou):
         print(f"  per-cell-best median IoU {np.median(o_iou):.3f}   "
               f"IoU>0.7 {100 * np.mean(o_iou > 0.7):.0f}%")
@@ -947,6 +1024,8 @@ def main():
 
     meta = dict(channel=a.channel, pixel_size_um=a.pixel_size,
                 image_subdir=a.image_subdir,
+                extra_channels=(list(a.extra_channels)
+                                if a.extra_channels else None),
                 trained_on=('processed'
                             if 'process' in a.image_subdir.lower()
                             else 'raw'),

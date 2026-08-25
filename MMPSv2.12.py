@@ -1665,7 +1665,23 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
 # ======================================================================
 from scipy import ndimage as ndi
 
-def _ml_pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
+def _ml_otsu(v):
+    """Otsu split of a 1-D array, on a 256-bin histogram."""
+    h, edges = np.histogram(v, bins=256, range=(0.0, 1.0))
+    h = h.astype(np.float64)
+    w0 = np.cumsum(h)
+    w1 = w0[-1] - w0
+    mids = (edges[:-1] + edges[1:]) / 2
+    m0 = np.cumsum(h * mids)
+    mt = m0[-1]
+    with np.errstate(invalid='ignore', divide='ignore'):
+        between = (mt * w0 / w0[-1] - m0) ** 2 / (w0 * w1)
+    between[~np.isfinite(between)] = -1
+    return float(mids[int(np.argmax(between))])
+
+
+def _ml_pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None,
+                   extra=None):
     """Multi-scale per-pixel features -> (n_pixels, n_features).
 
     Hessian eigenvalues are the important ones: for a BLOB both eigenvalues are
@@ -1693,6 +1709,35 @@ def _ml_pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
                  max(0, int(cx) - 3):int(cx) + 4]
         cval = float(np.median(core)) if core.size else 0.0
         feats += [rho, p - cval, p / (cval + 1e-3)]
+    if extra:
+        # Other stains, as features rather than as a seed. Seeding from DAPI
+        # has to ASSIGN a nucleus to a soma, and picking the wrong one among
+        # many is a hard error. Here the forest just receives how bright the
+        # stain is and how far the nearest positive structure sits, and learns
+        # from the accepted outlines how much that is worth -- a nearby wrong
+        # nucleus becomes a weak signal it can discount.
+        for ch in extra:
+            e = np.asarray(ch, dtype=np.float64)
+            elo, ehi = np.percentile(e, 1), np.percentile(e, 99.5)
+            e = (e - elo) / (ehi - elo) if ehi > elo else e * 0.0
+            for s in scales:
+                feats.append(ndi.gaussian_filter(e, s))
+            # distance to the stained structure: soma pixels sit on or beside a
+            # nucleus, process pixels are far from every nucleus, and no nucleus
+            # has to be matched to any particular cell for that to hold
+            thr = _ml_otsu(np.clip(e, 0.0, 1.0).ravel())
+            pos = e >= thr
+            if pos.any():
+                d = ndi.distance_transform_edt(~pos)
+            else:
+                d = np.full(e.shape, float(max(e.shape)), dtype=np.float64)
+            feats.append(d / float(max(e.shape)))
+            if center is not None:
+                ecore = e[max(0, int(center[0]) - 3):int(center[0]) + 4,
+                          max(0, int(center[1]) - 3):int(center[1]) + 4]
+                feats.append(e - (float(np.median(ecore)) if ecore.size else 0.0))
+            else:
+                feats.append(e * 0.0)
     for s in scales:
         g = ndi.gaussian_filter(p, s)
         feats.append(g)

@@ -16,7 +16,7 @@ import types
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FUNCS = ['pixel_features', 'radial_contour', 'mask_from_prob']
+FUNCS = ['pixel_features', 'radial_contour', 'mask_from_prob', 'otsu']
 
 
 def load_module(path, names, prefix=''):
@@ -29,7 +29,8 @@ def load_module(path, names, prefix=''):
     mod.__dict__['ndi'] = ndimage
     out = []
     for n in names:
-        m = re.search(rf'^def {prefix}{n}\(.*?(?=\n\ndef |\n\nclass |\n\n# ---)',
+        pat = rf'^def {prefix}{n}\(' if n != 'otsu' else rf'^def {prefix}_?otsu\('
+        m = re.search(pat + r'.*?(?=\n\ndef |\n\nclass |\n\n# ---)',
                       src, re.S | re.M)
         if not m:
             sys.exit(f"could not find {prefix}{n} in {os.path.basename(path)}")
@@ -39,6 +40,7 @@ def load_module(path, names, prefix=''):
         for n in names + ['disk', 'patch_around']:
             code = code.replace(f'{prefix}{n}(', f'{n}(')
         code = code.replace('def disk(', 'def _disk(').replace(' disk(', ' _disk(')
+        code = code.replace('def otsu(', 'def _otsu(').replace(' otsu(', ' _otsu(')
     exec(compile(code, path, 'exec'), mod.__dict__)
     return mod
 
@@ -57,8 +59,11 @@ def main():
         ctr = (float(rng.integers(5, h - 5)), float(rng.integers(5, h - 5)))
         scales = (1.0, 2.0, 4.0, 8.0) if trial % 2 else (1.0, 2.0, 4.0, 8.0, 16.0, 24.0)
 
-        a = trainer.pixel_features(patch, scales, center=ctr)
-        b = app.pixel_features(patch, scales, center=ctr)
+        extra = ([rng.random((h, h)) * 500] if trial % 3 == 0 else
+                 [rng.random((h, h)) * 500, rng.random((h, h)) * 90]
+                 if trial % 3 == 1 else None)
+        a = trainer.pixel_features(patch, scales, center=ctr, extra=extra)
+        b = app.pixel_features(patch, scales, center=ctr, extra=extra)
         if a.shape != b.shape or not np.array_equal(a, b):
             print(f"  trial {trial}: FEATURES DIFFER  {a.shape} vs {b.shape}")
             fails += 1
@@ -81,7 +86,8 @@ def main():
                  f"drifted from train_soma_model.py — the trained model will "
                  f"misbehave silently until they match again.")
     print("PASS: MMPS and train_soma_model.py produce identical features "
-          "and masks (25 random patches, both scale sets, all 5 mask modes).")
+          "and masks (25 random patches, both scale sets, all 5 mask modes, "
+          "with and without extra channels).")
 
 
 if __name__ == '__main__':
