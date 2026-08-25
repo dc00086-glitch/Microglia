@@ -13534,9 +13534,55 @@ if __name__ == '__main__':
         else:
             self.log(f"⚠ {soma_id} needs manual outline")
 
+    def _ml_session_summary(self):
+        """Report how the model did on the cells actually reviewed.
+
+        This is the model measured against your decisions on your images, which
+        is what matters -- held-out validation only stands in for it.
+        """
+        rows = []
+        for img_data in self.images.values():
+            for ol in img_data.get('soma_outlines', []) or []:
+                if ol.get('source') in ('ml_accepted', 'ml_edited'):
+                    rows.append(ol)
+        if not rows:
+            return
+        kept = [r for r in rows if r.get('source') == 'ml_accepted']
+        edited = [r for r in rows if r.get('source') == 'ml_edited']
+        ious = [r['iou_vs_proposal'] for r in edited
+                if r.get('iou_vs_proposal') is not None]
+        self.log("=" * 50)
+        self.log("Model performance on this session")
+        self.log(f"  {len(rows)} outlines from the model")
+        self.log(f"  accepted unchanged: {len(kept)} "
+                 f"({100 * len(kept) / len(rows):.0f}%)")
+        self.log(f"  edited or redrawn:  {len(edited)} "
+                 f"({100 * len(edited) / len(rows):.0f}%)")
+        if ious:
+            ious_sorted = sorted(ious)
+            med = ious_sorted[len(ious_sorted) // 2]
+            self.log(f"  on the edited ones, the proposal overlapped your final "
+                     f"outline by a median IoU of {med:.2f}")
+            self.log(f"  (1.00 = you changed nothing; low = you redrew it)")
+        confs = [r.get('ml_confidence') for r in kept
+                 if r.get('ml_confidence') is not None]
+        confs_e = [r.get('ml_confidence') for r in edited
+                   if r.get('ml_confidence') is not None]
+        if confs and confs_e:
+            self.log(f"  mean confidence: {sum(confs) / len(confs):.2f} when kept, "
+                     f"{sum(confs_e) / len(confs_e):.2f} when edited")
+            self.log("  (a gap here means the confidence score is doing its job)")
+        self.log("  Retraining will pick up your corrections automatically;")
+        self.log("  see soma_ml_feedback.csv in the output folder.")
+        self.log("=" * 50)
+
     def _finish_review_mode(self):
         """Finish review mode and complete outlining"""
         self._clear_ml_review_order()
+        try:
+            self._ml_session_summary()
+        except Exception:
+            pass
         self.review_mode = False
         self._finish_outlining()
 
@@ -14233,6 +14279,69 @@ if __name__ == '__main__':
             for ol in img_data['soma_outlines']
         )
 
+    def _outline_provenance(self, img_name, soma_idx, points):
+        """Classify an outline about to be stored, against the model proposal.
+
+        Retraining on outlines the model itself produced is self-training: its
+        biases return as labels and the score drifts optimistic while the model
+        drifts worse. Recording WHERE each outline came from lets training keep
+        your corrections, which are the informative cases, and hold the
+        untouched acceptances out.
+
+        Returns (source, confidence, iou_vs_proposal).
+        """
+        qi = getattr(self, 'current_review_idx', None)
+        if qi is None or not getattr(self, 'review_mode', False):
+            qi = getattr(self, 'current_outline_idx', None)
+        proposal = None
+        if qi is not None:
+            cands = getattr(self, 'auto_outlined_points', None) or {}
+            q = getattr(self, 'outlining_queue', None) or []
+            if qi in cands and qi < len(q) and tuple(q[qi]) == (img_name, soma_idx):
+                proposal = cands[qi]
+        conf = getattr(self, 'ml_confidence', {}).get((img_name, soma_idx))
+        if proposal is None:
+            return ('manual', conf, None)
+        if list(map(tuple, proposal)) == list(map(tuple, points)):
+            return ('ml_accepted', conf, 1.0)
+        # edited: measure how far the accepted outline moved from the proposal.
+        # This is the model scored against real decisions on real images, which
+        # held-out validation only approximates.
+        iou = None
+        try:
+            img_data = self.images.get(img_name) or {}
+            shape = None
+            oi = self._get_image_for_outlining(img_data)
+            if oi is not None:
+                shape = oi.shape[:2]
+            if shape:
+                a = self._polygon_to_mask(proposal, shape)
+                b = self._polygon_to_mask(list(points), shape)
+                u = np.logical_or(a, b).sum()
+                iou = float(np.logical_and(a, b).sum()) / float(u) if u else None
+        except Exception:
+            iou = None
+        return ('ml_edited', conf, iou)
+
+    def _log_ml_feedback(self, img_name, soma_id, source, conf, iou, area_um2):
+        """Append one review decision to soma_ml_feedback.csv."""
+        try:
+            path = self._get_checklist_path('soma_ml_feedback.csv')
+            if not path:
+                return
+            new = not os.path.exists(path)
+            with open(path, 'a', newline='') as fh:
+                w = csv.writer(fh)
+                if new:
+                    w.writerow(['image', 'soma_id', 'source', 'confidence',
+                                'iou_vs_proposal', 'soma_area_um2'])
+                w.writerow([img_name, soma_id, source,
+                            '' if conf is None else f"{conf:.4f}",
+                            '' if iou is None else f"{iou:.4f}",
+                            f"{area_um2:.2f}"])
+        except Exception:
+            pass
+
     def _record_ml_confidence(self, img_name, soma_idx, conf):
         """Remember how much the model trusted one outline."""
         if not hasattr(self, 'ml_confidence'):
@@ -14323,6 +14432,8 @@ if __name__ == '__main__':
         pixel_size = self._get_pixel_size(img_name)
         soma_area_um2 = float(np.sum(mask) * (pixel_size ** 2))
 
+        source, ml_conf, prop_iou = self._outline_provenance(
+            img_name, soma_idx, points)
         img_data['soma_outlines'].append({
             'soma_idx': soma_idx,
             'soma_id': soma_id,
@@ -14330,7 +14441,13 @@ if __name__ == '__main__':
             'outline': mask,
             'polygon_points': list(points),
             'soma_area_um2': soma_area_um2,
+            'source': source,
+            'ml_confidence': ml_conf,
+            'iou_vs_proposal': prop_iou,
         })
+        if source != 'manual':
+            self._log_ml_feedback(img_name, soma_id, source, ml_conf,
+                                  prop_iou, soma_area_um2)
         self._export_soma_outline(img_name, soma_id, mask, pixel_size,
                                   soma_area_um2)
         cl_path = self._get_checklist_path('soma_checklist.csv')
