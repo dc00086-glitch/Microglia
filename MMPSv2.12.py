@@ -1713,7 +1713,8 @@ def _ml_pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
 FEATURE_SCALES = (1.0, 2.0, 4.0, 8.0)
 
 
-def _ml_radial_contour(prob, center, cut, n_angles=180, smooth=9):
+def _ml_radial_contour(prob, center, cut, n_angles=180, smooth=9,
+                   harmonics=None):
     """Turn a probability map into a smooth star-convex outline around `center`.
 
     A hand-drawn soma outline is a smooth closed contour; a pixel classifier
@@ -1742,6 +1743,18 @@ def _ml_radial_contour(prob, center, cut, n_angles=180, smooth=9):
     bnd = rs[leaves]
     if smooth > 1:
         bnd = ndi.median_filter(bnd, size=smooth, mode='wrap')
+    if harmonics is not None:
+        # Keep only the lowest harmonics of the radius profile r(theta). The
+        # profile IS the shape: harmonic 0 alone is a circle, through harmonic 2
+        # is the round-to-rod family, and the higher terms carry exactly the
+        # spikes and notches a soma outline should not have. The median filter
+        # above runs first so a single runaway ray cannot smear across the
+        # spectrum.
+        F = np.fft.rfft(bnd)
+        if harmonics + 1 < len(F):
+            F[harmonics + 1:] = 0
+        bnd = np.fft.irfft(F, n=len(bnd))
+        bnd = np.maximum(bnd, 0.0)
     if not np.any(bnd > 0):
         return None
     gy, gx = np.ogrid[:H, :W]
@@ -1771,8 +1784,16 @@ def _ml_mask_from_prob(prob, center, prob_cut=0.5, open_r=0, mode='cc'):
     every combination, instead of re-running the forest 20 times per cell.
     """
     ly, lx = center
-    if mode == 'radial':
-        return _ml_radial_contour(prob, (ly, lx), prob_cut)
+    if mode.startswith('radial'):
+        # 'radial' keeps the full profile; 'radial_h<N>' truncates it to N
+        # harmonics, which is the shape dial.
+        h = None
+        if mode.startswith('radial_h'):
+            try:
+                h = int(mode[len('radial_h'):])
+            except ValueError:
+                h = None
+        return _ml_radial_contour(prob, (ly, lx), prob_cut, harmonics=h)
     binm = prob >= prob_cut
     # Sever thin structures BEFORE picking the component, so a process still
     # attached to the soma is dropped with it rather than dragged along. The
@@ -1793,127 +1814,6 @@ def _ml_mask_from_prob(prob, center, prob_cut=0.5, open_r=0, mode='cc'):
         i = int(np.argmin((ys - ly) ** 2 + (xs - lx) ** 2))
         cid = lab[ys[i], xs[i]]
     return ndi.binary_fill_holes(lab == cid)
-
-
-class _MLSomaOutliner:
-    """Wraps the trained forest so it can be used like the other detectors.
-
-    Scale matters: the forest was fitted at one pixel size, and every filter
-    width in the feature set is in pixels. An image at a different calibration
-    is cropped over the same PHYSICAL area and resampled to the training patch
-    size, so the model always sees a soma at the scale it was trained on.
-    """
-
-    def __init__(self, path):
-        import joblib
-        bundle = joblib.load(path)
-        self.model = bundle['model']
-        m = bundle.get('meta', {}) or {}
-        self.scales = tuple(m.get('scales') or (1.0, 2.0, 4.0, 8.0))
-        self.half = int(m.get('half') or 76)
-        self.prob_cut = float(m.get('prob_cut') or 0.5)
-        self.open_r = int(m.get('open_r') or 0)
-        self.mode = m.get('mode') or 'cc'
-        self.train_px = float(m.get('pixel_size_um') or 0.1046)
-        self.channel = m.get('channel')
-        # Which images the forest was fitted on. The app must hand it the same
-        # kind at use, or it reads a boundary that is not there.
-        self.trained_on = m.get('trained_on') or 'raw'
-        self.conf_cal = m.get('conf_cal') or {}
-        self.path = path
-        self.last_confidence = None
-        # Shifts the probability cut. The cut IS the size dial: a lower cut
-        # keeps more marginal pixels and grows the outline, a higher one
-        # tightens it. Held separately so the calibrated value stays visible.
-        self.size_bias = 0.0
-
-    def accept_threshold(self, which='top50'):
-        """Confidence at or above which a cell may be accepted unreviewed.
-
-        Calibrated on held-out cells at training time and carried in the model,
-        so it means the same thing on every image. Ranking the somas of one
-        batch and taking its top half would accept half of any batch, however
-        bad, which is not the same thing at all.
-        """
-        d = self.conf_cal.get(which) or {}
-        t = d.get('threshold')
-        return float(t) if t is not None else None
-
-    def describe(self):
-        parts = [f"scales {len(self.scales)}", f"cut {self.prob_cut}",
-                 f"{self.mode}", f"trained on {self.trained_on}"]
-        if self.channel:
-            parts.append(f"channel {self.channel}")
-        d = self.conf_cal.get('top50') or {}
-        if d.get('purity') is not None:
-            parts.append(f"top50 purity {100 * d['purity']:.0f}%")
-        return ", ".join(parts)
-
-    def _probability_map(self, image, centroid, pixel_size_um):
-        cy, cx = int(round(centroid[0])), int(round(centroid[1]))
-        img = image
-        if img.ndim > 2:
-            img = img[:, :, 0]
-        px = float(pixel_size_um or self.train_px)
-        # same physical window the model was trained on
-        half_img = max(8, int(round(self.half * self.train_px / max(px, 1e-6))))
-        patch, y1, x1 = _ml_patch_around(img.astype(np.float64), cy, cx, half_img)
-        if patch.size == 0 or min(patch.shape[:2]) < 8:
-            return None
-        side = 2 * self.half
-        work = cv2.resize(patch, (side, side), interpolation=cv2.INTER_LINEAR)
-        ctr = ((cy - y1) * side / patch.shape[0],
-               (cx - x1) * side / patch.shape[1])
-        F = _ml_pixel_features(work, self.scales, center=ctr)
-        prob = self.model.predict_proba(F)[:, 1].reshape(work.shape)
-        return prob, ctr, (y1, x1), patch.shape
-
-    def outline(self, image, centroid, pixel_size_um=None):
-        """-> (points, confidence). points are (row, col) in image coordinates."""
-        self.last_confidence = None
-        try:
-            got = self._probability_map(image, centroid, pixel_size_um)
-            if got is None:
-                return None, None
-            prob, ctr, (y1, x1), pshape = got
-            cut = float(np.clip(self.prob_cut - self.size_bias, 0.05, 0.95))
-            mask = _ml_mask_from_prob(prob, ctr, cut, self.open_r, self.mode)
-            if mask is None or not mask.any():
-                return None, None
-
-            # Confidence with no ground truth: how much the outline moves
-            # between a loose and a strict cut. A sharp boundary barely shifts;
-            # a diffuse one balloons.
-            lo = _ml_mask_from_prob(prob, ctr, 0.35, self.open_r, self.mode)
-            hi = _ml_mask_from_prob(prob, ctr, 0.65, self.open_r, self.mode)
-            conf = 0.0
-            if lo is not None and hi is not None:
-                u = np.logical_or(lo, hi).sum()
-                if u:
-                    conf = float(np.logical_and(lo, hi).sum()) / float(u)
-            self.last_confidence = conf
-
-            back = cv2.resize(mask.astype(np.uint8), (pshape[1], pshape[0]),
-                              interpolation=cv2.INTER_NEAREST)
-            contours, _ = cv2.findContours(back, cv2.RETR_EXTERNAL,
-                                           cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                return None, conf
-            best = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(best) < 10:
-                return None, conf
-            approx = _simplify_contour(best)
-            pts = [(int(p[0][1]) + y1, int(p[0][0]) + x1) for p in approx]
-            if len(pts) < MIN_OUTLINE_POINTS:
-                return None, conf
-            return pts, conf
-        except Exception as e:
-            print(f"ML outline error: {e}")
-            return None, None
-
-
-_ML_OUTLINER = None
-_ML_OUTLINER_PATH = None
 
 
 def ml_model_paths():

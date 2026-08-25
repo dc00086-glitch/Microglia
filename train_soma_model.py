@@ -273,7 +273,8 @@ def pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
 FEATURE_SCALES = (1.0, 2.0, 4.0, 8.0)
 
 
-def radial_contour(prob, center, cut, n_angles=180, smooth=9):
+def radial_contour(prob, center, cut, n_angles=180, smooth=9,
+                   harmonics=None):
     """Turn a probability map into a smooth star-convex outline around `center`.
 
     A hand-drawn soma outline is a smooth closed contour; a pixel classifier
@@ -302,6 +303,18 @@ def radial_contour(prob, center, cut, n_angles=180, smooth=9):
     bnd = rs[leaves]
     if smooth > 1:
         bnd = ndimage.median_filter(bnd, size=smooth, mode='wrap')
+    if harmonics is not None:
+        # Keep only the lowest harmonics of the radius profile r(theta). The
+        # profile IS the shape: harmonic 0 alone is a circle, through harmonic 2
+        # is the round-to-rod family, and the higher terms carry exactly the
+        # spikes and notches a soma outline should not have. The median filter
+        # above runs first so a single runaway ray cannot smear across the
+        # spectrum.
+        F = np.fft.rfft(bnd)
+        if harmonics + 1 < len(F):
+            F[harmonics + 1:] = 0
+        bnd = np.fft.irfft(F, n=len(bnd))
+        bnd = np.maximum(bnd, 0.0)
     if not np.any(bnd > 0):
         return None
     gy, gx = np.ogrid[:H, :W]
@@ -404,8 +417,16 @@ def mask_from_prob(prob, center, prob_cut=0.5, open_r=0, mode='cc'):
     every combination, instead of re-running the forest 20 times per cell.
     """
     ly, lx = center
-    if mode == 'radial':
-        return radial_contour(prob, (ly, lx), prob_cut)
+    if mode.startswith('radial'):
+        # 'radial' keeps the full profile; 'radial_h<N>' truncates it to N
+        # harmonics, which is the shape dial.
+        h = None
+        if mode.startswith('radial_h'):
+            try:
+                h = int(mode[len('radial_h'):])
+            except ValueError:
+                h = None
+        return radial_contour(prob, (ly, lx), prob_cut, harmonics=h)
     binm = prob >= prob_cut
     # Sever thin structures BEFORE picking the component, so a process still
     # attached to the soma is dropped with it rather than dragged along. The
@@ -654,6 +675,10 @@ def main():
     ap.add_argument('--size-tolerance', type=float, default=0.01,
                     help='held-out IoU worth trading for a smaller model; the '
                          'smallest forest within this of the best is kept')
+    ap.add_argument('--harmonics', type=int, nargs='*', default=[2, 4, 6],
+                    help='shape priors to try: keep only this many harmonics '
+                         'of the radius profile. 2 is the round-to-rod family, '
+                         '4 allows gentle irregularity, 6 is nearly unconstrained')
     ap.add_argument('--allow-tiny', action='store_true',
                     help='save even when trained on very few somas (normally '
                          'refused, so a --limit smoke test cannot overwrite a '
@@ -740,8 +765,9 @@ def main():
     max_samples = (min(a.max_samples, X.shape[0]) if a.max_samples else None)
     open_radii = sorted(set([0, max(2, half // 16), max(3, half // 10)]))
     cuts = (0.35, 0.45, 0.5, 0.55, 0.65)
+    shape_modes = ['radial'] + [f'radial_h{h}' for h in a.harmonics]
     combos = ([('cc', o, c) for o in open_radii for c in cuts]
-              + [('radial', 0, c) for c in cuts])
+              + [(m, 0, c) for m in shape_modes for c in cuts])
     rng = np.random.RandomState(1)
     train_sub = [train_pairs[i] for i in
                  sorted(rng.permutation(len(train_pairs))[:len(test_pairs)])]
@@ -775,7 +801,8 @@ def main():
         for key in combos:
             mode, orad, cut = key
             ious, ratios, fails = res[key]
-            tag = 'radial   ' if mode == 'radial' else f'open {orad:>2}px'
+            tag = (f'{mode:<9}' if mode.startswith('radial')
+               else f'open {orad:>2}px')
             if len(ious) == 0:
                 print(f"  {tag}  cut {cut}: no usable predictions")
                 continue

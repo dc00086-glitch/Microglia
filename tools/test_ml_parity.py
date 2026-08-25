@@ -65,7 +65,7 @@ def main():
             continue
 
         prob = rng.random((h, h))
-        for mode in ('cc', 'radial'):
+        for mode in ('cc', 'radial', 'radial_h2', 'radial_h4', 'radial_h6'):
             for cut in (0.35, 0.5, 0.65):
                 ma = trainer.mask_from_prob(prob, ctr, cut, 3, mode)
                 mb = app.mask_from_prob(prob, ctr, cut, 3, mode)
@@ -81,7 +81,7 @@ def main():
                  f"drifted from train_soma_model.py — the trained model will "
                  f"misbehave silently until they match again.")
     print("PASS: MMPS and train_soma_model.py produce identical features "
-          "and masks (25 random patches, both scale sets, both modes).")
+          "and masks (25 random patches, both scale sets, all 5 mask modes).")
 
 
 if __name__ == '__main__':
