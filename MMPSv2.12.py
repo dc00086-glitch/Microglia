@@ -1976,6 +1976,25 @@ class _MLSomaOutliner:
                 if u:
                     conf = float(np.logical_and(lo, hi).sum()) / float(u)
             self.last_confidence = conf
+            # One-shot report of what the forest actually produced. A confidence
+            # pinned at 0 means the strict cut found nothing, which says the
+            # probabilities are far lower than they were in validation -- i.e.
+            # the pixels reaching the model are not the pixels it was fitted on.
+            if not _ML_DIAG.get('done'):
+                _ML_DIAG['done'] = True
+                cy, cx = int(ctr[0]), int(ctr[1])
+                cy = min(max(cy, 0), prob.shape[0] - 1)
+                cx = min(max(cx, 0), prob.shape[1] - 1)
+                _ml_note(
+                    f"ML first soma: prob min {prob.min():.3f} "
+                    f"mean {prob.mean():.3f} max {prob.max():.3f}, "
+                    f"at click {prob[cy, cx]:.3f}; "
+                    f"px>=0.35 {100 * (prob >= 0.35).mean():.1f}% "
+                    f"px>=0.65 {100 * (prob >= 0.65).mean():.1f}%; "
+                    f"loose mask {'None' if lo is None else int(lo.sum())} "
+                    f"strict mask {'None' if hi is None else int(hi.sum())}; "
+                    f"extra channels supplied {len(extra or [])}, "
+                    f"model wants {len(self.extra_channels)}")
 
             back = cv2.resize(mask.astype(np.uint8), (pshape[1], pshape[0]),
                               interpolation=cv2.INTER_NEAREST)
@@ -1998,6 +2017,8 @@ class _MLSomaOutliner:
 
 _ML_OUTLINER = None
 _ML_OUTLINER_PATH = None
+# one-shot per-run diagnostic, reset when a batch starts
+_ML_DIAG = {}
 # What happened at load time, kept so the app can show it in its own Log panel.
 # Printing alone only reaches a terminal, and MMPS is normally double-clicked.
 _ML_LOAD_MESSAGES = []
@@ -13197,6 +13218,7 @@ if __name__ == '__main__':
         ml_threshold = thr if label.startswith("Auto-accept") else None
 
         px = self._get_pixel_size(self.current_image_name)
+        _ML_DIAG.clear()
         self.log("=" * 50)
         self.log("🤖 MACHINE-LEARNING OUTLINING")
         self.log(f"Model: {ml.describe()}")
