@@ -40,6 +40,19 @@ def load_trainer():
     return mod
 
 
+def load_mmps_loader():
+    """Pull load_tiff_image out of MMPSv2.12.py without importing the GUI."""
+    src = open(os.path.join(HERE, 'MMPSv2.12.py')).read()
+    m = re.search(r'^def load_tiff_image\(.*?(?=\n\ndef |\n\nclass )',
+                  src, re.S | re.M)
+    if not m:
+        sys.exit("could not find load_tiff_image in MMPSv2.12.py")
+    mod = types.ModuleType('mm')
+    mod.__dict__.update({'np': np, 'os': os, 'sys': sys})
+    exec(compile(m.group(0), 'MMPSv2.12.py', 'exec'), mod.__dict__)
+    return mod.load_tiff_image
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--root', required=True)
@@ -48,6 +61,10 @@ def main():
     ap.add_argument('--app-pixel-size', type=float, default=None,
                     help='pixel size MMPS is using, if different')
     ap.add_argument('--n', type=int, default=6)
+    ap.add_argument('--mmps-loader', action='store_true',
+                    help="read the image through MMPS's own load_tiff_image "
+                         "instead of tifffile.imread, which is the remaining "
+                         "difference between this script and the running app")
     a = ap.parse_args()
 
     T = load_trainer()
@@ -84,9 +101,32 @@ def main():
 
     print(f"{'soma':>4} {'path':>11} {'max':>6} {'@click':>7} "
           f"{'>=0.35':>7} {'>=0.65':>7} {'strict':>7} {'conf':>6}")
+    mmps_load = load_mmps_loader() if a.mmps_loader else None
+    if mmps_load:
+        print("reading through MMPS's load_tiff_image\n")
+
     for i, (mp, ip, r, c, tp) in enumerate(pairs[:a.n]):
-        img = T.load_gray(ip, ch)
-        ex_full = T.load_channels(ip, extra_ch)
+        if mmps_load:
+            raw = np.squeeze(np.asarray(mmps_load(ip)))
+            if raw.ndim == 3:
+                ax = int(np.argmin(raw.shape))
+                if raw.shape[ax] <= 8:
+                    raw = np.moveaxis(raw, ax, -1)
+            img = raw[:, :, (ch or 1) - 1].astype(np.float64)
+            ex_full = [raw[:, :, k - 1].astype(np.float64) for k in extra_ch]
+            if i == 0:
+                print(f"  MMPS loader gave {raw.shape} {raw.dtype}; "
+                      f"channel means "
+                      + ", ".join(f"{raw[:, :, k].mean():.2f}"
+                                  for k in range(raw.shape[2])))
+                t = np.squeeze(tifffile.imread(ip))
+                print(f"  tifffile gave    {t.shape} {t.dtype}; "
+                      f"channel means "
+                      + ", ".join(f"{t[:, :, k].mean():.2f}"
+                                  for k in range(t.shape[2])) + "\n")
+        else:
+            img = T.load_gray(ip, ch)
+            ex_full = T.load_channels(ip, extra_ch)
 
         for label in ('validation', 'app'):
             if label == 'app' and cv2 is None:
