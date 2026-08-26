@@ -13334,6 +13334,7 @@ if __name__ == '__main__':
         if needs_review:
             if getattr(self, '_ml_confidence_order', False):
                 self._ml_review_order = [qi for qi, _ in needs_review]
+                self._ml_order_pos = 0
             else:
                 # Queue order: image by image, soma by soma, the way every
                 # other review in MMPS runs. The confidence still shows on
@@ -14169,10 +14170,15 @@ if __name__ == '__main__':
         # wrong cells, because _find_next_unoutlined_idx follows it.
         _order = getattr(self, '_ml_review_order', None)
         if _order:
+            _removed_at = next((k for k, i in enumerate(_order)
+                                if i == queue_idx), None)
             self._ml_review_order = [
                 (i - 1 if i > queue_idx else i)
                 for i in _order if i != queue_idx
             ]
+            _pos = getattr(self, '_ml_order_pos', 0)
+            if _removed_at is not None and _removed_at < _pos:
+                self._ml_order_pos = max(0, _pos - 1)
 
         self.log(f"✗ Deleted {soma_id} from {img_name}")
         self.polygon_points = []
@@ -15094,6 +15100,7 @@ if __name__ == '__main__':
     def _clear_ml_review_order(self):
         """Drop any model-supplied review ordering."""
         self._ml_review_order = None
+        self._ml_order_pos = 0
 
     def _find_next_unoutlined_idx(self, start_from=0):
         """Find the next queue entry that doesn't have an outline yet.
@@ -15105,17 +15112,21 @@ if __name__ == '__main__':
         """
         order = getattr(self, '_ml_review_order', None)
         if order:
-            seen_start = start_from <= 0
-            for qi in order:
-                if not seen_start:
-                    # honour start_from as "resume after this one"
-                    if qi >= start_from:
-                        seen_start = True
-                    else:
-                        continue
+            # Walk the model's ordering by POSITION in that list. start_from is
+            # a queue index, and this list is sorted by confidence, so comparing
+            # the two discards every entry whose index happens to be lower and
+            # the review declares itself finished after a handful of somas.
+            if start_from <= 0:
+                self._ml_order_pos = 0
+            pos = getattr(self, '_ml_order_pos', 0)
+            while pos < len(order):
+                qi = order[pos]
+                pos += 1
                 if qi < len(self.outlining_queue) and not self._soma_has_outline(
                         *self.outlining_queue[qi]):
+                    self._ml_order_pos = pos
                     return qi
+            self._ml_order_pos = pos
         for qi in range(start_from, len(self.outlining_queue)):
             img_name, soma_idx = self.outlining_queue[qi]
             if not self._soma_has_outline(img_name, soma_idx):
