@@ -45,7 +45,49 @@ def load_module(path, names, prefix=''):
     return mod
 
 
+REQUIRED = [
+    '_MLSomaOutliner', 'get_ml_outliner', 'ml_model_paths', '_ml_note',
+    'drain_ml_messages', '_ml_pixel_features', '_ml_mask_from_prob',
+    '_ml_radial_contour', '_ml_otsu', '_ml_disk', '_ml_patch_around',
+]
+REQUIRED_METHODS = ['__init__', 'accept_threshold', 'describe',
+                    '_probability_map', 'outline']
+REQUIRED_GLOBALS = ['_ML_OUTLINER', '_ML_OUTLINER_PATH', '_ML_LOAD_MESSAGES']
+
+
+def check_structure():
+    """Every piece of the ML path is still defined.
+
+    A regex edit once matched from one function to the next `def` and, because
+    the class in between starts with `class`, deleted _MLSomaOutliner and the
+    module globals with it. Nothing failed to import -- the loader just caught
+    the NameError and reported no model -- so it shipped. Byte-comparing
+    features cannot catch a whole symbol going missing; this can.
+    """
+    import ast
+    src = open(os.path.join(ROOT, 'MMPSv2.12.py')).read()
+    tree = ast.parse(src)
+    names = {n.name for n in ast.walk(tree)
+             if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
+    missing = [n for n in REQUIRED if n not in names]
+    cls = next((n for n in ast.walk(tree)
+                if isinstance(n, ast.ClassDef) and n.name == '_MLSomaOutliner'),
+               None)
+    if cls is not None:
+        have = {m.name for m in cls.body if isinstance(m, ast.FunctionDef)}
+        missing += [f'_MLSomaOutliner.{m}' for m in REQUIRED_METHODS
+                    if m not in have]
+    missing += [g for g in REQUIRED_GLOBALS
+                if not re.search(rf'^{g} = ', src, re.M)]
+    if missing:
+        sys.exit("FAIL: MMPSv2.12.py is missing part of the ML path: "
+                 + ", ".join(missing))
+    print(f"PASS: all {len(REQUIRED) + len(REQUIRED_METHODS) + len(REQUIRED_GLOBALS)}"
+          f" ML symbols present in MMPSv2.12.py")
+
+
 def main():
+    check_structure()
     trainer = load_module(os.path.join(ROOT, 'train_soma_model.py'),
                           FUNCS + ['_disk', 'patch_around'])
     app = load_module(os.path.join(ROOT, 'MMPSv2.12.py'),

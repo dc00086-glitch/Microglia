@@ -1861,6 +1861,160 @@ def _ml_mask_from_prob(prob, center, prob_cut=0.5, open_r=0, mode='cc'):
     return ndi.binary_fill_holes(lab == cid)
 
 
+class _MLSomaOutliner:
+    """Wraps the trained forest so it can be used like the other detectors.
+
+    Scale matters: the forest was fitted at one pixel size, and every filter
+    width in the feature set is in pixels. An image at a different calibration
+    is cropped over the same PHYSICAL area and resampled to the training patch
+    size, so the model always sees a soma at the scale it was trained on.
+    """
+
+    def __init__(self, path):
+        import joblib
+        bundle = joblib.load(path)
+        self.model = bundle['model']
+        m = bundle.get('meta', {}) or {}
+        self.scales = tuple(m.get('scales') or (1.0, 2.0, 4.0, 8.0))
+        self.half = int(m.get('half') or 76)
+        self.prob_cut = float(m.get('prob_cut') or 0.5)
+        self.open_r = int(m.get('open_r') or 0)
+        self.mode = m.get('mode') or 'cc'
+        self.train_px = float(m.get('pixel_size_um') or 0.1046)
+        self.channel = m.get('channel')
+        # Which images the forest was fitted on. The app must hand it the same
+        # kind at use, or it reads a boundary that is not there.
+        self.trained_on = m.get('trained_on') or 'raw'
+        # Additional stains the forest was fitted with (1-based). It cannot run
+        # without them: the feature vector would be the wrong width.
+        self.extra_channels = list(m.get('extra_channels') or [])
+        self.conf_cal = m.get('conf_cal') or {}
+        self.path = path
+        self.last_confidence = None
+        # Shifts the probability cut. The cut IS the size dial: a lower cut
+        # keeps more marginal pixels and grows the outline, a higher one
+        # tightens it. Held separately so the calibrated value stays visible.
+        self.size_bias = 0.0
+
+    def accept_threshold(self, which='top50'):
+        """Confidence at or above which a cell may be accepted unreviewed.
+
+        Calibrated on held-out cells at training time and carried in the model,
+        so it means the same thing on every image. Ranking the somas of one
+        batch and taking its top half would accept half of any batch, however
+        bad, which is not the same thing at all.
+        """
+        d = self.conf_cal.get(which) or {}
+        t = d.get('threshold')
+        return float(t) if t is not None else None
+
+    def describe(self):
+        parts = [f"scales {len(self.scales)}", f"cut {self.prob_cut}",
+                 f"{self.mode}", f"trained on {self.trained_on}"]
+        if self.extra_channels:
+            parts.append(f"+channels {self.extra_channels}")
+        if self.channel:
+            parts.append(f"channel {self.channel}")
+        d = self.conf_cal.get('top50') or {}
+        if d.get('purity') is not None:
+            parts.append(f"top50 purity {100 * d['purity']:.0f}%")
+        return ", ".join(parts)
+
+    def _probability_map(self, image, centroid, pixel_size_um, extra=None):
+        cy, cx = int(round(centroid[0])), int(round(centroid[1]))
+        img = image
+        if img.ndim > 2:
+            img = img[:, :, 0]
+        px = float(pixel_size_um or self.train_px)
+        # same physical window the model was trained on
+        half_img = max(8, int(round(self.half * self.train_px / max(px, 1e-6))))
+        patch, y1, x1 = _ml_patch_around(img.astype(np.float64), cy, cx, half_img)
+        if patch.size == 0 or min(patch.shape[:2]) < 8:
+            return None
+        side = 2 * self.half
+        work = cv2.resize(patch, (side, side), interpolation=cv2.INTER_LINEAR)
+        ctr = ((cy - y1) * side / patch.shape[0],
+               (cx - x1) * side / patch.shape[1])
+        # Crop and resample the additional stains through exactly the same
+        # window, so every channel describes the same pixels.
+        ex = []
+        for e in (extra or []):
+            ep = np.asarray(e, dtype=np.float64)[y1:y1 + patch.shape[0],
+                                                 x1:x1 + patch.shape[1]]
+            if ep.shape != patch.shape:
+                return None
+            ex.append(cv2.resize(ep, (side, side),
+                                 interpolation=cv2.INTER_LINEAR))
+        if len(ex) != len(self.extra_channels):
+            return None
+        F = _ml_pixel_features(work, self.scales, center=ctr,
+                               extra=(ex if ex else None))
+        prob = self.model.predict_proba(F)[:, 1].reshape(work.shape)
+        return prob, ctr, (y1, x1), patch.shape
+
+    def outline(self, image, centroid, pixel_size_um=None, extra=None):
+        """-> (points, confidence). points are (row, col) in image coordinates."""
+        self.last_confidence = None
+        try:
+            got = self._probability_map(image, centroid, pixel_size_um, extra)
+            if got is None:
+                return None, None
+            prob, ctr, (y1, x1), pshape = got
+            cut = float(np.clip(self.prob_cut - self.size_bias, 0.05, 0.95))
+            mask = _ml_mask_from_prob(prob, ctr, cut, self.open_r, self.mode)
+            if mask is None or not mask.any():
+                return None, None
+
+            # Confidence with no ground truth: how much the outline moves
+            # between a loose and a strict cut. A sharp boundary barely shifts;
+            # a diffuse one balloons.
+            lo = _ml_mask_from_prob(prob, ctr, 0.35, self.open_r, self.mode)
+            hi = _ml_mask_from_prob(prob, ctr, 0.65, self.open_r, self.mode)
+            conf = 0.0
+            if lo is not None and hi is not None:
+                u = np.logical_or(lo, hi).sum()
+                if u:
+                    conf = float(np.logical_and(lo, hi).sum()) / float(u)
+            self.last_confidence = conf
+
+            back = cv2.resize(mask.astype(np.uint8), (pshape[1], pshape[0]),
+                              interpolation=cv2.INTER_NEAREST)
+            contours, _ = cv2.findContours(back, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return None, conf
+            best = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(best) < 10:
+                return None, conf
+            approx = _simplify_contour(best)
+            pts = [(int(p[0][1]) + y1, int(p[0][0]) + x1) for p in approx]
+            if len(pts) < MIN_OUTLINE_POINTS:
+                return None, conf
+            return pts, conf
+        except Exception as e:
+            print(f"ML outline error: {e}")
+            return None, None
+
+
+_ML_OUTLINER = None
+_ML_OUTLINER_PATH = None
+# What happened at load time, kept so the app can show it in its own Log panel.
+# Printing alone only reaches a terminal, and MMPS is normally double-clicked.
+_ML_LOAD_MESSAGES = []
+
+
+def _ml_note(msg):
+    print(msg)
+    _ML_LOAD_MESSAGES.append(msg)
+
+
+def drain_ml_messages():
+    """Return and clear anything the loader wanted to say."""
+    out = list(_ML_LOAD_MESSAGES)
+    del _ML_LOAD_MESSAGES[:]
+    return out
+
+
 def ml_model_paths():
     """Where a trained model may live, nearest first."""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -13074,12 +13228,18 @@ if __name__ == '__main__':
             soma_id = img_data['soma_ids'][soma_idx]
             progress.setLabelText(f"{soma_id}  ({n + 1}/{len(todo)})")
             outline_img = self._get_image_for_ml(img_data, ml)
-            if outline_img is None:
+            ml_extra = self._get_ml_extra_channels(img_data, ml)
+            if outline_img is None or ml_extra is None:
+                if ml_extra is None and not getattr(self, '_ml_ch_warned', False):
+                    self._ml_ch_warned = True
+                    self.log(f"   ⚠ ML: this model needs channels "
+                             f"{ml.extra_channels} and they are not available "
+                             f"in {img_name} — those somas are skipped.")
                 self.failed_auto_outlines.append(qi)
                 continue
             soma = img_data['somas'][soma_idx]
             px_here = self._get_pixel_size(img_name) or px
-            points, conf = ml.outline(outline_img, soma, px_here)
+            points, conf = ml.outline(outline_img, soma, px_here, ml_extra)
             if points is None or len(points) < 3:
                 self.failed_auto_outlines.append(qi)
                 continue
@@ -14011,10 +14171,17 @@ if __name__ == '__main__':
                 # feed the raw channel, not the processed image
                 _img_data = self.images.get(self.current_image_name) or {}
                 _raw = self._get_image_for_ml(_img_data, ml)
+                _ex = self._get_ml_extra_channels(_img_data, ml)
                 px_ml = self._get_pixel_size(self.current_image_name)
-                return lambda image, centroid, sensitivity: (
-                    ml.outline(_raw if _raw is not None else image,
-                               centroid, px_ml)[0])
+                if _ex is None:
+                    self.log(f"ML: this model needs channels "
+                             f"{ml.extra_channels}, which this image does not "
+                             f"provide — falling back to the soma-blob "
+                             f"detector.")
+                else:
+                    return lambda image, centroid, sensitivity: (
+                        ml.outline(_raw if _raw is not None else image,
+                                   centroid, px_ml, _ex)[0])
             if ml is None:
                 self.log("No trained soma model found — falling back to the "
                          "soma-blob detector. Train one with "
@@ -14040,6 +14207,39 @@ if __name__ == '__main__':
         return lambda image, centroid, sensitivity: auto_outline_soma_blob(
             image, centroid, sensitivity, max_soma_radius_px=rad_px,
             process_width_px=proc_px)
+
+    def _get_ml_extra_channels(self, img_data, ml):
+        """The additional stains the model needs, as full-frame arrays.
+
+        Returns None when any are missing: running with the wrong number of
+        channels would build a feature vector of the wrong width, and the
+        forest would either error or read the columns as something else.
+        """
+        want = getattr(ml, 'extra_channels', None) or []
+        if not want:
+            return []
+        src = None
+        raw_path = img_data.get('raw_path')
+        if raw_path and os.path.exists(raw_path):
+            try:
+                src = np.squeeze(np.asarray(load_tiff_image(raw_path)))
+            except Exception:
+                src = None
+        if src is None or src.ndim != 3:
+            c = img_data.get('color_image')
+            src = np.asarray(c) if c is not None else None
+        if src is None or src.ndim != 3:
+            return None
+        ax = int(np.argmin(src.shape))
+        if src.shape[ax] <= 8:
+            src = np.moveaxis(src, ax, -1)
+        out = []
+        for ch in want:
+            i = int(ch) - 1
+            if not (0 <= i < src.shape[2]):
+                return None
+            out.append(src[:, :, i].astype(np.float64))
+        return out
 
     def _get_image_for_ml(self, img_data, ml):
         """Give the model the same kind of image it was trained on.
