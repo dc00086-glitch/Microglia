@@ -13287,6 +13287,11 @@ if __name__ == '__main__':
                 self.auto_outlined_points[qi] = list(points)
                 needs_review.append((qi, c))
         progress.close()
+        # The per-run diagnostic is written while outlining, after the earlier
+        # drain, so without this it sits in the buffer and never reaches the
+        # Log panel -- invisible unless the app was started from a terminal.
+        for _m in drain_ml_messages():
+            self.log(_m)
 
         needs_review.sort(key=lambda t: t[1])      # least confident first
         self.polygon_points = []
@@ -14389,6 +14394,8 @@ if __name__ == '__main__':
                 if _ml is not None:
                     self._record_ml_confidence(img_name, soma_idx,
                                                _ml.last_confidence)
+                    for _m in drain_ml_messages():
+                        self.log(_m)
         except Exception:
             pass
 
