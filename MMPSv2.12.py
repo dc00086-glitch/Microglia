@@ -4326,6 +4326,18 @@ class MicrogliaAnalysisGUI(QMainWindow):
         per_image_px_action = advanced_menu.addAction("Set Per-Image Pixel Size...")
         per_image_px_action.setToolTip("Override pixel size for individual images")
         per_image_px_action.triggered.connect(self._set_per_image_pixel_size)
+        self.archive_rejected_masks = True
+        keep_rejected_action = advanced_menu.addAction(
+            "Keep Rejected Masks (for QA training)")
+        keep_rejected_action.setCheckable(True)
+        keep_rejected_action.setChecked(True)
+        keep_rejected_action.setToolTip(
+            "Store rejected masks under <output>/rejected_masks instead of "
+            "deleting them.\nA model that predicts which masks you reject "
+            "needs them: they are the negative class.\nSaved compressed, so a "
+            "few KB each.")
+        keep_rejected_action.toggled.connect(
+            lambda v: setattr(self, 'archive_rejected_masks', bool(v)))
         clear_outlines_action = advanced_menu.addAction("Clear Soma Outlines...")
         clear_outlines_action.setToolTip(
             "Delete the outlines for a range of somas so they can be redone")
@@ -16750,8 +16762,53 @@ if __name__ == '__main__':
             not in self._qa_finalized_somas
         ]
 
+    def _archive_rejected_mask(self, img_name, mask_path, mask_filename,
+                               mask_data):
+        """Keep a rejected mask instead of deleting it, for QA training.
+
+        A model that predicts which masks you reject needs the rejected ones.
+        They are the whole negative class, and deleting them leaves only
+        examples of masks you kept, which no classifier can learn from.
+
+        Stored compressed: a mask is a full-frame binary image, mostly zeros, so
+        it goes from megabytes to a few kilobytes. Thousands of them then cost
+        tens of MB rather than filling the disk.
+        """
+        try:
+            out_root = getattr(self, 'output_dir', None)
+            if not out_root:
+                return False
+            dest_dir = os.path.join(out_root, 'rejected_masks')
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, mask_filename)
+            arr = safe_tiff_read(mask_path)
+            if arr is None:
+                return False
+            arr = (np.asarray(arr) > 0).astype(np.uint8) * 255
+            tifffile.imwrite(dest, arr, compression='zlib')
+
+            # Why it was rejected. Duplicates are auto-rejected by a rule, not
+            # by judgement, and training on them teaches a rule the model does
+            # not need while inflating its score with free correct answers.
+            reason = 'duplicate' if mask_data.get('duplicate') else 'user'
+            csv_path = os.path.join(dest_dir, 'rejected_masks.csv')
+            new_file = not os.path.exists(csv_path)
+            with open(csv_path, 'a', newline='') as fh:
+                w = csv.writer(fh)
+                if new_file:
+                    w.writerow(['image', 'soma_id', 'target_area_um2',
+                                'reason', 'file'])
+                w.writerow([img_name, mask_data.get('soma_id', ''),
+                            mask_data.get('target_area_um2',
+                                          mask_data.get('area_um2', 0)),
+                            reason, mask_filename])
+            return True
+        except Exception as e:
+            self.log(f"   ⚠️ Could not archive {mask_filename}: {e}")
+            return False
+
     def _delete_rejected_mask_tiff(self, img_name, mask_data):
-        """Delete the TIFF file for a rejected mask from disk."""
+        """Remove a rejected mask from the masks folder, archiving it first."""
         if not self.masks_dir or not os.path.isdir(self.masks_dir):
             return
         img_basename = os.path.splitext(img_name)[0]
@@ -16760,9 +16817,19 @@ if __name__ == '__main__':
         mask_filename = _mask_tif_name(img_basename, soma_id, area_um2)
         mask_path = os.path.join(self.masks_dir, mask_filename)
         if os.path.exists(mask_path):
+            archived = False
+            if getattr(self, 'archive_rejected_masks', True):
+                archived = self._archive_rejected_mask(
+                    img_name, mask_path, mask_filename, mask_data)
             try:
                 os.remove(mask_path)
-                self.log(f"   🗑️ Deleted rejected mask: {mask_filename}")
+                if archived:
+                    if not getattr(self, '_archive_noted', False):
+                        self._archive_noted = True
+                        self.log(f"   Rejected masks are being kept in "
+                                 f"{os.path.join(self.output_dir, 'rejected_masks')}")
+                else:
+                    self.log(f"   🗑️ Deleted rejected mask: {mask_filename}")
             except Exception as e:
                 self.log(f"   ⚠️ Could not delete {mask_filename}: {e}")
 
