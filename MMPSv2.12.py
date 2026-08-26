@@ -13167,6 +13167,22 @@ if __name__ == '__main__':
                           QMessageBox.YesRole)
         box.addButton("Cancel", QMessageBox.RejectRole)
 
+        # Review order. Confidence order puts the model's worst work first,
+        # which is efficient but jumps between images; going through the queue
+        # keeps each image together and matches every other review in MMPS.
+        from PyQt5.QtWidgets import QCheckBox
+        order_box = QCheckBox("Review least-confident first (otherwise image "
+                              "and soma order)")
+        order_box.setChecked(bool(getattr(self, '_ml_confidence_order', False)))
+        order_box.setToolTip(
+            "Off: review in the usual queue order, image by image.\n"
+            "On: the least confident outlines come first, so the cells needing "
+            "the most attention are seen while you are freshest.")
+        try:
+            box.layout().addWidget(order_box, 3, 2)
+        except Exception:
+            pass
+
         # Outline size dial. Held-out area ratio at the calibrated cut is about
         # 1.1x, so if outlines look small on your images something differs from
         # validation -- but this lets you correct it now rather than retrain.
@@ -13211,6 +13227,7 @@ if __name__ == '__main__':
         label = clicked.text() if clicked else "Cancel"
         if label == "Cancel":
             return
+        self._ml_confidence_order = bool(order_box.isChecked())
         ml.size_bias = float(size_spin.value())
         if ml.size_bias:
             self.log(f"Outline size bias {ml.size_bias:+.2f} "
@@ -13304,8 +13321,10 @@ if __name__ == '__main__':
         msg = [f"Outlined {done} soma(s)."]
         if ml_threshold is not None:
             msg.append(f"{auto_ok} were confident enough to accept unreviewed.")
-        msg.append(f"{len(needs_review)} queued for review, least confident "
-                   f"first.")
+        msg.append(f"{len(needs_review)} queued for review, "
+                   + ("least confident first."
+                      if getattr(self, '_ml_confidence_order', False)
+                      else "in image and soma order."))
         if self.failed_auto_outlines:
             msg.append(f"{len(self.failed_auto_outlines)} could not be outlined "
                        f"and need manual work.")
@@ -13313,9 +13332,13 @@ if __name__ == '__main__':
                                 "\n".join(msg))
 
         if needs_review:
-            # Review least-confident first: that ordering is the point of having
-            # a confidence at all.
-            self._ml_review_order = [qi for qi, _ in needs_review]
+            if getattr(self, '_ml_confidence_order', False):
+                self._ml_review_order = [qi for qi, _ in needs_review]
+            else:
+                # Queue order: image by image, soma by soma, the way every
+                # other review in MMPS runs. The confidence still shows on
+                # each soma, it just does not decide the order.
+                self._ml_review_order = None
             self._start_review_mode()
             return
         self._ml_review_order = None
