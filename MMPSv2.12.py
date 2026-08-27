@@ -17798,18 +17798,22 @@ if __name__ == '__main__':
         if available_height < 200:
             available_height = 500
 
-        # Always 2 rows for up to 16 masks
-        n_cols = max(1, (n_masks + 1) // 2)
-        if n_masks <= 2:
-            n_cols = n_masks
-
-        # Size to fill width
-        thumb_w = max(80, (available_width - spacing * (n_cols + 1)) // max(n_cols, 1))
-        # Size to fill height (2 rows + labels)
+        # Choose the row/column split that makes the thumbnails LARGEST for the
+        # space available. Fixing the grid at two rows forced eight columns for
+        # sixteen masks, so tile size was capped by width while most of the
+        # height went unused -- the masks came out small with a dead band below
+        # them. Every split is cheap to evaluate, so just try them all.
+        label_h = 20
+        n_cols, n_rows, thumb_size = 1, n_masks, 80
+        for cols in range(1, n_masks + 1):
+            rows = (n_masks + cols - 1) // cols
+            w = (available_width - spacing * (cols + 1)) // cols
+            h = (available_height - spacing * (rows + 1) - label_h * rows) // rows
+            size = min(w, h)
+            if size > thumb_size:
+                n_cols, n_rows, thumb_size = cols, rows, size
+        thumb_size = int(max(80, min(thumb_size, 500)))
         n_rows = max(1, (n_masks + n_cols - 1) // n_cols)
-        thumb_h = max(80, (available_height - spacing * (n_rows + 1) - 20 * n_rows) // max(n_rows, 1))
-        # Use the smaller of width/height to keep square
-        thumb_size = min(thumb_w, thumb_h, 500)
 
         # Wrapping grid layout for 16+ masks
         from PyQt5.QtWidgets import QGridLayout
