@@ -324,7 +324,36 @@ def build(records, sig_ch, dapi_ch, pixel_size, verbose_every=200):
 # ----------------------------------------------------------------------
 # the metric that matters
 # ----------------------------------------------------------------------
-def size_choice_report(keys, y_true, p, cut):
+def pick(areas, probs, cut, rule):
+    """Choose the mask to accept from one soma's ladder of sizes.
+
+    Acceptability is a BAND, not a prefix: the smallest masks are too small,
+    the largest too big, and the acceptable ones sit between. So taking the
+    largest mask over the cut hands the answer to any single false positive at
+    the top of the ladder -- and choosing too large is the expensive error,
+    because an oversized mask pulls in neighbouring processes and inflates
+    every morphology metric computed from it.
+
+    'largest'  the largest mask over the cut.
+    'band'     the largest mask in the run of accepts containing the most
+               confident mask, so an isolated accept above a rejection cannot
+               drag the choice upward.
+    """
+    ok = [pr >= cut for pr in probs]
+    if not any(ok):
+        return None
+    if rule == 'largest':
+        return max(a for a, o in zip(areas, ok) if o)
+    best_i = max(range(len(probs)), key=lambda i: probs[i])
+    if not ok[best_i]:
+        return None
+    hi = best_i
+    while hi + 1 < len(ok) and ok[hi + 1]:
+        hi += 1
+    return areas[hi]
+
+
+def size_choice_report(keys, y_true, p, cut, rule='largest', quiet=False):
     """Does the model pick the same mask you did?
 
     Per-mask accuracy is not the task. The task is choosing, per soma, the
@@ -340,9 +369,8 @@ def size_choice_report(keys, y_true, p, cut):
         rows.sort(key=lambda z: z[0])
         areas = [z[0] for z in rows]
         truth = [z[0] for z in rows if z[1] == 1]
-        pred = [z[0] for z in rows if z[2] >= cut]
         t_best = max(truth) if truth else None
-        p_best = max(pred) if pred else None
+        p_best = pick(areas, [z[2] for z in rows], cut, rule)
         total += 1
         if t_best is None:
             none_tot += 1
@@ -363,16 +391,23 @@ def size_choice_report(keys, y_true, p, cut):
                 over += 1
             else:
                 under += 1
-    print(f"  somas scored: {total}   (of which {none_tot} had no acceptable "
-          f"mask at all)")
-    print(f"  picked exactly your mask:      {100 * exact / max(total, 1):5.1f}%")
-    print(f"  within one size step:          {100 * within / max(total, 1):5.1f}%")
-    print(f"  chose too large:               {100 * over / max(total, 1):5.1f}%")
-    print(f"  chose too small / nothing:     {100 * under / max(total, 1):5.1f}%")
-    if none_tot:
-        print(f"  correctly said 'none':         "
-              f"{100 * none_ok / none_tot:5.1f}% of the {none_tot}")
-    return exact / max(total, 1)
+    if not quiet:
+        print(f"  somas scored: {total}   (of which {none_tot} had no "
+              f"acceptable mask at all)")
+        print(f"  picked exactly your mask:      "
+              f"{100 * exact / max(total, 1):5.1f}%")
+        print(f"  within one size step:          "
+              f"{100 * within / max(total, 1):5.1f}%")
+        print(f"  chose too large:               "
+              f"{100 * over / max(total, 1):5.1f}%")
+        print(f"  chose too small / nothing:     "
+              f"{100 * under / max(total, 1):5.1f}%")
+        if none_tot:
+            print(f"  correctly said 'none':         "
+                  f"{100 * none_ok / none_tot:5.1f}% of the {none_tot}")
+    return dict(total=total, exact=exact / max(total, 1),
+                within=within / max(total, 1), over=over / max(total, 1),
+                under=under / max(total, 1))
 
 
 def main():
@@ -388,6 +423,16 @@ def main():
                     help='nuclear stain (blue); 0 to disable')
     ap.add_argument('--trees', type=int, default=400)
     ap.add_argument('--min-leaf', type=int, default=4)
+    ap.add_argument('--oversize-cost', type=float, default=3.0,
+                    help='how much worse choosing TOO LARGE is than choosing '
+                         'too small, when picking the threshold. An oversized '
+                         'mask pulls in neighbouring processes and inflates '
+                         'every downstream metric, where an undersized one is '
+                         'visible. 1.0 treats them equally.')
+    ap.add_argument('--reject-weight', type=float, default=2.0,
+                    help='how much more a wrongly ACCEPTED mask costs the '
+                         'forest during training than a wrongly rejected one. '
+                         '1.0 is a symmetric loss.')
     ap.add_argument('--keep-duplicates', action='store_true',
                     help='include auto-rejected duplicates (normally excluded: '
                          'they are a rule, not a judgement)')
@@ -429,10 +474,19 @@ def main():
     print(f"test : {len(te)} masks from {len(set(groups[te]))} images "
           f"(held out entirely)\n")
 
+    # Weight the classes so a wrongly accepted mask hurts more than a wrongly
+    # rejected one. 'balanced' alone only corrects for class sizes and treats
+    # the two mistakes as equally bad, which they are not here.
+    n_pos_tr = int((y[tr] == 1).sum())
+    n_neg_tr = int((y[tr] == 0).sum())
+    w = {1: len(tr) / (2.0 * max(n_pos_tr, 1)),
+         0: len(tr) / (2.0 * max(n_neg_tr, 1)) * a.reject_weight}
+    print(f"class weights: keep {w[1]:.2f}, reject {w[0]:.2f} "
+          f"(reject-weight {a.reject_weight})")
     clf = RandomForestClassifier(n_estimators=a.trees,
                                  min_samples_leaf=a.min_leaf,
                                  n_jobs=-1, random_state=0,
-                                 class_weight='balanced')
+                                 class_weight=w)
     clf.fit(X[tr], y[tr])
     p = clf.predict_proba(X[te])[:, 1]
 
@@ -452,15 +506,28 @@ def main():
         print(f"  cut {cut}: precision {prec:.3f} recall {rec:.3f}")
 
     print("\nSize choice — the actual task")
-    best = (None, -1)
     te_keys = [keys[i] for i in te]
-    for cut in (0.3, 0.4, 0.5, 0.6, 0.7):
-        print(f"\n cut {cut}")
-        acc = size_choice_report(te_keys, y[te], p, cut)
-        if acc > best[1]:
-            best = (cut, acc)
-    print(f"\nBest cut {best[0]} — picks your exact mask "
-          f"{100 * best[1]:.1f}% of the time")
+    cuts = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+    print(f"\n  {'rule':>8} {'cut':>5} {'exact':>7} {'within1':>8} "
+          f"{'too big':>8} {'too small':>10} {'cost':>7}")
+    best = None
+    for rule in ('largest', 'band'):
+        for cut in cuts:
+            r = size_choice_report(te_keys, y[te], p, cut, rule, quiet=True)
+            # what we actually minimise: a miss costs 1, an oversize costs more
+            cost = r['under'] + a.oversize_cost * r['over']
+            mark = ''
+            if best is None or cost < best['cost']:
+                best = dict(rule=rule, cut=cut, cost=cost, **r)
+                mark = '  <-'
+            print(f"  {rule:>8} {cut:>5} {100 * r['exact']:6.1f}% "
+                  f"{100 * r['within']:7.1f}% {100 * r['over']:7.1f}% "
+                  f"{100 * r['under']:9.1f}% {cost:7.3f}{mark}")
+
+    print(f"\nChosen: {best['rule']} rule at cut {best['cut']}")
+    size_choice_report(te_keys, y[te], p, best['cut'], best['rule'])
+    print(f"\n  (chosen by lowest cost, where choosing too large counts "
+          f"{a.oversize_cost}x a miss)")
 
     imp = sorted(zip(FEATURE_NAMES, clf.feature_importances_),
                  key=lambda z: -z[1])[:10]
@@ -471,7 +538,8 @@ def main():
     joblib.dump({'model': clf, 'meta': dict(
         features=FEATURE_NAMES, pixel_size_um=a.pixel_size,
         signal_channel=a.signal_channel, dapi_channel=a.dapi_channel,
-        prob_cut=best[0])}, a.out, compress=3)
+        prob_cut=best['cut'], select_rule=best['rule'],
+        oversize_cost=a.oversize_cost)}, a.out, compress=3)
     print(f"\nSaved -> {a.out} ({os.path.getsize(a.out) / 1e6:.1f} MB)")
     print("\nHow to read this:")
     print("  'picked exactly your mask' is the number that matters. Every")
