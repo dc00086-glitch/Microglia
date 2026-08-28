@@ -735,6 +735,11 @@ def main():
     ap.add_argument('--size-tolerance', type=float, default=0.01,
                     help='held-out IoU worth trading for a smaller model; the '
                          'smallest forest within this of the best is kept')
+    ap.add_argument('--channel-names', nargs='*', default=None,
+                    help='what each channel IS, main first then the extras, '
+                         'e.g. "--channel-names iba1 trem2 dapi". Recorded in '
+                         'the model so a dataset with the stains on different '
+                         'channels can be mapped onto it instead of guessed at.')
     ap.add_argument('--extra-channels', type=int, nargs='*', default=None,
                     help='1-based channels to add as EXTRA features, e.g. '
                          '"--extra-channels 3" for DAPI, or "2 3" for the rest '
@@ -1024,6 +1029,8 @@ def main():
 
     meta = dict(channel=a.channel, pixel_size_um=a.pixel_size,
                 image_subdir=a.image_subdir,
+                channel_names=(list(a.channel_names)
+                               if a.channel_names else None),
                 extra_channels=(list(a.extra_channels)
                                 if a.extra_channels else None),
                 trained_on=('processed'

@@ -1888,6 +1888,9 @@ class _MLSomaOutliner:
         # Additional stains the forest was fitted with (1-based). It cannot run
         # without them: the feature vector would be the wrong width.
         self.extra_channels = list(m.get('extra_channels') or [])
+        # What each channel is, main first then the extras. Recorded by newer
+        # models; older ones only know the numbers.
+        self.channel_names = list(m.get('channel_names') or [])
         self.conf_cal = m.get('conf_cal') or {}
         self.path = path
         self.last_confidence = None
@@ -1895,6 +1898,17 @@ class _MLSomaOutliner:
         # keeps more marginal pixels and grows the outline, a higher one
         # tightens it. Held separately so the calibrated value stays visible.
         self.size_bias = 0.0
+
+    def channel_roles(self):
+        """[(label, channel the model was trained on)], main first."""
+        names = list(self.channel_names)
+        roles = []
+        main_name = names[0] if names else 'microglia stain'
+        roles.append((main_name, self.channel))
+        for i, ch in enumerate(self.extra_channels):
+            nm = names[i + 1] if len(names) > i + 1 else f'extra stain {i + 1}'
+            roles.append((nm, ch))
+        return roles
 
     def accept_threshold(self, which='top50'):
         """Confidence at or above which a cell may be accepted unreviewed.
@@ -4338,6 +4352,12 @@ class MicrogliaAnalysisGUI(QMainWindow):
             "few KB each.")
         keep_rejected_action.toggled.connect(
             lambda v: setattr(self, 'archive_rejected_masks', bool(v)))
+        map_ch_action = advanced_menu.addAction("Map Model Channels...")
+        map_ch_action.setToolTip(
+            "Say which channel holds each stain the ML model expects.\n"
+            "Needed when a dataset puts IBA1 or DAPI on different channels "
+            "than the images the model was trained on.")
+        map_ch_action.triggered.connect(self._ml_channel_map_dialog)
         clear_outlines_action = advanced_menu.addAction("Clear Soma Outlines...")
         clear_outlines_action.setToolTip(
             "Delete the outlines for a range of somas so they can be redone")
@@ -13251,6 +13271,15 @@ if __name__ == '__main__':
         self.log("=" * 50)
         self.log("🤖 MACHINE-LEARNING OUTLINING")
         self.log(f"Model: {ml.describe()}")
+        _map = getattr(self, 'ml_channel_map', None)
+        if _map:
+            self.log("Channels mapped: "
+                     + ", ".join(f"{n} -> {c}"
+                                 for (n, _), c in zip(ml.channel_roles(), _map)))
+        else:
+            self.log("Channels: the model's own "
+                     + ", ".join(f"{n}=ch{c}" for n, c in ml.channel_roles())
+                     + "  (Advanced > Map Model Channels to change)")
         self.log(f"Policy: " + ("auto-accept confident, review the rest"
                                 if ml_threshold is not None else "review all"))
         self.log("=" * 50)
@@ -14276,6 +14305,86 @@ if __name__ == '__main__':
             image, centroid, sensitivity, max_soma_radius_px=rad_px,
             process_width_px=proc_px)
 
+    def _ml_channel_for(self, ml, role_index, default_ch):
+        """Which channel of THIS dataset supplies one of the model's stains.
+
+        The model records absolute channel numbers from the images it was
+        fitted on. Point it at a set where the stains sit on different channels
+        and it reads the wrong ones without complaint, so the mapping has to be
+        stated rather than assumed.
+        """
+        mapping = getattr(self, 'ml_channel_map', None)
+        if mapping and role_index < len(mapping) and mapping[role_index]:
+            return int(mapping[role_index])
+        return default_ch
+
+    def _ml_channel_map_dialog(self):
+        """Map the model's stains onto the channels of the current images."""
+        ml = get_ml_outliner()
+        for _m in drain_ml_messages():
+            self.log(_m)
+        if ml is None:
+            QMessageBox.warning(self, "Map Model Channels",
+                                "No trained model is loaded.")
+            return
+        roles = ml.channel_roles()
+
+        n_ch = 3
+        for idata in self.images.values():
+            c = idata.get('color_image')
+            if c is not None and np.asarray(c).ndim == 3:
+                n_ch = int(np.asarray(c).shape[2])
+                break
+
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QFormLayout
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Map Model Channels")
+        lay = QVBoxLayout()
+        lay.addWidget(QLabel(
+            "<b>This model was trained with the stains on particular "
+            "channels.</b><br>If your images put them elsewhere, say which "
+            "channel holds each one.<br>Getting this wrong makes the model "
+            "read the wrong stain and it will not complain."))
+        form = QFormLayout()
+        combos = []
+        current = getattr(self, 'ml_channel_map', None) or []
+        for i, (name, trained_ch) in enumerate(roles):
+            cb = QComboBox()
+            for c in range(1, n_ch + 1):
+                nm = self.channel_names.get(c - 1, '')
+                cb.addItem(f"Channel {c}" + (f" ({nm})" if nm else ""), c)
+            want = (current[i] if i < len(current) and current[i]
+                    else (trained_ch or 1))
+            cb.setCurrentIndex(min(max(int(want) - 1, 0), n_ch - 1))
+            form.addRow(f"{name}  (trained on channel {trained_ch}):", cb)
+            combos.append(cb)
+        lay.addLayout(form)
+
+        row = QHBoxLayout()
+        ok = QPushButton("Use this mapping")
+        ok.clicked.connect(lambda: dlg.done(1))
+        row.addWidget(ok)
+        rst = QPushButton("Reset to the model's own channels")
+        rst.clicked.connect(lambda: dlg.done(2))
+        row.addWidget(rst)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(lambda: dlg.done(0))
+        row.addWidget(cancel)
+        lay.addLayout(row)
+        dlg.setLayout(lay)
+        dlg.setMinimumWidth(460)
+        res = dlg.exec_()
+        if res == 0:
+            return
+        if res == 2:
+            self.ml_channel_map = None
+            self.log("ML channel mapping reset to the model's own channels")
+            return
+        self.ml_channel_map = [cb.currentData() for cb in combos]
+        self.log("ML channel mapping: "
+                 + ", ".join(f"{n} -> channel {c}"
+                             for (n, _), c in zip(roles, self.ml_channel_map)))
+
     def _get_ml_extra_channels(self, img_data, ml):
         """The additional stains the model needs, as full-frame arrays.
 
@@ -14302,8 +14411,8 @@ if __name__ == '__main__':
         if src.shape[ax] <= 8:
             src = np.moveaxis(src, ax, -1)
         out = []
-        for ch in want:
-            i = int(ch) - 1
+        for k, ch in enumerate(want):
+            i = int(self._ml_channel_for(ml, k + 1, ch)) - 1
             if not (0 <= i < src.shape[2]):
                 return None
             out.append(src[:, :, i].astype(np.float64))
@@ -14320,7 +14429,7 @@ if __name__ == '__main__':
         while still following the right boundary. Prefer the raw channel, and
         say so when falling back.
         """
-        want_ch = getattr(ml, 'channel', None)
+        want_ch = self._ml_channel_for(ml, 0, getattr(ml, 'channel', None))
         idx = (int(want_ch) - 1) if want_ch else None
 
         # A model fitted on MMPS-processed images wants the processed image --
