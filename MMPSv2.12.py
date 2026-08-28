@@ -11280,7 +11280,12 @@ if __name__ == '__main__':
                 row.addWidget(cb)
                 # optional channel name (also merged in from that dialog)
                 name_edit = QLineEdit(self.channel_names.get(idx, ''))
-                name_edit.setPlaceholderText(f"name (e.g. CD31)")
+                name_edit.setPlaceholderText("name (e.g. IBA1, DAPI)")
+                name_edit.setToolTip(
+                    "Naming a channel also tells the ML model where to find "
+                    "that stain.\nType IBA1 against the blue channel and the "
+                    "model reads blue for microglia.\nCase and punctuation are "
+                    "ignored: IBA1, Iba-1 and iba 1 all match.")
                 name_edit.setFixedWidth(110)
                 name_edit.textChanged.connect(make_rename(idx))
                 row.addWidget(name_edit)
@@ -13271,15 +13276,21 @@ if __name__ == '__main__':
         self.log("=" * 50)
         self.log("🤖 MACHINE-LEARNING OUTLINING")
         self.log(f"Model: {ml.describe()}")
-        _map = getattr(self, 'ml_channel_map', None)
-        if _map:
-            self.log("Channels mapped: "
-                     + ", ".join(f"{n} -> {c}"
-                                 for (n, _), c in zip(ml.channel_roles(), _map)))
-        else:
-            self.log("Channels: the model's own "
-                     + ", ".join(f"{n}=ch{c}" for n, c in ml.channel_roles())
-                     + "  (Advanced > Map Model Channels to change)")
+        # State the channel each stain is actually read from, and why. Reading
+        # the wrong stain produces worse outlines and no error, so this should
+        # never be something to work out afterwards.
+        _bits = []
+        for _i, (_n, _trained) in enumerate(ml.channel_roles()):
+            _used = self._ml_channel_for(ml, _i, _trained)
+            if getattr(self, 'ml_channel_map', None):
+                _why = 'mapped'
+            elif self._channel_by_stain_name(
+                    _n if self._stain_group(_n) or _i else 'iba1'):
+                _why = 'by name'
+            else:
+                _why = "model's own"
+            _bits.append(f"{_n}=ch{_used} ({_why})")
+        self.log("Channels: " + ", ".join(_bits))
         self.log(f"Policy: " + ("auto-accept confident, review the rest"
                                 if ml_threshold is not None else "review all"))
         self.log("=" * 50)
@@ -14305,17 +14316,78 @@ if __name__ == '__main__':
             image, centroid, sensitivity, max_soma_radius_px=rad_px,
             process_width_px=proc_px)
 
+    @staticmethod
+    def _stain_key(name):
+        """Normalise a stain name: case, spaces and punctuation all ignored.
+
+        'IBA1', 'Iba-1', 'iba 1' and 'IBA_1' are the same stain written four
+        ways, and a channel typed one way should not fail to match a model that
+        recorded it another.
+        """
+        return re.sub(r'[^a-z0-9]+', '', (name or '').lower())
+
+    # Names for the same stain, so a channel labelled any of them resolves.
+    _STAIN_ALIASES = {
+        'microglia': {'iba1', 'iba', 'microglia', 'tmem119', 'cx3cr1',
+                      'p2ry12', 'aif1'},
+        'nuclear': {'dapi', 'hoechst', 'nucleus', 'nuclei', 'nuclear',
+                    'draq5', 'topro3'},
+    }
+
+    @classmethod
+    def _stain_group(cls, name):
+        k = cls._stain_key(name)
+        for group, names in cls._STAIN_ALIASES.items():
+            if k in names:
+                return group
+        return None
+
+    def _channel_by_stain_name(self, wanted):
+        """1-based channel whose typed name means the same stain, or None."""
+        want_key = self._stain_key(wanted)
+        if not want_key:
+            return None
+        want_group = self._stain_group(wanted)
+        for idx, typed in sorted((getattr(self, 'channel_names', None)
+                                  or {}).items()):
+            k = self._stain_key(typed)
+            if not k:
+                continue
+            if k == want_key:
+                return idx + 1
+            if want_group and self._stain_group(typed) == want_group:
+                return idx + 1
+        return None
+
     def _ml_channel_for(self, ml, role_index, default_ch):
         """Which channel of THIS dataset supplies one of the model's stains.
 
         The model records absolute channel numbers from the images it was
-        fitted on. Point it at a set where the stains sit on different channels
-        and it reads the wrong ones without complaint, so the mapping has to be
-        stated rather than assumed.
+        fitted on. Point it at a set where the stains sit elsewhere and it reads
+        the wrong ones without complaint, so the channel is resolved in order:
+
+          1. an explicit mapping set in Advanced > Map Model Channels
+          2. a channel NAMED for that stain in Channel & Display Adjustments --
+             type IBA1 against the blue channel and the model reads blue
+          3. the channel the model was trained on
+
+        Naming beats the model's own numbers because a name is a statement
+        about the data in front of you; the number is only what was true of the
+        images it was fitted on.
         """
         mapping = getattr(self, 'ml_channel_map', None)
         if mapping and role_index < len(mapping) and mapping[role_index]:
             return int(mapping[role_index])
+
+        roles = ml.channel_roles() if hasattr(ml, 'channel_roles') else []
+        wanted = roles[role_index][0] if role_index < len(roles) else ''
+        # A model that never recorded names still has a main channel, and that
+        # is always the microglia stain.
+        if role_index == 0 and not self._stain_group(wanted):
+            wanted = 'iba1'
+        by_name = self._channel_by_stain_name(wanted)
+        if by_name:
+            return by_name
         return default_ch
 
     def _ml_channel_map_dialog(self):
