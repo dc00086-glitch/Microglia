@@ -17877,9 +17877,14 @@ if __name__ == '__main__':
         # Get non-duplicate masks sorted largest first
         size_key = 'target_area_um2'
         mask_items = []
+        n_identical = 0
         for fi in flat_indices:
             md = self.all_masks_flat[fi]['mask_data']
             if md.get('duplicate'):
+                # Pixel-identical to a smaller target: growth stopped before
+                # reaching this size, so the two masks are the same object.
+                # Showing both would be eight copies of one thumbnail.
+                n_identical += 1
                 continue
             mask_items.append((fi, md))
         mask_items.sort(key=lambda x: -x[1].get(size_key, 0))
@@ -17895,6 +17900,12 @@ if __name__ == '__main__':
         header_text = (f"<b>Soma {self._qa_grid_soma_idx + 1} / {total_somas}</b> | "
                       f"{os.path.splitext(img_name)[0]} | {soma_id} | "
                       f"{len(mask_items)} masks")
+        if n_identical:
+            # Say so rather than leaving a short grid looking like something
+            # failed: the sizes are absent because growth could not reach them.
+            header_text += (f" | <span style='color: #888;'>{n_identical} "
+                            f"larger size(s) identical to these — growth "
+                            f"stopped early</span>")
         if skipped_count > 0:
             header_text += f" | <span style='color: orange;'>{skipped_count} skipped</span>"
         header = QLabel(header_text)
