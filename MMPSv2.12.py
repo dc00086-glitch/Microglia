@@ -17809,16 +17809,38 @@ if __name__ == '__main__':
             self.qa_grid_scroll.setVisible(False)
             self.mask_label.setVisible(True)
 
-            # Find first unreviewed mask to show
-            found = False
-            for idx in range(len(self.all_masks_flat)):
-                md = self.all_masks_flat[idx]['mask_data']
-                if md.get('approved') is None and not md.get('duplicate'):
-                    self.mask_qa_idx = idx
-                    found = True
-                    break
-            if not found:
-                self.mask_qa_idx = max(0, len(self.all_masks_flat) - 1)
+            # Show a mask from the soma the grid was on. Scanning the whole
+            # list from zero jumps to the earliest unreviewed mask anywhere --
+            # any soma skipped earlier -- so switching views threw away your
+            # position and appeared to go backwards.
+            def _first_unreviewed(indices):
+                for fi in indices:
+                    md = self.all_masks_flat[fi]['mask_data']
+                    if md.get('approved') is None and not md.get('duplicate'):
+                        return fi
+                return None
+
+            idx = None
+            order = getattr(self, '_qa_soma_order', []) or []
+            start = min(max(getattr(self, '_qa_grid_soma_idx', 0), 0),
+                        max(len(order) - 1, 0))
+            if order:
+                # this soma first, then onwards, then wrap to the beginning
+                for k in list(range(start, len(order))) + list(range(0, start)):
+                    idx = _first_unreviewed(
+                        self._qa_soma_mask_index.get(order[k], []))
+                    if idx is not None:
+                        break
+            if idx is None:
+                idx = _first_unreviewed(range(len(self.all_masks_flat)))
+            if idx is None:
+                # nothing left unreviewed: stay on this soma rather than
+                # snapping to the end of the run
+                same = self._qa_soma_mask_index.get(order[start], []) if order \
+                    else []
+                idx = (same[0] if same
+                       else max(0, len(self.all_masks_flat) - 1))
+            self.mask_qa_idx = idx
 
             # Update progress bar to mask count
             auto_rejected = self._qa_auto_rejected_count
