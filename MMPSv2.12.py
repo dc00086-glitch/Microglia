@@ -16489,8 +16489,11 @@ if __name__ == '__main__':
                 self.min_intensity_percent, self.local_intensity_window,
                 global_max=float(processed_img.max()))
 
-        # Build territory constraint ROI if watershed territory_map is provided
+        # Build territory constraint ROI if watershed territory_map is provided.
+        # my_label must exist even without one: it is passed to the grower
+        # unconditionally, and the grower ignores it when there is no territory.
         territory_roi = None
+        my_label = 0
         if territory_map is not None:
             territory_roi = territory_map[y_min:y_max, x_min:x_max]
             my_label = territory_roi[cy_roi, cx_roi]
