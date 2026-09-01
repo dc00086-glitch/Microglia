@@ -346,6 +346,7 @@ def load_channels(path, sig_ch, dapi_ch):
 
 def build(records, sig_ch, dapi_ch, pixel_size, verbose_every=200):
     X, y, groups, keys = [], [], [], []
+    skipped, skip_reasons = 0, []
     cache_img, cache_path = None, None
     cache_grad = cache_bg = cache_dthr = None
     cache_soma, cache_soma_path = None, None
@@ -374,9 +375,25 @@ def build(records, sig_ch, dapi_ch, pixel_size, verbose_every=200):
             groups.append(rec['base'])
             keys.append((rec['base'], rec['row'], rec['col'], rec['area']))
         except Exception as e:
-            print(f"    skipped {os.path.basename(rec['mask_path'])}: {e}")
+            # A file being written by MMPS at the same moment reads back short
+            # or empty. One mask is not worth stopping for, but a lot of them
+            # means the run is measuring a fraction of the data.
+            skipped += 1
+            if len(skip_reasons) < 5:
+                skip_reasons.append(
+                    f"{os.path.basename(rec['mask_path'])}: {e}")
         if verbose_every and (i + 1) % verbose_every == 0:
-            print(f"    {i + 1}/{len(records)} masks processed")
+            print(f"    {i + 1}/{len(records)} masks processed"
+                  + (f"  ({skipped} unreadable)" if skipped else ""))
+    if skipped:
+        print(f"\n  {skipped} of {len(records)} masks could not be read "
+              f"({100 * skipped / max(len(records), 1):.1f}%)")
+        for r in skip_reasons:
+            print(f"    {r}")
+        if skipped > 0.05 * len(records):
+            print("  That is a lot. If MMPS was running at the same time it "
+                  "may have been\n  writing these files — close it and rerun "
+                  "rather than trusting this.")
     if not X:
         return None, None, None, None
     return (np.vstack(X), np.asarray(y), np.asarray(groups), keys)
@@ -522,6 +539,9 @@ def main():
     print(f"  ignored: {', '.join('channel %d' % c for c in ignored)} "
           f"— never loaded, so no feature can depend on them\n")
 
+    print("Reading the mask folders. If MMPS is open on this study, close it "
+          "first —\nit rewrites these files as it works and a half-written "
+          "one cannot be read.\n")
     print("Gathering masks…")
     recs = gather(a.root, a.timepoints, a.image_subdir,
                   drop_duplicates=not a.keep_duplicates)
