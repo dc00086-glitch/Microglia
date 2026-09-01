@@ -327,9 +327,20 @@ def load_channels(path, sig_ch, dapi_ch):
         a = np.moveaxis(a, ax, -1)
     else:
         return a.max(axis=0).astype(np.float64), None
-    sig = a[:, :, min(sig_ch - 1, a.shape[2] - 1)].astype(np.float64)
-    dapi = (a[:, :, dapi_ch - 1].astype(np.float64)
-            if dapi_ch and dapi_ch <= a.shape[2] else None)
+    n = a.shape[2]
+    # Clamping an out-of-range channel to the last one reads the wrong stain
+    # and reports nothing, which is the failure that leaves no trace.
+    if not 1 <= sig_ch <= n:
+        raise ValueError(f"--signal-channel {sig_ch} but this image has "
+                         f"{n} channels")
+    sig = a[:, :, sig_ch - 1].astype(np.float64)
+    dapi = None
+    if dapi_ch:
+        if not 1 <= dapi_ch <= n:
+            raise ValueError(f"--dapi-channel {dapi_ch} but this image has "
+                             f"{n} channels")
+        dapi = a[:, :, dapi_ch - 1].astype(np.float64)
+    # Every other channel is left unread: nothing downstream can see it.
     return sig, dapi
 
 
@@ -498,8 +509,18 @@ def main():
               hashlib.md5(open(__file__, 'rb').read()).hexdigest()[:8])
     except Exception:
         pass
-    print(f"signal channel {a.signal_channel}, DAPI channel "
-          f"{a.dapi_channel or 'none'}\n")
+    if a.dapi_channel and a.dapi_channel == a.signal_channel:
+        sys.exit(f"--signal-channel and --dapi-channel are both "
+                 f"{a.signal_channel}; they must be different stains.")
+    used = {a.signal_channel: 'microglia (IBA1)'}
+    if a.dapi_channel:
+        used[a.dapi_channel] = 'nuclear (DAPI)'
+    print("Channels read:")
+    for c in sorted(used):
+        print(f"  channel {c}: {used[c]}")
+    ignored = [c for c in (1, 2, 3, 4) if c not in used]
+    print(f"  ignored: {', '.join('channel %d' % c for c in ignored)} "
+          f"— never loaded, so no feature can depend on them\n")
 
     print("Gathering masks…")
     recs = gather(a.root, a.timepoints, a.image_subdir,
