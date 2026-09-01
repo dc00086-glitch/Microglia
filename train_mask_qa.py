@@ -158,6 +158,10 @@ def gather(root, timepoints, image_subdir, drop_duplicates=True):
         print(f"  [{tp}] {kept} kept, {rejected} rejected")
     if n_dup:
         print(f"  ({n_dup} auto-rejected duplicates excluded)")
+    # group by image so the per-image caches actually hit; without this each
+    # mask reloads the image and recomputes its gradient
+    records.sort(key=lambda r: (r['image_path'], r['base'], r['row'],
+                                r['col'], r['area']))
     return records
 
 
@@ -177,14 +181,37 @@ FEATURE_NAMES = [
 ]
 
 
-def mask_features(mask, soma_mask, sig, dapi, target_area, pixel_size):
-    """One mask -> one feature vector. Order must match FEATURE_NAMES."""
+def mask_features(mask, soma_mask, sig, dapi, target_area, pixel_size,
+                  grad=None, bg=None, dapi_thr=None):
+    """One mask -> one feature vector. Order must match FEATURE_NAMES.
+
+    Everything is computed on a crop around the mask rather than the full
+    frame. A mask occupies a few hundred pixels of a 1440x1920 image, so the
+    distance transform, labelling and dilation were doing seventy times more
+    work than they needed to, once per mask, over tens of thousands of masks.
+    The crop keeps a margin wider than any neighbourhood used below, so every
+    value is identical to the full-frame computation.
+    """
     f = []
-    m = mask > 0
-    area = int(m.sum())
+    m_full = mask > 0
+    area = int(m_full.sum())
     if area < 5:
         return None
     px2 = pixel_size ** 2
+
+    ys_f, xs_f = np.nonzero(m_full)
+    H, W = m_full.shape
+    MARGIN = 12                      # > the 6-px ring and the 3x3 skeleton pass
+    cy0 = max(0, int(ys_f.min()) - MARGIN)
+    cy1 = min(H, int(ys_f.max()) + 1 + MARGIN)
+    cx0 = max(0, int(xs_f.min()) - MARGIN)
+    cx1 = min(W, int(xs_f.max()) + 1 + MARGIN)
+    m = m_full[cy0:cy1, cx0:cx1]
+    sig_c = sig[cy0:cy1, cx0:cx1]
+    dapi_c = dapi[cy0:cy1, cx0:cx1] if dapi is not None else None
+    soma_c = (soma_mask[cy0:cy1, cx0:cx1]
+              if soma_mask is not None else None)
+    grad_c = grad[cy0:cy1, cx0:cx1] if grad is not None else None
 
     ys, xs = np.nonzero(m)
     y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
@@ -229,38 +256,43 @@ def mask_features(mask, soma_mask, sig, dapi, target_area, pixel_size):
           float(sk.sum()) / max(area, 1)]
 
     # how much of the mask is soma, and whether it grew away from it
-    if soma_mask is not None and soma_mask.any():
-        s = soma_mask > 0
+    if soma_c is not None and soma_c.any():
+        s = soma_c > 0
         f.append(float(s.sum()) / max(area, 1))
         sy, sx = np.nonzero(s)
         f.append(float(np.hypot(ys.mean() - sy.mean(), xs.mean() - sx.mean())))
     else:
         f += [0.0, 0.0]
-    f.append(1.0 if (y0 == 0 or x0 == 0 or y1 >= m.shape[0]
-                     or x1 >= m.shape[1]) else 0.0)
+    f.append(1.0 if (int(ys_f.min()) == 0 or int(xs_f.min()) == 0
+                     or int(ys_f.max()) >= H - 1
+                     or int(xs_f.max()) >= W - 1) else 0.0)
 
     # IBA1 signal: is the mask sitting on the cell, and does it stop at an edge?
     ring = ndimage.binary_dilation(m, iterations=6) & ~m
-    sin_ = sig[m]
-    sring = sig[ring] if ring.any() else np.array([0.0])
-    bg = float(np.median(sig))
+    sin_ = sig_c[m]
+    sring = sig_c[ring] if ring.any() else np.array([0.0])
+    if bg is None:               # image-wide, so computed once per image
+        bg = float(np.median(sig))
     f += [float(sin_.mean()), float(np.percentile(sin_, 90)),
           float(sring.mean()),
           float(sin_.mean()) / (float(sring.mean()) + 1e-6),
           float((sin_ > bg).mean())]
-    gy, gx = np.gradient(ndimage.gaussian_filter(sig, 1.5))
-    gm = np.hypot(gy, gx)
+    # the gradient depends only on the image, so it is computed once per image
+    if grad_c is None:
+        gy, gx = np.gradient(ndimage.gaussian_filter(sig_c, 1.5))
+        grad_c = np.hypot(gy, gx)
     edge = m & ~ndimage.binary_erosion(m)
-    f.append(float(gm[edge].mean()) if edge.any() else 0.0)
+    f.append(float(grad_c[edge].mean()) if edge.any() else 0.0)
 
     # DAPI: a real soma contains a nucleus
-    if dapi is not None:
-        d = dapi.astype(np.float64)
-        thr = float(np.percentile(d, 99)) * 0.35
+    if dapi_c is not None:
+        d = dapi_c.astype(np.float64)
+        thr = (dapi_thr if dapi_thr is not None
+               else float(np.percentile(dapi, 99)) * 0.35)
         pos = d >= max(thr, 1.0)
         f += [float(d[m].mean()), float(pos[m].mean())]
-        f.append(float(pos[soma_mask > 0].mean())
-                 if soma_mask is not None and soma_mask.any() else 0.0)
+        f.append(float(pos[soma_c > 0].mean())
+                 if soma_c is not None and soma_c.any() else 0.0)
         if pos.any():
             dist = ndimage.distance_transform_edt(~pos)
             f.append(float(dist[m].min()))
@@ -270,6 +302,20 @@ def mask_features(mask, soma_mask, sig, dapi, target_area, pixel_size):
         f += [0.0, 0.0, 0.0, 0.0]
 
     return np.asarray(f, dtype=np.float32)
+
+
+def image_stats(sig, dapi):
+    """Everything about an image that does not vary between its masks.
+
+    The gradient, the background level and the nuclear threshold are all
+    image-wide, and computing them per mask meant scanning two million pixels
+    tens of thousands of times.
+    """
+    gy, gx = np.gradient(ndimage.gaussian_filter(sig, 1.5))
+    grad = np.hypot(gy, gx)
+    bg = float(np.median(sig))
+    dthr = (float(np.percentile(dapi, 99)) * 0.35) if dapi is not None else None
+    return grad, bg, dthr
 
 
 def load_channels(path, sig_ch, dapi_ch):
@@ -290,11 +336,13 @@ def load_channels(path, sig_ch, dapi_ch):
 def build(records, sig_ch, dapi_ch, pixel_size, verbose_every=200):
     X, y, groups, keys = [], [], [], []
     cache_img, cache_path = None, None
+    cache_grad = cache_bg = cache_dthr = None
     cache_soma, cache_soma_path = None, None
     for i, rec in enumerate(records):
         try:
             if rec['image_path'] != cache_path:
                 cache_img = load_channels(rec['image_path'], sig_ch, dapi_ch)
+                cache_grad, cache_bg, cache_dthr = image_stats(*cache_img)
                 cache_path = rec['image_path']
             sig, dapi = cache_img
             mask = np.squeeze(np.asarray(tifffile.imread(rec['mask_path'])))
@@ -305,7 +353,9 @@ def build(records, sig_ch, dapi_ch, pixel_size, verbose_every=200):
                 cache_soma = np.squeeze(np.asarray(tifffile.imread(sp))) > 0
                 cache_soma_path = sp
             soma = cache_soma if sp else None
-            v = mask_features(mask, soma, sig, dapi, rec['area'], pixel_size)
+            v = mask_features(mask, soma, sig, dapi, rec['area'], pixel_size,
+                              grad=cache_grad, bg=cache_bg,
+                              dapi_thr=cache_dthr)
             if v is None:
                 continue
             X.append(v)
@@ -421,6 +471,8 @@ def main():
                     help='microglia stain (red)')
     ap.add_argument('--dapi-channel', type=int, default=3,
                     help='nuclear stain (blue); 0 to disable')
+    ap.add_argument('--max-masks', type=int, default=None,
+                    help='use at most N masks, sampled evenly, for a quick check')
     ap.add_argument('--trees', type=int, default=400)
     ap.add_argument('--min-leaf', type=int, default=4)
     ap.add_argument('--oversize-cost', type=float, default=3.0,
@@ -457,6 +509,11 @@ def main():
     print(f"\n{len(recs)} masks: {n_pos} kept, {n_neg} rejected")
     if n_pos < 30 or n_neg < 30:
         sys.exit("Too few of one class to learn from — do more QA first.")
+
+    if a.max_masks and len(recs) > a.max_masks:
+        step = len(recs) / float(a.max_masks)
+        recs = [recs[int(i * step)] for i in range(a.max_masks)]
+        print(f"  sampled down to {len(recs)} masks for a quick check")
 
     print("\nExtracting features…")
     X, y, groups, keys = build(recs, a.signal_channel, a.dapi_channel,
