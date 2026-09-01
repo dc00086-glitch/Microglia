@@ -441,23 +441,25 @@ def size_choice_report(keys, y_true, p, cut, rule='largest', quiet=False):
                 over += 1
             else:
                 under += 1
+    # Two different questions, so two different denominators. Mixing them --
+    # scoring the size choice across somas that have no correct size -- reads
+    # far worse than the model is behaving.
+    scoreable = total - none_tot
+    d = max(scoreable, 1)
     if not quiet:
-        print(f"  somas scored: {total}   (of which {none_tot} had no "
-              f"acceptable mask at all)")
-        print(f"  picked exactly your mask:      "
-              f"{100 * exact / max(total, 1):5.1f}%")
-        print(f"  within one size step:          "
-              f"{100 * within / max(total, 1):5.1f}%")
-        print(f"  chose too large:               "
-              f"{100 * over / max(total, 1):5.1f}%")
-        print(f"  chose too small / nothing:     "
-              f"{100 * under / max(total, 1):5.1f}%")
+        print(f"  {scoreable} somas had an acceptable mask; on those:")
+        print(f"    picked exactly your mask:    {100 * exact / d:5.1f}%")
+        print(f"    within one size step:        {100 * within / d:5.1f}%")
+        print(f"    chose too large:             {100 * over / d:5.1f}%")
+        print(f"    chose too small:             {100 * under / d:5.1f}%")
         if none_tot:
-            print(f"  correctly said 'none':         "
-                  f"{100 * none_ok / none_tot:5.1f}% of the {none_tot}")
-    return dict(total=total, exact=exact / max(total, 1),
-                within=within / max(total, 1), over=over / max(total, 1),
-                under=under / max(total, 1))
+            print(f"  {none_tot} somas had none acceptable; on those:")
+            print(f"    correctly proposed nothing:  "
+                  f"{100 * none_ok / none_tot:5.1f}%")
+    return dict(total=total, scoreable=scoreable, none_tot=none_tot,
+                exact=exact / d, within=within / d, over=over / d,
+                under=under / d,
+                none_ok=(none_ok / none_tot if none_tot else 1.0))
 
 
 def main():
@@ -511,9 +513,23 @@ def main():
         sys.exit("Too few of one class to learn from — do more QA first.")
 
     if a.max_masks and len(recs) > a.max_masks:
-        step = len(recs) / float(a.max_masks)
-        recs = [recs[int(i * step)] for i in range(a.max_masks)]
-        print(f"  sampled down to {len(recs)} masks for a quick check")
+        # Sample whole SOMAS. Taking every nth mask splits a soma's ladder of
+        # sizes, and a soma whose accepted mask falls outside the sample then
+        # looks like one where every size was rejected -- inflating "no
+        # acceptable mask" and distorting the size-choice score.
+        by_soma = {}
+        for r in recs:
+            by_soma.setdefault((r['base'], r['row'], r['col']), []).append(r)
+        keys = sorted(by_soma)
+        take, out = 0, []
+        step = max(1, int(round(len(recs) / float(a.max_masks))))
+        for k in keys[::1]:
+            out.extend(by_soma[k])
+            take += 1
+            if len(out) >= a.max_masks:
+                break
+        recs = out
+        print(f"  sampled down to {len(recs)} masks from {take} whole somas")
 
     print("\nExtracting features…")
     X, y, groups, keys = build(recs, a.signal_channel, a.dapi_channel,
@@ -565,21 +581,29 @@ def main():
     print("\nSize choice — the actual task")
     te_keys = [keys[i] for i in te]
     cuts = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+    print("  exact/within1/too big/too small are of somas that HAVE an "
+          "acceptable mask;")
+    print("  'none ok' is of somas where you rejected every size.")
     print(f"\n  {'rule':>8} {'cut':>5} {'exact':>7} {'within1':>8} "
-          f"{'too big':>8} {'too small':>10} {'cost':>7}")
+          f"{'too big':>8} {'too small':>10} {'none ok':>8} {'cost':>7}")
     best = None
     for rule in ('largest', 'band'):
         for cut in cuts:
             r = size_choice_report(te_keys, y[te], p, cut, rule, quiet=True)
             # what we actually minimise: a miss costs 1, an oversize costs more
-            cost = r['under'] + a.oversize_cost * r['over']
+            # a mask proposed where you accepted none is an oversize by
+            # another name: it puts a bad mask into the data
+            cost = (r['under'] + a.oversize_cost * r['over']
+                    + a.oversize_cost * (1.0 - r['none_ok'])
+                    * (r['none_tot'] / max(r['total'], 1)))
             mark = ''
             if best is None or cost < best['cost']:
                 best = dict(rule=rule, cut=cut, cost=cost, **r)
                 mark = '  <-'
             print(f"  {rule:>8} {cut:>5} {100 * r['exact']:6.1f}% "
                   f"{100 * r['within']:7.1f}% {100 * r['over']:7.1f}% "
-                  f"{100 * r['under']:9.1f}% {cost:7.3f}{mark}")
+                  f"{100 * r['under']:9.1f}% {100 * r['none_ok']:7.1f}% "
+                  f"{cost:7.3f}{mark}")
 
     print(f"\nChosen: {best['rule']} rule at cut {best['cut']}")
     size_choice_report(te_keys, y[te], p, best['cut'], best['rule'])
