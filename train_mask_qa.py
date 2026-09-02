@@ -178,11 +178,14 @@ FEATURE_NAMES = [
     'sig_mean_in', 'sig_p90_in', 'sig_mean_ring', 'sig_contrast',
     'sig_frac_above_bg', 'boundary_gradient',
     'dapi_mean_in', 'dapi_frac_in', 'dapi_in_soma', 'dapi_dist',
+    'nbr_dist', 'nbr_dist2', 'nbr_within_2r', 'frac_in_nbr_territory',
+    'reach_vs_gap',
 ]
 
 
 def mask_features(mask, soma_mask, sig, dapi, target_area, pixel_size,
-                  grad=None, bg=None, dapi_thr=None):
+                  grad=None, bg=None, dapi_thr=None, centre=None,
+                  neighbours=None):
     """One mask -> one feature vector. Order must match FEATURE_NAMES.
 
     Everything is computed on a crop around the mask rather than the full
@@ -301,6 +304,34 @@ def mask_features(mask, soma_mask, sig, dapi, target_area, pixel_size,
     else:
         f += [0.0, 0.0, 0.0, 0.0]
 
+    # Crowding. A mask is rejected when it runs into the cell next door, and
+    # nothing above can see where the neighbours are -- every feature so far
+    # describes the mask in isolation. These say how much room this cell had
+    # and whether the mask used more than its share of it.
+    cy_m, cx_m = (centre if centre is not None
+                  else (float(ys_f.mean()), float(xs_f.mean())))
+    nb = [n for n in (neighbours or [])
+          if abs(n[0] - cy_m) > 1e-6 or abs(n[1] - cx_m) > 1e-6]
+    far = float(max(H, W))
+    if nb:
+        d = sorted(float(np.hypot(n[0] - cy_m, n[1] - cx_m)) for n in nb)
+        d1 = d[0]
+        d2 = d[1] if len(d) > 1 else far
+        reach = float(np.hypot(ys_f - cy_m, xs_f - cx_m).max())
+        # how many neighbours sit within twice this mask's own reach
+        n2r = float(sum(1 for x in d if x < 2 * max(reach, 1.0)))
+        # pixels closer to some other soma than to this one: territory taken
+        pts = np.stack([ys_f, xs_f], axis=1).astype(np.float64)
+        own = np.hypot(pts[:, 0] - cy_m, pts[:, 1] - cx_m)
+        best_other = np.full(own.shape, np.inf)
+        for n in nb:
+            best_other = np.minimum(
+                best_other, np.hypot(pts[:, 0] - n[0], pts[:, 1] - n[1]))
+        f += [d1, d2, n2r, float((best_other < own).mean()),
+              reach / max(d1 / 2.0, 1.0)]
+    else:
+        f += [far, far, 0.0, 0.0, 0.0]
+
     return np.asarray(f, dtype=np.float32)
 
 
@@ -367,7 +398,9 @@ def build(records, sig_ch, dapi_ch, pixel_size, verbose_every=200):
             soma = cache_soma if sp else None
             v = mask_features(mask, soma, sig, dapi, rec['area'], pixel_size,
                               grad=cache_grad, bg=cache_bg,
-                              dapi_thr=cache_dthr)
+                              dapi_thr=cache_dthr,
+                              centre=(rec['row'], rec['col']),
+                              neighbours=per_image.get(rec['image_path'], []))
             if v is None:
                 continue
             X.append(v)
@@ -612,8 +645,13 @@ def main():
         z = np.load(a.cache, allow_pickle=True)
         X, y, groups = z['X'], z['y'], z['groups']
         keys = [tuple(k) for k in z['keys']]
-        print(f"\nReusing features from {a.cache} "
-              f"({X.shape[0]:,} masks x {X.shape[1]} features)")
+        if X.shape[1] != len(FEATURE_NAMES):
+            print(f"\n{a.cache} holds {X.shape[1]} features but this version "
+                  f"computes {len(FEATURE_NAMES)} — re-extracting.")
+            X = None
+        else:
+            print(f"\nReusing features from {a.cache} "
+                  f"({X.shape[0]:,} masks x {X.shape[1]} features)")
     if X is None:
         print("\nExtracting features…")
         X, y, groups, keys = build(recs, a.signal_channel, a.dapi_channel,
