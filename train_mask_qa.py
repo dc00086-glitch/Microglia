@@ -420,6 +420,18 @@ def pick(areas, probs, cut, rule):
     ok = [pr >= cut for pr in probs]
     if not any(ok):
         return None
+    if rule == 'edge':
+        # Acceptability ENDS somewhere on the ladder: sizes below the boundary
+        # are fine, above it the mask has swallowed a neighbour. Rather than
+        # asking each size independently whether it clears a threshold, find
+        # where confidence collapses and take the size just before it. The
+        # threshold then only decides whether anything is acceptable at all,
+        # not which size -- so the choice does not move every time it is tuned.
+        if len(probs) < 2:
+            return areas[0]
+        drops = [probs[i] - probs[i + 1] for i in range(len(probs) - 1)]
+        j = max(range(len(drops)), key=lambda i: drops[i])
+        return areas[j]
     if rule == 'largest':
         return max(a for a, o in zip(areas, ok) if o)
     best_i = max(range(len(probs)), key=lambda i: probs[i])
@@ -663,7 +675,7 @@ def main():
     print(f"\n  {'rule':>8} {'cut':>5} {'exact':>7} {'within1':>8} "
           f"{'too big':>8} {'too small':>10} {'none ok':>8} {'steps':>7}")
     best = None
-    for rule in ('largest', 'band'):
+    for rule in ('largest', 'band', 'edge'):
         for cut in cuts:
             r = size_choice_report(te_keys, y[te], p, cut, rule, quiet=True,
                                    over_w=a.oversize_cost)
