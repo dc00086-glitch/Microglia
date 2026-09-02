@@ -12868,9 +12868,21 @@ if __name__ == '__main__':
             self.log("=" * 50)
 
         self._auto_save()
+
+        # Write the colocalisation counts now, while the tags are fresh and
+        # before any outlining. They come straight from the picked somas, so
+        # waiting until after masks and QA would only risk losing them.
+        coloc_msg = ""
+        try:
+            if self.export_coloc_counts(auto=True):
+                coloc_msg = "\n\nColocalization counts written to the output folder."
+        except Exception as e:
+            self.log(f"⚠ Could not write colocalization counts: {e}")
+
         QMessageBox.information(
             self, "Complete",
-            f"Soma picking complete!\n\nTotal somas marked: {total_somas}\n\nReady to outline."
+            f"Soma picking complete!\n\nTotal somas marked: {total_somas}"
+            + coloc_msg + "\n\nReady to outline."
         )
 
     def start_batch_outlining(self):
@@ -18657,7 +18669,7 @@ if __name__ == '__main__':
 
         dialog.exec_()
 
-    def export_coloc_counts(self):
+    def export_coloc_counts(self, auto=False):
         """Per-image colocalization counts straight from the picked somas.
 
         Two-pass coloc soma picking tags every soma as 'coloc' or
@@ -18669,6 +18681,8 @@ if __name__ == '__main__':
         import csv as _csv
         picked = [(nm, d) for nm, d in self.images.items() if d.get('somas')]
         if not picked:
+            if auto:
+                return
             QMessageBox.warning(self, "Colocalization Counts",
                                 "No somas have been picked yet.")
             return
@@ -18676,6 +18690,11 @@ if __name__ == '__main__':
         tagged = sum(1 for _, d in picked
                      for g in (d.get('soma_groups') or []) if g)
         if tagged == 0:
+            # Nothing to count. Automatic export happens after every picking
+            # session, most of which are not colocalisation runs, so this is
+            # the normal case rather than a problem to report.
+            if auto:
+                return
             QMessageBox.warning(
                 self, "Colocalization Counts",
                 "These somas carry no colocalization tags.\n\n"
@@ -18725,6 +18744,9 @@ if __name__ == '__main__':
                 w.writeheader()
                 w.writerows(rows)
         except Exception as e:
+            if auto:
+                self.log(f"⚠ Could not write colocalization counts: {e}")
+                return
             QMessageBox.critical(self, "Colocalization Counts",
                                  f"Could not write the file:\n{e}")
             return
@@ -18735,11 +18757,13 @@ if __name__ == '__main__':
         self.log(f"Colocalization counts: {len(rows)} images, "
                  f"{tot_c} coloc / {tot_s} single-channel ({pct:.1f}% coloc)")
         self.log(f"  saved to {path}")
-        QMessageBox.information(
-            self, "Colocalization Counts",
-            f"{len(rows)} image(s) exported.\n\n"
-            f"Coloc: {tot_c}    Single-channel: {tot_s}    "
-            f"({pct:.1f}% coloc overall)\n\n{path}")
+        if not auto:
+            QMessageBox.information(
+                self, "Colocalization Counts",
+                f"{len(rows)} image(s) exported.\n\n"
+                f"Coloc: {tot_c}    Single-channel: {tot_s}    "
+                f"({pct:.1f}% coloc overall)\n\n{path}")
+        return True
 
     def collect_metadata_for_images(self):
         """Collect AnimalID and Treatment for each processed image"""
