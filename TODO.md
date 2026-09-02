@@ -83,6 +83,73 @@ actually holds the far-red tracer.
 
 ---
 
+## Mask QA by machine learning  *(not started — scoped)*
+
+Same idea as the soma-outlining model, applied to mask approval. Kept separate
+from that work on purpose; the two share no code beyond the UI pattern.
+
+### The data already exists
+`.mmps_session` files persist, per mask:
+
+```python
+{'soma_id': ..., 'approved': True/False/None,
+ 'soma_idx': ..., 'duplicate': False, 'target_area_um2': 200}
+```
+
+under `img_session['mask_qa_state']`, written by `save_session` (MMPSv2.12.py).
+The masks themselves are on disk as `<base>_soma_<r>_<c>_area<N>_mask.tif`, so
+every past accept/reject can be joined back to its mask.
+
+### Why this is a much easier problem than soma outlining
+Soma outlining is segmentation: reproduce a boundary of several thousand
+correlated pixel decisions, from images where the boundary is genuinely
+ambiguous. It stalled at held-out IoU 0.70.
+
+Mask QA is binary classification. One bit per mask, from about 25 whole-object
+features -- area, solidity, circularity, connected components, holes, skeleton
+branch and endpoint counts, soma-to-total area ratio, mean intensity inside vs
+outside, mask-centroid to soma-centroid distance, border contact,
+achieved-vs-target area. One row per mask, not 40 features x 23k pixels x 1.5k
+somas.
+
+Rejections are also gross rather than subtle: a mask is rejected because it bled
+into a neighbour, fragmented, swallowed a vessel, or came out far off target --
+all of which the shape features state directly. And a wrong prediction costs one
+click, not a bad outline in the dataset, so the useful accuracy bar is far lower.
+Hundreds of labelled masks should be enough.
+
+### Two traps
+**Exclude auto-rejected duplicates.** MMPS sets `approved = False,
+duplicate = True` by rule when two target areas produce identical pixel counts.
+Training on those teaches a rule the model does not need and inflates the score
+with free correct answers.
+
+**The real decision may be a ranking, not a binary.** Each soma gets several
+masks at different target areas and the user picks among them. If so, predicting
+WHICH target area gets chosen is both more useful and easier than independent
+accept/reject calls. Settle this before assembling the dataset -- it changes the
+label.
+
+### Method notes carried over from the soma model
+* split train/test **by image**, never by mask -- masks from one image share
+  illumination and staining, and splitting by mask lets the model memorise the
+  image and score well while having learned nothing transferable
+* report held-out numbers next to training numbers; a small gap with both low
+  means the features or labels are the limit, a large gap means it is not
+  transferring
+* name the stain channel explicitly, never infer it from which is brightest
+  (see `--channel` in train_soma_model.py; the brightest-channel guess picked a
+  different channel on different images and cost several runs)
+* carry any confidence threshold in the model as an absolute value calibrated on
+  held-out data, not as a per-batch ranking
+
+### UI, once a model works
+Reuse what `auto_outline_all_somas` already does: sort the QA queue
+least-confident-first, and show the bottom-left confidence badge
+(`_show_ml_confidence` / `info_text_bottom`). Roughly a day of work in total.
+
+---
+
 ## Dystrophy fragment analysis — follow-ups
 
 * **The search radius still ends about where the cell ends.** It is now

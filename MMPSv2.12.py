@@ -1971,7 +1971,23 @@ def auto_outline_watershed(image, centroid, sensitivity=50, region_size=200):
 # ======================================================================
 from scipy import ndimage as ndi
 
-def _ml_pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
+def _ml_otsu(v):
+    """Otsu split of a 1-D array, on a 256-bin histogram."""
+    h, edges = np.histogram(v, bins=256, range=(0.0, 1.0))
+    h = h.astype(np.float64)
+    w0 = np.cumsum(h)
+    w1 = w0[-1] - w0
+    mids = (edges[:-1] + edges[1:]) / 2
+    m0 = np.cumsum(h * mids)
+    mt = m0[-1]
+    with np.errstate(invalid='ignore', divide='ignore'):
+        between = (mt * w0 / w0[-1] - m0) ** 2 / (w0 * w1)
+    between[~np.isfinite(between)] = -1
+    return float(mids[int(np.argmax(between))])
+
+
+def _ml_pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None,
+                   extra=None):
     """Multi-scale per-pixel features -> (n_pixels, n_features).
 
     Hessian eigenvalues are the important ones: for a BLOB both eigenvalues are
@@ -1999,6 +2015,35 @@ def _ml_pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
                  max(0, int(cx) - 3):int(cx) + 4]
         cval = float(np.median(core)) if core.size else 0.0
         feats += [rho, p - cval, p / (cval + 1e-3)]
+    if extra:
+        # Other stains, as features rather than as a seed. Seeding from DAPI
+        # has to ASSIGN a nucleus to a soma, and picking the wrong one among
+        # many is a hard error. Here the forest just receives how bright the
+        # stain is and how far the nearest positive structure sits, and learns
+        # from the accepted outlines how much that is worth -- a nearby wrong
+        # nucleus becomes a weak signal it can discount.
+        for ch in extra:
+            e = np.asarray(ch, dtype=np.float64)
+            elo, ehi = np.percentile(e, 1), np.percentile(e, 99.5)
+            e = (e - elo) / (ehi - elo) if ehi > elo else e * 0.0
+            for s in scales:
+                feats.append(ndi.gaussian_filter(e, s))
+            # distance to the stained structure: soma pixels sit on or beside a
+            # nucleus, process pixels are far from every nucleus, and no nucleus
+            # has to be matched to any particular cell for that to hold
+            thr = _ml_otsu(np.clip(e, 0.0, 1.0).ravel())
+            pos = e >= thr
+            if pos.any():
+                d = ndi.distance_transform_edt(~pos)
+            else:
+                d = np.full(e.shape, float(max(e.shape)), dtype=np.float64)
+            feats.append(d / float(max(e.shape)))
+            if center is not None:
+                ecore = e[max(0, int(center[0]) - 3):int(center[0]) + 4,
+                          max(0, int(center[1]) - 3):int(center[1]) + 4]
+                feats.append(e - (float(np.median(ecore)) if ecore.size else 0.0))
+            else:
+                feats.append(e * 0.0)
     for s in scales:
         g = ndi.gaussian_filter(p, s)
         feats.append(g)
@@ -2019,7 +2064,8 @@ def _ml_pixel_features(patch, scales=(1.0, 2.0, 4.0, 8.0), center=None):
 FEATURE_SCALES = (1.0, 2.0, 4.0, 8.0)
 
 
-def _ml_radial_contour(prob, center, cut, n_angles=180, smooth=9):
+def _ml_radial_contour(prob, center, cut, n_angles=180, smooth=9,
+                   harmonics=None):
     """Turn a probability map into a smooth star-convex outline around `center`.
 
     A hand-drawn soma outline is a smooth closed contour; a pixel classifier
@@ -2048,6 +2094,18 @@ def _ml_radial_contour(prob, center, cut, n_angles=180, smooth=9):
     bnd = rs[leaves]
     if smooth > 1:
         bnd = ndi.median_filter(bnd, size=smooth, mode='wrap')
+    if harmonics is not None:
+        # Keep only the lowest harmonics of the radius profile r(theta). The
+        # profile IS the shape: harmonic 0 alone is a circle, through harmonic 2
+        # is the round-to-rod family, and the higher terms carry exactly the
+        # spikes and notches a soma outline should not have. The median filter
+        # above runs first so a single runaway ray cannot smear across the
+        # spectrum.
+        F = np.fft.rfft(bnd)
+        if harmonics + 1 < len(F):
+            F[harmonics + 1:] = 0
+        bnd = np.fft.irfft(F, n=len(bnd))
+        bnd = np.maximum(bnd, 0.0)
     if not np.any(bnd > 0):
         return None
     gy, gx = np.ogrid[:H, :W]
@@ -2077,8 +2135,16 @@ def _ml_mask_from_prob(prob, center, prob_cut=0.5, open_r=0, mode='cc'):
     every combination, instead of re-running the forest 20 times per cell.
     """
     ly, lx = center
-    if mode == 'radial':
-        return _ml_radial_contour(prob, (ly, lx), prob_cut)
+    if mode.startswith('radial'):
+        # 'radial' keeps the full profile; 'radial_h<N>' truncates it to N
+        # harmonics, which is the shape dial.
+        h = None
+        if mode.startswith('radial_h'):
+            try:
+                h = int(mode[len('radial_h'):])
+            except ValueError:
+                h = None
+        return _ml_radial_contour(prob, (ly, lx), prob_cut, harmonics=h)
     binm = prob >= prob_cut
     # Sever thin structures BEFORE picking the component, so a process still
     # attached to the soma is dropped with it rather than dragged along. The
@@ -2122,9 +2188,33 @@ class _MLSomaOutliner:
         self.mode = m.get('mode') or 'cc'
         self.train_px = float(m.get('pixel_size_um') or 0.1046)
         self.channel = m.get('channel')
+        # Which images the forest was fitted on. The app must hand it the same
+        # kind at use, or it reads a boundary that is not there.
+        self.trained_on = m.get('trained_on') or 'raw'
+        # Additional stains the forest was fitted with (1-based). It cannot run
+        # without them: the feature vector would be the wrong width.
+        self.extra_channels = list(m.get('extra_channels') or [])
+        # What each channel is, main first then the extras. Recorded by newer
+        # models; older ones only know the numbers.
+        self.channel_names = list(m.get('channel_names') or [])
         self.conf_cal = m.get('conf_cal') or {}
         self.path = path
         self.last_confidence = None
+        # Shifts the probability cut. The cut IS the size dial: a lower cut
+        # keeps more marginal pixels and grows the outline, a higher one
+        # tightens it. Held separately so the calibrated value stays visible.
+        self.size_bias = 0.0
+
+    def channel_roles(self):
+        """[(label, channel the model was trained on)], main first."""
+        names = list(self.channel_names)
+        roles = []
+        main_name = names[0] if names else 'microglia stain'
+        roles.append((main_name, self.channel))
+        for i, ch in enumerate(self.extra_channels):
+            nm = names[i + 1] if len(names) > i + 1 else f'extra stain {i + 1}'
+            roles.append((nm, ch))
+        return roles
 
     def accept_threshold(self, which='top50'):
         """Confidence at or above which a cell may be accepted unreviewed.
@@ -2140,7 +2230,9 @@ class _MLSomaOutliner:
 
     def describe(self):
         parts = [f"scales {len(self.scales)}", f"cut {self.prob_cut}",
-                 f"{self.mode}"]
+                 f"{self.mode}", f"trained on {self.trained_on}"]
+        if self.extra_channels:
+            parts.append(f"+channels {self.extra_channels}")
         if self.channel:
             parts.append(f"channel {self.channel}")
         d = self.conf_cal.get('top50') or {}
@@ -2148,7 +2240,7 @@ class _MLSomaOutliner:
             parts.append(f"top50 purity {100 * d['purity']:.0f}%")
         return ", ".join(parts)
 
-    def _probability_map(self, image, centroid, pixel_size_um):
+    def _probability_map(self, image, centroid, pixel_size_um, extra=None):
         cy, cx = int(round(centroid[0])), int(round(centroid[1]))
         img = image
         if img.ndim > 2:
@@ -2163,20 +2255,33 @@ class _MLSomaOutliner:
         work = cv2.resize(patch, (side, side), interpolation=cv2.INTER_LINEAR)
         ctr = ((cy - y1) * side / patch.shape[0],
                (cx - x1) * side / patch.shape[1])
-        F = _ml_pixel_features(work, self.scales, center=ctr)
+        # Crop and resample the additional stains through exactly the same
+        # window, so every channel describes the same pixels.
+        ex = []
+        for e in (extra or []):
+            ep = np.asarray(e, dtype=np.float64)[y1:y1 + patch.shape[0],
+                                                 x1:x1 + patch.shape[1]]
+            if ep.shape != patch.shape:
+                return None
+            ex.append(cv2.resize(ep, (side, side),
+                                 interpolation=cv2.INTER_LINEAR))
+        if len(ex) != len(self.extra_channels):
+            return None
+        F = _ml_pixel_features(work, self.scales, center=ctr,
+                               extra=(ex if ex else None))
         prob = self.model.predict_proba(F)[:, 1].reshape(work.shape)
         return prob, ctr, (y1, x1), patch.shape
 
-    def outline(self, image, centroid, pixel_size_um=None):
+    def outline(self, image, centroid, pixel_size_um=None, extra=None):
         """-> (points, confidence). points are (row, col) in image coordinates."""
         self.last_confidence = None
         try:
-            got = self._probability_map(image, centroid, pixel_size_um)
+            got = self._probability_map(image, centroid, pixel_size_um, extra)
             if got is None:
                 return None, None
             prob, ctr, (y1, x1), pshape = got
-            mask = _ml_mask_from_prob(prob, ctr, self.prob_cut, self.open_r,
-                                      self.mode)
+            cut = float(np.clip(self.prob_cut - self.size_bias, 0.05, 0.95))
+            mask = _ml_mask_from_prob(prob, ctr, cut, self.open_r, self.mode)
             if mask is None or not mask.any():
                 return None, None
 
@@ -2191,6 +2296,25 @@ class _MLSomaOutliner:
                 if u:
                     conf = float(np.logical_and(lo, hi).sum()) / float(u)
             self.last_confidence = conf
+            # One-shot report of what the forest actually produced. A confidence
+            # pinned at 0 means the strict cut found nothing, which says the
+            # probabilities are far lower than they were in validation -- i.e.
+            # the pixels reaching the model are not the pixels it was fitted on.
+            if not _ML_DIAG.get('done'):
+                _ML_DIAG['done'] = True
+                cy, cx = int(ctr[0]), int(ctr[1])
+                cy = min(max(cy, 0), prob.shape[0] - 1)
+                cx = min(max(cx, 0), prob.shape[1] - 1)
+                _ml_note(
+                    f"ML first soma: prob min {prob.min():.3f} "
+                    f"mean {prob.mean():.3f} max {prob.max():.3f}, "
+                    f"at click {prob[cy, cx]:.3f}; "
+                    f"px>=0.35 {100 * (prob >= 0.35).mean():.1f}% "
+                    f"px>=0.65 {100 * (prob >= 0.65).mean():.1f}%; "
+                    f"loose mask {'None' if lo is None else int(lo.sum())} "
+                    f"strict mask {'None' if hi is None else int(hi.sum())}; "
+                    f"extra channels supplied {len(extra or [])}, "
+                    f"model wants {len(self.extra_channels)}")
 
             back = cv2.resize(mask.astype(np.uint8), (pshape[1], pshape[0]),
                               interpolation=cv2.INTER_NEAREST)
@@ -2213,6 +2337,23 @@ class _MLSomaOutliner:
 
 _ML_OUTLINER = None
 _ML_OUTLINER_PATH = None
+# one-shot per-run diagnostic, reset when a batch starts
+_ML_DIAG = {}
+# What happened at load time, kept so the app can show it in its own Log panel.
+# Printing alone only reaches a terminal, and MMPS is normally double-clicked.
+_ML_LOAD_MESSAGES = []
+
+
+def _ml_note(msg):
+    print(msg)
+    _ML_LOAD_MESSAGES.append(msg)
+
+
+def drain_ml_messages():
+    """Return and clear anything the loader wanted to say."""
+    out = list(_ML_LOAD_MESSAGES)
+    del _ML_LOAD_MESSAGES[:]
+    return out
 
 
 def ml_model_paths():
@@ -2243,9 +2384,26 @@ def get_ml_outliner(path=None):
     try:
         _ML_OUTLINER = _MLSomaOutliner(path)
         _ML_OUTLINER_PATH = path
+        # Say which file was loaded and whether it can auto-accept. Several
+        # copies of the model tend to exist at once -- beside the script, inside
+        # the bundle, in Downloads -- and without this the only symptom of
+        # loading the wrong one is a missing button.
+        cal = _ML_OUTLINER.conf_cal or {}
+        _ml_note(f"ML soma model loaded: {os.path.basename(path)}")
+        _ml_note(f"  trained on {_ML_OUTLINER.trained_on} images"
+                 + (f", channel {_ML_OUTLINER.channel}"
+                    if _ML_OUTLINER.channel else ""))
+        if cal.get('top50'):
+            _ml_note(f"  calibrated — auto-accept available "
+                     f"(threshold {cal['top50'].get('threshold'):.3f}, "
+                     f"purity {100 * cal['top50'].get('purity', 0):.0f}%)")
+        else:
+            _ml_note("  NO confidence calibration in this file — auto-accept "
+                     "will be unavailable, review-all only.")
+            _ml_note("  Retrain with the current train_soma_model.py to add it.")
         return _ML_OUTLINER
     except Exception as e:
-        print(f"Could not load ML soma model from {path}: {e}")
+        _ml_note(f"Could not load ML soma model from {path}: {e}")
         return None
 
 
@@ -2993,6 +3151,9 @@ class InteractiveImageLabel(QLabel):
         self.info_text = None
         # Info text overlay (top-right corner)
         self.info_text_right = None
+        # Info text overlay (bottom-left corner) — outline confidence
+        self.info_text_bottom = None
+        self.info_text_bottom_color = None
         # Paint fill mode
         self.paint_mode = False
         self.erase_mode = False
@@ -3188,6 +3349,23 @@ class InteractiveImageLabel(QLabel):
             painter.drawRect(rx, 8, tw, th)
             painter.setPen(QColor(255, 255, 255))
             painter.drawText(rx + 6, 8 + fm.ascent() + 4, self.info_text_right)
+
+        # Info text overlay (bottom-left) — how much the model trusts this
+        # outline. Colour-coded so it reads at a glance during review.
+        if self.info_text_bottom:
+            font = painter.font()
+            font.setPointSize(11)
+            font.setBold(True)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(self.info_text_bottom) + 12
+            th = fm.height() + 8
+            by = self.height() - th - 8
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 180))
+            painter.drawRect(8, by, tw, th)
+            painter.setPen(self.info_text_bottom_color or QColor(255, 255, 255))
+            painter.drawText(14, by + fm.ascent() + 4, self.info_text_bottom)
 
         if self.zoom_level != 1.0:
             y_offset = 5 if not self.info_text else 8 + painter.fontMetrics().height() + 16
@@ -4593,6 +4771,28 @@ class MicrogliaAnalysisGUI(QMainWindow):
         per_image_px_action = advanced_menu.addAction("Set Per-Image Pixel Size...")
         per_image_px_action.setToolTip("Override pixel size for individual images")
         per_image_px_action.triggered.connect(self._set_per_image_pixel_size)
+        self.archive_rejected_masks = True
+        keep_rejected_action = advanced_menu.addAction(
+            "Keep Rejected Masks (for QA training)")
+        keep_rejected_action.setCheckable(True)
+        keep_rejected_action.setChecked(True)
+        keep_rejected_action.setToolTip(
+            "Store rejected masks under <output>/rejected_masks instead of "
+            "deleting them.\nA model that predicts which masks you reject "
+            "needs them: they are the negative class.\nSaved compressed, so a "
+            "few KB each.")
+        keep_rejected_action.toggled.connect(
+            lambda v: setattr(self, 'archive_rejected_masks', bool(v)))
+        map_ch_action = advanced_menu.addAction("Map Model Channels...")
+        map_ch_action.setToolTip(
+            "Say which channel holds each stain the ML model expects.\n"
+            "Needed when a dataset puts IBA1 or DAPI on different channels "
+            "than the images the model was trained on.")
+        map_ch_action.triggered.connect(self._ml_channel_map_dialog)
+        clear_outlines_action = advanced_menu.addAction("Clear Soma Outlines...")
+        clear_outlines_action.setToolTip(
+            "Delete the outlines for a range of somas so they can be redone")
+        clear_outlines_action.triggered.connect(self._clear_soma_outlines_dialog)
 
         # Cluster menu
         cluster_menu = menu_bar.addMenu("Cluster")
@@ -11511,7 +11711,12 @@ if __name__ == '__main__':
                 row.addWidget(cb)
                 # optional channel name (also merged in from that dialog)
                 name_edit = QLineEdit(self.channel_names.get(idx, ''))
-                name_edit.setPlaceholderText(f"name (e.g. CD31)")
+                name_edit.setPlaceholderText("name (e.g. IBA1, DAPI)")
+                name_edit.setToolTip(
+                    "Naming a channel also tells the ML model where to find "
+                    "that stain.\nType IBA1 against the blue channel and the "
+                    "model reads blue for microglia.\nCase and punctuation are "
+                    "ignored: IBA1, Iba-1 and iba 1 all match.")
                 name_edit.setFixedWidth(110)
                 name_edit.textChanged.connect(make_rename(idx))
                 row.addWidget(name_edit)
@@ -13175,6 +13380,38 @@ if __name__ == '__main__':
                             "Competitive growth prevents overlap between somas.")
         layout.addWidget(dapi_btn)
 
+        # Trained model. Only offered when one is actually present, with the
+        # reason stated when it is not -- a disabled button with no explanation
+        # is worse than no button.
+        _ml = get_ml_outliner()
+        for _m in drain_ml_messages():
+            self.log(_m)
+        ml_btn = QPushButton("Machine Learning - Trained on your accepted outlines")
+        if _ml is not None:
+            ml_btn.clicked.connect(lambda: dialog.done(4))
+            ml_btn.setStyleSheet("border: 2px solid #FF9800; font-weight: bold;")
+            _d = (_ml.conf_cal or {}).get('top50') or {}
+            if not _d:
+                ml_btn.setText("Machine Learning - Trained model (review all)")
+            _tip = ("Outlines with a model trained on the soma outlines you have "
+                    "already accepted.\nEach outline gets a confidence score; you "
+                    "choose whether to review them all\nor accept the confident "
+                    "ones and review the rest.")
+            if _d.get('purity') is not None:
+                _tip += (f"\n\nOn held-out images, {100 * _d['purity']:.0f}% of "
+                         f"outlines above the auto-accept\nthreshold were good "
+                         f"(about {100 * _d.get('covers', 0):.0f}% of cells).")
+            ml_btn.setToolTip(_tip)
+            layout.addWidget(ml_btn)
+        else:
+            ml_btn.setEnabled(False)
+            ml_btn.setToolTip("No trained model found.")
+            layout.addWidget(ml_btn)
+            _hint = QLabel("<i>No soma_model.joblib found — train one with "
+                           "train_soma_model.py and put it beside MMPS.</i>")
+            _hint.setWordWrap(True)
+            layout.addWidget(_hint)
+
         # Auto settings (soma-blob detector). Sensitivity shifts the threshold;
         # soma radius sizes the search window, the core used to sample the
         # soma's peak brightness, AND the max-size rejection ceiling — it is
@@ -13267,7 +13504,15 @@ if __name__ == '__main__':
         if result == 0:
             return  # Cancelled
 
-        self.auto_outline_method.setCurrentIndex(0)  # Always soma blob
+        # Pick the detector the chosen button implies. This used to force soma
+        # blob unconditionally, which made every other combo entry unreachable.
+        _want = 'Machine learning' if result == 4 else 'Soma blob'
+        for _i in range(self.auto_outline_method.count()):
+            if self.auto_outline_method.itemText(_i).startswith(_want):
+                self.auto_outline_method.setCurrentIndex(_i)
+                break
+        else:
+            self.auto_outline_method.setCurrentIndex(0)
         self._auto_outline_sensitivity_value = sens_spin.value()
         self.soma_max_radius_um = radius_spin.value()
         self._dapi_channel = dapi_ch_combo.currentData()
@@ -13322,6 +13567,9 @@ if __name__ == '__main__':
         elif result == 3:
             # DAPI-seeded mode — generate outlines, then review
             self._run_dapi_seeded_outlining()
+        elif result == 4:
+            # Trained model — same batch path, with the confidence policy
+            self._run_ml_outline_all()
         else:
             # Auto mode - outline all, then review
             self._run_auto_outline_all()
@@ -13347,6 +13595,242 @@ if __name__ == '__main__':
         self.log("Click to add points, right-click to complete")
         self.log("Press Enter or [Accept] to save and move to next")
         self.log("=" * 50)
+
+    def _run_ml_outline_all(self):
+        """Outline every queued soma with the trained model, then review.
+
+        Differs from the other detectors in one way: each outline carries a
+        confidence, so the user can accept the confident ones unreviewed. The
+        threshold is an absolute value calibrated on held-out cells at training
+        time and stored in the model -- ranking this batch and taking its top
+        half would accept half of any batch however badly it went.
+        """
+        ml = get_ml_outliner()
+        for _m in drain_ml_messages():
+            self.log(_m)
+        if ml is None:
+            QMessageBox.warning(self, "Machine Learning",
+                                "No trained model is available.")
+            return
+
+        thr = ml.accept_threshold('top50')
+        cal = (ml.conf_cal or {}).get('top50') or {}
+        box = QMessageBox(self)
+        box.setWindowTitle("Machine-Learning Outlining")
+        if thr is None:
+            box.setText("This model carries no confidence calibration, so every "
+                        "outline will be queued for review.")
+            box.addButton("Review all outlines", QMessageBox.AcceptRole)
+        else:
+            box.setText(
+                f"Outline with the trained model?\n\n"
+                f"Each outline gets a confidence score. On held-out images "
+                f"{100 * cal.get('purity', 0):.0f}% of the outlines above the "
+                f"auto-accept threshold were good, and they were about "
+                f"{100 * cal.get('covers', 0):.0f}% of all cells.\n\n"
+                f"Reviewing everything takes longer but nothing is accepted "
+                f"unseen.")
+            box.addButton("Review all outlines", QMessageBox.AcceptRole)
+            box.addButton("Auto-accept confident, review the rest",
+                          QMessageBox.YesRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+
+        # Review order. Confidence order puts the model's worst work first,
+        # which is efficient but jumps between images; going through the queue
+        # keeps each image together and matches every other review in MMPS.
+        from PyQt5.QtWidgets import QCheckBox
+        order_box = QCheckBox("Review least-confident first (otherwise image "
+                              "and soma order)")
+        order_box.setChecked(bool(getattr(self, '_ml_confidence_order', False)))
+        order_box.setToolTip(
+            "Off: review in the usual queue order, image by image.\n"
+            "On: the least confident outlines come first, so the cells needing "
+            "the most attention are seen while you are freshest.")
+        try:
+            box.layout().addWidget(order_box, 3, 2)
+        except Exception:
+            pass
+
+        # Outline size dial. Held-out area ratio at the calibrated cut is about
+        # 1.1x, so if outlines look small on your images something differs from
+        # validation -- but this lets you correct it now rather than retrain.
+        from PyQt5.QtWidgets import QDoubleSpinBox
+        size_spin = QDoubleSpinBox()
+        size_spin.setRange(-0.30, 0.30)
+        size_spin.setSingleStep(0.05)
+        size_spin.setDecimals(2)
+        size_spin.setValue(getattr(ml, 'size_bias', 0.0))
+        size_spin.setPrefix("Outline size  ")
+        size_spin.setToolTip(
+            "0 uses the threshold calibrated during training.\n"
+            "Positive = larger outlines, negative = smaller.\n"
+            "About 6-8% soma area per 0.05. Beyond +/-0.15 the outlines stop\n"
+            "behaving: too low and they merge with neighbours, too high and\n"
+            "the contour starts failing outright.")
+        # Show what the number actually does. "+0.10" means nothing on its own;
+        # the threshold it produces is the thing being changed.
+        size_note = QLabel("")
+        def _size_note():
+            b = size_spin.value()
+            cut = min(max(ml.prob_cut - b, 0.05), 0.95)
+            if abs(b) < 1e-9:
+                size_note.setText(f"<i>threshold {cut:.2f} — as calibrated</i>")
+            else:
+                word = "larger" if b > 0 else "smaller"
+                warn = ("  <b>— beyond the tested range</b>"
+                        if abs(b) > 0.15 else "")
+                size_note.setText(
+                    f"<i>threshold {ml.prob_cut:.2f} &rarr; {cut:.2f}, "
+                    f"roughly {abs(b) / 0.05 * 7:.0f}% {word}{warn}</i>")
+        size_spin.valueChanged.connect(lambda _: _size_note())
+        _size_note()
+        try:
+            box.layout().addWidget(size_spin, 1, 2)
+            box.layout().addWidget(size_note, 2, 2)
+        except Exception:
+            pass
+
+        box.exec_()
+        clicked = box.clickedButton()
+        label = clicked.text() if clicked else "Cancel"
+        if label == "Cancel":
+            return
+        self._ml_confidence_order = bool(order_box.isChecked())
+        ml.size_bias = float(size_spin.value())
+        if ml.size_bias:
+            self.log(f"Outline size bias {ml.size_bias:+.2f} "
+                     f"(effective cut {ml.prob_cut - ml.size_bias:.2f})")
+        ml_threshold = thr if label.startswith("Auto-accept") else None
+
+        px = self._get_pixel_size(self.current_image_name)
+        _ML_DIAG.clear()
+        self.log("=" * 50)
+        self.log("🤖 MACHINE-LEARNING OUTLINING")
+        self.log(f"Model: {ml.describe()}")
+        # State the channel each stain is actually read from, and why. Reading
+        # the wrong stain produces worse outlines and no error, so this should
+        # never be something to work out afterwards.
+        _bits = []
+        for _i, (_n, _trained) in enumerate(ml.channel_roles()):
+            _used = self._ml_channel_for(ml, _i, _trained)
+            if getattr(self, 'ml_channel_map', None):
+                _why = 'mapped'
+            elif self._channel_by_stain_name(
+                    _n if self._stain_group(_n) or _i else 'iba1'):
+                _why = 'by name'
+            else:
+                _why = "model's own"
+            _bits.append(f"{_n}=ch{_used} ({_why})")
+        self.log("Channels: " + ", ".join(_bits))
+        self.log(f"Policy: " + ("auto-accept confident, review the rest"
+                                if ml_threshold is not None else "review all"))
+        self.log("=" * 50)
+
+        from PyQt5.QtWidgets import QProgressDialog
+        todo = [(i, k) for i, k in enumerate(self.outlining_queue)
+                if not self._soma_has_outline(*k)]
+        progress = QProgressDialog("Outlining with the trained model…", "Cancel",
+                                   0, len(todo), self)
+        progress.setWindowTitle("Machine-Learning Outlining")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        self.auto_outlined_points = {}
+        self.failed_auto_outlines = []
+        needs_review, auto_ok, done = [], 0, 0
+
+        for n, (qi, (img_name, soma_idx)) in enumerate(todo):
+            if progress.wasCanceled():
+                break
+            progress.setValue(n)
+            QApplication.processEvents()
+            img_data = self.images.get(img_name)
+            if img_data is None:
+                continue
+            soma_id = img_data['soma_ids'][soma_idx]
+            progress.setLabelText(f"{soma_id}  ({n + 1}/{len(todo)})")
+            outline_img = self._get_image_for_ml(img_data, ml)
+            ml_extra = self._get_ml_extra_channels(img_data, ml)
+            if outline_img is None or ml_extra is None:
+                if ml_extra is None and not getattr(self, '_ml_ch_warned', False):
+                    self._ml_ch_warned = True
+                    self.log(f"   ⚠ ML: this model needs channels "
+                             f"{ml.extra_channels} and they are not available "
+                             f"in {img_name} — those somas are skipped.")
+                self.failed_auto_outlines.append(qi)
+                continue
+            soma = img_data['somas'][soma_idx]
+            px_here = self._get_pixel_size(img_name) or px
+            points, conf = ml.outline(outline_img, soma, px_here, ml_extra)
+            if points is None or len(points) < 3:
+                self.failed_auto_outlines.append(qi)
+                continue
+            try:
+                points = _remove_branch_juts(points, soma)
+            except Exception:
+                pass
+            done += 1
+            self._record_ml_confidence(img_name, soma_idx, conf)
+            c = -1.0 if conf is None else conf
+            if ml_threshold is not None and c >= ml_threshold:
+                # Accepted without review, so commit it now.
+                if self._store_outline(img_name, soma_idx, list(points)) is None:
+                    self.failed_auto_outlines.append(qi)
+                    done -= 1
+                    continue
+                auto_ok += 1
+            else:
+                # Hold as a CANDIDATE. Committing here would mark the soma
+                # outlined, and review skips anything already outlined -- so
+                # every outline would be saved unseen and there would be nothing
+                # left to review.
+                self.auto_outlined_points[qi] = list(points)
+                needs_review.append((qi, c))
+        progress.close()
+        # The per-run diagnostic is written while outlining, after the earlier
+        # drain, so without this it sits in the buffer and never reaches the
+        # Log panel -- invisible unless the app was started from a terminal.
+        for _m in drain_ml_messages():
+            self.log(_m)
+
+        needs_review.sort(key=lambda t: t[1])      # least confident first
+        self.polygon_points = []
+        self._update_outline_progress()
+        self._auto_save()
+        self.log(f"Model: {done} outlined, {auto_ok} accepted on confidence, "
+                 f"{len(needs_review)} queued for review, "
+                 f"{len(self.failed_auto_outlines)} failed")
+
+        msg = [f"Outlined {done} soma(s)."]
+        if ml_threshold is not None:
+            msg.append(f"{auto_ok} were confident enough to accept unreviewed.")
+        msg.append(f"{len(needs_review)} queued for review, "
+                   + ("least confident first."
+                      if getattr(self, '_ml_confidence_order', False)
+                      else "in image and soma order."))
+        if self.failed_auto_outlines:
+            msg.append(f"{len(self.failed_auto_outlines)} could not be outlined "
+                       f"and need manual work.")
+        QMessageBox.information(self, "Machine-Learning Outlining",
+                                "\n".join(msg))
+
+        if needs_review:
+            if getattr(self, '_ml_confidence_order', False):
+                self._ml_review_order = [qi for qi, _ in needs_review]
+                self._ml_order_pos = 0
+            else:
+                # Queue order: image by image, soma by soma, the way every
+                # other review in MMPS runs. The confidence still shows on
+                # each soma, it just does not decide the order.
+                self._ml_review_order = None
+            self._start_review_mode()
+            return
+        self._ml_review_order = None
+        nxt = self._find_next_unoutlined_idx(start_from=0)
+        if nxt is not None:
+            self._load_soma_for_outlining(nxt)
+        else:
+            self._finish_outlining()
 
     def _run_auto_outline_all(self):
         """Run auto-outline on all somas, then start review mode"""
@@ -13675,8 +14159,17 @@ if __name__ == '__main__':
             label.measure_pt2 = None
         self.measure_mode = False
 
-        # Find the first soma that actually needs review (skip already-outlined)
-        start_idx = self._find_next_unoutlined_idx(0)
+        # Find the first soma that actually needs review (skip already-outlined).
+        # With a model-supplied order, take the least confident first.
+        order = getattr(self, '_ml_review_order', None)
+        start_idx = None
+        if order:
+            for qi in order:
+                if not self._soma_has_outline(*self.outlining_queue[qi]):
+                    start_idx = qi
+                    break
+        if start_idx is None:
+            start_idx = self._find_next_unoutlined_idx(0)
         if start_idx is None:
             # All somas already outlined — nothing to review
             self._finish_review_mode()
@@ -13702,6 +14195,7 @@ if __name__ == '__main__':
 
         # Skip somas that already have saved outlines (from previous session)
         img_name_check, soma_idx_check = self.outlining_queue[review_idx]
+        self._show_ml_confidence(img_name_check, soma_idx_check, review_idx)
         if self._soma_has_outline(img_name_check, soma_idx_check):
             # This soma is already outlined — advance to the next unoutlined one
             next_idx = self._find_next_unoutlined_idx(start_from=review_idx + 1)
@@ -13779,8 +14273,55 @@ if __name__ == '__main__':
         else:
             self.log(f"⚠ {soma_id} needs manual outline")
 
+    def _ml_session_summary(self):
+        """Report how the model did on the cells actually reviewed.
+
+        This is the model measured against your decisions on your images, which
+        is what matters -- held-out validation only stands in for it.
+        """
+        rows = []
+        for img_data in self.images.values():
+            for ol in img_data.get('soma_outlines', []) or []:
+                if ol.get('source') in ('ml_accepted', 'ml_edited'):
+                    rows.append(ol)
+        if not rows:
+            return
+        kept = [r for r in rows if r.get('source') == 'ml_accepted']
+        edited = [r for r in rows if r.get('source') == 'ml_edited']
+        ious = [r['iou_vs_proposal'] for r in edited
+                if r.get('iou_vs_proposal') is not None]
+        self.log("=" * 50)
+        self.log("Model performance on this session")
+        self.log(f"  {len(rows)} outlines from the model")
+        self.log(f"  accepted unchanged: {len(kept)} "
+                 f"({100 * len(kept) / len(rows):.0f}%)")
+        self.log(f"  edited or redrawn:  {len(edited)} "
+                 f"({100 * len(edited) / len(rows):.0f}%)")
+        if ious:
+            ious_sorted = sorted(ious)
+            med = ious_sorted[len(ious_sorted) // 2]
+            self.log(f"  on the edited ones, the proposal overlapped your final "
+                     f"outline by a median IoU of {med:.2f}")
+            self.log(f"  (1.00 = you changed nothing; low = you redrew it)")
+        confs = [r.get('ml_confidence') for r in kept
+                 if r.get('ml_confidence') is not None]
+        confs_e = [r.get('ml_confidence') for r in edited
+                   if r.get('ml_confidence') is not None]
+        if confs and confs_e:
+            self.log(f"  mean confidence: {sum(confs) / len(confs):.2f} when kept, "
+                     f"{sum(confs_e) / len(confs_e):.2f} when edited")
+            self.log("  (a gap here means the confidence score is doing its job)")
+        self.log("  Retraining will pick up your corrections automatically;")
+        self.log("  see soma_ml_feedback.csv in the output folder.")
+        self.log("=" * 50)
+
     def _finish_review_mode(self):
         """Finish review mode and complete outlining"""
+        self._clear_ml_review_order()
+        try:
+            self._ml_session_summary()
+        except Exception:
+            pass
         self.review_mode = False
         self._finish_outlining()
 
@@ -13821,6 +14362,7 @@ if __name__ == '__main__':
         img_name, soma_idx = self.outlining_queue[queue_idx]
         self.current_image_name = img_name
         img_data = self.images[img_name]
+        self._show_ml_confidence(img_name, soma_idx, queue_idx)
 
         # Lazy-load processed image from disk if missing
         if img_data.get('processed') is None:
@@ -14106,6 +14648,20 @@ if __name__ == '__main__':
                 (i - 1 if i > queue_idx else i)
                 for i in self.failed_auto_outlines if i != queue_idx
             ]
+        # The model's least-confident-first ordering is queue indices too, so it
+        # shifts with everything else. Leaving it stale sends review to the
+        # wrong cells, because _find_next_unoutlined_idx follows it.
+        _order = getattr(self, '_ml_review_order', None)
+        if _order:
+            _removed_at = next((k for k, i in enumerate(_order)
+                                if i == queue_idx), None)
+            self._ml_review_order = [
+                (i - 1 if i > queue_idx else i)
+                for i in _order if i != queue_idx
+            ]
+            _pos = getattr(self, '_ml_order_pos', 0)
+            if _removed_at is not None and _removed_at < _pos:
+                self._ml_order_pos = max(0, _pos - 1)
 
         self.log(f"✗ Deleted {soma_id} from {img_name}")
         self.polygon_points = []
@@ -14114,24 +14670,27 @@ if __name__ == '__main__':
         self._update_outline_progress()
         self._auto_save()
 
-        # Move to next soma (queue_idx now points to what was the next entry)
+        # Move to next soma (queue_idx now points to what was the next entry).
+        # In review the next soma usually has a proposed outline waiting;
+        # _load_soma_for_outlining does not read those, so going through it
+        # opens the cell blank and the proposal looks lost.
+        def _go(idx):
+            if getattr(self, 'review_mode', False):
+                self._load_review_soma(idx)
+            else:
+                self._load_soma_for_outlining(idx)
+
         if not self.outlining_queue:
             self._finish_outlining()
-        elif queue_idx >= len(self.outlining_queue):
-            # Was the last one — check if all done
-            next_idx = self._find_next_unoutlined_idx(start_from=0)
-            if next_idx is None:
-                self._finish_outlining()
-            else:
-                self._load_soma_for_outlining(next_idx)
         else:
-            next_idx = self._find_next_unoutlined_idx(start_from=queue_idx)
-            if next_idx is None:
+            start = 0 if queue_idx >= len(self.outlining_queue) else queue_idx
+            next_idx = self._find_next_unoutlined_idx(start_from=start)
+            if next_idx is None and start != 0:
                 next_idx = self._find_next_unoutlined_idx(start_from=0)
             if next_idx is None:
                 self._finish_outlining()
             else:
-                self._load_soma_for_outlining(next_idx)
+                _go(next_idx)
 
     def _get_auto_outline_method(self):
         """Auto-outline detector, bound to the current soma-size setting.
@@ -14147,6 +14706,21 @@ if __name__ == '__main__':
             pass
         if name.startswith('Machine learning'):
             ml = get_ml_outliner()
+            if ml is not None:
+                # feed the raw channel, not the processed image
+                _img_data = self.images.get(self.current_image_name) or {}
+                _raw = self._get_image_for_ml(_img_data, ml)
+                _ex = self._get_ml_extra_channels(_img_data, ml)
+                px_ml = self._get_pixel_size(self.current_image_name)
+                if _ex is None:
+                    self.log(f"ML: this model needs channels "
+                             f"{ml.extra_channels}, which this image does not "
+                             f"provide — falling back to the soma-blob "
+                             f"detector.")
+                else:
+                    return lambda image, centroid, sensitivity: (
+                        ml.outline(_raw if _raw is not None else image,
+                                   centroid, px_ml, _ex)[0])
             if ml is None:
                 self.log("No trained soma model found — falling back to the "
                          "soma-blob detector. Train one with "
@@ -14172,6 +14746,237 @@ if __name__ == '__main__':
         return lambda image, centroid, sensitivity: auto_outline_soma_blob(
             image, centroid, sensitivity, max_soma_radius_px=rad_px,
             process_width_px=proc_px)
+
+    @staticmethod
+    def _stain_key(name):
+        """Normalise a stain name: case, spaces and punctuation all ignored.
+
+        'IBA1', 'Iba-1', 'iba 1' and 'IBA_1' are the same stain written four
+        ways, and a channel typed one way should not fail to match a model that
+        recorded it another.
+        """
+        return re.sub(r'[^a-z0-9]+', '', (name or '').lower())
+
+    # Names for the same stain, so a channel labelled any of them resolves.
+    _STAIN_ALIASES = {
+        'microglia': {'iba1', 'iba', 'microglia', 'tmem119', 'cx3cr1',
+                      'p2ry12', 'aif1'},
+        'nuclear': {'dapi', 'hoechst', 'nucleus', 'nuclei', 'nuclear',
+                    'draq5', 'topro3'},
+    }
+
+    @classmethod
+    def _stain_group(cls, name):
+        k = cls._stain_key(name)
+        for group, names in cls._STAIN_ALIASES.items():
+            if k in names:
+                return group
+        return None
+
+    def _channel_by_stain_name(self, wanted):
+        """1-based channel whose typed name means the same stain, or None."""
+        want_key = self._stain_key(wanted)
+        if not want_key:
+            return None
+        want_group = self._stain_group(wanted)
+        for idx, typed in sorted((getattr(self, 'channel_names', None)
+                                  or {}).items()):
+            k = self._stain_key(typed)
+            if not k:
+                continue
+            if k == want_key:
+                return idx + 1
+            if want_group and self._stain_group(typed) == want_group:
+                return idx + 1
+        return None
+
+    def _ml_channel_for(self, ml, role_index, default_ch):
+        """Which channel of THIS dataset supplies one of the model's stains.
+
+        The model records absolute channel numbers from the images it was
+        fitted on. Point it at a set where the stains sit elsewhere and it reads
+        the wrong ones without complaint, so the channel is resolved in order:
+
+          1. an explicit mapping set in Advanced > Map Model Channels
+          2. a channel NAMED for that stain in Channel & Display Adjustments --
+             type IBA1 against the blue channel and the model reads blue
+          3. the channel the model was trained on
+
+        Naming beats the model's own numbers because a name is a statement
+        about the data in front of you; the number is only what was true of the
+        images it was fitted on.
+        """
+        mapping = getattr(self, 'ml_channel_map', None)
+        if mapping and role_index < len(mapping) and mapping[role_index]:
+            return int(mapping[role_index])
+
+        roles = ml.channel_roles() if hasattr(ml, 'channel_roles') else []
+        wanted = roles[role_index][0] if role_index < len(roles) else ''
+        # A model that never recorded names still has a main channel, and that
+        # is always the microglia stain.
+        if role_index == 0 and not self._stain_group(wanted):
+            wanted = 'iba1'
+        by_name = self._channel_by_stain_name(wanted)
+        if by_name:
+            return by_name
+        return default_ch
+
+    def _ml_channel_map_dialog(self):
+        """Map the model's stains onto the channels of the current images."""
+        ml = get_ml_outliner()
+        for _m in drain_ml_messages():
+            self.log(_m)
+        if ml is None:
+            QMessageBox.warning(self, "Map Model Channels",
+                                "No trained model is loaded.")
+            return
+        roles = ml.channel_roles()
+
+        n_ch = 3
+        for idata in self.images.values():
+            c = idata.get('color_image')
+            if c is not None and np.asarray(c).ndim == 3:
+                n_ch = int(np.asarray(c).shape[2])
+                break
+
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QFormLayout
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Map Model Channels")
+        lay = QVBoxLayout()
+        lay.addWidget(QLabel(
+            "<b>This model was trained with the stains on particular "
+            "channels.</b><br>If your images put them elsewhere, say which "
+            "channel holds each one.<br>Getting this wrong makes the model "
+            "read the wrong stain and it will not complain."))
+        form = QFormLayout()
+        combos = []
+        current = getattr(self, 'ml_channel_map', None) or []
+        for i, (name, trained_ch) in enumerate(roles):
+            cb = QComboBox()
+            for c in range(1, n_ch + 1):
+                nm = self.channel_names.get(c - 1, '')
+                cb.addItem(f"Channel {c}" + (f" ({nm})" if nm else ""), c)
+            want = (current[i] if i < len(current) and current[i]
+                    else (trained_ch or 1))
+            cb.setCurrentIndex(min(max(int(want) - 1, 0), n_ch - 1))
+            form.addRow(f"{name}  (trained on channel {trained_ch}):", cb)
+            combos.append(cb)
+        lay.addLayout(form)
+
+        row = QHBoxLayout()
+        ok = QPushButton("Use this mapping")
+        ok.clicked.connect(lambda: dlg.done(1))
+        row.addWidget(ok)
+        rst = QPushButton("Reset to the model's own channels")
+        rst.clicked.connect(lambda: dlg.done(2))
+        row.addWidget(rst)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(lambda: dlg.done(0))
+        row.addWidget(cancel)
+        lay.addLayout(row)
+        dlg.setLayout(lay)
+        dlg.setMinimumWidth(460)
+        res = dlg.exec_()
+        if res == 0:
+            return
+        if res == 2:
+            self.ml_channel_map = None
+            self.log("ML channel mapping reset to the model's own channels")
+            return
+        self.ml_channel_map = [cb.currentData() for cb in combos]
+        self.log("ML channel mapping: "
+                 + ", ".join(f"{n} -> channel {c}"
+                             for (n, _), c in zip(roles, self.ml_channel_map)))
+
+    def _get_ml_extra_channels(self, img_data, ml):
+        """The additional stains the model needs, as full-frame arrays.
+
+        Returns None when any are missing: running with the wrong number of
+        channels would build a feature vector of the wrong width, and the
+        forest would either error or read the columns as something else.
+        """
+        want = getattr(ml, 'extra_channels', None) or []
+        if not want:
+            return []
+        src = None
+        raw_path = img_data.get('raw_path')
+        if raw_path and os.path.exists(raw_path):
+            try:
+                src = np.squeeze(np.asarray(load_tiff_image(raw_path)))
+            except Exception:
+                src = None
+        if src is None or src.ndim != 3:
+            c = img_data.get('color_image')
+            src = np.asarray(c) if c is not None else None
+        if src is None or src.ndim != 3:
+            return None
+        ax = int(np.argmin(src.shape))
+        if src.shape[ax] <= 8:
+            src = np.moveaxis(src, ax, -1)
+        out = []
+        for k, ch in enumerate(want):
+            i = int(self._ml_channel_for(ml, k + 1, ch)) - 1
+            if not (0 <= i < src.shape[2]):
+                return None
+            out.append(src[:, :, i].astype(np.float64))
+        return out
+
+    def _get_image_for_ml(self, img_data, ml):
+        """Give the model the same kind of image it was trained on.
+
+        Training read the RAW image and took one channel. The ordinary
+        outlining path hands back img_data['processed'], which has rolling-ball
+        background subtraction and any denoising applied. That darkens the
+        diffuse edge of a soma, so a model fitted on raw pixels reads the edge
+        as background and stops short -- outlines come out systematically small
+        while still following the right boundary. Prefer the raw channel, and
+        say so when falling back.
+        """
+        want_ch = self._ml_channel_for(ml, 0, getattr(ml, 'channel', None))
+        idx = (int(want_ch) - 1) if want_ch else None
+
+        # A model fitted on MMPS-processed images wants the processed image --
+        # that is what its labels were drawn on and what it learned to read.
+        if getattr(ml, 'trained_on', 'raw') == 'processed':
+            proc = img_data.get('processed')
+            if proc is not None:
+                return proc
+            if not getattr(self, '_ml_proc_warned', False):
+                self._ml_proc_warned = True
+                self.log("   ⚠ ML: model expects the PROCESSED image but none "
+                         "is loaded — process the images first, or outlines "
+                         "will be wrong.")
+            return self._get_image_for_outlining(img_data)
+
+        raw_path = img_data.get('raw_path')
+        if raw_path and os.path.exists(raw_path):
+            try:
+                raw = load_tiff_image(raw_path)
+                if raw is not None:
+                    raw = np.squeeze(np.asarray(raw))
+                    if raw.ndim == 2:
+                        return raw
+                    if raw.ndim == 3:
+                        ax = int(np.argmin(raw.shape))
+                        if raw.shape[ax] <= 8:
+                            raw = np.moveaxis(raw, ax, -1)
+                            if idx is not None and 0 <= idx < raw.shape[2]:
+                                return raw[:, :, idx]
+                            return raw[:, :, 0]
+                        return raw.max(axis=0)
+            except Exception as e:
+                self.log(f"   ML: could not read raw image ({e})")
+        color = img_data.get('color_image')
+        if color is not None:
+            c = np.asarray(color)
+            if c.ndim == 3 and idx is not None and 0 <= idx < c.shape[2]:
+                return c[:, :, idx]
+        if not getattr(self, '_ml_raw_warned', False):
+            self._ml_raw_warned = True
+            self.log("   ⚠ ML: no raw image available — using the PROCESSED "
+                     "image instead. The model was trained on raw pixels, so "
+                     "outlines will run small.")
+        return self._get_image_for_outlining(img_data)
 
     def _get_image_for_outlining(self, img_data):
         """Get the appropriate grayscale image for auto-outlining"""
@@ -14236,9 +15041,21 @@ if __name__ == '__main__':
 
         points = _remove_branch_juts(points, soma)
 
+        try:
+            if self.auto_outline_method.currentText().startswith('Machine learning'):
+                _ml = get_ml_outliner()
+                if _ml is not None:
+                    self._record_ml_confidence(img_name, soma_idx,
+                                               _ml.last_confidence)
+                    for _m in drain_ml_messages():
+                        self.log(_m)
+        except Exception:
+            pass
+
         self.polygon_points = list(points)
         pixmap = self._get_outlining_pixmap(img_data)
         self.processed_label.set_image(pixmap, centroids=[soma], polygon_pts=self.polygon_points)
+        self._show_ml_confidence(img_name, soma_idx, force=True)
 
         self.processed_label.point_edit_mode = True
         self.processed_label.selected_point_idx = None
@@ -14389,6 +15206,134 @@ if __name__ == '__main__':
             for ol in img_data['soma_outlines']
         )
 
+    def _outline_provenance(self, img_name, soma_idx, points):
+        """Classify an outline about to be stored, against the model proposal.
+
+        Retraining on outlines the model itself produced is self-training: its
+        biases return as labels and the score drifts optimistic while the model
+        drifts worse. Recording WHERE each outline came from lets training keep
+        your corrections, which are the informative cases, and hold the
+        untouched acceptances out.
+
+        Returns (source, confidence, iou_vs_proposal).
+        """
+        qi = getattr(self, 'current_review_idx', None)
+        if qi is None or not getattr(self, 'review_mode', False):
+            qi = getattr(self, 'current_outline_idx', None)
+        proposal = None
+        if qi is not None:
+            cands = getattr(self, 'auto_outlined_points', None) or {}
+            q = getattr(self, 'outlining_queue', None) or []
+            if qi in cands and qi < len(q) and tuple(q[qi]) == (img_name, soma_idx):
+                proposal = cands[qi]
+        conf = getattr(self, 'ml_confidence', {}).get((img_name, soma_idx))
+        if proposal is None:
+            return ('manual', conf, None)
+        if list(map(tuple, proposal)) == list(map(tuple, points)):
+            return ('ml_accepted', conf, 1.0)
+        # edited: measure how far the accepted outline moved from the proposal.
+        # This is the model scored against real decisions on real images, which
+        # held-out validation only approximates.
+        iou = None
+        try:
+            img_data = self.images.get(img_name) or {}
+            shape = None
+            oi = self._get_image_for_outlining(img_data)
+            if oi is not None:
+                shape = oi.shape[:2]
+            if shape:
+                a = self._polygon_to_mask(proposal, shape)
+                b = self._polygon_to_mask(list(points), shape)
+                u = np.logical_or(a, b).sum()
+                iou = float(np.logical_and(a, b).sum()) / float(u) if u else None
+        except Exception:
+            iou = None
+        return ('ml_edited', conf, iou)
+
+    def _log_ml_feedback(self, img_name, soma_id, source, conf, iou, area_um2):
+        """Append one review decision to soma_ml_feedback.csv."""
+        try:
+            path = self._get_checklist_path('soma_ml_feedback.csv')
+            if not path:
+                return
+            new = not os.path.exists(path)
+            with open(path, 'a', newline='') as fh:
+                w = csv.writer(fh)
+                if new:
+                    w.writerow(['image', 'soma_id', 'source', 'confidence',
+                                'iou_vs_proposal', 'soma_area_um2'])
+                w.writerow([img_name, soma_id, source,
+                            '' if conf is None else f"{conf:.4f}",
+                            '' if iou is None else f"{iou:.4f}",
+                            f"{area_um2:.2f}"])
+        except Exception:
+            pass
+
+    def _record_ml_confidence(self, img_name, soma_idx, conf):
+        """Remember how much the model trusted one outline."""
+        if not hasattr(self, 'ml_confidence'):
+            self.ml_confidence = {}
+        if conf is None:
+            self.ml_confidence.pop((img_name, soma_idx), None)
+        else:
+            self.ml_confidence[(img_name, soma_idx)] = float(conf)
+
+    def _ml_confidence_label(self, img_name, soma_idx):
+        """(text, colour) for the bottom-left badge, or (None, None).
+
+        The wording is deliberately about REVIEW rather than correctness -- the
+        score says how stable the boundary is, which predicts accuracy well but
+        is not a promise about any individual cell.
+        """
+        conf = getattr(self, 'ml_confidence', {}).get((img_name, soma_idx))
+        if conf is None:
+            return None, None
+        ml = get_ml_outliner()
+        thr = ml.accept_threshold('top50') if ml is not None else None
+        if thr is not None and conf >= thr:
+            return f"Model confidence {conf:.2f} — high", QColor(120, 230, 140)
+        if thr is not None and conf >= thr * 0.75:
+            return f"Model confidence {conf:.2f} — check", QColor(245, 205, 90)
+        return f"Model confidence {conf:.2f} — low, check closely", QColor(245, 130, 120)
+
+    def _show_ml_confidence(self, img_name, soma_idx, queue_idx=None,
+                            force=False):
+        """Put the confidence badge on both image views, or clear it.
+
+        Only shown when there is an outline for it to describe -- either one
+        already stored, or a model candidate waiting to be reviewed. The manual
+        outlining path opens a soma with an empty canvas, and a confidence score
+        floating over nothing reads as a missing outline rather than as a score
+        for an outline that was never drawn here.
+        """
+        # force covers the case where an outline was just produced and is on
+        # screen but not yet stored or queued as a candidate.
+        has = force or self._soma_has_outline(img_name, soma_idx)
+        if not has:
+            cands = getattr(self, 'auto_outlined_points', None) or {}
+            if queue_idx is not None:
+                has = queue_idx in cands
+            else:
+                q = getattr(self, 'outlining_queue', None) or []
+                for qi in cands:
+                    if qi < len(q) and tuple(q[qi]) == (img_name, soma_idx):
+                        has = True
+                        break
+        if not has:
+            text, colour = None, None
+        else:
+            text, colour = self._ml_confidence_label(img_name, soma_idx)
+        for lbl in (getattr(self, 'processed_label', None),
+                    getattr(self, 'original_label', None)):
+            if lbl is None:
+                continue
+            try:
+                lbl.info_text_bottom = text
+                lbl.info_text_bottom_color = colour
+                lbl.update()
+            except Exception:
+                pass
+
     def _store_outline(self, img_name, soma_idx, points, mask_shape=None):
         """Commit one soma outline: rasterise, record, export, tick checklist.
 
@@ -14414,6 +15359,8 @@ if __name__ == '__main__':
         pixel_size = self._get_pixel_size(img_name)
         soma_area_um2 = float(np.sum(mask) * (pixel_size ** 2))
 
+        source, ml_conf, prop_iou = self._outline_provenance(
+            img_name, soma_idx, points)
         img_data['soma_outlines'].append({
             'soma_idx': soma_idx,
             'soma_id': soma_id,
@@ -14421,7 +15368,13 @@ if __name__ == '__main__':
             'outline': mask,
             'polygon_points': list(points),
             'soma_area_um2': soma_area_um2,
+            'source': source,
+            'ml_confidence': ml_conf,
+            'iou_vs_proposal': prop_iou,
         })
+        if source != 'manual':
+            self._log_ml_feedback(img_name, soma_id, source, ml_conf,
+                                  prop_iou, soma_area_um2)
         self._export_soma_outline(img_name, soma_id, mask, pixel_size,
                                   soma_area_um2)
         cl_path = self._get_checklist_path('soma_checklist.csv')
@@ -14551,6 +15504,7 @@ if __name__ == '__main__':
                 done += 1
                 if ml is not None:
                     conf = ml.last_confidence
+                    self._record_ml_confidence(img_name, soma_idx, conf)
                     if ml_threshold is None:
                         # "review all" -- every ML outline is queued, least
                         # confident first so attention goes where it is needed
@@ -14621,8 +15575,182 @@ if __name__ == '__main__':
         else:
             self._finish_outlining()
 
+    def _clear_soma_outlines_dialog(self):
+        """Delete outlines for a range of queue positions so they can be redone.
+
+        Positions are 1-based and match the "N/M already done" counts shown when
+        outlining starts, so a run that outlined somas 334 onward is cleared by
+        entering 334 to the end.
+        """
+        if not getattr(self, 'outlining_queue', None):
+            QMessageBox.warning(self, "Clear Soma Outlines",
+                                "No soma queue is loaded. Open a session first.")
+            return
+        total = len(self.outlining_queue)
+        outlined = [qi for qi in range(total)
+                    if self._soma_has_outline(*self.outlining_queue[qi])]
+        if not outlined:
+            QMessageBox.information(self, "Clear Soma Outlines",
+                                    "No somas currently have outlines.")
+            return
+
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QSpinBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Clear Soma Outlines")
+        lay = QVBoxLayout()
+        lay.addWidget(QLabel(
+            f"<b>{len(outlined)} of {total} somas have outlines.</b><br><br>"
+            f"Delete outlines for somas in this range (1-based, inclusive).<br>"
+            f"Their soma TIFFs are deleted too, so they can be outlined again."))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("From:"))
+        from_spin = QSpinBox()
+        from_spin.setRange(1, total)
+        from_spin.setValue(1)
+        row.addWidget(from_spin)
+        row.addWidget(QLabel("  To:"))
+        to_spin = QSpinBox()
+        to_spin.setRange(1, total)
+        to_spin.setValue(total)
+        row.addWidget(to_spin)
+        lay.addLayout(row)
+
+        preview = QLabel("")
+        preview.setWordWrap(True)
+        lay.addWidget(preview)
+
+        def _refresh():
+            a, b = from_spin.value(), to_spin.value()
+            if a > b:
+                preview.setText("<i>'From' is after 'To' — nothing selected.</i>")
+                return
+            n = sum(1 for qi in range(a - 1, b)
+                    if self._soma_has_outline(*self.outlining_queue[qi]))
+            preview.setText(f"<b>{n}</b> outline(s) in that range would be "
+                            f"deleted. {len(outlined) - n} would be kept.")
+        from_spin.valueChanged.connect(_refresh)
+        to_spin.valueChanged.connect(_refresh)
+        _refresh()
+
+        btns = QHBoxLayout()
+        del_btn = QPushButton("Delete outlines in range")
+        del_btn.setStyleSheet("border: 2px solid #E53935; font-weight: bold;")
+        del_btn.clicked.connect(lambda: dlg.done(1))
+        btns.addWidget(del_btn)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(lambda: dlg.done(0))
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+        dlg.setLayout(lay)
+        dlg.setMinimumWidth(430)
+        if dlg.exec_() != 1:
+            return
+
+        a, b = from_spin.value(), to_spin.value()
+        if a > b:
+            return
+        targets = [qi for qi in range(a - 1, b)
+                   if self._soma_has_outline(*self.outlining_queue[qi])]
+        if not targets:
+            QMessageBox.information(self, "Clear Soma Outlines",
+                                    "No outlines in that range.")
+            return
+        if QMessageBox.question(
+                self, "Clear Soma Outlines",
+                f"Delete {len(targets)} outline(s) for somas {a}-{b}?\n\n"
+                f"This cannot be undone from inside MMPS. Reload your session "
+                f"file if you need them back.",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        removed = self._clear_outlines_for(targets)
+        self._clear_ml_review_order()
+        self._update_outline_progress()
+        self._auto_save()
+        self.log(f"Cleared {removed} soma outline(s) for queue positions "
+                 f"{a}-{b}")
+        QMessageBox.information(
+            self, "Clear Soma Outlines",
+            f"Deleted {removed} outline(s).\n\nThose somas are back in the "
+            f"queue and can be outlined again.")
+
+    def _clear_outlines_for(self, queue_indices):
+        """Remove stored outlines, their exported TIFFs, and checklist ticks."""
+        removed = 0
+        by_image = {}
+        for qi in queue_indices:
+            img_name, soma_idx = self.outlining_queue[qi]
+            by_image.setdefault(img_name, set()).add(soma_idx)
+        for img_name, idxs in by_image.items():
+            img_data = self.images.get(img_name)
+            if img_data is None:
+                continue
+            kept = []
+            for entry in img_data.get('soma_outlines', []):
+                if entry.get('soma_idx') in idxs:
+                    removed += 1
+                    soma_id = entry.get('soma_id', '')
+                    # delete the exported TIFF so a rerun does not find stale
+                    # files and so downstream steps cannot pick them up
+                    try:
+                        if getattr(self, 'somas_dir', None):
+                            base = os.path.splitext(img_name)[0]
+                            fp = os.path.join(self.somas_dir,
+                                              f"{base}_{soma_id}_soma.tif")
+                            if os.path.exists(fp):
+                                os.remove(fp)
+                    except Exception as e:
+                        self.log(f"   could not delete soma TIFF for "
+                                 f"{soma_id}: {e}")
+                    try:
+                        cl = self._get_checklist_path('soma_checklist.csv')
+                        if cl and os.path.exists(cl):
+                            self._update_checklist_row(
+                                cl, 0, f"{img_name}_{soma_id}", 1, 0)
+                    except Exception:
+                        pass
+                    if hasattr(self, 'ml_confidence'):
+                        self.ml_confidence.pop(
+                            (img_name, entry.get('soma_idx')), None)
+                else:
+                    kept.append(entry)
+            img_data['soma_outlines'] = kept
+        # candidates held in memory for these positions are stale too
+        for qi in queue_indices:
+            if hasattr(self, 'auto_outlined_points'):
+                self.auto_outlined_points.pop(qi, None)
+        return removed
+
+    def _clear_ml_review_order(self):
+        """Drop any model-supplied review ordering."""
+        self._ml_review_order = None
+        self._ml_order_pos = 0
+
     def _find_next_unoutlined_idx(self, start_from=0):
-        """Find the first queue entry that doesn't have an outline yet."""
+        """Find the next queue entry that doesn't have an outline yet.
+
+        When the model has supplied a review order, walk that instead of queue
+        position: the ordering puts the least confident outlines first, which is
+        the whole reason for scoring them. Falls back to queue order once that
+        list is exhausted, so nothing is stranded.
+        """
+        order = getattr(self, '_ml_review_order', None)
+        if order:
+            # Walk the model's ordering by POSITION in that list. start_from is
+            # a queue index, and this list is sorted by confidence, so comparing
+            # the two discards every entry whose index happens to be lower and
+            # the review declares itself finished after a handful of somas.
+            if start_from <= 0:
+                self._ml_order_pos = 0
+            pos = getattr(self, '_ml_order_pos', 0)
+            while pos < len(order):
+                qi = order[pos]
+                pos += 1
+                if qi < len(self.outlining_queue) and not self._soma_has_outline(
+                        *self.outlining_queue[qi]):
+                    self._ml_order_pos = pos
+                    return qi
+            self._ml_order_pos = pos
         for qi in range(start_from, len(self.outlining_queue)):
             img_name, soma_idx = self.outlining_queue[qi]
             if not self._soma_has_outline(img_name, soma_idx):
@@ -14641,6 +15769,7 @@ if __name__ == '__main__':
         self.progress_bar.setVisible(True)
 
     def _finish_outlining(self):
+        self._clear_ml_review_order()
         self.progress_bar.setVisible(False)
         self.progress_bar.setFormat("%p%")  # Reset to default format
         self.outline_controls_widget.setVisible(False)
@@ -15791,8 +16920,11 @@ if __name__ == '__main__':
                 self.min_intensity_percent, self.local_intensity_window,
                 global_max=float(processed_img.max()))
 
-        # Build territory constraint ROI if watershed territory_map is provided
+        # Build territory constraint ROI if watershed territory_map is provided.
+        # my_label must exist even without one: it is passed to the grower
+        # unconditionally, and the grower ignores it when there is no territory.
         territory_roi = None
+        my_label = 0
         if territory_map is not None:
             territory_roi = territory_map[y_min:y_max, x_min:x_max]
             my_label = territory_roi[cy_roi, cx_roi]
@@ -16245,8 +17377,53 @@ if __name__ == '__main__':
             not in self._qa_finalized_somas
         ]
 
+    def _archive_rejected_mask(self, img_name, mask_path, mask_filename,
+                               mask_data):
+        """Keep a rejected mask instead of deleting it, for QA training.
+
+        A model that predicts which masks you reject needs the rejected ones.
+        They are the whole negative class, and deleting them leaves only
+        examples of masks you kept, which no classifier can learn from.
+
+        Stored compressed: a mask is a full-frame binary image, mostly zeros, so
+        it goes from megabytes to a few kilobytes. Thousands of them then cost
+        tens of MB rather than filling the disk.
+        """
+        try:
+            out_root = getattr(self, 'output_dir', None)
+            if not out_root:
+                return False
+            dest_dir = os.path.join(out_root, 'rejected_masks')
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, mask_filename)
+            arr = safe_tiff_read(mask_path)
+            if arr is None:
+                return False
+            arr = (np.asarray(arr) > 0).astype(np.uint8) * 255
+            tifffile.imwrite(dest, arr, compression='zlib')
+
+            # Why it was rejected. Duplicates are auto-rejected by a rule, not
+            # by judgement, and training on them teaches a rule the model does
+            # not need while inflating its score with free correct answers.
+            reason = 'duplicate' if mask_data.get('duplicate') else 'user'
+            csv_path = os.path.join(dest_dir, 'rejected_masks.csv')
+            new_file = not os.path.exists(csv_path)
+            with open(csv_path, 'a', newline='') as fh:
+                w = csv.writer(fh)
+                if new_file:
+                    w.writerow(['image', 'soma_id', 'target_area_um2',
+                                'reason', 'file'])
+                w.writerow([img_name, mask_data.get('soma_id', ''),
+                            mask_data.get('target_area_um2',
+                                          mask_data.get('area_um2', 0)),
+                            reason, mask_filename])
+            return True
+        except Exception as e:
+            self.log(f"   ⚠️ Could not archive {mask_filename}: {e}")
+            return False
+
     def _delete_rejected_mask_tiff(self, img_name, mask_data):
-        """Delete the TIFF file for a rejected mask from disk."""
+        """Remove a rejected mask from the masks folder, archiving it first."""
         if not self.masks_dir or not os.path.isdir(self.masks_dir):
             return
         img_basename = os.path.splitext(img_name)[0]
@@ -16255,9 +17432,19 @@ if __name__ == '__main__':
         mask_filename = _mask_tif_name(img_basename, soma_id, area_um2)
         mask_path = os.path.join(self.masks_dir, mask_filename)
         if os.path.exists(mask_path):
+            archived = False
+            if getattr(self, 'archive_rejected_masks', True):
+                archived = self._archive_rejected_mask(
+                    img_name, mask_path, mask_filename, mask_data)
             try:
                 os.remove(mask_path)
-                self.log(f"   🗑️ Deleted rejected mask: {mask_filename}")
+                if archived:
+                    if not getattr(self, '_archive_noted', False):
+                        self._archive_noted = True
+                        self.log(f"   Rejected masks are being kept in "
+                                 f"{os.path.join(self.output_dir, 'rejected_masks')}")
+                else:
+                    self.log(f"   🗑️ Deleted rejected mask: {mask_filename}")
             except Exception as e:
                 self.log(f"   ⚠️ Could not delete {mask_filename}: {e}")
 
@@ -17053,16 +18240,38 @@ if __name__ == '__main__':
             self.qa_grid_scroll.setVisible(False)
             self.mask_label.setVisible(True)
 
-            # Find first unreviewed mask to show
-            found = False
-            for idx in range(len(self.all_masks_flat)):
-                md = self.all_masks_flat[idx]['mask_data']
-                if md.get('approved') is None and not md.get('duplicate'):
-                    self.mask_qa_idx = idx
-                    found = True
-                    break
-            if not found:
-                self.mask_qa_idx = max(0, len(self.all_masks_flat) - 1)
+            # Show a mask from the soma the grid was on. Scanning the whole
+            # list from zero jumps to the earliest unreviewed mask anywhere --
+            # any soma skipped earlier -- so switching views threw away your
+            # position and appeared to go backwards.
+            def _first_unreviewed(indices):
+                for fi in indices:
+                    md = self.all_masks_flat[fi]['mask_data']
+                    if md.get('approved') is None and not md.get('duplicate'):
+                        return fi
+                return None
+
+            idx = None
+            order = getattr(self, '_qa_soma_order', []) or []
+            start = min(max(getattr(self, '_qa_grid_soma_idx', 0), 0),
+                        max(len(order) - 1, 0))
+            if order:
+                # this soma first, then onwards, then wrap to the beginning
+                for k in list(range(start, len(order))) + list(range(0, start)):
+                    idx = _first_unreviewed(
+                        self._qa_soma_mask_index.get(order[k], []))
+                    if idx is not None:
+                        break
+            if idx is None:
+                idx = _first_unreviewed(range(len(self.all_masks_flat)))
+            if idx is None:
+                # nothing left unreviewed: stay on this soma rather than
+                # snapping to the end of the run
+                same = self._qa_soma_mask_index.get(order[start], []) if order \
+                    else []
+                idx = (same[0] if same
+                       else max(0, len(self.all_masks_flat) - 1))
+            self.mask_qa_idx = idx
 
             # Update progress bar to mask count
             auto_rejected = self._qa_auto_rejected_count
@@ -17121,9 +18330,14 @@ if __name__ == '__main__':
         # Get non-duplicate masks sorted largest first
         size_key = 'target_area_um2'
         mask_items = []
+        n_identical = 0
         for fi in flat_indices:
             md = self.all_masks_flat[fi]['mask_data']
             if md.get('duplicate'):
+                # Pixel-identical to a smaller target: growth stopped before
+                # reaching this size, so the two masks are the same object.
+                # Showing both would be eight copies of one thumbnail.
+                n_identical += 1
                 continue
             mask_items.append((fi, md))
         mask_items.sort(key=lambda x: -x[1].get(size_key, 0))
@@ -17139,6 +18353,12 @@ if __name__ == '__main__':
         header_text = (f"<b>Soma {self._qa_grid_soma_idx + 1} / {total_somas}</b> | "
                       f"{os.path.splitext(img_name)[0]} | {soma_id} | "
                       f"{len(mask_items)} masks")
+        if n_identical:
+            # Say so rather than leaving a short grid looking like something
+            # failed: the sizes are absent because growth could not reach them.
+            header_text += (f" | <span style='color: #888;'>{n_identical} "
+                            f"larger size(s) identical to these — growth "
+                            f"stopped early</span>")
         if skipped_count > 0:
             header_text += f" | <span style='color: orange;'>{skipped_count} skipped</span>"
         header = QLabel(header_text)
@@ -17226,18 +18446,22 @@ if __name__ == '__main__':
         if available_height < 200:
             available_height = 500
 
-        # Always 2 rows for up to 16 masks
-        n_cols = max(1, (n_masks + 1) // 2)
-        if n_masks <= 2:
-            n_cols = n_masks
-
-        # Size to fill width
-        thumb_w = max(80, (available_width - spacing * (n_cols + 1)) // max(n_cols, 1))
-        # Size to fill height (2 rows + labels)
+        # Choose the row/column split that makes the thumbnails LARGEST for the
+        # space available. Fixing the grid at two rows forced eight columns for
+        # sixteen masks, so tile size was capped by width while most of the
+        # height went unused -- the masks came out small with a dead band below
+        # them. Every split is cheap to evaluate, so just try them all.
+        label_h = 20
+        n_cols, n_rows, thumb_size = 1, n_masks, 80
+        for cols in range(1, n_masks + 1):
+            rows = (n_masks + cols - 1) // cols
+            w = (available_width - spacing * (cols + 1)) // cols
+            h = (available_height - spacing * (rows + 1) - label_h * rows) // rows
+            size = min(w, h)
+            if size > thumb_size:
+                n_cols, n_rows, thumb_size = cols, rows, size
+        thumb_size = int(max(80, min(thumb_size, 500)))
         n_rows = max(1, (n_masks + n_cols - 1) // n_cols)
-        thumb_h = max(80, (available_height - spacing * (n_rows + 1) - 20 * n_rows) // max(n_rows, 1))
-        # Use the smaller of width/height to keep square
-        thumb_size = min(thumb_w, thumb_h, 500)
 
         # Wrapping grid layout for 16+ masks
         from PyQt5.QtWidgets import QGridLayout

@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# Trained soma models. These are hundreds of MB, and MMPSv2.spec bundles any
+# soma_model.joblib sitting beside the script -- committing one would ship it
+# into every build. Train locally with train_soma_model.py instead.
+*.joblib
