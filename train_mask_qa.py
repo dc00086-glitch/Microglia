@@ -431,7 +431,8 @@ def pick(areas, probs, cut, rule):
     return areas[hi]
 
 
-def size_choice_report(keys, y_true, p, cut, rule='largest', quiet=False):
+def size_choice_report(keys, y_true, p, cut, rule='largest', quiet=False,
+                       over_w=3.0, miss_w=4.0):
     """Does the model pick the same mask you did?
 
     Per-mask accuracy is not the task. The task is choosing, per soma, the
@@ -443,6 +444,8 @@ def size_choice_report(keys, y_true, p, cut, rule='largest', quiet=False):
     exact = within = none_ok = none_tot = 0
     over = under = 0
     total = 0
+    step_pen = 0.0      # how far off, in size steps, direction-weighted
+    n_pen = 0
     for _, rows in somas.items():
         rows.sort(key=lambda z: z[0])
         areas = [z[0] for z in rows]
@@ -454,21 +457,35 @@ def size_choice_report(keys, y_true, p, cut, rule='largest', quiet=False):
             none_tot += 1
             if p_best is None:
                 none_ok += 1
+            else:
+                # proposing a mask where every size was rejected puts a bad
+                # mask into the data, like an oversize
+                step_pen += over_w
+                n_pen += 1
             continue
         if p_best is None:
+            # proposing nothing where a size was acceptable: the cell is lost
             under += 1
+            step_pen += miss_w
+            n_pen += 1
             continue
+        ti, pi = areas.index(t_best), areas.index(p_best)
         if p_best == t_best:
             exact += 1
             within += 1
         else:
-            ti, pi = areas.index(t_best), areas.index(p_best)
             if abs(ti - pi) <= 1:
                 within += 1
             if pi > ti:
                 over += 1
             else:
                 under += 1
+        # Distance in size steps, so being one step out is not scored the same
+        # as being eight. Overshooting is weighted more: an oversized mask
+        # absorbs neighbouring processes, where an undersized one is visible.
+        d = pi - ti
+        step_pen += (over_w * d) if d > 0 else (-d)
+        n_pen += 1
     # Two different questions, so two different denominators. Mixing them --
     # scoring the size choice across somas that have no correct size -- reads
     # far worse than the model is behaving.
@@ -480,13 +497,15 @@ def size_choice_report(keys, y_true, p, cut, rule='largest', quiet=False):
         print(f"    within one size step:        {100 * within / d:5.1f}%")
         print(f"    chose too large:             {100 * over / d:5.1f}%")
         print(f"    chose too small:             {100 * under / d:5.1f}%")
+        print(f"    mean size error:             {step_pen / max(n_pen, 1):5.2f} "
+              f"weighted steps (0 = always exact)")
         if none_tot:
             print(f"  {none_tot} somas had none acceptable; on those:")
             print(f"    correctly proposed nothing:  "
                   f"{100 * none_ok / none_tot:5.1f}%")
     return dict(total=total, scoreable=scoreable, none_tot=none_tot,
                 exact=exact / d, within=within / d, over=over / d,
-                under=under / d,
+                under=under / d, steps=step_pen / max(n_pen, 1),
                 none_ok=(none_ok / none_tot if none_tot else 1.0))
 
 
@@ -501,6 +520,10 @@ def main():
                     help='microglia stain (red)')
     ap.add_argument('--dapi-channel', type=int, default=3,
                     help='nuclear stain (blue); 0 to disable')
+    ap.add_argument('--cache', default=None,
+                    help='save extracted features here, and reuse them next '
+                         'time. Feature extraction is the slow part; the '
+                         'decision rule can then be retried in seconds.')
     ap.add_argument('--max-masks', type=int, default=None,
                     help='use at most N masks, sampled evenly, for a quick check')
     ap.add_argument('--trees', type=int, default=400)
@@ -572,9 +595,21 @@ def main():
         recs = out
         print(f"  sampled down to {len(recs)} masks from {take} whole somas")
 
-    print("\nExtracting features…")
-    X, y, groups, keys = build(recs, a.signal_channel, a.dapi_channel,
-                               a.pixel_size)
+    X = None
+    if a.cache and os.path.exists(a.cache):
+        z = np.load(a.cache, allow_pickle=True)
+        X, y, groups = z['X'], z['y'], z['groups']
+        keys = [tuple(k) for k in z['keys']]
+        print(f"\nReusing features from {a.cache} "
+              f"({X.shape[0]:,} masks x {X.shape[1]} features)")
+    if X is None:
+        print("\nExtracting features…")
+        X, y, groups, keys = build(recs, a.signal_channel, a.dapi_channel,
+                                   a.pixel_size)
+        if X is not None and a.cache:
+            np.savez_compressed(a.cache, X=X, y=y, groups=groups,
+                                keys=np.array(keys, dtype=object))
+            print(f"  cached to {a.cache}")
     if X is None:
         sys.exit("No usable masks.")
     print(f"  {X.shape[0]:,} masks x {X.shape[1]} features")
@@ -626,7 +661,7 @@ def main():
           "acceptable mask;")
     print("  'none ok' is of somas where you rejected every size.")
     print(f"\n  {'rule':>8} {'cut':>5} {'exact':>7} {'within1':>8} "
-          f"{'too big':>8} {'too small':>10} {'none ok':>8} {'cost':>7}")
+          f"{'too big':>8} {'too small':>10} {'none ok':>8} {'steps':>7}")
     best = None
     for rule in ('largest', 'band'):
         for cut in cuts:
@@ -647,9 +682,10 @@ def main():
                   f"{cost:7.3f}{mark}")
 
     print(f"\nChosen: {best['rule']} rule at cut {best['cut']}")
-    size_choice_report(te_keys, y[te], p, best['cut'], best['rule'])
-    print(f"\n  (chosen by lowest cost, where choosing too large counts "
-          f"{a.oversize_cost}x a miss)")
+    size_choice_report(te_keys, y[te], p, best['cut'], best['rule'],
+                       over_w=a.oversize_cost)
+    print(f"\n  (chosen by the smallest mean size error, counting a step too "
+          f"large as {a.oversize_cost} steps too small)")
 
     imp = sorted(zip(FEATURE_NAMES, clf.feature_importances_),
                  key=lambda z: -z[1])[:10]
