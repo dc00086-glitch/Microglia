@@ -665,13 +665,13 @@ def main():
     best = None
     for rule in ('largest', 'band'):
         for cut in cuts:
-            r = size_choice_report(te_keys, y[te], p, cut, rule, quiet=True)
-            # what we actually minimise: a miss costs 1, an oversize costs more
-            # a mask proposed where you accepted none is an oversize by
-            # another name: it puts a bad mask into the data
-            cost = (r['under'] + a.oversize_cost * r['over']
-                    + a.oversize_cost * (1.0 - r['none_ok'])
-                    * (r['none_tot'] / max(r['total'], 1)))
+            r = size_choice_report(te_keys, y[te], p, cut, rule, quiet=True,
+                                   over_w=a.oversize_cost)
+            # Mean distance from your choice, in ladder steps, overshoots
+            # weighted heavier. Counting only the DIRECTION of the error let a
+            # threshold that is almost always far too small score best, since
+            # never overshooting is trivially achieved by never reaching.
+            cost = r['steps']
             mark = ''
             if best is None or cost < best['cost']:
                 best = dict(rule=rule, cut=cut, cost=cost, **r)
