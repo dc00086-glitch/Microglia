@@ -376,6 +376,13 @@ def load_channels(path, sig_ch, dapi_ch):
 
 
 def build(records, sig_ch, dapi_ch, pixel_size, verbose_every=200):
+    # Every soma position per image, so a mask can be told how close its
+    # neighbours are. Built once here rather than per mask.
+    per_image = {}
+    for r in records:
+        per_image.setdefault(r['image_path'], set()).add((r['row'], r['col']))
+    per_image = {k: sorted(v) for k, v in per_image.items()}
+
     X, y, groups, keys = [], [], [], []
     skipped, skip_reasons = 0, []
     cache_img, cache_path = None, None
