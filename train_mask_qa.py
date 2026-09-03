@@ -561,6 +561,70 @@ def size_choice_report(keys, y_true, p, cut, rule='largest', quiet=False,
                 none_ok=(none_ok / none_tot if none_tot else 1.0))
 
 
+def soma_confidence(areas, probs, chosen):
+    """How cleanly this soma's ladder splits at the chosen size.
+
+    The decision is a boundary: sizes at or below it should score high, sizes
+    above it low. When that separation is wide the boundary is obvious; when the
+    probabilities drift across the ladder the model is picking between options
+    it cannot really distinguish. That gap is computable without any ground
+    truth, so it can sort somas into ones worth trusting and ones to look at.
+    """
+    if chosen is None:
+        # nothing proposed: confident only if the whole ladder scored low
+        return max(0.0, 0.5 - float(np.max(probs)))
+    i = areas.index(chosen)
+    below = probs[:i + 1]
+    above = probs[i + 1:]
+    m_below = float(np.mean(below))
+    m_above = float(np.mean(above)) if len(above) else 0.0
+    return m_below - m_above
+
+
+def triage_report(keys, y_true, p, cut, rule, quiet=False):
+    """Accuracy as a function of confidence, so a trustworthy subset can be cut.
+
+    An average over every soma is not what a review workflow needs. What it
+    needs is: which of these can I accept without looking, and how many are
+    there.
+    """
+    somas = {}
+    for k, t, pr in zip(keys, y_true, p):
+        somas.setdefault(k[:3], []).append((k[3], t, pr))
+    rows = []
+    for _, r in somas.items():
+        r.sort(key=lambda z: z[0])
+        areas = [z[0] for z in r]
+        probs = [z[2] for z in r]
+        truth = [z[0] for z in r if z[1] == 1]
+        t_best = max(truth) if truth else None
+        p_best = pick(areas, probs, cut, rule)
+        conf = soma_confidence(areas, probs, p_best)
+        if t_best is None:
+            ok = (p_best is None)
+            near = ok
+        else:
+            ok = (p_best == t_best)
+            near = (p_best is not None
+                    and abs(areas.index(p_best) - areas.index(t_best)) <= 1)
+        rows.append((conf, ok, near))
+    rows.sort(key=lambda z: -z[0])
+    n = len(rows)
+    if not quiet:
+        print(f"\n  Confidence triage over {n} somas "
+              f"(no ground truth needed to compute it):")
+        print(f"    {'accept top':>11} {'n':>5} {'threshold':>10} "
+              f"{'exact':>8} {'within 1':>9}")
+        for frac in (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0):
+            k = max(1, int(n * frac))
+            sub = rows[:k]
+            thr = sub[-1][0]
+            print(f"    {100 * frac:9.0f}% {k:5d} {thr:10.3f} "
+                  f"{100 * sum(1 for _, o, _ in sub if o) / k:7.1f}% "
+                  f"{100 * sum(1 for _, _, nr in sub if nr) / k:8.1f}%")
+    return rows
+
+
 def bootstrap_ci(keys, y_true, p, cut, rule, over_w, n_boot=2000, seed=0):
     """95% intervals by resampling IMAGES, not somas.
 
@@ -781,6 +845,8 @@ def main():
     print(f"\nChosen: {best['rule']} rule at cut {best['cut']}")
     size_choice_report(te_keys, y[te], p, best['cut'], best['rule'],
                        over_w=a.oversize_cost)
+    triage_report(te_keys, y[te], p, best['cut'], best['rule'])
+
     if a.boot:
         print(f"\n  95% confidence intervals ({a.boot} draws, resampling "
               f"images):")
@@ -805,7 +871,8 @@ def main():
         features=FEATURE_NAMES, pixel_size_um=a.pixel_size,
         signal_channel=a.signal_channel, dapi_channel=a.dapi_channel,
         prob_cut=best['cut'], select_rule=best['rule'],
-        oversize_cost=a.oversize_cost)}, a.out, compress=3)
+        oversize_cost=a.oversize_cost,
+        confidence='mean_below_minus_mean_above')}, a.out, compress=3)
     print(f"\nSaved -> {a.out} ({os.path.getsize(a.out) / 1e6:.1f} MB)")
     print("\nHow to read this:")
     print("  'picked exactly your mask' is the number that matters. Every")
