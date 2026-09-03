@@ -2101,6 +2101,255 @@ def get_ml_outliner(path=None):
         return None
 
 
+# ======================================================================
+# Machine-learning mask QA
+#
+# COPIED VERBATIM from train_mask_qa.py. The forest was fitted on features
+# produced by that exact code, so any divergence feeds it the wrong numbers
+# and it degrades with no error. tools/test_maskqa_parity.py fails on drift.
+# ======================================================================
+_MQ_FEATURE_NAMES = [
+    'target_area', 'area_px', 'area_um2', 'area_vs_target',
+    'perimeter', 'circularity', 'solidity', 'extent', 'aspect_ratio',
+    'eccentricity', 'n_components', 'n_holes', 'euler',
+    'max_thickness', 'mean_thickness', 'skel_length', 'skel_endpoints',
+    'skel_branchpoints', 'skel_per_area',
+    'soma_frac', 'centroid_offset', 'touches_border',
+    'sig_mean_in', 'sig_p90_in', 'sig_mean_ring', 'sig_contrast',
+    'sig_frac_above_bg', 'boundary_gradient',
+    'dapi_mean_in', 'dapi_frac_in', 'dapi_in_soma', 'dapi_dist',
+    'nbr_dist', 'nbr_dist2', 'nbr_within_2r', 'frac_in_nbr_territory',
+    'reach_vs_gap',
+]
+
+
+def _mq_image_stats(sig, dapi):
+    """Everything about an image that does not vary between its masks.
+
+    The gradient, the background level and the nuclear threshold are all
+    image-wide, and computing them per mask meant scanning two million pixels
+    tens of thousands of times.
+    """
+    gy, gx = np.gradient(ndi.gaussian_filter(sig, 1.5))
+    grad = np.hypot(gy, gx)
+    bg = float(np.median(sig))
+    dthr = (float(np.percentile(dapi, 99)) * 0.35) if dapi is not None else None
+    return grad, bg, dthr
+
+
+def _mq_mask_features(mask, soma_mask, sig, dapi, target_area, pixel_size,
+                  grad=None, bg=None, dapi_thr=None, centre=None,
+                  neighbours=None):
+    """One mask -> one feature vector. Order must match FEATURE_NAMES.
+
+    Everything is computed on a crop around the mask rather than the full
+    frame. A mask occupies a few hundred pixels of a 1440x1920 image, so the
+    distance transform, labelling and dilation were doing seventy times more
+    work than they needed to, once per mask, over tens of thousands of masks.
+    The crop keeps a margin wider than any neighbourhood used below, so every
+    value is identical to the full-frame computation.
+    """
+    f = []
+    m_full = mask > 0
+    area = int(m_full.sum())
+    if area < 5:
+        return None
+    px2 = pixel_size ** 2
+
+    ys_f, xs_f = np.nonzero(m_full)
+    H, W = m_full.shape
+    MARGIN = 12                      # > the 6-px ring and the 3x3 skeleton pass
+    cy0 = max(0, int(ys_f.min()) - MARGIN)
+    cy1 = min(H, int(ys_f.max()) + 1 + MARGIN)
+    cx0 = max(0, int(xs_f.min()) - MARGIN)
+    cx1 = min(W, int(xs_f.max()) + 1 + MARGIN)
+    m = m_full[cy0:cy1, cx0:cx1]
+    sig_c = sig[cy0:cy1, cx0:cx1]
+    dapi_c = dapi[cy0:cy1, cx0:cx1] if dapi is not None else None
+    soma_c = (soma_mask[cy0:cy1, cx0:cx1]
+              if soma_mask is not None else None)
+    grad_c = grad[cy0:cy1, cx0:cx1] if grad is not None else None
+
+    ys, xs = np.nonzero(m)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    sub = m[y0:y1, x0:x1]
+    u8 = sub.astype(np.uint8)
+
+    f += [float(target_area), float(area), area * px2,
+          (area * px2) / max(float(target_area), 1e-6)]
+
+    cnts, _ = cv2.findContours(u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    cnt = max(cnts, key=cv2.contourArea) if cnts else None
+    per = cv2.arcLength(cnt, True) if cnt is not None else 0.0
+    # circularity 4*pi*A/P^2: 1 for a disc, lower for ragged or elongated
+    circ = (4 * np.pi * area / (per ** 2)) if per > 0 else 0.0
+    hull_a = cv2.contourArea(cv2.convexHull(cnt)) if cnt is not None else 0.0
+    solidity = area / hull_a if hull_a > 0 else 0.0
+    extent = area / float(sub.size) if sub.size else 0.0
+    h, w = sub.shape
+    aspect = max(h, w) / max(min(h, w), 1)
+    if cnt is not None and len(cnt) >= 5:
+        (_, _), (MA, ma), _ = cv2.fitEllipse(cnt)
+        a_, b_ = max(MA, ma) / 2, min(MA, ma) / 2
+        ecc = float(np.sqrt(1 - (b_ * b_) / (a_ * a_))) if a_ > 0 else 0.0
+    else:
+        ecc = 0.0
+    f += [float(per), float(circ), float(solidity), float(extent),
+          float(aspect), float(ecc)]
+
+    lab, ncomp = ndi.label(m)
+    filled = ndi.binary_fill_holes(m)
+    _, nholes = ndi.label(filled & ~m)
+    f += [float(ncomp), float(nholes), float(ncomp - nholes)]
+
+    dt = ndi.distance_transform_edt(m)
+    f += [float(dt.max()), float(dt[m].mean())]
+
+    sk = skeletonize(sub)
+    nb = ndi.convolve(sk.astype(np.uint8), np.ones((3, 3), np.uint8),
+                          mode='constant') - sk.astype(np.uint8)
+    f += [float(sk.sum()), float(((nb == 1) & sk).sum()),
+          float(((nb >= 3) & sk).sum()),
+          float(sk.sum()) / max(area, 1)]
+
+    # how much of the mask is soma, and whether it grew away from it
+    if soma_c is not None and soma_c.any():
+        s = soma_c > 0
+        f.append(float(s.sum()) / max(area, 1))
+        sy, sx = np.nonzero(s)
+        f.append(float(np.hypot(ys.mean() - sy.mean(), xs.mean() - sx.mean())))
+    else:
+        f += [0.0, 0.0]
+    f.append(1.0 if (int(ys_f.min()) == 0 or int(xs_f.min()) == 0
+                     or int(ys_f.max()) >= H - 1
+                     or int(xs_f.max()) >= W - 1) else 0.0)
+
+    # IBA1 signal: is the mask sitting on the cell, and does it stop at an edge?
+    ring = ndi.binary_dilation(m, iterations=6) & ~m
+    sin_ = sig_c[m]
+    sring = sig_c[ring] if ring.any() else np.array([0.0])
+    if bg is None:               # image-wide, so computed once per image
+        bg = float(np.median(sig))
+    f += [float(sin_.mean()), float(np.percentile(sin_, 90)),
+          float(sring.mean()),
+          float(sin_.mean()) / (float(sring.mean()) + 1e-6),
+          float((sin_ > bg).mean())]
+    # the gradient depends only on the image, so it is computed once per image
+    if grad_c is None:
+        gy, gx = np.gradient(ndi.gaussian_filter(sig_c, 1.5))
+        grad_c = np.hypot(gy, gx)
+    edge = m & ~ndi.binary_erosion(m)
+    f.append(float(grad_c[edge].mean()) if edge.any() else 0.0)
+
+    # DAPI: a real soma contains a nucleus
+    if dapi_c is not None:
+        d = dapi_c.astype(np.float64)
+        thr = (dapi_thr if dapi_thr is not None
+               else float(np.percentile(dapi, 99)) * 0.35)
+        pos = d >= max(thr, 1.0)
+        f += [float(d[m].mean()), float(pos[m].mean())]
+        f.append(float(pos[soma_c > 0].mean())
+                 if soma_c is not None and soma_c.any() else 0.0)
+        if pos.any():
+            dist = ndi.distance_transform_edt(~pos)
+            f.append(float(dist[m].min()))
+        else:
+            f.append(float(max(m.shape)))
+    else:
+        f += [0.0, 0.0, 0.0, 0.0]
+
+    # Crowding. A mask is rejected when it runs into the cell next door, and
+    # nothing above can see where the neighbours are -- every feature so far
+    # describes the mask in isolation. These say how much room this cell had
+    # and whether the mask used more than its share of it.
+    cy_m, cx_m = (centre if centre is not None
+                  else (float(ys_f.mean()), float(xs_f.mean())))
+    nb = [n for n in (neighbours or [])
+          if abs(n[0] - cy_m) > 1e-6 or abs(n[1] - cx_m) > 1e-6]
+    far = float(max(H, W))
+    if nb:
+        d = sorted(float(np.hypot(n[0] - cy_m, n[1] - cx_m)) for n in nb)
+        d1 = d[0]
+        d2 = d[1] if len(d) > 1 else far
+        reach = float(np.hypot(ys_f - cy_m, xs_f - cx_m).max())
+        # how many neighbours sit within twice this mask's own reach
+        n2r = float(sum(1 for x in d if x < 2 * max(reach, 1.0)))
+        # pixels closer to some other soma than to this one: territory taken
+        pts = np.stack([ys_f, xs_f], axis=1).astype(np.float64)
+        own = np.hypot(pts[:, 0] - cy_m, pts[:, 1] - cx_m)
+        best_other = np.full(own.shape, np.inf)
+        for n in nb:
+            best_other = np.minimum(
+                best_other, np.hypot(pts[:, 0] - n[0], pts[:, 1] - n[1]))
+        f += [d1, d2, n2r, float((best_other < own).mean()),
+              reach / max(d1 / 2.0, 1.0)]
+    else:
+        f += [far, far, 0.0, 0.0, 0.0]
+
+    return np.asarray(f, dtype=np.float32)
+
+
+def _mq_pick(areas, probs, cut, rule):
+    """Choose the mask to accept from one soma's ladder of sizes.
+
+    Acceptability is a BAND, not a prefix: the smallest masks are too small,
+    the largest too big, and the acceptable ones sit between. So taking the
+    largest mask over the cut hands the answer to any single false positive at
+    the top of the ladder -- and choosing too large is the expensive error,
+    because an oversized mask pulls in neighbouring processes and inflates
+    every morphology metric computed from it.
+
+    'largest'  the largest mask over the cut.
+    'band'     the largest mask in the run of accepts containing the most
+               confident mask, so an isolated accept above a rejection cannot
+               drag the choice upward.
+    """
+    ok = [pr >= cut for pr in probs]
+    if not any(ok):
+        return None
+    if rule == 'edge':
+        # Acceptability ENDS somewhere on the ladder: sizes below the boundary
+        # are fine, above it the mask has swallowed a neighbour. Rather than
+        # asking each size independently whether it clears a threshold, find
+        # where confidence collapses and take the size just before it. The
+        # threshold then only decides whether anything is acceptable at all,
+        # not which size -- so the choice does not move every time it is tuned.
+        if len(probs) < 2:
+            return areas[0]
+        drops = [probs[i] - probs[i + 1] for i in range(len(probs) - 1)]
+        j = max(range(len(drops)), key=lambda i: drops[i])
+        return areas[j]
+    if rule == 'largest':
+        return max(a for a, o in zip(areas, ok) if o)
+    best_i = max(range(len(probs)), key=lambda i: probs[i])
+    if not ok[best_i]:
+        return None
+    hi = best_i
+    while hi + 1 < len(ok) and ok[hi + 1]:
+        hi += 1
+    return areas[hi]
+
+
+def _mq_soma_confidence(areas, probs, chosen):
+    """How cleanly this soma's ladder splits at the chosen size.
+
+    The decision is a boundary: sizes at or below it should score high, sizes
+    above it low. When that separation is wide the boundary is obvious; when the
+    probabilities drift across the ladder the model is picking between options
+    it cannot really distinguish. That gap is computable without any ground
+    truth, so it can sort somas into ones worth trusting and ones to look at.
+    """
+    if chosen is None:
+        # nothing proposed: confident only if the whole ladder scored low
+        return max(0.0, 0.5 - float(np.max(probs)))
+    i = areas.index(chosen)
+    below = probs[:i + 1]
+    above = probs[i + 1:]
+    m_below = float(np.mean(below))
+    m_above = float(np.mean(above)) if len(above) else 0.0
+    return m_below - m_above
+
+
 def auto_outline_soma_blob(image, centroid, sensitivity=50,
                            max_soma_radius_px=14, process_width_px=None):
     """Outline the SOMA only: a compact, locally-bright blob.
