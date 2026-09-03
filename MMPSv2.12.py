@@ -4767,7 +4767,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         coloc_counts_action.setToolTip(
             "Per-image coloc vs single-channel cell counts straight from soma "
             "picking — no masks or morphology needed")
-        coloc_counts_action.triggered.connect(self.export_coloc_counts)
+        # Through a lambda: triggered carries a checked flag, and connecting
+        # the method directly feeds it into `auto`, which decides whether the
+        # export reports its problems or fails silently.
+        coloc_counts_action.triggered.connect(
+            lambda: self.export_coloc_counts())
         composite_action = export_menu.addAction("Export Figure Composites...")
         composite_action.setToolTip("Export publication-ready overlay images (processed + mask outline + scale bar)")
         composite_action.triggered.connect(self._export_figure_composites)
@@ -15804,7 +15808,18 @@ if __name__ == '__main__':
         self._auto_save()
         QMessageBox.information(self, "Complete", "All somas outlined!\n\nReady to generate masks.")
 
-    def batch_generate_masks(self, ask=True, configure_only=False):
+    def batch_generate_masks(self):
+        """Ask for the settings, then grow the masks. The button's slot.
+
+        Takes no arguments ON PURPOSE. Qt's clicked signal carries a checked
+        flag, and PyQt passes it to any slot whose signature will accept one --
+        so giving this function an `ask` parameter made every click arrive as
+        ask=False, skipping the settings dialog and generating with whatever
+        was last stored. Callers that need the options use the method below.
+        """
+        return self._generate_masks()
+
+    def _generate_masks(self, ask=True, configure_only=False):
         """Grow every mask size for every accepted outline.
 
         `configure_only` collects the settings and stops, and `ask=False` runs
@@ -17569,7 +17584,7 @@ if __name__ == '__main__':
         gate, apply_decisions = got
 
         # Mask sizes, asked now rather than in the middle of the run.
-        if self.batch_generate_masks(configure_only=True) is not True:
+        if self._generate_masks(configure_only=True) is not True:
             return
 
         self.log("=" * 50)
@@ -17615,7 +17630,7 @@ if __name__ == '__main__':
 
         # --- 2. grow ----------------------------------------------------
         self.log("  growing masks…")
-        self.batch_generate_masks(ask=False)
+        self._generate_masks(ask=False)
 
         # --- 3. size ----------------------------------------------------
         stats = self._run_ml_mask_qa(gate, apply_decisions=apply_decisions)
