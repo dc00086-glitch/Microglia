@@ -263,6 +263,32 @@ def report(keys, y_true, p, cut, quiet=False, over_w=3.0, miss_w=4.0):
                 none_ok=(none_ok / none_tot if none_tot else 1.0))
 
 
+def bootstrap_ci(keys, y_true, p, cut, over_w, n_boot=2000, seed=0):
+    """95% intervals by resampling IMAGES. See train_mask_qa.bootstrap_ci."""
+    by_img = {}
+    for i, k in enumerate(keys):
+        by_img.setdefault(k[0], []).append(i)
+    imgs = sorted(by_img)
+    rng = np.random.default_rng(seed)
+    fields = ('exact', 'within', 'over', 'under')
+    acc = {f: [] for f in fields}
+    for _ in range(n_boot):
+        pick = rng.integers(0, len(imgs), len(imgs))
+        kk, tt, pp = [], [], []
+        for rep, j in enumerate(pick):
+            for i in by_img[imgs[j]]:
+                k = keys[i]
+                kk.append((f"{k[0]}#{rep}",) + tuple(k[1:]))
+                tt.append(y_true[i])
+                pp.append(p[i])
+        r = report(kk, np.asarray(tt), np.asarray(pp), cut, quiet=True,
+                   over_w=over_w)
+        for f in fields:
+            acc[f].append(r[f])
+    return {f: (float(np.percentile(acc[f], 2.5)),
+                float(np.percentile(acc[f], 97.5))) for f in fields}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--root', required=True)
@@ -274,6 +300,7 @@ def main():
     ap.add_argument('--trees', type=int, default=400)
     ap.add_argument('--min-leaf', type=int, default=4)
     ap.add_argument('--oversize-cost', type=float, default=3.0)
+    ap.add_argument('--boot', type=int, default=2000)
     ap.add_argument('--cache', default=None)
     ap.add_argument('--out', default='mask_ring_model.joblib')
     a = ap.parse_args()
@@ -345,6 +372,17 @@ def main():
 
     print(f"\nChosen cut {best['cut']}")
     report(te_keys, y[te], p, best['cut'], over_w=a.oversize_cost)
+    if a.boot:
+        print(f"\n  95% confidence intervals ({a.boot} draws, resampling "
+              f"images):")
+        ci = bootstrap_ci(te_keys, y[te], p, best['cut'], a.oversize_cost,
+                          n_boot=a.boot)
+        for lbl, f in (('picked exactly your mask', 'exact'),
+                       ('within one size step', 'within'),
+                       ('chose too large', 'over'),
+                       ('chose too small', 'under')):
+            lo, hi = ci[f]
+            print(f"    {lbl:26s} {100 * lo:5.1f}% – {100 * hi:5.1f}%")
 
     imp = sorted(zip(RING_FEATURES, clf.feature_importances_),
                  key=lambda z: -z[1])[:10]

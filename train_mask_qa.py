@@ -554,6 +554,43 @@ def size_choice_report(keys, y_true, p, cut, rule='largest', quiet=False,
                 none_ok=(none_ok / none_tot if none_tot else 1.0))
 
 
+def bootstrap_ci(keys, y_true, p, cut, rule, over_w, n_boot=2000, seed=0):
+    """95% intervals by resampling IMAGES, not somas.
+
+    Somas from one image share staining, background and crowding, so they are
+    not independent observations. A binomial interval over somas treats 500 of
+    them as 500 independent trials and comes out about half as wide as it
+    should be. Resampling whole images keeps that correlation in the estimate.
+    """
+    by_img = {}
+    for i, k in enumerate(keys):
+        by_img.setdefault(k[0], []).append(i)
+    imgs = sorted(by_img)
+    rng = np.random.default_rng(seed)
+    fields = ('exact', 'within', 'over', 'under')
+    acc = {f: [] for f in fields}
+    for _ in range(n_boot):
+        pick = rng.integers(0, len(imgs), len(imgs))
+        idx = []
+        for j in pick:
+            idx.extend(by_img[imgs[j]])
+        # a resampled image appears more than once; make its somas distinct so
+        # they are not collapsed into one group by the reporter
+        kk, tt, pp = [], [], []
+        for rep, j in enumerate(pick):
+            for i in by_img[imgs[j]]:
+                k = keys[i]
+                kk.append((f"{k[0]}#{rep}",) + tuple(k[1:]))
+                tt.append(y_true[i])
+                pp.append(p[i])
+        r = size_choice_report(kk, np.asarray(tt), np.asarray(pp), cut, rule,
+                               quiet=True, over_w=over_w)
+        for f in fields:
+            acc[f].append(r[f])
+    return {f: (float(np.percentile(acc[f], 2.5)),
+                float(np.percentile(acc[f], 97.5))) for f in fields}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--root', required=True)
@@ -565,6 +602,9 @@ def main():
                     help='microglia stain (red)')
     ap.add_argument('--dapi-channel', type=int, default=3,
                     help='nuclear stain (blue); 0 to disable')
+    ap.add_argument('--boot', type=int, default=2000,
+                    help='bootstrap draws for the confidence intervals; 0 to '
+                         'skip')
     ap.add_argument('--cache', default=None,
                     help='save extracted features here, and reuse them next '
                          'time. Feature extraction is the slow part; the '
@@ -734,6 +774,17 @@ def main():
     print(f"\nChosen: {best['rule']} rule at cut {best['cut']}")
     size_choice_report(te_keys, y[te], p, best['cut'], best['rule'],
                        over_w=a.oversize_cost)
+    if a.boot:
+        print(f"\n  95% confidence intervals ({a.boot} draws, resampling "
+              f"images):")
+        ci = bootstrap_ci(te_keys, y[te], p, best['cut'], best['rule'],
+                          a.oversize_cost, n_boot=a.boot)
+        for lbl, f in (('picked exactly your mask', 'exact'),
+                       ('within one size step', 'within'),
+                       ('chose too large', 'over'),
+                       ('chose too small', 'under')):
+            lo, hi = ci[f]
+            print(f"    {lbl:26s} {100 * lo:5.1f}% – {100 * hi:5.1f}%")
     print(f"\n  (chosen by the smallest mean size error, counting a step too "
           f"large as {a.oversize_cost} steps too small)")
 
