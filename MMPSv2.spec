@@ -39,6 +39,16 @@ if os.path.isfile('soma_model.joblib'):
 else:
     print('spec: no soma_model.joblib found — ML outlining will be unavailable')
 
+# Same for the mask-sizing model. Left out of the bundle it is still found in
+# Downloads, so a build with it missing works on the machine it was built on
+# and quietly loses the feature everywhere else -- the worst way to fail.
+if os.path.isfile('mask_qa_model.joblib'):
+    datas.append(('mask_qa_model.joblib', '.'))
+    print('spec: bundling mask_qa_model.joblib')
+else:
+    print('spec: no mask_qa_model.joblib found — automatic mask sizing and '
+          'the full pipeline will be unavailable')
+
 a = Analysis(
     [SCRIPT],
     pathex=[],
