@@ -5116,6 +5116,17 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.clear_masks_btn.setVisible(False)
         self.clear_masks_btn.setStyleSheet("border: 2px solid #F44336; font-weight: bold; padding: 4px 10px;")
 
+        self.auto_pipeline_btn = QPushButton("⚡ Run Full Pipeline (ML)")
+        self.auto_pipeline_btn.clicked.connect(self.run_auto_pipeline)
+        self.auto_pipeline_btn.setEnabled(False)
+        self.auto_pipeline_btn.setStyleSheet(
+            "border: 2px solid #9C27B0; font-weight: bold; padding: 4px;")
+        self.auto_pipeline_btn.setToolTip(
+            "Outline, grow masks and size every picked cell in one run.\n"
+            "Asks everything up front, then runs unattended.\n"
+            "Whatever the models are unsure of goes to a review queue.")
+        batch_layout.addWidget(self.auto_pipeline_btn)
+
         self.ml_qa_btn = QPushButton("🤖 Auto QA (ML)")
         self.ml_qa_btn.clicked.connect(self._ml_mask_qa_dialog)
         self.ml_qa_btn.setEnabled(False)
@@ -11129,6 +11140,7 @@ if __name__ == '__main__':
             self.batch_pick_somas_btn.setEnabled(True)
         if has_somas:
             self.batch_outline_btn.setEnabled(True)
+            self.auto_pipeline_btn.setEnabled(True)
         if has_outlines:
             self.batch_generate_masks_btn.setEnabled(True)
 
@@ -13241,6 +13253,7 @@ if __name__ == '__main__':
         self.done_btn.setEnabled(False)
         total_somas = sum(len(data['somas']) for data in self.images.values() if data['selected'])
         self.batch_outline_btn.setEnabled(True)
+        self.auto_pipeline_btn.setEnabled(True)
 
         # Log group counts if coloc mode was used
         if self.colocalization_mode:
@@ -13573,6 +13586,65 @@ if __name__ == '__main__':
         self.log("Press Enter or [Accept] to save and move to next")
         self.log("=" * 50)
 
+    def _ml_outline_pass(self, ml, todo, ml_threshold, px, progress):
+        """Run the model over `todo`, committing only what clears the threshold.
+
+        Shared by the outlining button and the unattended pipeline so there is
+        one copy of the model call, the channel handling and the accept rule.
+        Returns (outlined, auto-accepted, [(queue index, confidence)] to review).
+        """
+        done, auto_ok, needs_review = 0, 0, []
+        for n, (qi, (img_name, soma_idx)) in enumerate(todo):
+            if progress is not None and progress.wasCanceled():
+                break
+            if progress is not None:
+                progress.setValue(n)
+                QApplication.processEvents()
+            img_data = self.images.get(img_name)
+            if img_data is None:
+                continue
+            soma_id = img_data['soma_ids'][soma_idx]
+            if progress is not None:
+                progress.setLabelText(f"{soma_id}  ({n + 1}/{len(todo)})")
+            outline_img = self._get_image_for_ml(img_data, ml)
+            ml_extra = self._get_ml_extra_channels(img_data, ml)
+            if outline_img is None or ml_extra is None:
+                if ml_extra is None and not getattr(self, '_ml_ch_warned', False):
+                    self._ml_ch_warned = True
+                    self.log(f"   ⚠ ML: this model needs channels "
+                             f"{ml.extra_channels} and they are not available "
+                             f"in {img_name} — those somas are skipped.")
+                self.failed_auto_outlines.append(qi)
+                continue
+            soma = img_data['somas'][soma_idx]
+            px_here = self._get_pixel_size(img_name) or px
+            points, conf = ml.outline(outline_img, soma, px_here, ml_extra)
+            if points is None or len(points) < 3:
+                self.failed_auto_outlines.append(qi)
+                continue
+            try:
+                points = _remove_branch_juts(points, soma)
+            except Exception:
+                pass
+            done += 1
+            self._record_ml_confidence(img_name, soma_idx, conf)
+            c = -1.0 if conf is None else conf
+            if ml_threshold is not None and c >= ml_threshold:
+                # Accepted without review, so commit it now.
+                if self._store_outline(img_name, soma_idx, list(points)) is None:
+                    self.failed_auto_outlines.append(qi)
+                    done -= 1
+                    continue
+                auto_ok += 1
+            else:
+                # Hold as a CANDIDATE. Committing here would mark the soma
+                # outlined, and review skips anything already outlined -- so
+                # every outline would be saved unseen and there would be nothing
+                # left to review.
+                self.auto_outlined_points[qi] = list(points)
+                needs_review.append((qi, c))
+        return done, auto_ok, needs_review
+
     def _run_ml_outline_all(self):
         """Outline every queued soma with the trained model, then review.
 
@@ -13714,55 +13786,8 @@ if __name__ == '__main__':
 
         self.auto_outlined_points = {}
         self.failed_auto_outlines = []
-        needs_review, auto_ok, done = [], 0, 0
-
-        for n, (qi, (img_name, soma_idx)) in enumerate(todo):
-            if progress.wasCanceled():
-                break
-            progress.setValue(n)
-            QApplication.processEvents()
-            img_data = self.images.get(img_name)
-            if img_data is None:
-                continue
-            soma_id = img_data['soma_ids'][soma_idx]
-            progress.setLabelText(f"{soma_id}  ({n + 1}/{len(todo)})")
-            outline_img = self._get_image_for_ml(img_data, ml)
-            ml_extra = self._get_ml_extra_channels(img_data, ml)
-            if outline_img is None or ml_extra is None:
-                if ml_extra is None and not getattr(self, '_ml_ch_warned', False):
-                    self._ml_ch_warned = True
-                    self.log(f"   ⚠ ML: this model needs channels "
-                             f"{ml.extra_channels} and they are not available "
-                             f"in {img_name} — those somas are skipped.")
-                self.failed_auto_outlines.append(qi)
-                continue
-            soma = img_data['somas'][soma_idx]
-            px_here = self._get_pixel_size(img_name) or px
-            points, conf = ml.outline(outline_img, soma, px_here, ml_extra)
-            if points is None or len(points) < 3:
-                self.failed_auto_outlines.append(qi)
-                continue
-            try:
-                points = _remove_branch_juts(points, soma)
-            except Exception:
-                pass
-            done += 1
-            self._record_ml_confidence(img_name, soma_idx, conf)
-            c = -1.0 if conf is None else conf
-            if ml_threshold is not None and c >= ml_threshold:
-                # Accepted without review, so commit it now.
-                if self._store_outline(img_name, soma_idx, list(points)) is None:
-                    self.failed_auto_outlines.append(qi)
-                    done -= 1
-                    continue
-                auto_ok += 1
-            else:
-                # Hold as a CANDIDATE. Committing here would mark the soma
-                # outlined, and review skips anything already outlined -- so
-                # every outline would be saved unseen and there would be nothing
-                # left to review.
-                self.auto_outlined_points[qi] = list(points)
-                needs_review.append((qi, c))
+        done, auto_ok, needs_review = self._ml_outline_pass(
+            ml, todo, ml_threshold, px, progress)
         progress.close()
         # The per-run diagnostic is written while outlining, after the earlier
         # drain, so without this it sits in the buffer and never reaches the
@@ -15779,7 +15804,14 @@ if __name__ == '__main__':
         self._auto_save()
         QMessageBox.information(self, "Complete", "All somas outlined!\n\nReady to generate masks.")
 
-    def batch_generate_masks(self):
+    def batch_generate_masks(self, ask=True, configure_only=False):
+        """Grow every mask size for every accepted outline.
+
+        `configure_only` collects the settings and stops, and `ask=False` runs
+        with settings already collected. Together they let the unattended
+        pipeline put its questions up front instead of interrupting an hour of
+        outlining to ask how big the masks should be.
+        """
         dialog = QDialog(self)
         dialog.setWindowTitle("Mask Generation Settings")
         dialog.setModal(True)
@@ -16041,20 +16073,23 @@ if __name__ == '__main__':
         dialog.setLayout(layout)
         dialog.setMinimumWidth(400)
 
-        if dialog.exec_() != QDialog.Accepted:
-            return  # User cancelled
+        if ask:
+            if dialog.exec_() != QDialog.Accepted:
+                return  # User cancelled
 
-        self.use_min_intensity = min_intensity_check.isChecked()
-        self.min_intensity_percent = min_intensity_slider.value()
-        self.local_intensity_window = local_win_spin2.value()
-        self.mask_smooth_enabled = smooth_check2.isChecked()
-        self.mask_smooth_gap_size = smooth_slider2.value()
-        self.mask_min_area = min_area_spin.value()
-        self.mask_max_area = max_area_spin.value()
-        self.mask_step_size = step_spin.value()
-        self.mask_segmentation_method = seg_combo.currentData()
-        self.use_circular_constraint = circular_check.isChecked()
-        self.circular_buffer_um2 = buffer_spin.value()
+            self.use_min_intensity = min_intensity_check.isChecked()
+            self.min_intensity_percent = min_intensity_slider.value()
+            self.local_intensity_window = local_win_spin2.value()
+            self.mask_smooth_enabled = smooth_check2.isChecked()
+            self.mask_smooth_gap_size = smooth_slider2.value()
+            self.mask_min_area = min_area_spin.value()
+            self.mask_max_area = max_area_spin.value()
+            self.mask_step_size = step_spin.value()
+            self.mask_segmentation_method = seg_combo.currentData()
+            self.use_circular_constraint = circular_check.isChecked()
+            self.circular_buffer_um2 = buffer_spin.value()
+        if configure_only:
+            return True
 
         # Now proceed with mask generation
         try:
@@ -17388,50 +17423,41 @@ if __name__ == '__main__':
             self.log(f"   ⚠ could not write ml_qa_decisions.csv: {e}")
             return None
 
-    def _ml_mask_qa_dialog(self):
-        """Offer the accuracy/coverage trade the model measured, then run it."""
-        mq = get_mask_qa_model()
-        for _m in drain_ml_messages():
-            self.log(_m)
-        if mq is None:
-            QMessageBox.warning(
-                self, "ML Mask QA",
-                "No mask-QA model found.\n\nPut mask_qa_model.joblib beside "
-                "MMPS or in your Downloads folder.")
-            return
+    def _mq_gate_dialog(self, mq, title, lead, extra_widgets=None):
+        """Ask how much the mask model may decide alone.
 
+        The choice is offered as the trade it measured -- accept this many, be
+        this accurate -- because a bare confidence threshold carries no
+        evidence: 0.7 means nothing until you know what share of cells clears
+        it and how often those are right.
+
+        Returns (gate, apply_decisions) or None if cancelled.
+        """
         from PyQt5.QtWidgets import QDialog, QVBoxLayout, QRadioButton, \
             QButtonGroup
         dlg = QDialog(self)
-        dlg.setWindowTitle("Auto QA with the mask model")
+        dlg.setWindowTitle(title)
         lay = QVBoxLayout()
-        lay.addWidget(QLabel(
-            "<b>How much should the model decide on its own?</b><br>"
-            "Cells it is confident about are sized and approved without "
-            "review. Everything else goes to the grid as usual, opened on "
-            "the model's own answer.<br><i>Measured on held-out images the "
-            "model never saw.</i>"))
+        lay.addWidget(QLabel(lead))
 
         group = QButtonGroup(dlg)
         buttons = []
-        rows = mq.conf_cal or []
-        if rows:
-            for i, r in enumerate(rows):
-                if r.get('frac', 1.0) >= 1.0:
-                    continue
-                rb = QRadioButton(
-                    f"Top {100 * r['frac']:.0f}% most confident   —   "
-                    f"{100 * r['exact']:.0f}% exactly your size, "
-                    f"{100 * r['within']:.0f}% within one step")
-                rb.setProperty('gate', float(r['threshold']))
-                group.addButton(rb)
-                lay.addWidget(rb)
-                buttons.append(rb)
-                if abs(r.get('frac', 0) - 0.2) < 1e-6:
-                    rb.setChecked(True)
-            if not any(b.isChecked() for b in buttons) and buttons:
-                buttons[0].setChecked(True)
-        else:
+        for r in (mq.conf_cal or []):
+            if r.get('frac', 1.0) >= 1.0:
+                continue
+            rb = QRadioButton(
+                f"Top {100 * r['frac']:.0f}% most confident   —   "
+                f"{100 * r['exact']:.0f}% exactly your size, "
+                f"{100 * r['within']:.0f}% within one step")
+            rb.setProperty('gate', float(r['threshold']))
+            group.addButton(rb)
+            lay.addWidget(rb)
+            buttons.append(rb)
+            if abs(r.get('frac', 0) - 0.2) < 1e-6:
+                rb.setChecked(True)
+        if buttons and not any(b.isChecked() for b in buttons):
+            buttons[0].setChecked(True)
+        if not buttons:
             lay.addWidget(QLabel(
                 "<i>This model file carries no calibration, so the trade "
                 "above cannot be shown. Retrain with the current "
@@ -17445,6 +17471,18 @@ if __name__ == '__main__':
         if not buttons:
             rb_none.setChecked(True)
 
+        lay.addWidget(QLabel(
+            "<span style='color:gray'>These figures are for the sizing step "
+            "alone, measured on held-out images. How often a cell is right at "
+            "BOTH stages has not been measured — the outline and sizing rates "
+            "come from differently selected sets of cells, so they cannot "
+            "simply be multiplied. Every run writes ml_qa_decisions.csv with "
+            "both confidences so that number can be worked out from your own "
+            "data.</span>"))
+
+        for w in (extra_widgets or []):
+            lay.addWidget(w)
+
         row = QHBoxLayout()
         go = QPushButton("Run")
         go.setStyleSheet("font-weight: bold; padding: 6px;")
@@ -17455,15 +17493,199 @@ if __name__ == '__main__':
         row.addWidget(cancel)
         lay.addLayout(row)
         dlg.setLayout(lay)
-        dlg.setMinimumWidth(520)
+        dlg.setMinimumWidth(560)
         if dlg.exec_() != 1:
-            return
+            return None
 
         checked = group.checkedButton()
         if checked is rb_none or checked is None:
-            gate, apply_decisions = float('inf'), False
-        else:
-            gate, apply_decisions = float(checked.property('gate')), True
+            return float('inf'), False
+        return float(checked.property('gate')), True
+
+    def run_auto_pipeline(self):
+        """Outline, grow, size and approve in one unattended run.
+
+        Everything that needs a decision is asked before it starts, so the run
+        itself does not stop to ask how big the masks should be an hour in.
+        What the models are not confident about is not guessed at -- it is
+        collected into two review queues and handed back at the end.
+        """
+        ml = get_ml_outliner()
+        mq = get_mask_qa_model()
+        for _m in drain_ml_messages():
+            self.log(_m)
+        missing = []
+        if ml is None:
+            missing.append("soma_model.joblib — outlining")
+        if mq is None:
+            missing.append("mask_qa_model.joblib — sizing")
+        if missing:
+            QMessageBox.warning(
+                self, "Auto Pipeline",
+                "The pipeline needs both trained models:\n\n  "
+                + "\n  ".join(missing)
+                + "\n\nPut them beside MMPS or in your Downloads folder.")
+            return
+
+        thr = ml.accept_threshold('top50')
+        if thr is None:
+            QMessageBox.warning(
+                self, "Auto Pipeline",
+                "The soma model in use carries no confidence calibration, so "
+                "it cannot tell which outlines are safe to accept unseen and "
+                "every one would go to review — there would be nothing for "
+                "the rest of the pipeline to work on.\n\nRetrain with the "
+                "current train_soma_model.py, or outline with the ML button "
+                "and review as usual.")
+            return
+
+        queue = []
+        for img_name, img_data in self.images.items():
+            if not img_data.get('selected'):
+                continue
+            for soma_idx in range(len(img_data.get('somas', []))):
+                queue.append((img_name, soma_idx))
+        if not queue:
+            QMessageBox.warning(self, "Auto Pipeline",
+                                "No somas have been picked yet.")
+            return
+        self.outlining_queue = queue
+
+        cal = (ml.conf_cal or {}).get('top50') or {}
+        lead = (
+            f"<b>Run the whole thing on {len(queue)} picked cells.</b><br><br>"
+            f"1. Outline every cell with the model. Those above its "
+            f"auto-accept threshold are kept; on held-out images "
+            f"{100 * cal.get('purity', 0):.0f}% of those were good, and they "
+            f"were about {100 * cal.get('covers', 0):.0f}% of all cells. The "
+            f"rest are held for you.<br>"
+            f"2. Grow every mask size for the kept outlines.<br>"
+            f"3. Size each cell with the mask model and approve the confident "
+            f"ones.<br><br>"
+            f"<b>How much should the sizing model decide on its own?</b>")
+        got = self._mq_gate_dialog(mq, "Auto Pipeline", lead)
+        if got is None:
+            return
+        gate, apply_decisions = got
+
+        # Mask sizes, asked now rather than in the middle of the run.
+        if self.batch_generate_masks(configure_only=True) is not True:
+            return
+
+        self.log("=" * 50)
+        self.log("⚡ AUTO PIPELINE")
+        self.log(f"  {len(queue)} cells | soma threshold {thr:.3f} | "
+                 f"mask gate " + ("none" if gate == float('inf')
+                                  else f"{gate:.3f}"))
+        self.log("=" * 50)
+        t0 = time.time()
+
+        # --- 1. outline -------------------------------------------------
+        from PyQt5.QtWidgets import QProgressDialog
+        todo = [(i, k) for i, k in enumerate(queue)
+                if not self._soma_has_outline(*k)]
+        progress = QProgressDialog("Outlining with the trained model…",
+                                   "Stop", 0, max(len(todo), 1), self)
+        progress.setWindowTitle("Auto Pipeline — 1 of 3: outlining")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        self.auto_outlined_points = {}
+        self.failed_auto_outlines = []
+        px = self._get_pixel_size()
+        done, auto_ok, needs_review = self._ml_outline_pass(
+            ml, todo, thr, px, progress)
+        progress.close()
+        for _m in drain_ml_messages():
+            self.log(_m)
+        self._update_outline_progress()
+        self.log(f"  outlined {done}, accepted {auto_ok}, "
+                 f"{len(needs_review)} held for review, "
+                 f"{len(self.failed_auto_outlines)} failed")
+
+        if auto_ok == 0:
+            self._ml_review_order = None
+            QMessageBox.information(
+                self, "Auto Pipeline",
+                f"No outline was confident enough to accept unseen, so there "
+                f"is nothing to grow masks from.\n\n{len(needs_review)} are "
+                f"waiting for review.")
+            if needs_review:
+                self._start_review_mode()
+            return
+
+        # --- 2. grow ----------------------------------------------------
+        self.log("  growing masks…")
+        self.batch_generate_masks(ask=False)
+
+        # --- 3. size ----------------------------------------------------
+        stats = self._run_ml_mask_qa(gate, apply_decisions=apply_decisions)
+        if stats is None:
+            QMessageBox.warning(self, "Auto Pipeline",
+                                "Masks were grown but none could be sized.")
+            return
+        path = self._write_mq_decisions(gate, apply_decisions)
+
+        mins = (time.time() - t0) / 60.0
+        self.log(f"  sized {stats['scored']} cells, "
+                 f"{stats['auto']} approved automatically, "
+                 f"{stats['review']} for review")
+        self.log(f"⚡ pipeline finished in {mins:.0f} min")
+        if path:
+            self.log(f"  decisions written to {os.path.basename(path)}")
+        self.log("=" * 50)
+        self._auto_save()
+
+        lines = [f"Ran {len(queue)} cells in {mins:.0f} minutes.", "",
+                 f"{auto_ok} outlines accepted, {stats['auto']} of those "
+                 f"sized and approved automatically.", ""]
+        if needs_review:
+            lines.append(f"{len(needs_review)} cells need their outline "
+                         f"reviewed.")
+        if stats['review']:
+            lines.append(f"{stats['review']} cells need their size checked — "
+                         f"each opens on the model's answer.")
+        if self.failed_auto_outlines:
+            lines.append(f"{len(self.failed_auto_outlines)} could not be "
+                         f"outlined at all.")
+        lines += ["", "Nothing uncertain was guessed at — it is all in the "
+                  "review queues."]
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Auto Pipeline")
+        box.setText("\n".join(lines))
+        b_soma = (box.addButton("Review outlines", QMessageBox.AcceptRole)
+                  if needs_review else None)
+        b_mask = (box.addButton("Review mask sizes", QMessageBox.AcceptRole)
+                  if stats['review'] else None)
+        box.addButton("Later", QMessageBox.RejectRole)
+        box.exec_()
+        if b_soma is not None and box.clickedButton() is b_soma:
+            self._ml_review_order = None
+            self._start_review_mode()
+        elif b_mask is not None and box.clickedButton() is b_mask:
+            self.start_batch_qa()
+
+    def _ml_mask_qa_dialog(self):
+        """Offer the accuracy/coverage trade the model measured, then run it."""
+        mq = get_mask_qa_model()
+        for _m in drain_ml_messages():
+            self.log(_m)
+        if mq is None:
+            QMessageBox.warning(
+                self, "ML Mask QA",
+                "No mask-QA model found.\n\nPut mask_qa_model.joblib beside "
+                "MMPS or in your Downloads folder.")
+            return
+
+        got = self._mq_gate_dialog(
+            mq, "Auto QA with the mask model",
+            "<b>How much should the model decide on its own?</b><br>"
+            "Cells it is confident about are sized and approved without "
+            "review. Everything else goes to the grid as usual, opened on "
+            "the model's own answer.")
+        if got is None:
+            return
+        gate, apply_decisions = got
 
         self.log("=" * 50)
         self.log("🤖 ML MASK QA")
