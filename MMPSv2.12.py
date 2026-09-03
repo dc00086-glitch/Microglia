@@ -4845,6 +4845,20 @@ class MicrogliaAnalysisGUI(QMainWindow):
         layout.addWidget(file_group)
         param_group = QGroupBox("2. Parameters")
         param_layout = QVBoxLayout()
+        param_layout.setSpacing(8)
+
+        # A row that belongs to a checkbox above it should line up with that
+        # checkbox's TEXT, not with its indicator. The two literal spaces this
+        # used to put in the label are about a third of the indicator's width,
+        # so every child row sat to the LEFT of the option it qualifies --
+        # which reads as a squashed, randomly aligned column. Ask the style for
+        # the real offset instead of guessing: it differs between platforms and
+        # again at high DPI.
+        from PyQt5.QtWidgets import QStyle
+        _st = self.style()
+        sub_indent = (_st.pixelMetric(QStyle.PM_IndicatorWidth)
+                      + _st.pixelMetric(QStyle.PM_CheckBoxLabelSpacing))
+
         form_layout = QFormLayout()
 
         # --- Pixel size inputs (X, Y with link toggle) ---
@@ -4905,7 +4919,7 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         self.extra_channel_widget = QWidget()
         extra_ch_layout = QHBoxLayout(self.extra_channel_widget)
-        extra_ch_layout.setContentsMargins(20, 0, 0, 0)
+        extra_ch_layout.setContentsMargins(sub_indent, 0, 0, 0)
         extra_ch_layout.addWidget(QLabel("Clean:"))
         self.clean_ch_checks = []
         self._extra_ch_layout = extra_ch_layout   # kept so channels can be added
@@ -4926,7 +4940,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         param_layout.addWidget(self.rb_check)
 
         rb_layout = QHBoxLayout()
-        rb_layout.addWidget(QLabel("  Rolling ball radius:"))
+        rb_layout.setContentsMargins(sub_indent, 0, 0, 0)
+        rb_layout.addWidget(QLabel("Rolling ball radius:"))
         self.rb_slider = QSlider(Qt.Horizontal)
         self.rb_slider.setRange(5, 150)
         self.rb_slider.setValue(50)
@@ -4941,8 +4956,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
 
         # Additional processing options
         extra_processing_group = QGroupBox("Additional Processing (Optional)")
-        extra_processing_group.setMinimumHeight(150)
         extra_layout = QVBoxLayout()
+        extra_layout.setSpacing(6)
 
         # Denoising
         self.denoise_check = QCheckBox("Apply Denoising (Median Filter)")
@@ -4950,7 +4965,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         extra_layout.addWidget(self.denoise_check)
 
         denoise_layout = QHBoxLayout()
-        denoise_layout.addWidget(QLabel("  Denoise size:"))
+        denoise_layout.setContentsMargins(sub_indent, 0, 0, 0)
+        denoise_layout.addWidget(QLabel("Denoise size:"))
         self.denoise_spin = QSpinBox()
         self.denoise_spin.setRange(1, 10)
         self.denoise_spin.setValue(3)
@@ -4966,7 +4982,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         extra_layout.addWidget(self.sharpen_check)
 
         sharpen_layout = QHBoxLayout()
-        sharpen_layout.addWidget(QLabel("  Sharpen amount:"))
+        sharpen_layout.setContentsMargins(sub_indent, 0, 0, 0)
+        sharpen_layout.addWidget(QLabel("Sharpen amount:"))
         self.sharpen_slider = QSlider(Qt.Horizontal)
         self.sharpen_slider.setRange(10, 50)
         self.sharpen_slider.setValue(13)
@@ -4983,7 +5000,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         extra_layout.addWidget(self.branch_boost_check)
 
         branch_boost_layout = QHBoxLayout()
-        branch_boost_layout.addWidget(QLabel("  Boost strength:"))
+        branch_boost_layout.setContentsMargins(sub_indent, 0, 0, 0)
+        branch_boost_layout.addWidget(QLabel("Boost strength:"))
         self.branch_boost_slider = QSlider(Qt.Horizontal)
         self.branch_boost_slider.setRange(0, 100)     # 0-100 strength dial
         self.branch_boost_slider.setValue(30)
