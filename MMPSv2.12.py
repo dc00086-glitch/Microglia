@@ -750,12 +750,19 @@ def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
     if not coords:
         return result
 
-    # Beading index: bulbs per process tip (degree-1 skeleton endpoints, non-soma).
+    # Beading index: bulbs per process tip. Cutting the skeleton at the soma
+    # severs every process, leaving an artificial degree-1 endpoint where the
+    # cut was, so a raw endpoint count is almost exactly DOUBLE the real tip
+    # count -- 12 for a 6-process cell, 24 for a 12-process cell -- and halves
+    # the index. Drop the endpoints 8-adjacent to the soma region; a real distal
+    # tip is nowhere near it. (An 8-connected dilation is needed: the default
+    # cross leaves the diagonal cut ends behind.)
     skel_nosoma = skeleton & ~soma_region
     su = skel_nosoma.astype(np.uint8)
     nbr = ndimage.convolve(su, np.ones((3, 3), dtype=np.uint8),
                            mode='constant', cval=0) - su
-    n_tips = int(np.count_nonzero(skel_nosoma & (nbr == 1)))
+    at_cut = ndimage.binary_dilation(soma_region, structure=struct, iterations=1)
+    n_tips = int(np.count_nonzero(skel_nosoma & (nbr == 1) & ~at_cut))
 
     result['num_bulbous_endings'] = len(coords)
     result['mean_bulb_diameter_um'] = round(float(np.mean(diameters)), 4)
@@ -1045,6 +1052,25 @@ def _detect_disconnected_fragments(processed_img, cells, pixel_size_um,
     for i, c in enumerate(cells):
         frags = per_cell[i]
         p = _empty_fragment_params()
+
+        # Beading, recomputed on this cell's ATTACHED material rather than on
+        # the area-capped mask. Bulbs sit on process tips, which is exactly
+        # what the area budget truncates: on a synthetic 3-bulb cell, capping
+        # the mask at 90% of the cell took the count from 3 to 0. The owner map
+        # keeps a neighbour's arbor out of it.
+        own_attached = attached & (owner == i + 1)
+        if np.any(own_attached):
+            box = ndimage.find_objects(own_attached.astype(np.uint8))[0]
+            sm = c.get('soma_mask')
+            sm_box = (np.asarray(sm) > 0)[box] if (
+                sm is not None and np.shape(sm) == (h, w)) else None
+            bulb = _detect_bulbous_endings(own_attached[box], px,
+                                           soma_mask=sm_box)
+            p['num_bulbous_endings'] = bulb['num_bulbous_endings']
+            p['mean_bulb_diameter_um'] = bulb['mean_bulb_diameter_um']
+            p['beading_index'] = bulb['beading_index']
+            p['bulb_source'] = 'attached'
+
         p['frag_search_radius_um'] = round(radii_px[i] * px, 4)
         p['frag_gap_um'] = gap_um
         p['frag_threshold'] = round(float(threshold), 4)
@@ -2629,6 +2655,9 @@ class MorphologyCalculator:
             params['num_bulbous_endings'] = bulb['num_bulbous_endings']
             params['mean_bulb_diameter_um'] = bulb['mean_bulb_diameter_um']
             params['beading_index'] = bulb['beading_index']
+            # Overwritten with the attached-material figure when the dystrophy
+            # pass runs; this mask-based value is the fallback.
+            params['bulb_source'] = 'mask'
         else:
             params = {k: 0 for k in ['perimeter', 'mask_area', 'eccentricity',
                                      'roundness', 'avg_centroid_distance', 'soma_area',
@@ -2636,6 +2665,7 @@ class MorphologyCalculator:
                                      'major_axis_um', 'minor_axis_um',
                                      'num_bulbous_endings', 'mean_bulb_diameter_um',
                                      'beading_index']}
+            params['bulb_source'] = ''
         return params
 
     def _calculate_polarity(self, coords, centroid):

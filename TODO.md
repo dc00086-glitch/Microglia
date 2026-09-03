@@ -162,10 +162,23 @@ least-confident-first, and show the bottom-left confidence badge
   `soma_452_379`). With fragments planted from 14 µm out, the sweep recovers
   1-2 of 7 per cell at scale 1.0 and most of them by 2.0. Pick the scale from
   real data before the fragment columns are used for anything.
-* **Cluster script has no fragment columns.** `_build_spread_analysis_script`
+* **Beading numbers changed; anything exported before this is not comparable.**
+  Two bugs were fixed at once, both in the same direction (they were suppressing
+  the signal): `beading_index` counted the artificial skeleton endpoint left
+  where the soma cut each process, so the denominator was ~2x too large and the
+  index ~2x too small — a 6-process cell with every tip bulbed read 0.500
+  instead of 1.000. And `num_bulbous_endings` ran on the area-capped mask, so
+  bulbs on truncated tips vanished: a synthetic 3-bulb cell read 3 at full
+  extent and 0 once the mask was capped at 90%. Beading is now computed on the
+  cell's owned attached material inside the dystrophy pass; `bulb_source` says
+  `attached` when that ran and `mask` when it fell back. Re-run any dataset
+  whose beading numbers are in use.
+* **Cluster script has no fragment or corrected-beading columns.** `_build_spread_analysis_script`
   works from `masks/` + `somas/` only; fragment detection needs the intensity
   image, so the generated SLURM script would need a `processed/` folder and a
   copy of the detector. In-app morphology has the columns; batch exports do not.
+  This now also means batch exports carry the OLD mask-based beading numbers,
+  which disagree with the app's.
 * **`mask_metadata.csv` writes `soma_x, soma_y` from `img_data['somas']`,
   which holds (row, col).** Pre-existing: the two columns are swapped. Not
   touched here because downstream matching may already rely on it.

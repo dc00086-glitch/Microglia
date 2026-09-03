@@ -50,7 +50,9 @@ def load_detector(mmps_path):
     tree = ast.parse(open(mmps_path).read())
     want_fn = {'_empty_fragment_params', '_avg_centroid_distance_um',
                '_soma_radius_um', '_fragment_search_radius_um',
-               '_dystrophy_signal_threshold', '_detect_disconnected_fragments'}
+               '_dystrophy_signal_threshold', '_detect_disconnected_fragments',
+               # the fragment pass also recomputes beading on attached material
+               '_detect_bulbous_endings', '_branch_extends_past'}
     want_const = {'DYSTROPHY_GAP_UM', 'DYSTROPHY_MIN_FRAGMENT_EXTENT_UM',
                   'DYSTROPHY_MAX_FRAGMENT_AREA_UM2', 'DYSTROPHY_MIN_SEARCH_RADIUS_UM',
                   'DYSTROPHY_SEARCH_RADIUS_SCALE', '_FRAGMENT_KEYS'}

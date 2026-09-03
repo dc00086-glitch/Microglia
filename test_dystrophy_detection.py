@@ -46,7 +46,8 @@ def load_detector(mmps_path):
     tree = ast.parse(open(mmps_path).read())
     want_fn = {'_empty_fragment_params', '_avg_centroid_distance_um',
                '_soma_radius_um', '_fragment_search_radius_um',
-               '_dystrophy_signal_threshold', '_detect_disconnected_fragments'}
+               '_dystrophy_signal_threshold', '_detect_disconnected_fragments',
+               '_detect_bulbous_endings', '_branch_extends_past'}
     want_const = {'DYSTROPHY_GAP_UM', 'DYSTROPHY_MIN_FRAGMENT_EXTENT_UM',
                   'DYSTROPHY_MAX_FRAGMENT_AREA_UM2', 'DYSTROPHY_MIN_SEARCH_RADIUS_UM',
                   'DYSTROPHY_SEARCH_RADIUS_SCALE', '_FRAGMENT_KEYS'}
@@ -229,6 +230,35 @@ def main():
     if inside:
         print(f"        searched {len(inside)} positions from {inside[0][0]:.1f} to "
               f"{inside[-1][0]:.1f} um out; {len(outside)} positions beyond the limit")
+
+    print("9. beading_index counts real process tips, not the soma cut")
+    print("   (cutting the skeleton at the soma leaves a false endpoint on every")
+    print("    process, which used to double the denominator and halve the index)")
+    bulbs_fn = ns['_detect_bulbous_endings']
+    for n_bulbed, want in [(0, 0.0), (3, 0.5), (6, 1.0)]:
+        img = blank(); star(img, n=6, length=60)
+        for k in range(n_bulbed):
+            a = 2 * np.pi * k / 6
+            disk(img, SOMA[0] + np.sin(a) * 64, SOMA[1] + np.cos(a) * 64, 4)
+        mask = img >= THR
+        yy, xx = np.ogrid[:H, :W]
+        soma = (yy - SOMA[0]) ** 2 + (xx - SOMA[1]) ** 2 <= SOMA_R ** 2
+        r = bulbs_fn(mask, PX, soma_mask=soma)
+        check(f"{n_bulbed} of 6 tips bulbed -> bulbs", r['num_bulbous_endings'], n_bulbed)
+        check(f"{n_bulbed} of 6 tips bulbed -> beading_index",
+              round(r['beading_index'], 3), want)
+
+    print("10. bulbs survive an area-capped mask")
+    print("    (they sit on process tips, which is what the area budget cuts off)")
+    img = blank(); star(img, n=6, length=60)
+    for k in range(3):
+        a = 2 * np.pi * k / 6
+        disk(img, SOMA[0] + np.sin(a) * 64, SOMA[1] + np.cos(a) * 64, 4)
+    for budget in [None, 3000, 2000, 1200]:
+        r = run(img, [cell(img, budget_px=budget)], scale=3.0)['c1']
+        check(f"mask budget {budget}", r['num_bulbous_endings'], 3)
+        if r.get('bulb_source') != 'attached':
+            fails.append(f"bulb_source for budget {budget}")
 
     print()
     print("FAILED:", fails if fails else "none")
