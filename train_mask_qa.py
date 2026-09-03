@@ -625,6 +625,30 @@ def triage_report(keys, y_true, p, cut, rule, quiet=False):
     return rows
 
 
+def calibration_table(rows):
+    """Turn the triage into numbers the app can act on.
+
+    Without this the app would need a confidence threshold typed in by hand,
+    and a bare number carries no evidence: 0.7 means nothing until you know
+    what fraction of cells clears it and how often those are right. Carrying
+    the whole table in the model lets the app offer the actual trade -- accept
+    this many, be this accurate -- measured on held-out images at fit time.
+    """
+    rows = sorted(rows, key=lambda z: -z[0])
+    n = len(rows)
+    table = []
+    if not n:
+        return table
+    for frac in (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0):
+        k = max(1, int(n * frac))
+        sub = rows[:k]
+        table.append(dict(
+            frac=frac, n=k, threshold=float(sub[-1][0]),
+            exact=sum(1 for _, o, _ in sub if o) / k,
+            within=sum(1 for _, _, nr in sub if nr) / k))
+    return table
+
+
 def bootstrap_ci(keys, y_true, p, cut, rule, over_w, n_boot=2000, seed=0):
     """95% intervals by resampling IMAGES, not somas.
 
@@ -845,7 +869,8 @@ def main():
     print(f"\nChosen: {best['rule']} rule at cut {best['cut']}")
     size_choice_report(te_keys, y[te], p, best['cut'], best['rule'],
                        over_w=a.oversize_cost)
-    triage_report(te_keys, y[te], p, best['cut'], best['rule'])
+    triage_rows = triage_report(te_keys, y[te], p, best['cut'], best['rule'])
+    conf_cal = calibration_table(triage_rows)
 
     if a.boot:
         print(f"\n  95% confidence intervals ({a.boot} draws, resampling "
@@ -872,7 +897,8 @@ def main():
         signal_channel=a.signal_channel, dapi_channel=a.dapi_channel,
         prob_cut=best['cut'], select_rule=best['rule'],
         oversize_cost=a.oversize_cost,
-        confidence='mean_below_minus_mean_above')}, a.out, compress=3)
+        confidence='mean_below_minus_mean_above',
+        conf_cal=conf_cal)}, a.out, compress=3)
     print(f"\nSaved -> {a.out} ({os.path.getsize(a.out) / 1e6:.1f} MB)")
     print("\nHow to read this:")
     print("  'picked exactly your mask' is the number that matters. Every")

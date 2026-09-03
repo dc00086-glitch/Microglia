@@ -2350,6 +2350,142 @@ def _mq_soma_confidence(areas, probs, chosen):
     return m_below - m_above
 
 
+class _MaskQAModel:
+    """Wraps the trained mask-QA forest so the app can size cells with it.
+
+    Sizing a cell is a choice along a ladder: every candidate mask for one soma
+    is scored, and the choice is where acceptability ends. That is why this
+    scores a whole soma at once rather than a mask at a time -- the rule needs
+    to see the neighbouring rungs to know which one is the boundary.
+    """
+
+    def __init__(self, path):
+        import joblib
+        bundle = joblib.load(path)
+        self.model = bundle['model']
+        m = bundle.get('meta', {}) or {}
+        self.features = list(m.get('features') or _MQ_FEATURE_NAMES)
+        self.train_px = float(m.get('pixel_size_um') or 0.1046)
+        self.signal_channel = int(m.get('signal_channel') or 1)
+        self.dapi_channel = int(m.get('dapi_channel') or 3)
+        self.prob_cut = float(m.get('prob_cut') or 0.5)
+        self.select_rule = m.get('select_rule') or 'band'
+        self.oversize_cost = float(m.get('oversize_cost') or 3.0)
+        # Accuracy as a function of how much is accepted unreviewed, measured
+        # on held-out images at fit time. Without it the app can only offer a
+        # bare number with no evidence attached.
+        self.conf_cal = list(m.get('conf_cal') or [])
+        self.path = path
+
+    def usable(self):
+        """The forest was fitted on a feature vector of one exact width.
+
+        A mismatch means the app's feature code and the model have drifted
+        apart, and the forest would read every column as something else while
+        reporting nothing.
+        """
+        return len(self.features) == len(_MQ_FEATURE_NAMES)
+
+    def channel_roles(self):
+        return [('IBA1', self.signal_channel), ('DAPI', self.dapi_channel)]
+
+    def threshold_for(self, frac):
+        """Confidence to clear so that about `frac` of cells go unreviewed."""
+        if not self.conf_cal:
+            return None
+        best = min(self.conf_cal, key=lambda r: abs(r.get('frac', 1.0) - frac))
+        return float(best.get('threshold', 0.0))
+
+    def describe(self):
+        parts = [f"{self.select_rule} rule", f"cut {self.prob_cut}",
+                 f"channels {self.signal_channel}/{self.dapi_channel}"]
+        row = None
+        for r in self.conf_cal:
+            if abs(r.get('frac', 0) - 0.2) < 1e-6:
+                row = r
+        if row:
+            parts.append(f"top 20% {100 * row.get('exact', 0):.0f}% exact")
+        return ", ".join(parts)
+
+    def score_soma(self, ladder, sig, dapi, soma_mask, pixel_size,
+                   centre, neighbours, stats=None):
+        """One soma's ladder -> (chosen target area, confidence, probabilities).
+
+        `ladder` is [(target_area_um2, mask array)] ascending by target area,
+        which is the order the model was fitted and evaluated in.
+        """
+        if not ladder:
+            return None, None, []
+        if stats is None:
+            stats = _mq_image_stats(sig, dapi)
+        grad, bg, dthr = stats
+        rows, areas = [], []
+        for target, mask in ladder:
+            v = _mq_mask_features(mask, soma_mask, sig, dapi, target,
+                                  pixel_size, grad=grad, bg=bg, dapi_thr=dthr,
+                                  centre=centre, neighbours=neighbours)
+            if v is None:
+                continue
+            rows.append(v)
+            areas.append(target)
+        if not rows:
+            return None, None, []
+        probs = self.model.predict_proba(np.vstack(rows))[:, 1].tolist()
+        chosen = _mq_pick(areas, probs, self.prob_cut, self.select_rule)
+        conf = _mq_soma_confidence(areas, probs, chosen)
+        return chosen, conf, list(zip(areas, probs))
+
+
+_MQ_MODEL = None
+_MQ_MODEL_PATH = None
+
+
+def mask_qa_model_paths():
+    """Where a trained mask-QA model may live, nearest first."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [os.path.join(here, 'mask_qa_model.joblib')]
+    try:
+        cands.append(os.path.join(sys._MEIPASS, 'mask_qa_model.joblib'))
+    except Exception:
+        pass
+    cands += [os.path.expanduser('~/Downloads/mask_qa_model.joblib'),
+              os.path.expanduser('~/mask_qa_model.joblib')]
+    return cands
+
+
+def get_mask_qa_model(path=None):
+    """Load the mask-QA model once and reuse it. None if unavailable."""
+    global _MQ_MODEL, _MQ_MODEL_PATH
+    if path is None:
+        for c in mask_qa_model_paths():
+            if os.path.exists(c):
+                path = c
+                break
+    if path is None or not os.path.exists(path):
+        return None
+    if _MQ_MODEL is not None and _MQ_MODEL_PATH == path:
+        return _MQ_MODEL
+    try:
+        mq = _MaskQAModel(path)
+        if not mq.usable():
+            _ml_note(f"Mask-QA model expects {len(mq.features)} features but "
+                     f"this build computes {len(_MQ_FEATURE_NAMES)} — "
+                     f"refusing to use it.")
+            return None
+        _MQ_MODEL, _MQ_MODEL_PATH = mq, path
+        _ml_note(f"Mask QA model loaded: {os.path.basename(path)}")
+        _ml_note(f"  {mq.describe()}")
+        if not mq.conf_cal:
+            _ml_note("  NO confidence calibration in this file — auto-approve "
+                     "will need a threshold typed by hand.")
+            _ml_note("  Retrain with the current train_mask_qa.py (use "
+                     "--cache, it reuses the features) to add it.")
+        return mq
+    except Exception as e:
+        _ml_note(f"Could not load mask-QA model from {path}: {e}")
+        return None
+
+
 def auto_outline_soma_blob(image, centroid, sensitivity=50,
                            max_soma_radius_px=14, process_width_px=None):
     """Outline the SOMA only: a compact, locally-bright blob.
@@ -4980,9 +5116,19 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.clear_masks_btn.setVisible(False)
         self.clear_masks_btn.setStyleSheet("border: 2px solid #F44336; font-weight: bold; padding: 4px 10px;")
 
+        self.ml_qa_btn = QPushButton("🤖 Auto QA (ML)")
+        self.ml_qa_btn.clicked.connect(self._ml_mask_qa_dialog)
+        self.ml_qa_btn.setEnabled(False)
+        self.ml_qa_btn.setToolTip(
+            "Size every cell with the trained model.\n"
+            "Confident cells are approved without review; the rest go to the "
+            "grid opened on the model's answer.")
+        batch_layout.addWidget(self.ml_qa_btn)
+
         self.batch_qa_btn = QPushButton("QA All Masks")
         self.batch_qa_btn.clicked.connect(self.start_batch_qa)
         self.batch_qa_btn.setEnabled(False)
+        self.ml_qa_btn.setEnabled(False)
         batch_layout.addWidget(self.batch_qa_btn)
         self.undo_qa_btn = QPushButton("Undo QA")
         self.undo_qa_btn.clicked.connect(self.undo_last_qa)
@@ -10990,6 +11136,7 @@ if __name__ == '__main__':
         has_qa_complete = any(d['status'] in ('qa_complete', 'analyzed') for d in self.images.values())
         if has_masks:
             self.batch_qa_btn.setEnabled(True)
+            self.ml_qa_btn.setEnabled(True)
             self.opacity_widget.setVisible(True)
         if has_qa_complete:
             self.batch_calculate_btn.setEnabled(True)
@@ -14969,6 +15116,7 @@ if __name__ == '__main__':
                     self.log(f"Warning: Could not delete {os.path.basename(mask_file)}: {e}")
         
         self.batch_qa_btn.setEnabled(False)
+        self.ml_qa_btn.setEnabled(False)
         self.batch_calculate_btn.setEnabled(False)
         self.clear_masks_btn.setEnabled(False)
         self.clear_masks_btn.setVisible(False)
@@ -16125,6 +16273,7 @@ if __name__ == '__main__':
                     pass
 
             self.batch_qa_btn.setEnabled(True)
+            self.ml_qa_btn.setEnabled(True)
             self.clear_masks_btn.setEnabled(True)
             self.opacity_widget.setVisible(True)
             # self.update_workflow_status()
@@ -16418,6 +16567,7 @@ if __name__ == '__main__':
                     return
         else:
             self.batch_qa_btn.setEnabled(True)
+            self.ml_qa_btn.setEnabled(True)
             self.opacity_widget.setVisible(True)
             QMessageBox.information(self, "Done",
                 f"Regenerated {total} masks for {os.path.splitext(img_name)[0]}.\n\nReady for QA.")
@@ -16941,6 +17091,413 @@ if __name__ == '__main__':
             f"auto-rejected for touching the image border:\n\n{shown}{extra}\n\n"
             f"These cells are excluded from QA and analysis.")
         self._border_rejected_report = []
+
+    # ------------------------------------------------------------------
+    # Machine-learning mask QA
+    #
+    # Sizing a cell is choosing where on its ladder of candidate masks
+    # acceptability ends. The model scores the whole ladder and picks that
+    # boundary; the confidence is how cleanly the ladder splits there, which
+    # needs no ground truth and so can be computed on your images.
+    # ------------------------------------------------------------------
+
+    def _mq_channel_for(self, mq, role_index, default_ch):
+        """Which channel of THIS dataset holds a stain the QA model wants.
+
+        Deliberately does NOT consult the soma model's channel map. That map is
+        indexed by the SOMA model's roles, whose second entry is a different
+        stain entirely, so borrowing it would feed the nuclear features from
+        whatever channel happened to sit in that slot -- silently.
+        """
+        mapping = getattr(self, 'mq_channel_map', None)
+        if mapping and role_index < len(mapping) and mapping[role_index]:
+            return int(mapping[role_index])
+        roles = mq.channel_roles()
+        wanted = roles[role_index][0] if role_index < len(roles) else ''
+        by_name = self._channel_by_stain_name(wanted)
+        if by_name:
+            return by_name
+        return default_ch
+
+    def _mq_channels_for(self, img_data, mq):
+        """(signal, dapi) as full-frame float arrays, or (None, None).
+
+        Reads the RAW image: the model was fitted on raw pixels, and the
+        processed image has had its background subtracted, which moves every
+        intensity feature it relies on.
+        """
+        src = None
+        raw_path = img_data.get('raw_path')
+        if raw_path and os.path.exists(raw_path):
+            try:
+                src = np.squeeze(np.asarray(load_tiff_image(raw_path)))
+            except Exception:
+                src = None
+        if src is None or np.asarray(src).ndim != 3:
+            c = img_data.get('color_image')
+            src = np.squeeze(np.asarray(c)) if c is not None else None
+        if src is None or src.ndim != 3:
+            return None, None
+        ax = int(np.argmin(src.shape))
+        if src.shape[ax] > 8:
+            return None, None
+        src = np.moveaxis(src, ax, -1)
+        n = src.shape[2]
+        si = int(self._mq_channel_for(mq, 0, mq.signal_channel)) - 1
+        di = int(self._mq_channel_for(mq, 1, mq.dapi_channel)) - 1
+        if not 0 <= si < n:
+            return None, None
+        sig = src[:, :, si].astype(np.float64)
+        dapi = src[:, :, di].astype(np.float64) if 0 <= di < n else None
+        return sig, dapi
+
+    @staticmethod
+    def _mq_centre_of(soma_id, fallback=None):
+        """(row, col) the model expects, taken from the soma's own id.
+
+        Training read these numbers out of the mask filenames, which are built
+        from the same id, so parsing it keeps the crowding features identical
+        to what the forest was fitted on.
+        """
+        m = re.match(r'soma_(-?\d+)_(-?\d+)$', str(soma_id or ''))
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        if fallback is not None:
+            return int(round(fallback[0])), int(round(fallback[1]))
+        return None
+
+    def _mq_soma_mask(self, img_data, soma_id, shape):
+        """The accepted soma outline as a full-frame boolean mask, or None."""
+        for o in img_data.get('soma_outlines') or []:
+            if o.get('soma_id') != soma_id:
+                continue
+            m = o.get('outline')
+            if m is not None:
+                return np.asarray(m) > 0
+            pts = o.get('polygon_points')
+            if pts and len(pts) >= 3:
+                return self._polygon_to_mask(pts, shape) > 0
+            return None
+        return None
+
+    def _run_ml_mask_qa(self, gate, apply_decisions=True):
+        """Size every cell with the model; accept the confident ones.
+
+        Returns a summary dict. Cells below the gate are left untouched with
+        their proposal recorded, so the review grid can open on the model's
+        answer instead of on nothing.
+        """
+        mq = get_mask_qa_model()
+        for _m in drain_ml_messages():
+            self.log(_m)
+        if mq is None:
+            return None
+
+        from PyQt5.QtWidgets import QProgressDialog
+        todo = []
+        for img_name, img_data in self.images.items():
+            if not img_data.get('selected') or not img_data.get('masks'):
+                continue
+            todo.append((img_name, img_data))
+        if not todo:
+            return None
+
+        total_somas = 0
+        for _, img_data in todo:
+            total_somas += len({m.get('soma_id') for m in img_data['masks']})
+
+        prog = QProgressDialog("Sizing cells with the mask model…", "Stop",
+                               0, max(total_somas, 1), self)
+        prog.setWindowTitle("ML Mask QA")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+
+        stats = dict(scored=0, auto=0, review=0, none_proposed=0,
+                     skipped=0, images=0, stopped=False)
+        self._mq_proposals = getattr(self, '_mq_proposals', {})
+        done = 0
+
+        for img_name, img_data in todo:
+            if prog.wasCanceled():
+                stats['stopped'] = True
+                break
+            sig, dapi = self._mq_channels_for(img_data, mq)
+            if sig is None:
+                self.log(f"   ⚠ ML QA: could not read channels for {img_name} "
+                         f"— skipped")
+                stats['skipped'] += len({m.get('soma_id')
+                                         for m in img_data['masks']})
+                done += len({m.get('soma_id') for m in img_data['masks']})
+                prog.setValue(min(done, total_somas))
+                continue
+            img_stats = _mq_image_stats(sig, dapi)
+            pixel_size = self._get_pixel_size(img_name)
+            stats['images'] += 1
+
+            by_soma = {}
+            for md in img_data['masks']:
+                by_soma.setdefault(md.get('soma_id', ''), []).append(md)
+
+            # Every soma in this image, so a cell can be told how close its
+            # neighbours are. Built once per image, as in training.
+            neighbours = sorted(
+                c for c in (self._mq_centre_of(sid) for sid in by_soma)
+                if c is not None)
+
+            for soma_id, mds in by_soma.items():
+                if prog.wasCanceled():
+                    stats['stopped'] = True
+                    break
+                done += 1
+                if done % 5 == 0:
+                    prog.setValue(min(done, total_somas))
+                    prog.setLabelText(f"Sizing cells…  {done}/{total_somas}")
+                    QApplication.processEvents()
+
+                # Masks already decided by a rule stay decided: a duplicate is
+                # the same mask twice, and a border-touching mask is unusable
+                # whatever the model thinks of its shape.
+                rungs = [m for m in mds
+                         if not m.get('duplicate')
+                         and not m.get('border_rejected')]
+                if not rungs:
+                    stats['skipped'] += 1
+                    continue
+                rungs.sort(key=lambda m: m.get('target_area_um2', 0))
+                ladder = []
+                for m in rungs:
+                    if m.get('mask') is None:
+                        self._reload_mask_from_disk(m, img_name)
+                    arr = m.get('mask')
+                    if arr is None or np.asarray(arr).shape != sig.shape:
+                        continue
+                    ladder.append((m.get('target_area_um2', 0),
+                                   np.asarray(arr) > 0))
+                if not ladder:
+                    stats['skipped'] += 1
+                    continue
+
+                soma_mask = self._mq_soma_mask(img_data, soma_id, sig.shape)
+                centre = self._mq_centre_of(soma_id)
+                try:
+                    chosen, conf, per_mask = mq.score_soma(
+                        ladder, sig, dapi, soma_mask, pixel_size,
+                        centre, neighbours, stats=img_stats)
+                except Exception as e:
+                    self.log(f"   ⚠ ML QA failed on {soma_id}: {e}")
+                    stats['skipped'] += 1
+                    continue
+                if conf is None:
+                    stats['skipped'] += 1
+                    continue
+
+                stats['scored'] += 1
+                self._mq_proposals[(img_name, soma_id)] = dict(
+                    chosen=chosen, confidence=float(conf),
+                    probs=[(float(a), float(p)) for a, p in per_mask])
+
+                confident = conf >= gate
+                if chosen is None:
+                    stats['none_proposed'] += 1
+                if not (apply_decisions and confident):
+                    stats['review'] += 1
+                    continue
+
+                self._mq_apply_choice(img_name, rungs, chosen)
+                stats['auto'] += 1
+
+            if stats['stopped']:
+                break
+
+        prog.setValue(total_somas)
+        prog.close()
+        return stats
+
+    def _mq_apply_choice(self, img_name, rungs, chosen):
+        """Accept `chosen` and everything below it; reject everything above.
+
+        The same cascade a double-click performs, so an auto-sized cell is
+        indistinguishable downstream from one you sized yourself.
+        """
+        for md in rungs:
+            target = md.get('target_area_um2', 0)
+            keep = (chosen is not None and target <= chosen)
+            if keep:
+                if md.get('approved') is not True:
+                    md['approved'] = True
+                    self._qa_approved_count = getattr(
+                        self, '_qa_approved_count', 0) + 1
+            else:
+                if md.get('approved') is not False:
+                    md['approved'] = False
+                    self._qa_user_rejected_count = getattr(
+                        self, '_qa_user_rejected_count', 0) + 1
+                    self._delete_rejected_mask_tiff(img_name, md)
+            md['qa_source'] = 'ml'
+
+    def _write_mq_decisions(self, gate, applied):
+        """Record what the model decided and how sure it was, per cell.
+
+        Auto-sized and hand-sized cells are indistinguishable in the results
+        CSV by design -- they are the same measurement. This file is what makes
+        them separable again afterwards, so an analysis can be repeated on the
+        reviewed cells alone if a reviewer ever wants to check the auto stream
+        did not shift a result.
+
+        It also carries the SOMA stage's confidence and source for the same
+        cell. The two stages have only ever been measured apart, on differently
+        selected samples, so how often a cell is right at both ends is not
+        known -- and multiplying the two rates assumes an independence that the
+        gate itself destroys, since the cells clearing it are the clean,
+        isolated ones whose outlines are better than average. Writing both here
+        makes that joint rate computable from a real run instead of assumed.
+        """
+        props = getattr(self, '_mq_proposals', None)
+        if not props or not getattr(self, 'output_dir', None):
+            return None
+        soma_info = {}
+        for img_name, img_data in self.images.items():
+            for o in img_data.get('soma_outlines') or []:
+                soma_info[(img_name, o.get('soma_id'))] = (
+                    o.get('source', ''), o.get('ml_confidence'))
+        path = os.path.join(self.output_dir, 'ml_qa_decisions.csv')
+        try:
+            with open(path, 'w', newline='') as fh:
+                w = csv.writer(fh)
+                w.writerow(['image', 'soma_id', 'proposed_area_um2',
+                            'confidence', 'gate', 'auto_approved',
+                            'soma_source', 'soma_confidence',
+                            'ladder_probabilities'])
+                for (img_name, soma_id), d in sorted(props.items()):
+                    conf = d.get('confidence', 0.0)
+                    auto = 1 if (applied and conf >= gate) else 0
+                    chosen = d.get('chosen')
+                    src, sconf = soma_info.get((img_name, soma_id), ('', None))
+                    w.writerow([
+                        os.path.splitext(img_name)[0], soma_id,
+                        '' if chosen is None else int(chosen),
+                        f"{conf:.4f}",
+                        '' if gate == float('inf') else f"{gate:.4f}",
+                        auto, src,
+                        '' if sconf is None else f"{float(sconf):.4f}",
+                        ';'.join(f"{int(a)}:{p:.3f}"
+                                 for a, p in d.get('probs', []))])
+            return path
+        except Exception as e:
+            self.log(f"   ⚠ could not write ml_qa_decisions.csv: {e}")
+            return None
+
+    def _ml_mask_qa_dialog(self):
+        """Offer the accuracy/coverage trade the model measured, then run it."""
+        mq = get_mask_qa_model()
+        for _m in drain_ml_messages():
+            self.log(_m)
+        if mq is None:
+            QMessageBox.warning(
+                self, "ML Mask QA",
+                "No mask-QA model found.\n\nPut mask_qa_model.joblib beside "
+                "MMPS or in your Downloads folder.")
+            return
+
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QRadioButton, \
+            QButtonGroup
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Auto QA with the mask model")
+        lay = QVBoxLayout()
+        lay.addWidget(QLabel(
+            "<b>How much should the model decide on its own?</b><br>"
+            "Cells it is confident about are sized and approved without "
+            "review. Everything else goes to the grid as usual, opened on "
+            "the model's own answer.<br><i>Measured on held-out images the "
+            "model never saw.</i>"))
+
+        group = QButtonGroup(dlg)
+        buttons = []
+        rows = mq.conf_cal or []
+        if rows:
+            for i, r in enumerate(rows):
+                if r.get('frac', 1.0) >= 1.0:
+                    continue
+                rb = QRadioButton(
+                    f"Top {100 * r['frac']:.0f}% most confident   —   "
+                    f"{100 * r['exact']:.0f}% exactly your size, "
+                    f"{100 * r['within']:.0f}% within one step")
+                rb.setProperty('gate', float(r['threshold']))
+                group.addButton(rb)
+                lay.addWidget(rb)
+                buttons.append(rb)
+                if abs(r.get('frac', 0) - 0.2) < 1e-6:
+                    rb.setChecked(True)
+            if not any(b.isChecked() for b in buttons) and buttons:
+                buttons[0].setChecked(True)
+        else:
+            lay.addWidget(QLabel(
+                "<i>This model file carries no calibration, so the trade "
+                "above cannot be shown. Retrain with the current "
+                "train_mask_qa.py — with --cache it takes a minute.</i>"))
+
+        rb_none = QRadioButton(
+            "Size every cell but approve none   —   review them all, "
+            "pre-sized")
+        group.addButton(rb_none)
+        lay.addWidget(rb_none)
+        if not buttons:
+            rb_none.setChecked(True)
+
+        row = QHBoxLayout()
+        go = QPushButton("Run")
+        go.setStyleSheet("font-weight: bold; padding: 6px;")
+        go.clicked.connect(lambda: dlg.done(1))
+        row.addWidget(go)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(lambda: dlg.done(0))
+        row.addWidget(cancel)
+        lay.addLayout(row)
+        dlg.setLayout(lay)
+        dlg.setMinimumWidth(520)
+        if dlg.exec_() != 1:
+            return
+
+        checked = group.checkedButton()
+        if checked is rb_none or checked is None:
+            gate, apply_decisions = float('inf'), False
+        else:
+            gate, apply_decisions = float(checked.property('gate')), True
+
+        self.log("=" * 50)
+        self.log("🤖 ML MASK QA")
+        self.log(f"  model: {os.path.basename(mq.path)} — {mq.describe()}")
+        t0 = time.time()
+        stats = self._run_ml_mask_qa(gate, apply_decisions=apply_decisions)
+        if stats is None:
+            self.log("  nothing to size")
+            return
+        self.log(f"  scored {stats['scored']} cells across "
+                 f"{stats['images']} images in {time.time() - t0:.0f}s")
+        if apply_decisions:
+            self.log(f"  ✓ {stats['auto']} sized and approved automatically")
+        self.log(f"  → {stats['review']} left for review")
+        if stats['none_proposed']:
+            self.log(f"  {stats['none_proposed']} cells: no size looked "
+                     f"acceptable")
+        if stats['skipped']:
+            self.log(f"  {stats['skipped']} cells could not be scored")
+        if stats['stopped']:
+            self.log("  stopped early — the rest are untouched")
+        path = self._write_mq_decisions(gate, apply_decisions)
+        if path:
+            self.log(f"  decisions written to {os.path.basename(path)}")
+        self.log("=" * 50)
+
+        QMessageBox.information(
+            self, "ML Mask QA",
+            f"Sized {stats['scored']} cells.\n\n"
+            + (f"{stats['auto']} approved automatically.\n" if apply_decisions
+               else "")
+            + f"{stats['review']} left for you to review.\n\n"
+            f"Open QA All Masks to work through the rest — each cell opens "
+            f"on the model's proposed size.")
 
     def start_batch_qa(self):
         # Flatten all masks from all images
@@ -18191,6 +18748,21 @@ if __name__ == '__main__':
                             f"stopped early</span>")
         if skipped_count > 0:
             header_text += f" | <span style='color: orange;'>{skipped_count} skipped</span>"
+        # What the model proposed for this cell, if it was asked. Shown even
+        # when it was not confident enough to act on: an answer to check is
+        # faster to review than a blank grid.
+        _mq_prop = (getattr(self, '_mq_proposals', {}) or {}).get(soma_key)
+        _mq_proposed_area = None
+        if _mq_prop:
+            _mq_proposed_area = _mq_prop.get('chosen')
+            if _mq_proposed_area is None:
+                header_text += (" | <span style='color: #FFC107;'>model: no "
+                                "size acceptable</span>")
+            else:
+                header_text += (f" | <span style='color: #FFC107;'>model: "
+                                f"{int(_mq_proposed_area)} µm² "
+                                f"(confidence {_mq_prop.get('confidence', 0):.2f})"
+                                f"</span>")
         header = QLabel(header_text)
         header.setStyleSheet("font-size: 14px; padding: 5px;")
         grid_main_layout.addWidget(header)
@@ -18366,6 +18938,12 @@ if __name__ == '__main__':
                 border = "3px solid #4CAF50"
             elif approved is False:
                 border = "3px solid #F44336"
+            elif _mq_proposed_area is not None and \
+                    abs(md.get(size_key, 0) - _mq_proposed_area) < 1e-6:
+                # The model's answer, on a cell it was not confident enough to
+                # decide alone. Marking it turns the review from "choose a
+                # size" into "is this one right", which is a much faster ask.
+                border = "3px solid #FFC107"
             else:
                 border = "2px solid gray"
             thumb_label.setStyleSheet(f"border: {border}; background: black;")
