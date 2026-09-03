@@ -49,10 +49,16 @@ if [ -z "$ICON" ]; then
     echo "  Place MMPS.icns in this directory or on your Desktop to include it."
 fi
 
-# Check PyInstaller is installed
-if ! command -v pyinstaller &> /dev/null; then
+# Check PyInstaller is installed.
+#
+# Asking whether the `pyinstaller` COMMAND exists is the wrong question: pip
+# installs it under the user's own Python, whose bin directory is often not on
+# PATH. That reports it missing, reinstalls it, pip says it is already there,
+# and the build then fails at the last line with "command not found". Ask
+# whether the MODULE imports instead, and run it the same way.
+if ! python3 -c "import PyInstaller" &> /dev/null; then
     echo "PyInstaller not found. Installing..."
-    pip install pyinstaller
+    python3 -m pip install pyinstaller
 fi
 
 # Check key dependencies are installed
@@ -81,7 +87,7 @@ echo "Running PyInstaller..."
 echo ""
 
 # Build using the spec file
-pyinstaller MMPSv2.spec --noconfirm
+python3 -m PyInstaller MMPSv2.spec --noconfirm
 
 echo ""
 echo "======================================"
