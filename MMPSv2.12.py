@@ -11221,11 +11221,19 @@ if __name__ == '__main__':
         import csv
         import re as _re
         data = {}
+        # Columns that identify a cell rather than measure it. They are dropped
+        # because the morphology sheet already carries them; keeping them would
+        # write a second, prefixed copy of every identifier.
+        #
+        # mask_area_um2 is deliberately NOT here. It is a measurement -- the
+        # area the mask actually came out at -- and it belongs in the merged
+        # sheet next to the other mask shape metrics.
         id_columns = {'cell_name', 'image_name', 'soma_id', 'mask_file',
-                       'target_area_um2', 'mask_area_um2', 'cell', 'mask name', 'image name',
+                       'target_area_um2', 'cell', 'mask name', 'image name',
                        'soma id', 'mask area (um2)', 'centroid x (px)',
                        'centroid y (px)', 'start radius (um)',
-                       'pixel_size_um', 'skeleton_file',
+                       'pixel_size_um', 'skeleton_file', 'upscale_factor',
+                       'animal_id', 'treatment', 'soma_idx',
                        'soma area (um2)'}
         try:
             with open(file_path, 'r') as f:
@@ -11252,12 +11260,32 @@ if __name__ == '__main__':
                             if m:
                                 area = int(m.group(1))
                     else:
-                        area_str = row.get('target_area_um2', row.get('mask_area_um2', ''))
+                        # The merge joins on the TARGET area -- the size that
+                        # was asked for, which is what the morphology sheet
+                        # records and what the mask filename is built from.
+                        #
+                        # mask_area_um2 must never stand in for it. That is the
+                        # area the mask MEASURED, which is never exactly the
+                        # target: a 150 um2 mask comes out at 147. The
+                        # standalone SkeletonAnalysisImageJ.py writes no
+                        # target_area_um2 column at all, so falling back to it
+                        # keyed every skeleton row to an area no morphology row
+                        # has, and the whole file merged as zero matches with
+                        # nothing raised. The filename has the target in it.
+                        area_str = row.get('target_area_um2', '')
                         if area_str:
                             try:
                                 area = int(float(area_str))
                             except (ValueError, TypeError):
                                 pass
+                        if area is None:
+                            for fld in ('mask_file', 'cell_name',
+                                        'skeleton_file'):
+                                m = _re.search(r'_area(\d+)',
+                                               str(row.get(fld, '')))
+                                if m:
+                                    area = int(m.group(1))
+                                    break
 
                     prefix_map = {'sholl': 'sholl_', 'skeleton': 'skel_', 'fractal': 'fractal_'}
                     prefix = prefix_map.get(csv_type, '')
@@ -11291,7 +11319,18 @@ if __name__ == '__main__':
                         dict_key = f"{cell_name}_area{area}"
                     else:
                         dict_key = cell_name
-                    data[dict_key] = {'data': row_data, 'area': area}
+                    # Keep the identifiers the file states outright. The merge
+                    # used to recover them by re-splitting the key with a
+                    # regex, which only works while image names never resemble
+                    # a soma id -- and these files say plainly which image and
+                    # which soma each row is.
+                    data[dict_key] = {
+                        'data': row_data, 'area': area,
+                        'image_name': (row.get('image_name')
+                                       or row.get('Image Name') or ''),
+                        'soma_id': (row.get('soma_id')
+                                    or row.get('Soma ID') or ''),
+                    }
         except Exception as e:
             self.log(f"  ERROR reading {os.path.basename(file_path)}: {e}")
         return data
@@ -11465,6 +11504,13 @@ if __name__ == '__main__':
                 lookup = {}
                 for dict_key, entry in ij_data.items():
                     area = entry.get('area')
+                    # Prefer what the file states. Only fall back to splitting
+                    # the key apart when the CSV carried no identifier columns.
+                    img = entry.get('image_name') or ''
+                    sid = entry.get('soma_id') or ''
+                    if img and sid:
+                        lookup[(img, sid, area)] = entry['data']
+                        continue
                     # Parse image_name and soma_id from dict_key format: "imagename_soma_Y_X_area123"
                     m = _re3.match(r'^(.+?)_(soma_\d+_\d+(?:_\d+)?)(?:_area(\d+))?$', dict_key)
                     if m:
