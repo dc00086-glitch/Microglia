@@ -1037,7 +1037,7 @@ def _grown_by_um(mask, pixel_size_um, radius_um):
 
 
 def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
-                                dist_um=None, soma_mask=None, cd31=None,
+                                dist_um=None, soma_mask=None,
                                 juxta_max_um=_JUXTAVASCULAR_MAX_UM,
                                 halo_um=_EXPOSURE_HALO_UM):
     """Per-microglia leakage exposure to join onto the morphology row.
@@ -1054,19 +1054,17 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     counted. ``<tracer>_exposure_mean_cell_only`` is the same measure over the
     bare footprint, kept so runs from before the halo remain comparable. Both
     are blank, not zero, when their region has no extravascular pixel;
-    ``exposure_region_px`` / ``exposure_region_um2`` say how much tissue the
-    halo mean rests on.
+    ``exposure_region_um2`` says how much tissue the halo mean rests on.
 
     ``dist_to_vessel_um`` is measured from the SOMA (``soma_mask`` — the soma
     outline or a disk at the soma centroid) when provided, NOT the whole arbor,
     so a single long process touching a vessel doesn't make the cell body read
     as perivascular. Falls back to the cell footprint if no soma region is given.
 
-    Blood-vessel metrics for the cell (analogous to tracer exposure):
+    Blood-vessel metrics for the cell:
       ``vessel_contact_fraction`` — fraction of the footprint overlapping the
                                     segmented vessel mask (microglia–vessel contact).
-      ``cd31_exposure_mean``      — mean CD31 (vessel-marker) intensity within
-                                    the footprint, when the ``cd31`` channel is given.
+      ``vessel_contact_area_um2`` — the same contact as an absolute area.
     """
     m = {}
     vessel_mask = vessel_mask > 0
@@ -1118,7 +1116,6 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
             round(float(arr[cell_only].mean()), 3) if n_cell_only else '')
     # What each mean actually rests on, so a value averaged over a sliver of
     # tissue is not read like a full neighbourhood measurement.
-    m['exposure_region_px'] = n_region
     m['exposure_region_um2'] = round(float(n_region) * (pixel_size_um ** 2), 3)
     # Blood-vessel metrics for this cell.
     overlap = cm & vessel_mask
@@ -1129,9 +1126,6 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     # cell size, so a big ramified cell and a small round one aren't comparable).
     m['vessel_contact_area_um2'] = round(
         float(overlap.sum()) * (pixel_size_um ** 2), 3)
-    if cd31 is not None:
-        m['cd31_exposure_mean'] = round(
-            float(np.asarray(cd31, dtype=np.float64)[cm].mean()), 3)
     return m
 
 
@@ -10723,7 +10717,7 @@ if __name__ == '__main__':
                     soma_masks[sid] = mk
                     exp = _microglia_leakage_exposure(
                         mk, vessel_mask, tracers, ps, dist_um=dist_um,
-                        soma_mask=soma_region, cd31=cd31)
+                        soma_mask=soma_region)
                     crow = {'image_name': img_base, 'animal_id': animal_id,
                             'treatment': treatment, 'region': region,
                             'timepoint': timepoint, 'soma_id': sid,

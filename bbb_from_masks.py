@@ -9,7 +9,6 @@ image it:
         dist_to_vessel_um       (measured from the SOMA, parsed from the filename)
         <tracer>_exposure_mean  (tracer the cell is bathed in: the mask grown
                                  10 um outward, vessels excluded)
-        cd31_exposure_mean      (vessel-marker signal in the cell)
         vessel_contact_fraction (fraction of the cell overlapping vessels)
 
 Writes two CSVs: one per-microglia, one per-image (vessel/leakage summary).
@@ -239,7 +238,7 @@ def grown_by_um(mask, ps, radius_um):
     return grown
 
 
-def microglia_exposure(cell_mask, vessel_mask, tracers, ps, dist_um, soma_mask, cd31,
+def microglia_exposure(cell_mask, vessel_mask, tracers, ps, dist_um, soma_mask,
                        halo_um=EXPOSURE_HALO_UM):
     m = {}
     vessel_mask = vessel_mask > 0
@@ -264,10 +263,8 @@ def microglia_exposure(cell_mask, vessel_mask, tracers, ps, dist_um, soma_mask, 
             round(float(arr[region].mean()), 3) if n_region else '')
         m['%s_exposure_mean_cell_only' % name] = (
             round(float(arr[cell_only].mean()), 3) if n_cell_only else '')
-    m['exposure_region_px'] = n_region
     m['exposure_region_um2'] = round(float(n_region) * (ps ** 2), 3)
     m['vessel_contact_fraction'] = round(float((cm & vessel_mask).sum()) / n_cell, 4)
-    m['cd31_exposure_mean'] = round(float(cd31[cm].mean()), 3)
     return m
 
 
@@ -399,7 +396,7 @@ def main():
                 print(f"  ! {os.path.basename(mp)}: shape {mk.shape} != image {vessel_mask.shape} — skipped")
                 continue
             sm = soma_disk(vessel_mask.shape, int(mm.group('r')), int(mm.group('c')), PIXEL_SIZE_UM)
-            exp = microglia_exposure(mk, vessel_mask, tracers, PIXEL_SIZE_UM, dist_um, sm, cd31)
+            exp = microglia_exposure(mk, vessel_mask, tracers, PIXEL_SIZE_UM, dist_um, sm)
             crow = {'image_name': base, 'soma_id': mm.group('sid'),
                     'target_area_um2': int(mm.group('area'))}
             crow.update(exp)

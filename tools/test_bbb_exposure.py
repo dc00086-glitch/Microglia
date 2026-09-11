@@ -77,11 +77,11 @@ def expose(mod, cell, vessel, tracer, halo=HALO_UM):
     """Call either file's exposure function through one signature."""
     if hasattr(mod, '_microglia_leakage_exposure'):
         return mod._microglia_leakage_exposure(
-            cell, vessel, {'dex': tracer}, PS, soma_mask=cell, cd31=None,
+            cell, vessel, {'dex': tracer}, PS, soma_mask=cell,
             halo_um=halo)
     dist = ndimage.distance_transform_edt(~(vessel > 0)) * PS
     return mod.microglia_exposure(cell, vessel, {'dex': tracer}, PS, dist,
-                                  cell, np.zeros((H, W)), halo_um=halo)
+                                  cell, halo_um=halo)
 
 
 def check_no_lumen(mod, label, fails):
@@ -110,9 +110,9 @@ def check_undefined(mod, label, fails):
         fails.append(f"{label}: with every pixel intravascular, exposure came "
                      f"back as {got!r} — there is no extravascular value to "
                      f"report and {INTRA:.0f} is the blood signal itself")
-    if out.get('exposure_region_px') not in (0, None) and got == '':
-        fails.append(f"{label}: blank exposure but exposure_region_px = "
-                     f"{out.get('exposure_region_px')}")
+    if out.get('exposure_region_um2') not in (0, 0.0, None) and got == '':
+        fails.append(f"{label}: blank exposure but exposure_region_um2 = "
+                     f"{out.get('exposure_region_um2')}")
 
 
 def check_halo(mod, label, fails):
@@ -136,11 +136,12 @@ def check_halo(mod, label, fails):
                      f"footprint's own 10.0 — the 10 um halo is not being "
                      f"sampled")
 
-    # Region size: cell grown by 10 px, give or take the disk's discretisation.
-    n = out.get('exposure_region_px')
-    want = int((ndimage.distance_transform_edt(~cell) <= HALO_UM / PS).sum())
+    # Region size: the cell grown by 10 um. PS is 1 um/px here, so the pixel
+    # count and the um2 figure are the same number.
+    n = out.get('exposure_region_um2')
+    want = float((ndimage.distance_transform_edt(~cell) <= HALO_UM / PS).sum())
     if n is None or abs(n - want) > 0.02 * want:
-        fails.append(f"{label}: exposure_region_px {n}, expected about {want} "
+        fails.append(f"{label}: exposure_region_um2 {n}, expected about {want} "
                      f"for a {HALO_UM:g} um halo")
 
     # And a zero halo must reproduce the footprint-only number exactly.
