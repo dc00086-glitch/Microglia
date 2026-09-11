@@ -92,7 +92,7 @@ def check_no_lumen(mod, label, fails):
             ("straddling the wall",      box(20, 26, 35, 46)),
             ("mostly inside the vessel", box(20, 26, 37, 44)),
             ("entirely inside the vessel", box(20, 26, 39, 42))):
-        got = expose(mod, cell, vessel, tracer).get('dex_exposure_mean')
+        got = expose(mod, cell, vessel, tracer).get('microglia_dex_exposure_mean')
         if not isinstance(got, float) or abs(got - EXTRA) > 1e-6:
             fails.append(f"{label}: a cell {name} reported exposure {got!r}, "
                          f"expected {EXTRA} — lumen signal ({INTRA:.0f}) is "
@@ -105,7 +105,7 @@ def check_undefined(mod, label, fails):
     vessel = vessel_stripe(0, W)            # the whole frame is vessel
     tracer = tracer_for(vessel)
     out = expose(mod, box(30, 36, 30, 40), vessel, tracer)
-    got = out.get('dex_exposure_mean')
+    got = out.get('microglia_dex_exposure_mean')
     if got != '':
         fails.append(f"{label}: with every pixel intravascular, exposure came "
                      f"back as {got!r} — there is no extravascular value to "
@@ -127,8 +127,8 @@ def check_halo(mod, label, fails):
     tracer[ring] = 100.0
 
     out = expose(mod, cell, vessel, tracer)
-    halo_mean = out.get('dex_exposure_mean')
-    cell_mean = out.get('dex_exposure_mean_cell_only')
+    halo_mean = out.get('microglia_dex_exposure_mean')
+    cell_mean = out.get('microglia_dex_exposure_mean_cell_only')
     if not isinstance(cell_mean, float) or abs(cell_mean - 10.0) > 1e-6:
         fails.append(f"{label}: cell-only mean {cell_mean!r}, expected 10.0")
     if not isinstance(halo_mean, float) or halo_mean <= 10.0:
@@ -145,7 +145,7 @@ def check_halo(mod, label, fails):
                      f"for a {HALO_UM:g} um halo")
 
     # And a zero halo must reproduce the footprint-only number exactly.
-    bare = expose(mod, cell, vessel, tracer, halo=0.0).get('dex_exposure_mean')
+    bare = expose(mod, cell, vessel, tracer, halo=0.0).get('microglia_dex_exposure_mean')
     if bare != cell_mean:
         fails.append(f"{label}: halo_um=0 gave {bare!r} but the cell-only "
                      f"column says {cell_mean!r}; they must agree")

@@ -7,7 +7,8 @@ image it:
   * quantifies tracer leakage per tracer (leakage index, perivascular rings),
   * for every mask, computes per-microglia exposure:
         dist_to_vessel_um       (measured from the SOMA, parsed from the filename)
-        <tracer>_exposure_mean  (tracer the cell is bathed in: the mask grown
+        microglia_<tracer>_exposure_mean
+                                (tracer the cell is bathed in: the mask grown
                                  10 um outward, vessels excluded)
         vessel_contact_fraction (fraction of the cell overlapping vessels)
 
@@ -257,11 +258,14 @@ def microglia_exposure(cell_mask, vessel_mask, tracers, ps, dist_um, soma_mask,
     n_region = int(region.sum())
     cell_only = cm & ~vessel_mask
     n_cell_only = int(cell_only.sum())
+    # "microglia_" prefix: the per-image leakage sheet carries columns built
+    # from the same tracer names, so the bare form said nothing about which
+    # sheet a column came from. Mirrors MMPSv2.12.py.
     for name, ch in tracers.items():
         arr = np.asarray(ch, dtype=np.float64)
-        m['%s_exposure_mean' % name] = (
+        m['microglia_%s_exposure_mean' % name] = (
             round(float(arr[region].mean()), 3) if n_region else '')
-        m['%s_exposure_mean_cell_only' % name] = (
+        m['microglia_%s_exposure_mean_cell_only' % name] = (
             round(float(arr[cell_only].mean()), 3) if n_cell_only else '')
     m['exposure_region_um2'] = round(float(n_region) * (ps ** 2), 3)
     m['vessel_contact_fraction'] = round(float((cm & vessel_mask).sum()) / n_cell, 4)

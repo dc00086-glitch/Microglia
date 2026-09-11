@@ -1047,14 +1047,15 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     cell (the tracer the cell is actually bathed in). ``dist_um`` (a precomputed
     distance-to-vessel map) can be passed to avoid recomputing it per cell.
 
-    ``<tracer>_exposure_mean`` averages the tracer over the cell footprint grown
-    outward by ``halo_um`` (10 µm by default), MINUS every pixel inside the
-    segmented vessel mask — so it is the tracer standing in the tissue the cell
-    occupies and immediately abuts, and tracer still in the lumen is never
-    counted. ``<tracer>_exposure_mean_cell_only`` is the same measure over the
-    bare footprint, kept so runs from before the halo remain comparable. Both
-    are blank, not zero, when their region has no extravascular pixel;
-    ``exposure_region_um2`` says how much tissue the halo mean rests on.
+    ``microglia_<tracer>_exposure_mean`` averages the tracer over the cell
+    footprint grown outward by ``halo_um`` (10 µm by default), MINUS every pixel
+    inside the segmented vessel mask — so it is the tracer standing in the
+    tissue the cell occupies and immediately abuts, and tracer still in the
+    lumen is never counted. ``microglia_<tracer>_exposure_mean_cell_only`` is
+    the same measure over the bare footprint, kept so runs from before the halo
+    remain comparable. Both are blank, not zero, when their region has no
+    extravascular pixel; ``exposure_region_um2`` says how much tissue the halo
+    mean rests on.
 
     ``dist_to_vessel_um`` is measured from the SOMA (``soma_mask`` — the soma
     outline or a disk at the soma centroid) when provided, NOT the whole arbor,
@@ -1108,11 +1109,15 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     # halo existed stay comparable to runs measured after it.
     cell_only = cm & ~vessel_mask
     n_cell_only = int(cell_only.sum())
+    # Prefixed "microglia_" because the per-IMAGE leakage row carries columns
+    # built from the same tracer names (<tracer>_extravascular_mean and the
+    # rest), and once both sheets are open side by side a bare
+    # <tracer>_exposure_mean gives no clue which one it came from.
     for name, ch in tracers.items():
         arr = np.asarray(ch, dtype=np.float64)
-        m['%s_exposure_mean' % name] = (
+        m['microglia_%s_exposure_mean' % name] = (
             round(float(arr[region].mean()), 3) if n_region else '')
-        m['%s_exposure_mean_cell_only' % name] = (
+        m['microglia_%s_exposure_mean_cell_only' % name] = (
             round(float(arr[cell_only].mean()), 3) if n_cell_only else '')
     # What each mean actually rests on, so a value averaged over a sliver of
     # tissue is not read like a full neighbourhood measurement.

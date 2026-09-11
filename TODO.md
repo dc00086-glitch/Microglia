@@ -2,9 +2,9 @@
 
 ## BBB per-cell exposure: what region it averages  *(changed)*
 
-`<tracer>_exposure_mean` now averages the microglia mask **grown 10 µm
+`microglia_<tracer>_exposure_mean` now averages the microglia mask **grown 10 µm
 outward**, with every pixel inside the segmented vessel mask removed. The bare
-footprint is kept alongside as `<tracer>_exposure_mean_cell_only`, so runs
+footprint is kept alongside as `microglia_<tracer>_exposure_mean_cell_only`, so runs
 measured before this change stay comparable — expect the halo value to be the
 lower of the two wherever the cell is brighter than the tissue around it.
 
