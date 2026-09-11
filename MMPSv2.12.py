@@ -4491,6 +4491,69 @@ class VesselReviewDialog(QDialog):
                 'action': self.result_action}
 
 
+def _fit_dialog_to_screen(dialog, layout, keep_last=1, max_height_frac=0.85):
+    """Set a tall settings dialog's layout so its buttons stay reachable.
+
+    These dialogs grew past the height of a laptop screen -- Mask Generation
+    Settings alone asks for sizes, intensity floor, local window, smoothing,
+    segmentation and the circular constraint, and comes out around 850px. A
+    window taller than the screen has its bottom row pushed off the edge, where
+    it can be neither clicked nor scrolled to: the dialog opens, and then there
+    is no way to press Generate. Nothing errors and the button that opened it
+    behaves normally, so it reads as the click doing nothing.
+
+    Everything except the last ``keep_last`` items of ``layout`` (the row of
+    action buttons) goes into a scroll area, and the dialog is capped to a
+    fraction of the screen it opens on. On a big screen the cap never binds and
+    the dialog looks exactly as it did.
+
+    Call INSTEAD of ``dialog.setLayout(layout)``.
+    """
+    from PyQt5.QtWidgets import QScrollArea, QWidget
+
+    tail = []
+    for _ in range(max(0, int(keep_last))):
+        if layout.count() == 0:
+            break
+        tail.insert(0, layout.takeAt(layout.count() - 1))
+
+    inner = QWidget()
+    inner.setLayout(layout)
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QScrollArea.NoFrame)
+    scroll.setWidget(inner)
+
+    outer = QVBoxLayout()
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.addWidget(scroll)
+    for item in tail:
+        if item.layout() is not None:
+            outer.addLayout(item.layout())
+        elif item.widget() is not None:
+            outer.addWidget(item.widget())
+    dialog.setLayout(outer)
+
+    # Cap against the screen this dialog will actually open on, not the primary
+    # one -- an external monitor is usually the taller of the two.
+    avail = None
+    try:
+        scr = dialog.screen() if hasattr(dialog, 'screen') else None
+        if scr is None:
+            scr = QApplication.primaryScreen()
+        if scr is not None:
+            avail = scr.availableGeometry()
+    except Exception:
+        avail = None
+    hint = dialog.sizeHint()
+    if avail is not None and avail.height() > 200:
+        max_h = int(avail.height() * max_height_frac)
+        dialog.setMaximumHeight(max_h)
+        dialog.resize(hint.width(), min(hint.height(), max_h))
+    else:
+        dialog.resize(hint)
+
+
 class BBBAnalysisDialog(QDialog):
     """Assign channels and run BBB analysis: CD31 vessel segmentation, tracer
     extravasation/leakage, and per-microglia tracer exposure. The number of
@@ -4529,7 +4592,7 @@ class BBBAnalysisDialog(QDialog):
             self._all_combos.append((combo, allow_none))
             return combo
 
-        layout = QVBoxLayout(self)
+        layout = QVBoxLayout()   # parented at the end by _fit_dialog_to_screen
 
         # --- Raw individual-channel folder ---------------------------------
         layout.addWidget(QLabel(
@@ -4645,6 +4708,10 @@ class BBBAnalysisDialog(QDialog):
         btns.addWidget(run_btn)
         btns.addWidget(cancel_btn)
         layout.addLayout(btns)
+
+        # A dialog with eight tracer rows showing runs past a laptop screen, so
+        # the Run/Cancel row is held outside the scrolling part.
+        _fit_dialog_to_screen(self, layout)
 
         # Wired last: the probe touches the combos and the tracer rows, so
         # every widget it reaches has to exist before it can run.
@@ -5020,6 +5087,14 @@ class MicrogliaAnalysisGUI(QMainWindow):
             "Needed when a dataset puts IBA1 or DAPI on different channels "
             "than the images the model was trained on.")
         map_ch_action.triggered.connect(self._ml_channel_map_dialog)
+        self.auto_pipeline_action = advanced_menu.addAction(
+            "Run Full Pipeline (ML)...")
+        self.auto_pipeline_action.setEnabled(False)
+        self.auto_pipeline_action.setToolTip(
+            "Outline, grow masks and size every picked cell in one run.\n"
+            "Asks everything up front, then runs unattended.\n"
+            "Whatever the models are unsure of goes to a review queue.")
+        self.auto_pipeline_action.triggered.connect(self.run_auto_pipeline)
         clear_outlines_action = advanced_menu.addAction("Clear Soma Outlines...")
         clear_outlines_action.setToolTip(
             "Delete the outlines for a range of somas so they can be redone")
@@ -5415,30 +5490,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.clear_masks_btn.setVisible(False)
         self.clear_masks_btn.setStyleSheet("border: 2px solid #F44336; font-weight: bold; padding: 4px 10px;")
 
-        self.auto_pipeline_btn = QPushButton("⚡ Run Full Pipeline (ML)")
-        self.auto_pipeline_btn.clicked.connect(self.run_auto_pipeline)
-        self.auto_pipeline_btn.setEnabled(False)
-        self.auto_pipeline_btn.setStyleSheet(
-            "border: 2px solid #9C27B0; font-weight: bold; padding: 4px;")
-        self.auto_pipeline_btn.setToolTip(
-            "Outline, grow masks and size every picked cell in one run.\n"
-            "Asks everything up front, then runs unattended.\n"
-            "Whatever the models are unsure of goes to a review queue.")
-        batch_layout.addWidget(self.auto_pipeline_btn)
-
-        self.ml_qa_btn = QPushButton("🤖 Auto QA (ML)")
-        self.ml_qa_btn.clicked.connect(self._ml_mask_qa_dialog)
-        self.ml_qa_btn.setEnabled(False)
-        self.ml_qa_btn.setToolTip(
-            "Size every cell with the trained model.\n"
-            "Confident cells are approved without review; the rest go to the "
-            "grid opened on the model's answer.")
-        batch_layout.addWidget(self.ml_qa_btn)
-
+        # Full Pipeline lives in the Advanced menu (see _build_menu_bar) and
+        # Auto QA is the first question "QA All Masks" asks, so neither takes a
+        # slot in the ordinary step-by-step panel any more.
         self.batch_qa_btn = QPushButton("QA All Masks")
         self.batch_qa_btn.clicked.connect(self.start_batch_qa)
         self.batch_qa_btn.setEnabled(False)
-        self.ml_qa_btn.setEnabled(False)
+        self.batch_qa_btn.setToolTip(
+            "Review every mask. Starts by offering to let the trained mask "
+            "model size the cells first, so each one opens on its answer.")
         batch_layout.addWidget(self.batch_qa_btn)
         self.undo_qa_btn = QPushButton("Undo QA")
         self.undo_qa_btn.clicked.connect(self.undo_last_qa)
@@ -11503,7 +11563,7 @@ if __name__ == '__main__':
             self.batch_pick_somas_btn.setEnabled(True)
         if has_somas:
             self.batch_outline_btn.setEnabled(True)
-            self.auto_pipeline_btn.setEnabled(True)
+            self.auto_pipeline_action.setEnabled(True)
         if has_outlines:
             self.batch_generate_masks_btn.setEnabled(True)
 
@@ -11511,7 +11571,6 @@ if __name__ == '__main__':
         has_qa_complete = any(d['status'] in ('qa_complete', 'analyzed') for d in self.images.values())
         if has_masks:
             self.batch_qa_btn.setEnabled(True)
-            self.ml_qa_btn.setEnabled(True)
             self.opacity_widget.setVisible(True)
         if has_qa_complete:
             self.batch_calculate_btn.setEnabled(True)
@@ -11548,7 +11607,9 @@ if __name__ == '__main__':
                     QMessageBox.Yes | QMessageBox.No
                 )
                 if reply == QMessageBox.Yes:
-                    self.start_batch_qa()
+                    # Resuming an interrupted pass: the sizing question was
+                    # answered when it started.
+                    self._begin_mask_qa()
 
     # ========================================================================
     # IMPORT IMAGEJ RESULTS
@@ -13662,7 +13723,7 @@ if __name__ == '__main__':
         self.done_btn.setEnabled(False)
         total_somas = sum(len(data['somas']) for data in self.images.values() if data['selected'])
         self.batch_outline_btn.setEnabled(True)
-        self.auto_pipeline_btn.setEnabled(True)
+        self.auto_pipeline_action.setEnabled(True)
 
         # Log group counts if coloc mode was used
         if self.colocalization_mode:
@@ -15550,7 +15611,6 @@ if __name__ == '__main__':
                     self.log(f"Warning: Could not delete {os.path.basename(mask_file)}: {e}")
         
         self.batch_qa_btn.setEnabled(False)
-        self.ml_qa_btn.setEnabled(False)
         self.batch_calculate_btn.setEnabled(False)
         self.clear_masks_btn.setEnabled(False)
         self.clear_masks_btn.setVisible(False)
@@ -15792,7 +15852,22 @@ if __name__ == '__main__':
         cl_path = self._get_checklist_path('soma_checklist.csv')
         if cl_path and os.path.exists(cl_path):
             self._update_checklist_row(cl_path, 0, f"{img_name}_{soma_id}", 1, 1)
+        self._refresh_generate_masks_enabled()
         return soma_area_um2
+
+    def _refresh_generate_masks_enabled(self):
+        """Enable "Generate All Masks" as soon as ANY outline exists.
+
+        It used to be enabled only by _finish_outlining, which runs only when
+        every soma in the queue has an outline. Any run that ends short of that
+        -- somas the auto-outliner could not do, a cancelled Auto All, a queue
+        left part-way -- left outlines on disk and the button greyed out, with
+        no way back to it but saving and reloading the session (which enables
+        it on exactly this rule). Masks can be grown for the outlines that do
+        exist, so the button follows the outlines, not the queue.
+        """
+        if any(d.get('soma_outlines') for d in self.images.values()):
+            self.batch_generate_masks_btn.setEnabled(True)
 
     def auto_outline_all_somas(self):
         """Auto-outline every soma still waiting in the queue.
@@ -16490,7 +16565,9 @@ if __name__ == '__main__':
 
         layout.addLayout(button_layout)
 
-        dialog.setLayout(layout)
+        # The button row (added last) stays outside the scroll area so it is
+        # always reachable, however tall the settings above it get.
+        _fit_dialog_to_screen(dialog, layout)
         dialog.setMinimumWidth(400)
 
         if ask:
@@ -16728,7 +16805,6 @@ if __name__ == '__main__':
                     pass
 
             self.batch_qa_btn.setEnabled(True)
-            self.ml_qa_btn.setEnabled(True)
             self.clear_masks_btn.setEnabled(True)
             self.opacity_widget.setVisible(True)
             # self.update_workflow_status()
@@ -16906,7 +16982,7 @@ if __name__ == '__main__':
         button_layout.addWidget(ok_btn)
 
         layout.addLayout(button_layout)
-        dialog.setLayout(layout)
+        _fit_dialog_to_screen(dialog, layout)
         dialog.setMinimumWidth(420)
 
         if dialog.exec_() != QDialog.Accepted:
@@ -17022,7 +17098,6 @@ if __name__ == '__main__':
                     return
         else:
             self.batch_qa_btn.setEnabled(True)
-            self.ml_qa_btn.setEnabled(True)
             self.opacity_widget.setVisible(True)
             QMessageBox.information(self, "Done",
                 f"Regenerated {total} masks for {os.path.splitext(img_name)[0]}.\n\nReady for QA.")
@@ -18083,10 +18158,15 @@ if __name__ == '__main__':
             self._ml_review_order = None
             self._start_review_mode()
         elif b_mask is not None and box.clickedButton() is b_mask:
-            self.start_batch_qa()
+            # The pipeline already ran the model over these cells.
+            self._begin_mask_qa()
 
     def _ml_mask_qa_dialog(self):
-        """Offer the accuracy/coverage trade the model measured, then run it."""
+        """Offer the accuracy/coverage trade the model measured, then run it.
+
+        Returns True when the caller should carry on into the review pass,
+        False when the user cancelled out.
+        """
         mq = get_mask_qa_model()
         for _m in drain_ml_messages():
             self.log(_m)
@@ -18095,7 +18175,7 @@ if __name__ == '__main__':
                 self, "ML Mask QA",
                 "No mask-QA model found.\n\nPut mask_qa_model.joblib beside "
                 "MMPS or in your Downloads folder.")
-            return
+            return False
 
         got = self._mq_gate_dialog(
             mq, "Auto QA with the mask model",
@@ -18104,7 +18184,7 @@ if __name__ == '__main__':
             "review. Everything else goes to the grid as usual, opened on "
             "the model's own answer.")
         if got is None:
-            return
+            return False
         gate, apply_decisions = got
 
         self.log("=" * 50)
@@ -18113,8 +18193,10 @@ if __name__ == '__main__':
         t0 = time.time()
         stats = self._run_ml_mask_qa(gate, apply_decisions=apply_decisions)
         if stats is None:
+            # Nothing for the model to do is not a reason to refuse the
+            # review pass; let it open and say for itself what it found.
             self.log("  nothing to size")
-            return
+            return True
         self.log(f"  scored {stats['scored']} cells across "
                  f"{stats['images']} images in {time.time() - t0:.0f}s")
         if apply_decisions:
@@ -18138,10 +18220,59 @@ if __name__ == '__main__':
             + (f"{stats['auto']} approved automatically.\n" if apply_decisions
                else "")
             + f"{stats['review']} left for you to review.\n\n"
-            f"Open QA All Masks to work through the rest — each cell opens "
-            f"on the model's proposed size.")
+            f"The review grid opens next — each cell opens on the model's "
+            f"proposed size.")
+        return True
 
     def start_batch_qa(self):
+        """Button slot: offer the model's help, then start the QA pass.
+
+        Auto QA used to be a button of its own sitting beside this one, which
+        put the choice in front of the user before they had said they wanted to
+        QA anything. It is the same decision either way, so ask it here, as the
+        first question of the QA pass. Kept argument-free: Qt fills a checked
+        flag into any slot that will accept one.
+        """
+        if not self._offer_ml_mask_qa():
+            return
+        self._begin_mask_qa()
+
+    def _offer_ml_mask_qa(self):
+        """Ask whether the mask model should size the cells before review.
+
+        Returns True to go on into the review pass, False if the user backed
+        out. With no model installed there is nothing to choose between, so it
+        returns True without asking.
+        """
+        mq = get_mask_qa_model()
+        for _m in drain_ml_messages():
+            self.log(_m)
+        if mq is None:
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("Mask QA")
+        box.setIcon(QMessageBox.Question)
+        box.setText("<b>How should these cells be sized?</b>")
+        box.setInformativeText(
+            "The trained mask model can size every cell first, so each one "
+            "opens on its proposed answer — and the cells it is confident "
+            "about can be approved without review.\n\n"
+            "Either way you review the rest in the same grid.")
+        b_auto = box.addButton("Auto QA with the model…", QMessageBox.AcceptRole)
+        b_manual = box.addButton("Review by hand", QMessageBox.AcceptRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(b_auto)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is b_auto:
+            # Cancelling the model's own dialog backs out of QA rather than
+            # dropping silently into a hand review nobody asked for.
+            return bool(self._ml_mask_qa_dialog())
+        return clicked is b_manual
+
+    def _begin_mask_qa(self):
+        """Start the QA pass itself. Call this, not start_batch_qa, from code
+        that has already settled how the cells get sized."""
         # Flatten all masks from all images
         self.all_masks_flat = []
         for img_name, img_data in self.images.items():
@@ -18608,6 +18739,10 @@ if __name__ == '__main__':
 
         # Keep current_image_name in sync when QA switches images
         self.current_image_name = img_name
+        # ...and the top-left name overlay with it. Only the picking and
+        # outlining steps used to set it, so through the whole QA pass it kept
+        # showing whichever image outlining had stopped on.
+        self._set_image_name_overlay(img_name)
 
         try:
             # Reload processed image from disk if it was freed to save RAM
@@ -19335,6 +19470,7 @@ if __name__ == '__main__':
                 return
 
         self.current_image_name = img_name
+        self._set_image_name_overlay(img_name)
 
         # Load processed image
         processed_img = self._ensure_processed_loaded(img_name)
