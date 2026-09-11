@@ -1005,15 +1005,57 @@ def _quantify_leakage(vessel_mask, tracer, pixel_size_um,
 _JUXTAVASCULAR_MAX_UM = 10.0
 
 
+#: How far beyond the microglia footprint tracer exposure is sampled. The cell
+#: is bathed in the tracer standing in the tissue immediately around it, not
+#: only in what happens to fall inside its own silhouette -- a thin process
+#: samples almost no parenchyma on its own.
+_EXPOSURE_HALO_UM = 10.0
+
+
+def _grown_by_um(mask, pixel_size_um, radius_um):
+    """``mask`` grown outward by ``radius_um``, the original included.
+
+    Computed on a bounding-box crop rather than the whole frame: BBB runs this
+    once per cell per image, and a full-frame distance transform per cell is
+    what makes that slow. Growth is clipped at the image edge, which is correct
+    -- there is no data past the border to average.
+    """
+    r_px = int(round(float(radius_um) / max(float(pixel_size_um), 1e-9)))
+    m = mask > 0
+    if r_px <= 0 or not np.any(m):
+        return m
+    h, w = m.shape
+    ys, xs = np.nonzero(m)
+    y0 = max(int(ys.min()) - r_px - 1, 0)
+    y1 = min(int(ys.max()) + r_px + 2, h)
+    x0 = max(int(xs.min()) - r_px - 1, 0)
+    x1 = min(int(xs.max()) + r_px + 2, w)
+    sub = m[y0:y1, x0:x1]
+    grown = np.zeros_like(m)
+    grown[y0:y1, x0:x1] = ndimage.distance_transform_edt(~sub) <= r_px
+    return grown
+
+
 def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
                                 dist_um=None, soma_mask=None, cd31=None,
-                                juxta_max_um=_JUXTAVASCULAR_MAX_UM):
+                                juxta_max_um=_JUXTAVASCULAR_MAX_UM,
+                                halo_um=_EXPOSURE_HALO_UM):
     """Per-microglia leakage exposure to join onto the morphology row.
 
     ``tracers`` is a dict name -> channel array. Returns distance to the nearest
     vessel and, for each tracer, the mean extravascular intensity within the
     cell (the tracer the cell is actually bathed in). ``dist_um`` (a precomputed
     distance-to-vessel map) can be passed to avoid recomputing it per cell.
+
+    ``<tracer>_exposure_mean`` averages the tracer over the cell footprint grown
+    outward by ``halo_um`` (10 µm by default), MINUS every pixel inside the
+    segmented vessel mask — so it is the tracer standing in the tissue the cell
+    occupies and immediately abuts, and tracer still in the lumen is never
+    counted. ``<tracer>_exposure_mean_cell_only`` is the same measure over the
+    bare footprint, kept so runs from before the halo remain comparable. Both
+    are blank, not zero, when their region has no extravascular pixel;
+    ``exposure_region_px`` / ``exposure_region_um2`` say how much tissue the
+    halo mean rests on.
 
     ``dist_to_vessel_um`` is measured from the SOMA (``soma_mask`` — the soma
     outline or a disk at the soma centroid) when provided, NOT the whole arbor,
@@ -1048,13 +1090,38 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     # does not make the cell count as juxtavascular.
     m['juxtavascular'] = 1 if d_soma <= juxta_max_um else 0
     m['juxtavascular_threshold_um'] = juxta_max_um
-    outside = cm & ~vessel_mask
-    reg = outside if np.any(outside) else cm
-    for name, ch in tracers.items():
-        m['%s_exposure_mean' % name] = round(
-            float(np.asarray(ch, dtype=np.float64)[reg].mean()), 3)
-    # Blood-vessel metrics for this cell.
     n_cell = int(cm.sum())
+    # Exposure region: the cell footprint PLUS everything within halo_um of it,
+    # then vessels removed. Two separate rules --
+    #   the halo, because the cell is bathed in the tracer standing in the
+    #   tissue around it, and a thin process covers almost no parenchyma of its
+    #   own, so a footprint-only mean mostly measures the cell's own background;
+    #   minus vessels, because tracer still in the lumen is blood, not leak, and
+    #   must never count towards what the cell is exposed to.
+    region = _grown_by_um(cm, pixel_size_um, halo_um) & ~vessel_mask
+    n_region = int(region.sum())
+    # A cell whose whole neighbourhood is vessel has NO extravascular pixel and
+    # so no exposure value. This used to fall back to averaging the footprint --
+    # every pixel of it intravascular -- handing back pure lumen signal under
+    # the name "exposure", indistinguishable from a genuinely tracer-soaked
+    # cell. Blank instead: undefined is neither zero nor the blood value.
+    #
+    # The footprint-only mean is kept alongside so runs measured before the
+    # halo existed stay comparable to runs measured after it.
+    cell_only = cm & ~vessel_mask
+    n_cell_only = int(cell_only.sum())
+    for name, ch in tracers.items():
+        arr = np.asarray(ch, dtype=np.float64)
+        m['%s_exposure_mean' % name] = (
+            round(float(arr[region].mean()), 3) if n_region else '')
+        m['%s_exposure_mean_cell_only' % name] = (
+            round(float(arr[cell_only].mean()), 3) if n_cell_only else '')
+    # What each mean actually rests on, so a value averaged over a sliver of
+    # tissue is not read like a full neighbourhood measurement.
+    m['exposure_halo_um'] = halo_um
+    m['exposure_region_px'] = n_region
+    m['exposure_region_um2'] = round(float(n_region) * (pixel_size_um ** 2), 3)
+    # Blood-vessel metrics for this cell.
     overlap = cm & vessel_mask
     m['vessel_contact_fraction'] = (
         round(float(overlap.sum()) / n_cell, 4) if n_cell else 0.0)

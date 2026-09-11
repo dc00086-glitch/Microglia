@@ -7,7 +7,8 @@ image it:
   * quantifies tracer leakage per tracer (leakage index, perivascular rings),
   * for every mask, computes per-microglia exposure:
         dist_to_vessel_um       (measured from the SOMA, parsed from the filename)
-        <tracer>_exposure_mean  (tracer the cell is bathed in, extravascular)
+        <tracer>_exposure_mean  (tracer the cell is bathed in: the mask grown
+                                 10 um outward, vessels excluded)
         cd31_exposure_mean      (vessel-marker signal in the cell)
         vessel_contact_fraction (fraction of the cell overlapping vessels)
 
@@ -213,7 +214,33 @@ def soma_disk(shape, cy, cx, ps, radius_um=SOMA_RADIUS_UM):
     return ((yy - cy) ** 2 + (xx - cx) ** 2 <= r * r)
 
 
-def microglia_exposure(cell_mask, vessel_mask, tracers, ps, dist_um, soma_mask, cd31):
+EXPOSURE_HALO_UM = 10.0        # how far past the footprint exposure is sampled
+
+
+def grown_by_um(mask, ps, radius_um):
+    """``mask`` grown outward by ``radius_um``, the original included.
+
+    Cropped to a bounding box: this runs once per cell, and a full-frame
+    distance transform each time is what makes that slow. Mirrors
+    _grown_by_um in MMPSv2.12.py.
+    """
+    r_px = int(round(float(radius_um) / max(float(ps), 1e-9)))
+    m = mask > 0
+    if r_px <= 0 or not np.any(m):
+        return m
+    h, w = m.shape
+    ys, xs = np.nonzero(m)
+    y0 = max(int(ys.min()) - r_px - 1, 0)
+    y1 = min(int(ys.max()) + r_px + 2, h)
+    x0 = max(int(xs.min()) - r_px - 1, 0)
+    x1 = min(int(xs.max()) + r_px + 2, w)
+    grown = np.zeros_like(m)
+    grown[y0:y1, x0:x1] = ndimage.distance_transform_edt(~m[y0:y1, x0:x1]) <= r_px
+    return grown
+
+
+def microglia_exposure(cell_mask, vessel_mask, tracers, ps, dist_um, soma_mask, cd31,
+                       halo_um=EXPOSURE_HALO_UM):
     m = {}
     vessel_mask = vessel_mask > 0
     cm = cell_mask > 0
@@ -221,11 +248,25 @@ def microglia_exposure(cell_mask, vessel_mask, tracers, ps, dist_um, soma_mask, 
         return m
     dist_region = soma_mask if (soma_mask is not None and np.any(soma_mask)) else cm
     m['dist_to_vessel_um'] = round(float(dist_um[dist_region].min()), 3)
-    outside = cm & ~vessel_mask
-    reg = outside if np.any(outside) else cm
-    for name, ch in tracers.items():
-        m['%s_exposure_mean' % name] = round(float(ch[reg].mean()), 3)
+    # The cell footprint plus everything within halo_um of it, minus vessels:
+    # the cell is bathed in the tracer standing in the tissue around it, while
+    # tracer still in the lumen is blood and never counts. A region with no
+    # extravascular pixel has no value to report -- blank, not the in-lumen
+    # mean this used to fall back to. Mirrors MMPSv2.12.py.
     n_cell = int(cm.sum())
+    region = grown_by_um(cm, ps, halo_um) & ~vessel_mask
+    n_region = int(region.sum())
+    cell_only = cm & ~vessel_mask
+    n_cell_only = int(cell_only.sum())
+    for name, ch in tracers.items():
+        arr = np.asarray(ch, dtype=np.float64)
+        m['%s_exposure_mean' % name] = (
+            round(float(arr[region].mean()), 3) if n_region else '')
+        m['%s_exposure_mean_cell_only' % name] = (
+            round(float(arr[cell_only].mean()), 3) if n_cell_only else '')
+    m['exposure_halo_um'] = halo_um
+    m['exposure_region_px'] = n_region
+    m['exposure_region_um2'] = round(float(n_region) * (ps ** 2), 3)
     m['vessel_contact_fraction'] = round(float((cm & vessel_mask).sum()) / n_cell, 4)
     m['cd31_exposure_mean'] = round(float(cd31[cm].mean()), 3)
     return m

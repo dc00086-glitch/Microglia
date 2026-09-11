@@ -1,5 +1,29 @@
 # MMPS — open items
 
+## BBB per-cell exposure: what region it averages  *(changed)*
+
+`<tracer>_exposure_mean` now averages the microglia mask **grown 10 µm
+outward**, with every pixel inside the segmented vessel mask removed. The bare
+footprint is kept alongside as `<tracer>_exposure_mean_cell_only`, so runs
+measured before this change stay comparable — expect the halo value to be the
+lower of the two wherever the cell is brighter than the tissue around it.
+
+Two rules, deliberately separate:
+
+* **the halo**, because a cell is bathed in the tracer standing in the tissue
+  around it, and a thin process covers almost no parenchyma of its own — a
+  footprint-only mean largely measures the cell's own background;
+* **minus vessels**, because tracer still in the lumen is blood, not leak.
+
+Both are blank, never zero, when the region contains no extravascular pixel at
+all (a cell the vessel mask swallows whole, which happens readily when CD31
+over-segments). That case used to fall back to averaging the footprint — every
+pixel of it intravascular — and report pure blood signal under the name
+"exposure". `exposure_region_px` / `exposure_region_um2` say how much tissue
+each mean rests on, and `exposure_halo_um` records the radius used.
+
+Pinned by `tools/test_bbb_exposure.py`.
+
 ## Far-red channel is not recoverable from current exports  *(deferred)*
 
 **Status:** parked — not blocking current analysis. Revisit before any work that
