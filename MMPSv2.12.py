@@ -18417,6 +18417,9 @@ if __name__ == '__main__':
         self._qa_grid_soma_idx = 0
         self._qa_skipped_somas = set()
         self._qa_grid_edit_return = False
+        # Which cell the single view last drew, so a zoom-out can be held
+        # across that cell's other mask sizes. None = auto-zoom on.
+        self._qa_last_shown_soma = None
 
         self.mask_qa_progress_bar.setVisible(True)
 
@@ -18737,6 +18740,16 @@ if __name__ == '__main__':
         img_name = flat_data['image_name']
         img_data = self.images.get(img_name, {})
 
+        # Zooming back out is a decision about THIS cell: the next size up or
+        # down is the same cell in the same place, so snapping back in undoes
+        # the user's view on every accept. Honour it for as long as the cell
+        # stays the same -- the next cell is somewhere else and has to be
+        # found again, so auto-zoom returns there.
+        soma_key = (img_name, mask_data.get('soma_id', ''))
+        stay_zoomed_out = (
+            soma_key == getattr(self, '_qa_last_shown_soma', None)
+            and self.mask_label.zoom_level <= 1.0)
+
         # Keep current_image_name in sync when QA switches images
         self.current_image_name = img_name
         # ...and the top-left name overlay with it. Only the picking and
@@ -18785,9 +18798,12 @@ if __name__ == '__main__':
             self.original_label.info_text_right = os.path.splitext(img_name)[0]
             self.original_label._update_display()
 
-            # Auto-zoom to mask center
-            mask_coords = np.argwhere(mask_data['mask'] > 0)
-            if len(mask_coords) > 0:
+            # Auto-zoom to mask center, unless the user zoomed out on this
+            # same cell and has not moved on from it yet.
+            current_mask = mask_data.get('mask')
+            mask_coords = (np.argwhere(current_mask > 0)
+                           if current_mask is not None else [])
+            if len(mask_coords) > 0 and not stay_zoomed_out:
                 center_row = float(np.mean(mask_coords[:, 0]))
                 center_col = float(np.mean(mask_coords[:, 1]))
                 self.mask_label.zoom_to_point(center_row, center_col, zoom_level=self.qa_autozoom_spin.value())
@@ -18795,6 +18811,8 @@ if __name__ == '__main__':
             self.log(f"ERROR displaying mask: {str(e)}")
             import traceback
             traceback.print_exc()
+
+        self._qa_last_shown_soma = soma_key
 
         status = mask_data.get('approved')
         status_text = "Approved" if status is True else "Rejected" if status is False else "Not reviewed"

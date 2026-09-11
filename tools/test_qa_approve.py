@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if Approve during mask QA acts on anything but the cell on screen.
+"""Fail if mask QA acts on the wrong cell, or fights the user's zoom.
 
 Grid view lays out one soma's whole size ladder; single view shows one mask.
 Approve used to work off mask_qa_idx in both, but the grid does not move that
@@ -137,6 +137,42 @@ def main():
         if int(md['mask'].sum()) <= before:
             fails.append("a paint stroke did not change the stored mask")
 
+    # --- a zoom-out is held across the rest of that cell's sizes ------------
+    # Zooming out is a decision about the cell, and the next size up or down is
+    # the same cell in the same place. Snapping back in on every accept undid
+    # that view over and over. It must hold until the cell changes -- and no
+    # further, because the next cell is somewhere else and has to be found.
+    gui = build(app)
+    gui.resize(900, 700)
+    gui.mask_label.resize(600, 500)
+    gui.qa_autozoom_spin.setValue(4.0)
+    gui.mask_qa_idx = 0
+    gui._qa_last_shown_soma = None
+    gui._show_current_mask()
+    if gui.mask_label.zoom_level <= 1.0:
+        fails.append("the first mask of a cell did not auto-zoom at all")
+    gui._reset_current_zoom()                       # the user presses U
+    first_soma = gui.all_masks_flat[0]['mask_data']['soma_id']
+    for _ in range(len(SIZES) - 1):                 # the rest of THIS cell
+        gui.reject_current_mask()
+        md = gui.all_masks_flat[gui.mask_qa_idx]['mask_data']
+        if md['soma_id'] != first_soma:
+            fails.append("test drifted off the first cell too early")
+            break
+        if gui.mask_label.zoom_level > 1.0:
+            fails.append(f"zoom snapped back to {gui.mask_label.zoom_level:.1f}x "
+                         f"on {md['soma_id']}@{md['target_area_um2']} — a "
+                         f"zoom-out must hold across one cell's sizes")
+            break
+    else:
+        gui.reject_current_mask()                   # on to the NEXT cell
+        md = gui.all_masks_flat[gui.mask_qa_idx]['mask_data']
+        if md['soma_id'] == first_soma:
+            fails.append("test never reached a second cell")
+        elif gui.mask_label.zoom_level <= 1.0:
+            fails.append("auto-zoom did not come back for the next cell — a "
+                         "new cell is elsewhere and has to be found")
+
     # --- Reject still works off the displayed soma in grid view -------------
     gui = build(app)
     gui._qa_use_grid = False
@@ -156,7 +192,7 @@ def main():
         for f in fails:
             print("  " + f)
         sys.exit(1)
-    print("OK: Approve and Reject act on the cell actually on screen")
+    print("OK: QA acts on the cell on screen and keeps the zoom you chose")
 
 
 if __name__ == '__main__':
