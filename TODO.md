@@ -5,6 +5,19 @@
 **Status:** parked — not blocking current analysis. Revisit before any work that
 needs the far-red tracer quantitatively.
 
+**Update — MMPS can now read the unflattened route.** The BBB dialog has a
+**Raw channel folder** field: point it at a folder of individual channel TIFFs
+(`C1-image.tif`, `image_C2.tif`, `image_ch03.tif`, … — what Fiji's *Split
+Channels* and `export_4channel.ijm` produce) and CD31 and every tracer are read
+from their own planes, at full bit depth, instead of from the composite loaded
+in the image list. The channel pickers renumber to whatever the folder holds, so
+a 4th far-red channel appears as `Channel 4` once it exists as its own file.
+This does not recover anything from an already-flattened composite — the
+unmixing problem below is still unsolvable — it just means a correct export is
+now usable without re-importing anything. `bbb_vessel_leakage.csv` records per
+image which files the numbers came from, so a folder that silently matched
+nothing is visible in the results rather than only in the log.
+
 ### The problem
 The images currently being loaded are saved as **3-channel RGB composites**. A
 4th (far-red) dye was pseudo-coloured **magenta** and flattened into them, so:

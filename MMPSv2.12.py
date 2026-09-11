@@ -1093,6 +1093,141 @@ def _soma_footprint_mask(shape, centroid, pixel_size_um,
     return m.astype(np.uint8)
 
 
+# ----------------------------------------------------------------------
+# Raw individual-channel folder
+#
+# WHY THIS EXISTS: once channels are merged into an RGB composite, a tracer
+# that images white is high in R, G AND B -- so it is arithmetically identical
+# to a red tracer in the red plane, and no later processing can pull them
+# apart. Reading the individual channel files instead keeps every tracer in its
+# own plane, so "white" never gets counted as "red". Fiji's Split Channels and
+# most exporters write those files as C1-<image>.tif or <image>_C1.tif.
+# ----------------------------------------------------------------------
+
+# <image>_C2 / <image>_ch02 / <image>-channel2  (channel token at the END)
+_BBB_CH_SUFFIX_RE = re.compile(
+    r'^(?P<base>.+?)[ _.\-]*(?:c|ch|channel)[ _\-]?(?P<num>\d{1,2})$', re.IGNORECASE)
+# C2-<image> / ch02_<image>  (channel token at the START, Fiji's own default)
+_BBB_CH_PREFIX_RE = re.compile(
+    r'^(?:c|ch|channel)[ _\-]?(?P<num>\d{1,2})[ _\-]+(?P<base>.+)$', re.IGNORECASE)
+
+
+def _bbb_split_channel_token(stem):
+    """Split a per-channel filename stem into (base, channel number).
+
+    Returns (None, None) when the stem carries no channel token — which is how
+    a whole multi-channel stack sitting in the same folder is recognised.
+    """
+    for rx in (_BBB_CH_PREFIX_RE, _BBB_CH_SUFFIX_RE):
+        m = rx.match(str(stem))
+        if m:
+            base = m.group('base').strip(' _-.')
+            if base:
+                return base, int(m.group('num'))
+    return None, None
+
+
+def _bbb_norm_key(s):
+    """Comparison key for image names: case and punctuation are ignored, so
+    'YR_13-1 Slice 1' and 'yr_13-1_slice_1' are the same image."""
+    return re.sub(r'[^0-9a-z]+', '', str(s).lower())
+
+
+def _index_raw_channel_folder(folder):
+    """Map every TIFF in ``folder`` to the image it belongs to.
+
+    Returns {normalised base: {'channels': {n: path}, 'whole': path}}. A file
+    with a channel token lands in 'channels' keyed by its 1-based channel
+    number; a file without one lands in 'whole' as that image's multi-channel
+    stack. Non-recursive, and never touches the images loaded in MMPS.
+    """
+    index = {}
+    if not folder or not os.path.isdir(folder):
+        return index
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return index
+    for fn in names:
+        if not fn.lower().endswith(('.tif', '.tiff')):
+            continue
+        stem = os.path.splitext(fn)[0]
+        path = os.path.join(folder, fn)
+        base, num = _bbb_split_channel_token(stem)
+        key = _bbb_norm_key(base if base is not None else stem)
+        if not key:
+            continue
+        entry = index.setdefault(key, {'channels': {}, 'whole': None})
+        if base is None:
+            if entry['whole'] is None:
+                entry['whole'] = path
+        else:
+            entry['channels'].setdefault(num, path)
+    return index
+
+
+def _lookup_raw_entry(index, image_name):
+    """Find ``image_name``'s entry in a raw-folder index, or None."""
+    key = _bbb_norm_key(os.path.splitext(os.path.basename(str(image_name)))[0])
+    if not key:
+        return None
+    if key in index:
+        return index[key]
+    # The image loaded in MMPS is often an export of the raw file under a
+    # longer or shorter name ('..._composite', '..._RGB'), so allow one name to
+    # be a prefix of the other. An AMBIGUOUS match is treated as no match --
+    # measuring the wrong image's tracers is worse than measuring none.
+    hits = [v for k, v in index.items() if k and (key.startswith(k) or k.startswith(key))]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _flatten_single_channel(arr):
+    """Reduce one channel FILE to a single (H, W) plane.
+
+    A split channel is sometimes saved with its LUT applied (an RGB file that
+    is really one channel) or as a Z-stack; both collapse to one plane by
+    taking the maximum, matching how MMPS reads stacks elsewhere.
+    """
+    a = np.squeeze(np.asarray(arr))
+    while a.ndim > 2:
+        # A trailing axis of 3 or 4 is colour only when it is also the SMALLEST
+        # axis; otherwise it is image width and the leading axis is the stack.
+        if a.shape[-1] <= 4 and a.shape[-1] == min(a.shape):
+            a = a.max(axis=-1)
+        else:
+            a = a.max(axis=0)
+    return a
+
+
+def _load_raw_channel_stack(index, image_name):
+    """Return ((H, W, C) array, description) for ``image_name``'s raw channels,
+    or (None, reason). Channel order follows the file numbers, so C1 is
+    Channel 1 in the dialog."""
+    entry = _lookup_raw_entry(index, image_name)
+    if entry is None:
+        return None, "no matching file in the raw folder"
+    chans = entry.get('channels') or {}
+    if chans:
+        nums = sorted(chans)
+        planes = [_flatten_single_channel(load_tiff_image(chans[n])) for n in nums]
+        shapes = {p.shape for p in planes}
+        if len(shapes) != 1:
+            return None, ("channel files differ in size (%s)"
+                          % ", ".join("%dx%d" % s for s in sorted(shapes)))
+        stack = np.stack(planes, axis=-1)
+        return stack, ("%d channel files, C%s" % (len(nums),
+                                                  "+C".join(str(n) for n in nums)))
+    whole = entry.get('whole')
+    if whole:
+        arr = np.asarray(load_tiff_image(whole))
+        if arr.ndim == 2:
+            arr = arr[:, :, None]
+        if arr.ndim != 3:
+            return None, "not readable as multi-channel"
+        return arr, ("%d-channel file %s" % (arr.shape[2], os.path.basename(whole)))
+    return None, "no matching file in the raw folder"
+
+
 def _load_bbb_image(path):
     """Load a multi-channel image as (H, W, C) for BBB analysis. Delegates to the
     shared channel-preserving loader and guarantees a trailing channel axis."""
@@ -1103,14 +1238,19 @@ def _load_bbb_image(path):
 
 
 def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None,
-                      vmax_map=None):
+                      vmax_map=None, source_label=None):
     """Save, per tracer, a readable leak map.
 
-    Each panel shows one tracer's intensity as a heatmap WITH a colorbar (so the
-    amount of signal is readable, not just false color), the vessel lumen drawn
-    as a translucent cyan fill + outline (everything inside is intravascular),
-    and microglia as lime outlines. The takeaway: bright heatmap signal OUTSIDE
-    the cyan vessels is tracer that has leaked out of the blood into the tissue.
+    Each panel is the RAW tracer plane as a heatmap WITH a colorbar (so the
+    amount of signal is readable, not just false color), with the PROCESSED
+    layers drawn over it: the segmented vessel lumen as a translucent cyan fill
+    + outline (everything inside is intravascular) and each microglia footprint
+    as a lime outline. The takeaway: bright heatmap signal OUTSIDE the cyan
+    vessels is tracer that has leaked out of the blood into the tissue.
+
+    Keeping the tracer as its own single-channel heatmap — never a merged RGB —
+    is what stops a white-looking tracer from also reading as red.
+    ``source_label`` records on the figure which files those planes came from.
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -1140,8 +1280,10 @@ def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None,
                 ax.contour(cm > 0, levels=[0.5], colors='lime', linewidths=0.6)
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label('%s intensity (a.u.)' % name)
-        ax.set_title(name)
+        ax.set_title('%s (raw) — cyan: vessels, lime: microglia' % name)
         ax.axis('off')
+    if source_label:
+        fig.suptitle('channels from %s' % source_label, fontsize=9, color='0.35')
     fig.tight_layout()
     fig.savefig(path, dpi=110, bbox_inches='tight')
     plt.close(fig)
@@ -4355,7 +4497,12 @@ class BBBAnalysisDialog(QDialog):
     tracers is user-settable (1..#channels) and each tracer is named by the user
     (the name is used as the column prefix and overlay title). Non-destructive.
     """
-    def __init__(self, parent, color_image=None, defaults=None):
+    # Tracer rows are built once and shown/hidden, so pointing the dialog at a
+    # raw folder with MORE channels than the loaded composite still has rows to
+    # show. Eight is the channel ceiling the TIFF loaders already assume.
+    MAX_TRACER_ROWS = 8
+
+    def __init__(self, parent, color_image=None, defaults=None, image_names=None):
         super().__init__(parent)
         self.setWindowTitle("Blood-Brain-Barrier Analysis")
         self.setModal(True)
@@ -4364,7 +4511,10 @@ class BBBAnalysisDialog(QDialog):
         if color_image is not None and getattr(color_image, 'ndim', 0) == 3:
             n = color_image.shape[2]
         self.num_channels = max(n, 1)
+        self.image_names = list(image_names or [])
         defaults = defaults or {}
+        # Every channel picker, so a new raw folder can renumber them all.
+        self._all_combos = []
 
         def channel_combo(default, allow_none):
             combo = QComboBox()
@@ -4376,9 +4526,36 @@ class BBBAnalysisDialog(QDialog):
                 else (-1 if allow_none else 0)
             idx = combo.findData(valid)
             combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self._all_combos.append((combo, allow_none))
             return combo
 
         layout = QVBoxLayout(self)
+
+        # --- Raw individual-channel folder ---------------------------------
+        layout.addWidget(QLabel(
+            "<b>Raw channel folder</b> (optional, strongly recommended):"))
+        raw_row = QHBoxLayout()
+        self.rawdir_edit = QLineEdit()
+        self.rawdir_edit.setText(str(defaults.get('raw_dir') or ''))
+        self.rawdir_edit.setPlaceholderText(
+            "Folder of individual channel TIFFs — C1-image.tif, image_C2.tif, …")
+        raw_row.addWidget(self.rawdir_edit)
+        self.rawdir_btn = QPushButton("Browse…")
+        raw_row.addWidget(self.rawdir_btn)
+        layout.addLayout(raw_row)
+        self.rawdir_label = QLabel("")
+        self.rawdir_label.setWordWrap(True)
+        self.rawdir_label.setStyleSheet("color: gray;")
+        layout.addWidget(self.rawdir_label)
+        why = QLabel(
+            "Measuring tracers off a merged composite conflates colours: a "
+            "white tracer is bright in red, green AND blue, so it is counted "
+            "as red as well. Point this at the split channel files and each "
+            "tracer is read from its own plane instead.")
+        why.setWordWrap(True)
+        why.setStyleSheet("color: gray;")
+        layout.addWidget(why)
+
         layout.addWidget(QLabel(
             "<b>Assign channels</b> (leak tracers must be intravascular):"))
 
@@ -4405,7 +4582,7 @@ class BBBAnalysisDialog(QDialog):
             {'name': 'red_dextran', 'channel': 1 if self.num_channels > 1 else 0},
             {'name': 'far_red_albumin', 'channel': 2 if self.num_channels > 2 else 0}]
         self.tracer_rows = []
-        for i in range(max(1, self.num_channels)):
+        for i in range(max(1, self.num_channels, self.MAX_TRACER_ROWS)):
             w = QWidget()
             rl = QHBoxLayout(w)
             rl.setContentsMargins(0, 0, 0, 0)
@@ -4450,9 +4627,12 @@ class BBBAnalysisDialog(QDialog):
         layout.addWidget(self.review_check)
 
         note = QLabel("Runs on all loaded images with masks. Saves leak overlays\n"
-                      "(bbb_overlays/), an Otsu-vs-tubeness vessel comparison\n"
-                      "(bbb_vessel_previews/), and folds per-cell exposure into\n"
-                      "the morphology master CSV.")
+                      "(bbb_overlays/) — each raw tracer plane under the\n"
+                      "segmented vessels and microglia — an Otsu-vs-tubeness\n"
+                      "vessel comparison (bbb_vessel_previews/), and folds\n"
+                      "per-cell exposure into the morphology master CSV.\n"
+                      "bbb_vessel_leakage.csv records, per image, which files\n"
+                      "the channels were read from.")
         note.setStyleSheet("color: gray;")
         layout.addWidget(note)
 
@@ -4465,6 +4645,98 @@ class BBBAnalysisDialog(QDialog):
         btns.addWidget(run_btn)
         btns.addWidget(cancel_btn)
         layout.addLayout(btns)
+
+        # Wired last: the probe touches the combos and the tracer rows, so
+        # every widget it reaches has to exist before it can run.
+        self.rawdir_btn.clicked.connect(self._browse_raw_dir)
+        self.rawdir_edit.textChanged.connect(lambda _t: self._probe_raw_dir())
+        self._probe_raw_dir()
+
+    def _browse_raw_dir(self):
+        """Pick the folder holding the individual channel TIFFs."""
+        start = self.rawdir_edit.text().strip() or os.path.expanduser('~')
+        folder = QFileDialog.getExistingDirectory(
+            self, "Folder with the raw individual channel files", start)
+        if folder:
+            self.rawdir_edit.setText(folder)   # textChanged re-probes
+
+    def _probe_raw_dir(self):
+        """Report what the raw folder matches and renumber the channel pickers.
+
+        Shows the match for a real loaded image rather than just a file count,
+        because the failure that matters is a folder full of channels whose
+        names do not line up with the images in the list.
+        """
+        folder = self.rawdir_edit.text().strip()
+        if not folder:
+            self.rawdir_label.setText(
+                "Not set — channels are read from the images loaded in MMPS.")
+            return
+        if not os.path.isdir(folder):
+            self.rawdir_label.setText("Folder not found.")
+            return
+        index = _index_raw_channel_folder(folder)
+        if not index:
+            self.rawdir_label.setText("No TIFF files in that folder.")
+            return
+        matched, first = [], None
+        for nm in self.image_names:
+            try:
+                entry = _lookup_raw_entry(index, nm)
+            except Exception:
+                entry = None
+            if entry is None:
+                continue
+            nch, desc = None, ''
+            if entry.get('channels'):
+                nch = len(entry['channels'])
+                desc = "%d channel files (C%s)" % (
+                    nch, "+C".join(str(k) for k in sorted(entry['channels'])))
+            elif entry.get('whole'):
+                desc = os.path.basename(entry['whole'])
+            else:
+                continue
+            matched.append(nm)
+            if first is None:
+                first = (nm, nch, desc)
+        if not matched:
+            self.rawdir_label.setText(
+                "Found %d image(s) in that folder, but none of their names "
+                "match the images loaded in MMPS — channels will still come "
+                "from the loaded images." % len(index))
+            return
+        nm, nch, desc = first
+        if nch:
+            self._rebuild_channel_combos(nch)
+            self.rawdir_label.setText(
+                "Matched %d of %d loaded image(s). %s → %s. Channel 1 = C1."
+                % (len(matched), max(len(self.image_names), 1), nm, desc))
+        else:
+            self.rawdir_label.setText(
+                "Matched %d of %d loaded image(s). %s → %s (multi-channel "
+                "file)." % (len(matched), max(len(self.image_names), 1), nm, desc))
+
+    def _rebuild_channel_combos(self, n):
+        """Renumber every channel picker for an n-channel source, keeping each
+        current choice where it still exists."""
+        n = max(1, int(n))
+        if n == self.num_channels:
+            return
+        self.num_channels = n
+        for combo, allow_none in self._all_combos:
+            want = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            if allow_none:
+                combo.addItem("(none)", -1)
+            for i in range(n):
+                combo.addItem(f"Channel {i + 1}", i)
+            if want is None or want >= n:
+                want = -1 if allow_none else 0
+            idx = combo.findData(want)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+        self.ntracer_spin.setMaximum(max(1, min(n, len(self.tracer_rows))))
 
     def get_channels(self):
         import re
@@ -4479,6 +4751,7 @@ class BBBAnalysisDialog(QDialog):
         return {'cd31': self.cd31_combo.currentData(),
                 'iba1': self.iba1_combo.currentData(),
                 'tracers': tracers,
+                'raw_dir': self.rawdir_edit.text().strip(),
                 'use_tubeness': self.tubeness_check.isChecked(),
                 'review_vessels': self.review_check.isChecked()}
 
@@ -4553,6 +4826,10 @@ class MicrogliaAnalysisGUI(QMainWindow):
             'cd31': 0, 'iba1': 3,
             'tracers': [{'name': 'red_dextran', 'channel': 1},
                         {'name': 'far_red_albumin', 'channel': 2}]}
+        # Folder of individual raw channel TIFFs. When set, BBB reads CD31 and
+        # every tracer from these instead of the (possibly RGB-merged) image
+        # loaded in MMPS, so a white tracer is never also counted as red.
+        self.bbb_raw_dir = ''
         # Channel names (can be customized by user)
         self.channel_names = {0: '', 1: '', 2: ''}
         # What the grayscale view shows: 'process' (the analysed channel) or
@@ -9948,12 +10225,19 @@ if __name__ == '__main__':
             if ci is not None and getattr(ci, 'ndim', 0) == 3:
                 color_img = ci
                 break
+        # A single-channel loaded image is no longer a dead end: the dialog's
+        # raw channel folder can supply the channels, and that is exactly the
+        # case where it is needed most.
         if color_img is None:
-            QMessageBox.warning(self, "BBB Analysis",
-                                "No multi-channel image found — BBB analysis needs "
-                                "a color/multi-channel image.")
-            return
-        dlg = BBBAnalysisDialog(self, color_image=color_img, defaults=self.bbb_channels)
+            QMessageBox.information(
+                self, "BBB Analysis",
+                "None of the loaded images is multi-channel.\n\n"
+                "Set the raw channel folder in the next dialog to read CD31 "
+                "and the tracers from the individual channel files.")
+        defaults = dict(self.bbb_channels)
+        defaults.setdefault('raw_dir', getattr(self, 'bbb_raw_dir', ''))
+        dlg = BBBAnalysisDialog(self, color_image=color_img, defaults=defaults,
+                                image_names=list(self.images))
         if dlg.exec_() != QDialog.Accepted:
             return
         ch = dlg.get_channels()
@@ -9962,6 +10246,7 @@ if __name__ == '__main__':
                                 "Assign the CD31 channel and at least one tracer.")
             return
         self.bbb_channels = ch
+        self.bbb_raw_dir = ch.get('raw_dir', '')
         self.bbb_use_tubeness = bool(ch.get('use_tubeness', False))
         self.run_bbb_analysis(ch)
 
@@ -9984,6 +10269,47 @@ if __name__ == '__main__':
             tracer_specs = [{'name': n, 'channel': channels.get(n, -1)}
                             for n in ('dextran', 'albumin')
                             if channels.get(n, -1) >= 0]
+        raw_dir = channels.get('raw_dir') or ''
+        raw_index = _index_raw_channel_folder(raw_dir) if raw_dir else {}
+        if raw_dir and not raw_index:
+            self.log(f"BBB: no TIFFs in the raw channel folder — {raw_dir}")
+        elif raw_index:
+            self.log(f"BBB: reading channels from {raw_dir} "
+                     f"({len(raw_index)} image(s) indexed)")
+
+        raw_misses = {}        # image -> why the raw folder could not serve it
+
+        def _image_channels(img_name, idata):
+            """Return ((H, W, C) channels, where they came from) for one image.
+
+            The raw per-channel folder wins whenever it has a match. A merged
+            composite cannot be un-merged: a white tracer is bright in red,
+            green and blue at once, so reading 'red' off it counts the white
+            tracer too. Individual channel files keep each tracer in its own
+            plane. Falls back to the loaded image when the folder has no match,
+            so a partly-matched folder still analyses every image.
+            """
+            if raw_index:
+                try:
+                    arr, why = _load_raw_channel_stack(raw_index, img_name)
+                except Exception as e:
+                    arr, why = None, str(e)
+                if arr is not None and getattr(arr, 'ndim', 0) == 3:
+                    return arr, 'raw folder (%s)' % why
+                raw_misses[img_name] = why
+            rp = idata.get('raw_path')
+            if rp and os.path.exists(rp):
+                try:
+                    a = _load_bbb_image(rp)
+                    if a is not None and getattr(a, 'ndim', 0) == 3:
+                        return a, 'loaded image'
+                except Exception:
+                    pass
+            cc = idata.get('color_image')
+            if cc is not None and getattr(cc, 'ndim', 0) == 3:
+                return np.asarray(cc), 'cached colour image'
+            return None, 'not multi-channel'
+
         vessel_rows, cell_rows, n_imgs = [], [], 0
         skipped_imgs = []      # images that could not be analysed, with reason
         review_vessels = bool(channels.get('review_vessels', False))
@@ -10022,10 +10348,7 @@ if __name__ == '__main__':
             progress0.setValue(_i)
             QApplication.processEvents()
             try:
-                rp = dat.get('raw_path')
-                col = _load_bbb_image(rp) if (rp and os.path.exists(rp)) else None
-                if col is None or getattr(col, 'ndim', 0) != 3:
-                    col = dat.get('color_image')
+                col, _src = _image_channels(nm, dat)
                 if col is None or getattr(col, 'ndim', 0) != 3:
                     continue
                 for spec in tracer_specs:
@@ -10056,23 +10379,32 @@ if __name__ == '__main__':
             progress.setValue(_k)
             QApplication.processEvents()
             masks = idata.get('masks') or []
-            # Load all channels from the raw file via tifffile (preserves the
-            # far-red / 4th+ channels PIL would collapse); fall back to cache.
-            color = None
-            rp = idata.get('raw_path')
-            if rp and os.path.exists(rp):
-                try:
-                    color = _load_bbb_image(rp)
-                except Exception:
-                    color = None
-            if color is None or getattr(color, 'ndim', 0) != 3:
-                cc = idata.get('color_image')
-                color = cc if (cc is not None and getattr(cc, 'ndim', 0) == 3) else None
+            # Channels come from the raw individual-channel folder when one is
+            # set, else from the loaded image (tifffile preserves the far-red /
+            # 4th+ channels PIL would collapse), else from the cache.
+            color, ch_source = _image_channels(img_name, idata)
             if color is None:
                 self.log(f"BBB: skipped {img_name} — could not read it as a "
                          f"multi-channel image (no CD31/tracer channels).")
                 skipped_imgs.append((img_name, "not multi-channel"))
                 continue
+            # Masks, soma centroids and every distance live in the LOADED
+            # image's pixel grid. Channels of a different size would put the
+            # vessels somewhere else entirely and still produce numbers, so
+            # refuse them rather than silently measure the wrong pixels.
+            ref_shape = None
+            for _cand in (idata.get('processed'), idata.get('color_image')):
+                if _cand is not None and getattr(_cand, 'ndim', 0) >= 2:
+                    ref_shape = tuple(np.asarray(_cand).shape[:2])
+                    break
+            if ref_shape and tuple(color.shape[:2]) != ref_shape:
+                got = '%dx%d' % color.shape[:2]
+                want = '%dx%d' % ref_shape
+                self.log(f"BBB: skipped {img_name} — {ch_source} is {got} but "
+                         f"the loaded image is {want}; masks would not line up.")
+                skipped_imgs.append((img_name, f"channel size {got} != {want}"))
+                continue
+            self.log(f"BBB: {img_name} — channels from {ch_source}")
             nch = color.shape[2]
             if not (0 <= cd31_i < nch):
                 self.log(f"BBB: skipped {img_name} — CD31 set to Channel "
@@ -10152,7 +10484,8 @@ if __name__ == '__main__':
                     self.log(f"BBB: vessel preview failed for {img_name}: {e}")
                 row = {'image_name': os.path.splitext(img_name)[0],
                        'animal_id': animal_id, 'treatment': treatment,
-                       'region': region, 'timepoint': timepoint}
+                       'region': region, 'timepoint': timepoint,
+                       'channel_source': ch_source}
                 row.update(vmetrics)
                 tracers = {}
                 for spec in tracer_specs:
@@ -10281,7 +10614,8 @@ if __name__ == '__main__':
                             os.path.join(ov_dir, img_base + '_bbb.png'),
                             vessel_mask, tracers,
                             cell_masks=list(soma_masks.values()),
-                            vmax_map=overlay_vmax)
+                            vmax_map=overlay_vmax,
+                            source_label=ch_source)
                     except Exception as e:
                         self.log(f"BBB: overlay failed for {img_name}: {e}")
                 n_imgs += 1
@@ -10302,6 +10636,13 @@ if __name__ == '__main__':
                 w = _csv.DictWriter(f, fieldnames=keys, extrasaction='ignore')
                 w.writeheader()
                 w.writerows(rows)
+
+        if raw_index and raw_misses:
+            self.log("BBB: %d image(s) did NOT match the raw channel folder and "
+                     "were measured from the loaded image instead — %s"
+                     % (len(raw_misses),
+                        "; ".join(f"{k} ({v})" for k, v in
+                                  list(raw_misses.items())[:6])))
 
         if vessel_rows:
             _write(os.path.join(out_dir, 'bbb_vessel_leakage.csv'), vessel_rows)
