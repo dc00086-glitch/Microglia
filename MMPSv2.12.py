@@ -18812,8 +18812,47 @@ if __name__ == '__main__':
         self.mask_qa_progress_bar.setValue(reviewed)
 
 
+    def _qa_grid_largest_unreviewed(self):
+        """Flat index of the largest unreviewed mask of the soma the grid shows.
+
+        The grid lays out one soma's whole size ladder at once, so "the current
+        mask" only means something once a size is named. Largest-unreviewed is
+        the one single view would be sitting on, which keeps the A key doing
+        the same thing in both views.
+        """
+        order = getattr(self, '_qa_soma_order', None) or []
+        si = getattr(self, '_qa_grid_soma_idx', 0)
+        if not order or not (0 <= si < len(order)):
+            return None
+        best, best_size = None, None
+        for fi in self._qa_soma_mask_index.get(order[si], []):
+            md = self.all_masks_flat[fi]['mask_data']
+            if md.get('approved') is not None or md.get('duplicate'):
+                continue
+            size = md.get('target_area_um2', md.get('area_um2', 0))
+            if best is None or size > best_size:
+                best, best_size = fi, size
+        return best
+
     def approve_current_mask(self):
-        if not self.mask_qa_active or self.mask_qa_idx >= len(self.all_masks_flat):
+        """Approve the mask on screen and every smaller mask of the same soma.
+
+        In grid mode this used to approve whatever mask_qa_idx still pointed
+        at -- a soma the user was not looking at, usually the first in the run.
+        The soma on screen kept its unreviewed state and the grid stayed put,
+        so Approve read as skipping the mask while quietly accepting somebody
+        else's cells. Reject already worked off the displayed soma; this now
+        does too.
+        """
+        if not self.mask_qa_active:
+            return
+        if getattr(self, '_qa_use_grid', False):
+            idx = self._qa_grid_largest_unreviewed()
+            if idx is None:
+                self.log("Nothing left to approve for this soma.")
+                return
+            self.mask_qa_idx = idx
+        if self.mask_qa_idx >= len(self.all_masks_flat):
             return
 
         flat_data = self.all_masks_flat[self.mask_qa_idx]
@@ -18847,7 +18886,7 @@ if __name__ == '__main__':
         for idx in self._qa_soma_mask_index.get(soma_key, []):
             other_flat = self.all_masks_flat[idx]
             other_mask = other_flat['mask_data']
-            other_size = other_mask.get(size_key, 0)
+            other_size = other_mask.get(size_key, other_mask.get('area_um2', 0))
 
             if other_size < current_size and other_mask.get('approved') is None:
                 other_mask['approved'] = True
