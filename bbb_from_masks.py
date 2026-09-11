@@ -264,7 +264,6 @@ def microglia_exposure(cell_mask, vessel_mask, tracers, ps, dist_um, soma_mask, 
             round(float(arr[region].mean()), 3) if n_region else '')
         m['%s_exposure_mean_cell_only' % name] = (
             round(float(arr[cell_only].mean()), 3) if n_cell_only else '')
-    m['exposure_halo_um'] = halo_um
     m['exposure_region_px'] = n_region
     m['exposure_region_um2'] = round(float(n_region) * (ps ** 2), 3)
     m['vessel_contact_fraction'] = round(float((cm & vessel_mask).sum()) / n_cell, 4)

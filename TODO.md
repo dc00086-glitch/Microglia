@@ -20,7 +20,8 @@ all (a cell the vessel mask swallows whole, which happens readily when CD31
 over-segments). That case used to fall back to averaging the footprint — every
 pixel of it intravascular — and report pure blood signal under the name
 "exposure". `exposure_region_px` / `exposure_region_um2` say how much tissue
-each mean rests on, and `exposure_halo_um` records the radius used.
+each mean rests on. The radius itself is the `_EXPOSURE_HALO_UM` constant in
+MMPSv2.12.py (mirrored as `EXPOSURE_HALO_UM` in bbb_from_masks.py).
 
 Pinned by `tools/test_bbb_exposure.py`.
 

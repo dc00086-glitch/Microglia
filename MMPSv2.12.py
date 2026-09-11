@@ -1118,7 +1118,6 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
             round(float(arr[cell_only].mean()), 3) if n_cell_only else '')
     # What each mean actually rests on, so a value averaged over a sliver of
     # tissue is not read like a full neighbourhood measurement.
-    m['exposure_halo_um'] = halo_um
     m['exposure_region_px'] = n_region
     m['exposure_region_um2'] = round(float(n_region) * (pixel_size_um ** 2), 3)
     # Blood-vessel metrics for this cell.
