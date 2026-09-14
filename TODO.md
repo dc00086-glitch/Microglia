@@ -1,28 +1,37 @@
 # MMPS — open items
 
-## BBB per-cell exposure: what region it averages  *(changed)*
+## BBB per-cell columns  *(changed)*
 
-`microglia_<tracer>_exposure_mean` now averages the microglia mask **grown 10 µm
-outward**, with every pixel inside the segmented vessel mask removed. The bare
-footprint is kept alongside as `microglia_<tracer>_exposure_mean_cell_only`, so runs
-measured before this change stay comparable — expect the halo value to be the
-lower of the two wherever the cell is brighter than the tissue around it.
+Every per-cell BBB column is prefixed `bbb_`, and these are the only ones
+added to the morphology sheet:
 
-Two rules, deliberately separate:
+```
+bbb_dist_to_vessel_um            soma to nearest vessel
+bbb_juxtavascular                1 when that distance is within 10 um
+bbb_vessel_contact_fraction      footprint overlapping vessel
+bbb_vessel_contact_area_um2      the same contact as an absolute area
+bbb_<tracer>_exposure_microglia  tracer over the mask itself
+bbb_<tracer>_exposure_10um       over the mask grown 10 um
+bbb_<tracer>_exposure_20um       ...20 um
+bbb_<tracer>_exposure_30um       ...30 um
+bbb_<tracer>_exposure_<N>um      ONLY when a radius is set in the BBB dialog
+bbb_<tracer>_vessel_mean         tracer inside the vessels near the cell
+```
 
-* **the halo**, because a cell is bathed in the tracer standing in the tissue
-  around it, and a thin process covers almost no parenchyma of its own — a
-  footprint-only mean largely measures the cell's own background;
-* **minus vessels**, because tracer still in the lumen is blood, not leak.
+The four radii always run. The dialog's "Extra exposure radius" adds exactly
+one more and nothing else; left at `none` it adds nothing. A fractional radius
+is named `12p5um`, not `12.5um`, because R's `read.csv` rewrites a dot.
 
-Both are blank, never zero, when the region contains no extravascular pixel at
-all (a cell the vessel mask swallows whole, which happens readily when CD31
-over-segments). That case used to fall back to averaging the footprint — every
-pixel of it intravascular — and report pure blood signal under the name
-"exposure". `exposure_region_um2` says how much tissue each mean rests on. The radius itself is the `_EXPOSURE_HALO_UM` constant in
-MMPSv2.12.py (mirrored as `EXPOSURE_HALO_UM` in bbb_from_masks.py).
+Every exposure region has the segmented vessel mask removed, so tracer still
+in the lumen is never counted as tracer the cell is bathed in. An exposure is
+blank, never zero, when its region has no extravascular pixel left — a cell
+wholly inside a vessel has no `_exposure_microglia` value, though its wider
+radii still reach parenchyma. `bbb_<tracer>_vessel_mean` is the opposite
+measure, the blood level right next to that cell, and is the denominator a
+per-cell leak ratio needs; it is blank when no vessel reaches the cell.
 
-Pinned by `tools/test_bbb_exposure.py`.
+Pinned by `tools/test_bbb_exposure.py`, which also holds the column set to
+exactly the list above.
 
 ## Far-red channel is not recoverable from current exports  *(deferred)*
 

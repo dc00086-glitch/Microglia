@@ -6,11 +6,14 @@ image it:
   * segments blood vessels from the CD31 channel (Otsu + close + despeckle),
   * quantifies tracer leakage per tracer (leakage index, perivascular rings),
   * for every mask, computes per-microglia exposure:
-        dist_to_vessel_um       (measured from the SOMA, parsed from the filename)
-        microglia_<tracer>_exposure_mean
-                                (tracer the cell is bathed in: the mask grown
-                                 10 um outward, vessels excluded)
-        vessel_contact_fraction (fraction of the cell overlapping vessels)
+        bbb_dist_to_vessel_um   (measured from the SOMA, parsed from the filename)
+        bbb_juxtavascular       (1 when that distance is within 10 um)
+        bbb_vessel_contact_fraction / _area_um2
+        bbb_<tracer>_exposure_microglia / _10um / _20um / _30um
+                                (tracer the cell is bathed in, at each distance
+                                 out from the mask; vessels always excluded)
+        bbb_<tracer>_vessel_mean
+                                (tracer INSIDE the vessels near the cell)
 
 Writes two CSVs: one per-microglia, one per-image (vessel/leakage summary).
 
@@ -46,6 +49,7 @@ TRACERS = [                    # (name, channel number) — one per injected tra
     ("dextran", 1),
 ]
 SOMA_RADIUS_UM = 6.0           # disk radius around the soma for the distance basis
+JUXTAVASCULAR_MAX_UM = 10.0    # soma within this of a vessel counts as juxtavascular
 
 # Vessel segmentation: tubeness (Sato) enhances tube-like CD31 and suppresses
 # speckle before thresholding, giving cleaner vessels. Turn it on/off here.
@@ -214,61 +218,88 @@ def soma_disk(shape, cy, cx, ps, radius_um=SOMA_RADIUS_UM):
     return ((yy - cy) ** 2 + (xx - cx) ** 2 <= r * r)
 
 
-EXPOSURE_HALO_UM = 10.0        # how far past the footprint exposure is sampled
+# Distances out from the footprint at which exposure is measured. 0 is the
+# mask itself. Add one more here if you want it (e.g. 50.0). Mirrors
+# _EXPOSURE_RADII_UM in MMPSv2.12.py.
+EXPOSURE_RADII_UM = (0.0, 10.0, 20.0, 30.0)
 
 
-def grown_by_um(mask, ps, radius_um):
-    """``mask`` grown outward by ``radius_um``, the original included.
+def exposure_radius_tag(radius_um):
+    """Column suffix for a radius: 0 -> 'microglia', 10 -> '10um'. A fraction
+    becomes '12p5um', since a dot in a header is rewritten by R's read.csv."""
+    r = float(radius_um)
+    if r <= 0:
+        return 'microglia'
+    if abs(r - round(r)) < 1e-9:
+        return '%dum' % int(round(r))
+    return ('%.1fum' % r).replace('.', 'p')
 
-    Cropped to a bounding box: this runs once per cell, and a full-frame
-    distance transform each time is what makes that slow. Mirrors
-    _grown_by_um in MMPSv2.12.py.
-    """
-    r_px = int(round(float(radius_um) / max(float(ps), 1e-9)))
-    m = mask > 0
-    if r_px <= 0 or not np.any(m):
-        return m
+
+def exposure_regions(mask, ps, radii_um):
+    """{radius: region} for ``mask`` grown by each radius. One distance
+    transform on one crop, thresholded per radius. Mirrors MMPSv2.12.py."""
+    m = np.asarray(mask) > 0
+    radii = [float(r) for r in radii_um]
+    if not np.any(m) or not radii:
+        return {r: m for r in radii}
+    psv = max(float(ps), 1e-9)
+    r_px_max = int(round(max(radii) / psv))
+    if r_px_max <= 0:
+        return {r: m for r in radii}
     h, w = m.shape
     ys, xs = np.nonzero(m)
-    y0 = max(int(ys.min()) - r_px - 1, 0)
-    y1 = min(int(ys.max()) + r_px + 2, h)
-    x0 = max(int(xs.min()) - r_px - 1, 0)
-    x1 = min(int(xs.max()) + r_px + 2, w)
-    grown = np.zeros_like(m)
-    grown[y0:y1, x0:x1] = ndimage.distance_transform_edt(~m[y0:y1, x0:x1]) <= r_px
-    return grown
+    y0 = max(int(ys.min()) - r_px_max - 1, 0)
+    y1 = min(int(ys.max()) + r_px_max + 2, h)
+    x0 = max(int(xs.min()) - r_px_max - 1, 0)
+    x1 = min(int(xs.max()) + r_px_max + 2, w)
+    d = ndimage.distance_transform_edt(~m[y0:y1, x0:x1])
+    out = {}
+    for r in radii:
+        if r <= 0:
+            out[r] = m
+            continue
+        grown = np.zeros_like(m)
+        grown[y0:y1, x0:x1] = d <= (r / psv)
+        out[r] = grown
+    return out
 
 
 def microglia_exposure(cell_mask, vessel_mask, tracers, ps, dist_um, soma_mask,
-                       halo_um=EXPOSURE_HALO_UM):
+                       halo_radii_um=EXPOSURE_RADII_UM,
+                       juxta_max_um=JUXTAVASCULAR_MAX_UM):
+    """Per-cell BBB columns, all prefixed bbb_. Mirrors MMPSv2.12.py."""
     m = {}
     vessel_mask = vessel_mask > 0
     cm = cell_mask > 0
     if not np.any(cm):
         return m
     dist_region = soma_mask if (soma_mask is not None and np.any(soma_mask)) else cm
-    m['dist_to_vessel_um'] = round(float(dist_um[dist_region].min()), 3)
-    # The cell footprint plus everything within halo_um of it, minus vessels:
-    # the cell is bathed in the tracer standing in the tissue around it, while
-    # tracer still in the lumen is blood and never counts. A region with no
-    # extravascular pixel has no value to report -- blank, not the in-lumen
-    # mean this used to fall back to. Mirrors MMPSv2.12.py.
+    d_soma = float(dist_um[dist_region].min())
+    m['bbb_dist_to_vessel_um'] = round(d_soma, 3)
+    m['bbb_juxtavascular'] = 1 if d_soma <= juxta_max_um else 0
     n_cell = int(cm.sum())
-    region = grown_by_um(cm, ps, halo_um) & ~vessel_mask
-    n_region = int(region.sum())
-    cell_only = cm & ~vessel_mask
-    n_cell_only = int(cell_only.sum())
-    # "microglia_" prefix: the per-image leakage sheet carries columns built
-    # from the same tracer names, so the bare form said nothing about which
-    # sheet a column came from. Mirrors MMPSv2.12.py.
+    overlap = cm & vessel_mask
+    m['bbb_vessel_contact_fraction'] = round(float(overlap.sum()) / n_cell, 4)
+    m['bbb_vessel_contact_area_um2'] = round(float(overlap.sum()) * (ps ** 2), 3)
+    # Vessels come out of every exposure region: tracer in the lumen is blood,
+    # not leak. A region with no extravascular pixel left has no value at all
+    # and is blank, never zero.
+    radii = [float(r) for r in (halo_radii_um or (0.0,))]
+    grown = exposure_regions(cm, ps, radii)
+    sampled = []
+    for r in radii:
+        reg = grown[r] & ~vessel_mask
+        sampled.append((exposure_radius_tag(r), reg, bool(reg.any())))
+    widest = grown[max(radii)] if radii else cm
+    near_vessel = widest & vessel_mask
+    has_vessel = bool(near_vessel.any())
     for name, ch in tracers.items():
         arr = np.asarray(ch, dtype=np.float64)
-        m['microglia_%s_exposure_mean' % name] = (
-            round(float(arr[region].mean()), 3) if n_region else '')
-        m['microglia_%s_exposure_mean_cell_only' % name] = (
-            round(float(arr[cell_only].mean()), 3) if n_cell_only else '')
-    m['exposure_region_um2'] = round(float(n_region) * (ps ** 2), 3)
-    m['vessel_contact_fraction'] = round(float((cm & vessel_mask).sum()) / n_cell, 4)
+        for tag, reg, ok in sampled:
+            m['bbb_%s_exposure_%s' % (name, tag)] = (
+                round(float(arr[reg].mean()), 3) if ok else '')
+        m['bbb_%s_vessel_mean' % name] = (
+            round(float(arr[near_vessel].mean()), 3) if has_vessel else '')
     return m
 
 

@@ -1005,41 +1005,67 @@ def _quantify_leakage(vessel_mask, tracer, pixel_size_um,
 _JUXTAVASCULAR_MAX_UM = 10.0
 
 
-#: How far beyond the microglia footprint tracer exposure is sampled. The cell
-#: is bathed in the tracer standing in the tissue immediately around it, not
-#: only in what happens to fall inside its own silhouette -- a thin process
-#: samples almost no parenchyma on its own.
-_EXPOSURE_HALO_UM = 10.0
+#: Distances out from the microglia footprint at which tracer exposure is
+#: measured, every run. 0 is the mask itself; the rest say how far into the
+#: surrounding tissue to look, because a cell is bathed in the tracer standing
+#: around it and a thin process covers almost no parenchyma on its own. A run
+#: may add ONE more radius chosen in the BBB dialog.
+_EXPOSURE_RADII_UM = (0.0, 10.0, 20.0, 30.0)
 
 
-def _grown_by_um(mask, pixel_size_um, radius_um):
-    """``mask`` grown outward by ``radius_um``, the original included.
+def _exposure_radius_tag(radius_um):
+    """Column suffix for one exposure radius: 0 -> 'microglia', 10 -> '10um'.
 
-    Computed on a bounding-box crop rather than the whole frame: BBB runs this
-    once per cell per image, and a full-frame distance transform per cell is
-    what makes that slow. Growth is clipped at the image edge, which is correct
-    -- there is no data past the border to average.
+    A fractional radius becomes e.g. '12p5um' rather than '12.5um' -- a dot in
+    a header is legal CSV but R's read.csv rewrites it, so the column you ask
+    for is not the column you get.
     """
-    r_px = int(round(float(radius_um) / max(float(pixel_size_um), 1e-9)))
-    m = mask > 0
-    if r_px <= 0 or not np.any(m):
-        return m
+    r = float(radius_um)
+    if r <= 0:
+        return 'microglia'
+    if abs(r - round(r)) < 1e-9:
+        return '%dum' % int(round(r))
+    return ('%.1fum' % r).replace('.', 'p')
+
+
+def _exposure_regions(mask, pixel_size_um, radii_um):
+    """{radius: boolean region} for ``mask`` grown outward by each radius.
+
+    ONE distance transform, thresholded at every radius, on a crop sized for
+    the largest one -- not a dilation per radius, and not over the whole frame.
+    BBB runs this once per cell per image, so both matter. Growth is clipped at
+    the image edge, which is correct: there is no data past the border.
+    """
+    m = np.asarray(mask) > 0
+    radii = [float(r) for r in radii_um]
+    if not np.any(m):
+        return {r: m for r in radii}
+    ps = max(float(pixel_size_um), 1e-9)
+    r_px_max = int(round(max(radii) / ps)) if radii else 0
+    out = {}
+    if r_px_max <= 0:
+        return {r: m for r in radii}
     h, w = m.shape
     ys, xs = np.nonzero(m)
-    y0 = max(int(ys.min()) - r_px - 1, 0)
-    y1 = min(int(ys.max()) + r_px + 2, h)
-    x0 = max(int(xs.min()) - r_px - 1, 0)
-    x1 = min(int(xs.max()) + r_px + 2, w)
-    sub = m[y0:y1, x0:x1]
-    grown = np.zeros_like(m)
-    grown[y0:y1, x0:x1] = ndimage.distance_transform_edt(~sub) <= r_px
-    return grown
+    y0 = max(int(ys.min()) - r_px_max - 1, 0)
+    y1 = min(int(ys.max()) + r_px_max + 2, h)
+    x0 = max(int(xs.min()) - r_px_max - 1, 0)
+    x1 = min(int(xs.max()) + r_px_max + 2, w)
+    d = ndimage.distance_transform_edt(~m[y0:y1, x0:x1])
+    for r in radii:
+        if r <= 0:
+            out[r] = m
+            continue
+        grown = np.zeros_like(m)
+        grown[y0:y1, x0:x1] = d <= (r / ps)
+        out[r] = grown
+    return out
 
 
 def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
                                 dist_um=None, soma_mask=None,
                                 juxta_max_um=_JUXTAVASCULAR_MAX_UM,
-                                halo_um=_EXPOSURE_HALO_UM):
+                                halo_radii_um=_EXPOSURE_RADII_UM):
     """Per-microglia leakage exposure to join onto the morphology row.
 
     ``tracers`` is a dict name -> channel array. Returns distance to the nearest
@@ -1047,25 +1073,34 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     cell (the tracer the cell is actually bathed in). ``dist_um`` (a precomputed
     distance-to-vessel map) can be passed to avoid recomputing it per cell.
 
-    ``microglia_<tracer>_exposure_mean`` averages the tracer over the cell
-    footprint grown outward by ``halo_um`` (10 µm by default), MINUS every pixel
-    inside the segmented vessel mask — so it is the tracer standing in the
-    tissue the cell occupies and immediately abuts, and tracer still in the
-    lumen is never counted. ``microglia_<tracer>_exposure_mean_cell_only`` is
-    the same measure over the bare footprint, kept so runs from before the halo
-    remain comparable. Both are blank, not zero, when their region has no
-    extravascular pixel; ``exposure_region_um2`` says how much tissue the halo
-    mean rests on.
+    Every column is prefixed ``bbb_``. The full set, and nothing else:
 
-    ``dist_to_vessel_um`` is measured from the SOMA (``soma_mask`` — the soma
-    outline or a disk at the soma centroid) when provided, NOT the whole arbor,
-    so a single long process touching a vessel doesn't make the cell body read
-    as perivascular. Falls back to the cell footprint if no soma region is given.
+      ``bbb_dist_to_vessel_um``        soma to nearest vessel
+      ``bbb_juxtavascular``            1 when that distance is within
+                                       ``juxta_max_um``
+      ``bbb_vessel_contact_fraction``  footprint overlapping vessel
+      ``bbb_vessel_contact_area_um2``  the same contact as an absolute area
+      ``bbb_<tracer>_exposure_microglia``  tracer over the footprint
+      ``bbb_<tracer>_exposure_10um``       over the footprint grown 10 um
+      ``bbb_<tracer>_exposure_20um``       ...20 um
+      ``bbb_<tracer>_exposure_30um``       ...30 um
+      ``bbb_<tracer>_exposure_<N>um``      only when the dialog names one more
+      ``bbb_<tracer>_vessel_mean``     tracer INSIDE the vessels within the
+                                       widest of those neighbourhoods -- the
+                                       local blood level, which is the
+                                       denominator a per-cell leak ratio needs
 
-    Blood-vessel metrics for the cell:
-      ``vessel_contact_fraction`` — fraction of the footprint overlapping the
-                                    segmented vessel mask (microglia–vessel contact).
-      ``vessel_contact_area_um2`` — the same contact as an absolute area.
+    Every exposure region has the segmented vessel mask removed, so tracer
+    still in the lumen is never counted as tracer the cell is bathed in. An
+    exposure value is blank, never zero, when its region has no extravascular
+    pixel left; ``bbb_<tracer>_vessel_mean`` is blank when no vessel reaches
+    the cell at all.
+
+    ``bbb_dist_to_vessel_um`` is measured from the SOMA (``soma_mask`` -- the
+    soma outline or a disk at the soma centroid) when provided, NOT the whole
+    arbor, so a single long process touching a vessel doesn't make the cell body
+    read as perivascular. Falls back to the cell footprint if no soma region is
+    given.
     """
     m = {}
     vessel_mask = vessel_mask > 0
@@ -1083,54 +1118,50 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
     if dist_region is None:
         dist_region = cm
     d_soma = float(dist_um[dist_region].min())
-    m['dist_to_vessel_um'] = round(d_soma, 3)
+    m['bbb_dist_to_vessel_um'] = round(d_soma, 3)
     # Juxtavascular: soma apposed to a vessel wall (standard field convention).
     # Uses the same soma-based distance, so a lone process touching a vessel
     # does not make the cell count as juxtavascular.
-    m['juxtavascular'] = 1 if d_soma <= juxta_max_um else 0
-    m['juxtavascular_threshold_um'] = juxta_max_um
+    m['bbb_juxtavascular'] = 1 if d_soma <= juxta_max_um else 0
     n_cell = int(cm.sum())
-    # Exposure region: the cell footprint PLUS everything within halo_um of it,
-    # then vessels removed. Two separate rules --
-    #   the halo, because the cell is bathed in the tracer standing in the
-    #   tissue around it, and a thin process covers almost no parenchyma of its
-    #   own, so a footprint-only mean mostly measures the cell's own background;
-    #   minus vessels, because tracer still in the lumen is blood, not leak, and
-    #   must never count towards what the cell is exposed to.
-    region = _grown_by_um(cm, pixel_size_um, halo_um) & ~vessel_mask
-    n_region = int(region.sum())
-    # A cell whose whole neighbourhood is vessel has NO extravascular pixel and
-    # so no exposure value. This used to fall back to averaging the footprint --
-    # every pixel of it intravascular -- handing back pure lumen signal under
-    # the name "exposure", indistinguishable from a genuinely tracer-soaked
-    # cell. Blank instead: undefined is neither zero nor the blood value.
-    #
-    # The footprint-only mean is kept alongside so runs measured before the
-    # halo existed stay comparable to runs measured after it.
-    cell_only = cm & ~vessel_mask
-    n_cell_only = int(cell_only.sum())
-    # Prefixed "microglia_" because the per-IMAGE leakage row carries columns
-    # built from the same tracer names (<tracer>_extravascular_mean and the
-    # rest), and once both sheets are open side by side a bare
-    # <tracer>_exposure_mean gives no clue which one it came from.
-    for name, ch in tracers.items():
-        arr = np.asarray(ch, dtype=np.float64)
-        m['microglia_%s_exposure_mean' % name] = (
-            round(float(arr[region].mean()), 3) if n_region else '')
-        m['microglia_%s_exposure_mean_cell_only' % name] = (
-            round(float(arr[cell_only].mean()), 3) if n_cell_only else '')
-    # What each mean actually rests on, so a value averaged over a sliver of
-    # tissue is not read like a full neighbourhood measurement.
-    m['exposure_region_um2'] = round(float(n_region) * (pixel_size_um ** 2), 3)
-    # Blood-vessel metrics for this cell.
+    # Blood-vessel contact for this cell.
     overlap = cm & vessel_mask
-    m['vessel_contact_fraction'] = (
+    m['bbb_vessel_contact_fraction'] = (
         round(float(overlap.sum()) / n_cell, 4) if n_cell else 0.0)
     # Contact extent along the vessel wall, in µm² — area of the cell that
     # actually sits on vessel. Complements the fraction (which is normalised by
     # cell size, so a big ramified cell and a small round one aren't comparable).
-    m['vessel_contact_area_um2'] = round(
+    m['bbb_vessel_contact_area_um2'] = round(
         float(overlap.sum()) * (pixel_size_um ** 2), 3)
+    # Exposure regions: the footprint, and the footprint grown out to each
+    # radius. Vessels come out of every one of them -- tracer still in the
+    # lumen is blood, not leak, and must never count towards what the cell is
+    # exposed to. A region left with no extravascular pixel has no exposure
+    # value at all, and is blank rather than a number: undefined is neither
+    # zero nor the blood value.
+    radii = [float(r) for r in (halo_radii_um or (0.0,))]
+    grown = _exposure_regions(cm, pixel_size_um, radii)
+    sampled = []                       # (column tag, region, has any pixel)
+    for r in radii:
+        reg = grown[r] & ~vessel_mask
+        sampled.append((_exposure_radius_tag(r), reg, bool(reg.any())))
+    # The blood level near THIS cell: vessel pixels inside its widest
+    # neighbourhood. It is the denominator a per-cell leak ratio needs, and
+    # unlike the image-wide intravascular mean it tracks the vessel the cell is
+    # actually next to. Blank when no vessel reaches that far.
+    widest = grown[max(radii)] if radii else cm
+    near_vessel = widest & vessel_mask
+    has_vessel = bool(near_vessel.any())
+    # Every column is prefixed "bbb_" so it is obvious which analysis put it in
+    # the morphology sheet, and the per-image leakage sheet builds its own
+    # columns from the same tracer names.
+    for name, ch in tracers.items():
+        arr = np.asarray(ch, dtype=np.float64)
+        for tag, reg, ok in sampled:
+            m['bbb_%s_exposure_%s' % (name, tag)] = (
+                round(float(arr[reg].mean()), 3) if ok else '')
+        m['bbb_%s_vessel_mean' % name] = (
+            round(float(arr[near_vessel].mean()), 3) if has_vessel else '')
     return m
 
 
@@ -1302,8 +1333,28 @@ def _load_bbb_image(path):
     return arr
 
 
+def _channel_rgb01(colour, fallback=(0.0, 0.85, 1.0)):
+    """A channel's display colour as matplotlib 0-1 RGB.
+
+    The BBB figures outline vessels and microglia in the SAME colour those
+    channels are displayed in, so the outline in the figure and the signal in
+    the image are obviously the same thing. Falls back when no channel is
+    assigned (the microglia channel is optional).
+    """
+    if not colour:
+        return fallback
+    try:
+        r, g, b = (float(c) for c in tuple(colour)[:3])
+    except (TypeError, ValueError):
+        return fallback
+    if max(r, g, b) > 1.0:
+        r, g, b = r / 255.0, g / 255.0, b / 255.0
+    return (min(max(r, 0.0), 1.0), min(max(g, 0.0), 1.0), min(max(b, 0.0), 1.0))
+
+
 def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None,
-                      vmax_map=None, source_label=None):
+                      vmax_map=None, source_label=None,
+                      vessel_colour=None, cell_colour=None):
     """Save, per tracer, a readable leak map.
 
     Each panel is the RAW tracer plane as a heatmap WITH a colorbar (so the
@@ -1323,7 +1374,12 @@ def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None,
 
     names = list(tracers.keys()) or ['tracer']
     vmask = vessel_mask > 0
-    vessel_rgba = (0.0, 0.85, 1.0, 0.35)  # translucent cyan
+    # Outline each structure in the colour ITS OWN channel is displayed in, so
+    # the figure and the image agree: if CD31 shows green, the vessel outline
+    # is green. Falls back to cyan/lime when a channel has no colour assigned.
+    v_rgb = _channel_rgb01(vessel_colour, (0.0, 0.85, 1.0))
+    c_rgb = _channel_rgb01(cell_colour, (0.2, 1.0, 0.2))
+    vessel_rgba = v_rgb + (0.35,)          # translucent fill, same hue
     fig, axes = plt.subplots(1, len(names), figsize=(6.8 * len(names), 6.2),
                              squeeze=False)
     for ax, name in zip(axes[0], names):
@@ -1339,13 +1395,14 @@ def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None,
             fill = np.zeros(vmask.shape + (4,), dtype=float)
             fill[vmask] = vessel_rgba
             ax.imshow(fill)
-            ax.contour(vmask, levels=[0.5], colors='cyan', linewidths=0.8)
+            ax.contour(vmask, levels=[0.5], colors=[v_rgb], linewidths=0.8)
         if cell_masks:
             for cm in cell_masks:
-                ax.contour(cm > 0, levels=[0.5], colors='lime', linewidths=0.6)
+                ax.contour(cm > 0, levels=[0.5], colors=[c_rgb], linewidths=0.6)
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label('%s intensity (a.u.)' % name)
-        ax.set_title('%s (raw) — cyan: vessels, lime: microglia' % name)
+        ax.set_title('%s (raw) — vessels and microglia outlined in their own '
+                     'channel colours' % name)
         ax.axis('off')
     if source_label:
         fig.suptitle('channels from %s' % source_label, fontsize=9, color='0.35')
@@ -1356,7 +1413,7 @@ def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None,
 
 def _save_vessel_seg_preview(path, cd31, pixel_size_um,
                              sigmas=_VESSEL_TUBENESS_SIGMAS,
-                             vessel_mask=None):
+                             vessel_mask=None, vessel_colour=None):
     """Save a PNG of the CD31 vessel segmentation.
 
     The first panel is THE MASK THAT WAS MEASURED — the one every BBB number in
@@ -1382,20 +1439,28 @@ def _save_vessel_seg_preview(path, cd31, pixel_size_um,
     cd = np.asarray(cd31, dtype=np.float64)
     vmax = float(np.percentile(cd, 99)) if cd.size else 1.0
 
+    # Every panel outlines vessels, so they all take the CD31 channel's own
+    # display colour; the measured one is told apart by a solid, heavier line
+    # against the comparisons' dashed ones, which leaves colour free to mean
+    # "this is the vessel channel".
+    v_rgb = _channel_rgb01(vessel_colour, (0.0, 0.85, 1.0))
     panels = []
     if vessel_mask is not None:
         panels.append((np.asarray(vessel_mask) > 0,
                        'MASK USED — every BBB number comes from this',
-                       'lime'))
-    panels.append((plain, 'for comparison: Otsu at default settings', 'cyan'))
-    panels.append((tube, 'for comparison: tubeness at default settings', 'cyan'))
+                       'solid', 1.1))
+    panels.append((plain, 'for comparison: Otsu at default settings',
+                   'dashed', 0.6))
+    panels.append((tube, 'for comparison: tubeness at default settings',
+                   'dashed', 0.6))
 
     fig, axes = plt.subplots(1, len(panels), figsize=(6.5 * len(panels), 6.2),
                              squeeze=False)
-    for a, (mask, title, colour) in zip(axes[0], panels):
+    for a, (mask, title, style, lw) in zip(axes[0], panels):
         a.imshow(cd, cmap='gray', vmax=vmax if vmax > 0 else 1.0)
         if np.any(mask):
-            a.contour(mask, levels=[0.5], colors=colour, linewidths=0.6)
+            a.contour(mask, levels=[0.5], colors=[v_rgb], linewidths=lw,
+                      linestyles=style)
         a.set_title('%s\narea fraction %.2f%%'
                     % (title, 100.0 * float(mask.mean())))
         a.axis('off')
@@ -4759,6 +4824,29 @@ class BBBAnalysisDialog(QDialog):
         self.ntracer_spin.setValue(min(len(default_tracers), max(1, self.num_channels)) or 1)
         _update_visible(self.ntracer_spin.value())
 
+        # --- one extra exposure radius -------------------------------------
+        from PyQt5.QtWidgets import QDoubleSpinBox
+        rad_row = QHBoxLayout()
+        rad_row.addWidget(QLabel("Extra exposure radius:"))
+        self.radius_spin = QDoubleSpinBox()
+        self.radius_spin.setRange(0.0, 500.0)
+        self.radius_spin.setSingleStep(5.0)
+        self.radius_spin.setDecimals(1)
+        self.radius_spin.setSuffix(" µm")
+        self.radius_spin.setSpecialValueText("none")
+        self.radius_spin.setValue(float(defaults.get('extra_radius_um') or 0.0))
+        self.radius_spin.setToolTip(
+            "Tracer exposure is always measured on the microglia mask itself "
+            "and on the mask grown 10, 20 and 30 µm.\n"
+            "Set a distance here to add ONE more, e.g. 50 µm -> "
+            "bbb_<tracer>_exposure_50um. Leave at none to add nothing.")
+        rad_row.addWidget(self.radius_spin)
+        rad_row.addWidget(QLabel(
+            "<span style='color:gray'>microglia, 10, 20 and 30 µm are always "
+            "measured</span>"))
+        rad_row.addStretch()
+        layout.addLayout(rad_row)
+
         self.tubeness_check = QCheckBox(
             "Enhance vessels with tubeness (Sato) — recommended for faint CD31")
         # On by default: plain Otsu splits a hazy CD31 background into large
@@ -4909,6 +4997,7 @@ class BBBAnalysisDialog(QDialog):
                 'iba1': self.iba1_combo.currentData(),
                 'tracers': tracers,
                 'raw_dir': self.rawdir_edit.text().strip(),
+                'extra_radius_um': float(self.radius_spin.value()),
                 'use_tubeness': self.tubeness_check.isChecked(),
                 'review_vessels': self.review_check.isChecked()}
 
@@ -4987,6 +5076,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # every tracer from these instead of the (possibly RGB-merged) image
         # loaded in MMPS, so a white tracer is never also counted as red.
         self.bbb_raw_dir = ''
+        # One optional extra exposure radius; microglia/10/20/30 µm always run.
+        self.bbb_extra_radius_um = 0.0
         # Channel names (can be customized by user)
         self.channel_names = {0: '', 1: '', 2: ''}
         # What the grayscale view shows: 'process' (the analysed channel) or
@@ -10386,6 +10477,8 @@ if __name__ == '__main__':
                 "and the tracers from the individual channel files.")
         defaults = dict(self.bbb_channels)
         defaults.setdefault('raw_dir', getattr(self, 'bbb_raw_dir', ''))
+        defaults.setdefault('extra_radius_um',
+                            getattr(self, 'bbb_extra_radius_um', 0.0))
         dlg = BBBAnalysisDialog(self, color_image=color_img, defaults=defaults,
                                 image_names=list(self.images))
         if dlg.exec_() != QDialog.Accepted:
@@ -10397,6 +10490,7 @@ if __name__ == '__main__':
             return
         self.bbb_channels = ch
         self.bbb_raw_dir = ch.get('raw_dir', '')
+        self.bbb_extra_radius_um = ch.get('extra_radius_um', 0.0)
         self.bbb_use_tubeness = bool(ch.get('use_tubeness', False))
         self.run_bbb_analysis(ch)
 
@@ -10419,6 +10513,16 @@ if __name__ == '__main__':
             tracer_specs = [{'name': n, 'channel': channels.get(n, -1)}
                             for n in ('dextran', 'albumin')
                             if channels.get(n, -1) >= 0]
+        # The fixed radii always run; the dialog may add exactly one more, kept
+        # last so the column the user asked for is the obvious one in the sheet.
+        exposure_radii = list(_EXPOSURE_RADII_UM)
+        extra_um = float(channels.get('extra_radius_um') or 0.0)
+        if extra_um > 0 and not any(abs(extra_um - r) < 1e-6
+                                    for r in exposure_radii):
+            exposure_radii.append(extra_um)
+        self.log("BBB: exposure measured at " + ", ".join(
+            _exposure_radius_tag(r) for r in exposure_radii))
+
         raw_dir = channels.get('raw_dir') or ''
         raw_index = _index_raw_channel_folder(raw_dir) if raw_dir else {}
         if raw_dir and not raw_index:
@@ -10561,6 +10665,16 @@ if __name__ == '__main__':
                          f"{cd31_i + 1} but this image has {nch} channel(s).")
                 skipped_imgs.append((img_name, f"CD31 ch{cd31_i + 1} > {nch} ch"))
                 continue
+            # Outline colours follow the channels themselves: whatever CD31
+            # and IBA1 are displayed as is what they are drawn as in the
+            # figures, so an outline and the signal under it are obviously the
+            # same structure. Placed after the CD31 index is known good.
+            iba1_i = channels.get('iba1', -1)
+            vessel_colour = (self.channel_colors.get(cd31_i)
+                             or _default_channel_color(cd31_i, nch))
+            cell_colour = ((self.channel_colors.get(iba1_i)
+                            or _default_channel_color(iba1_i, nch))
+                           if 0 <= iba1_i < nch else None)
             ps = float(self._get_pixel_size(img_name))
             animal_id = idata.get('animal_id', '')
             treatment = idata.get('treatment', '')
@@ -10633,7 +10747,7 @@ if __name__ == '__main__':
                     os.makedirs(prev_dir, exist_ok=True)
                     _save_vessel_seg_preview(
                         os.path.join(prev_dir, img_base + '_vessels.png'), cd31, ps,
-                        vessel_mask=vessel_mask)
+                        vessel_mask=vessel_mask, vessel_colour=vessel_colour)
                 except Exception as e:
                     self.log(f"BBB: vessel preview failed for {img_name}: {e}")
                 row = {'image_name': os.path.splitext(img_name)[0],
@@ -10751,11 +10865,10 @@ if __name__ == '__main__':
                     soma_masks[sid] = mk
                     exp = _microglia_leakage_exposure(
                         mk, vessel_mask, tracers, ps, dist_um=dist_um,
-                        soma_mask=soma_region)
+                        soma_mask=soma_region, halo_radii_um=exposure_radii)
                     crow = {'image_name': img_base, 'animal_id': animal_id,
                             'treatment': treatment, 'region': region,
-                            'timepoint': timepoint, 'soma_id': sid,
-                            'bbb_footprint': source}
+                            'timepoint': timepoint, 'soma_id': sid}
                     crow.update(exp)
                     cell_rows.append(crow)
 
@@ -10769,7 +10882,9 @@ if __name__ == '__main__':
                             vessel_mask, tracers,
                             cell_masks=list(soma_masks.values()),
                             vmax_map=overlay_vmax,
-                            source_label=ch_source)
+                            source_label=ch_source,
+                            vessel_colour=vessel_colour,
+                            cell_colour=cell_colour)
                     except Exception as e:
                         self.log(f"BBB: overlay failed for {img_name}: {e}")
                 n_imgs += 1
