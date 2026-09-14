@@ -1355,10 +1355,25 @@ def _save_bbb_overlay(path, vessel_mask, tracers, cell_masks=None,
 
 
 def _save_vessel_seg_preview(path, cd31, pixel_size_um,
-                             sigmas=_VESSEL_TUBENESS_SIGMAS):
-    """Save a 2-panel PNG comparing the CD31 vessel mask WITHOUT tubeness (plain
-    Otsu) vs WITH tubeness (Sato), each as a cyan outline over CD31, so the user
-    can see the difference and decide whether to enable tubeness."""
+                             sigmas=_VESSEL_TUBENESS_SIGMAS,
+                             vessel_mask=None):
+    """Save a PNG of the CD31 vessel segmentation.
+
+    The first panel is THE MASK THAT WAS MEASURED — the one every BBB number in
+    this run comes from, including any hand-drawn marks and whatever
+    sensitivity or target-area rule was accepted in the review window. It is
+    passed in as ``vessel_mask``.
+
+    The other two recompute plain Otsu and tubeness from the raw CD31 at default
+    settings, to show what those rules would have given. They are a comparison,
+    nothing more.
+
+    Keeping that distinction visible is the point. This file used to draw only
+    the two recomputed panels, so after a manual review it showed a mask nobody
+    measured: vessels painted in by hand were simply absent from it, and the
+    obvious reading of a file called "<image>_vessels.png" is that it shows the
+    vessels the run used.
+    """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -1366,13 +1381,23 @@ def _save_vessel_seg_preview(path, cd31, pixel_size_um,
     tube, _ = _vessel_binary(cd31, pixel_size_um, use_tubeness=True, sigmas=sigmas)
     cd = np.asarray(cd31, dtype=np.float64)
     vmax = float(np.percentile(cd, 99)) if cd.size else 1.0
-    fig, ax = plt.subplots(1, 2, figsize=(13, 6.2))
-    for a, mask, title in ((ax[0], plain, 'CD31 vessels — Otsu (no tubeness)'),
-                           (ax[1], tube, 'CD31 vessels — tubeness (Sato)')):
+
+    panels = []
+    if vessel_mask is not None:
+        panels.append((np.asarray(vessel_mask) > 0,
+                       'MASK USED — every BBB number comes from this',
+                       'lime'))
+    panels.append((plain, 'for comparison: Otsu at default settings', 'cyan'))
+    panels.append((tube, 'for comparison: tubeness at default settings', 'cyan'))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.5 * len(panels), 6.2),
+                             squeeze=False)
+    for a, (mask, title, colour) in zip(axes[0], panels):
         a.imshow(cd, cmap='gray', vmax=vmax if vmax > 0 else 1.0)
         if np.any(mask):
-            a.contour(mask, levels=[0.5], colors='cyan', linewidths=0.6)
-        a.set_title('%s\narea fraction %.2f%%' % (title, 100.0 * float(mask.mean())))
+            a.contour(mask, levels=[0.5], colors=colour, linewidths=0.6)
+        a.set_title('%s\narea fraction %.2f%%'
+                    % (title, 100.0 * float(mask.mean())))
         a.axis('off')
     fig.tight_layout()
     fig.savefig(path, dpi=110, bbox_inches='tight')
@@ -10599,12 +10624,16 @@ if __name__ == '__main__':
                     vessel_mask=reviewed_mask,
                     target_area_frac=(target_area_pct / 100.0
                                       if target_area_pct else None))
-                # Save an Otsu-vs-tubeness vessel comparison so the choice is visible.
+                # Save the mask that was actually measured, beside what the
+                # two automatic rules would have given. Passing vessel_mask is
+                # what makes the first panel the real one -- without it the
+                # file shows a recomputed mask that ignores the review.
                 try:
                     prev_dir = os.path.join(out_dir, 'bbb_vessel_previews')
                     os.makedirs(prev_dir, exist_ok=True)
                     _save_vessel_seg_preview(
-                        os.path.join(prev_dir, img_base + '_vessels.png'), cd31, ps)
+                        os.path.join(prev_dir, img_base + '_vessels.png'), cd31, ps,
+                        vessel_mask=vessel_mask)
                 except Exception as e:
                     self.log(f"BBB: vessel preview failed for {img_name}: {e}")
                 row = {'image_name': os.path.splitext(img_name)[0],
