@@ -911,6 +911,49 @@ def _vessel_binary(cd31, pixel_size_um, use_tubeness=False,
     return vessels, thr
 
 
+def _skeleton_length_um(skel, pixel_size_um):
+    """Skeleton length, with a diagonal step counted as sqrt(2) pixels.
+
+    Counting skeleton PIXELS treats a diagonal run as no longer than an
+    orthogonal one, so a vessel at 45 degrees measures 1/sqrt(2) = 0.71 of its
+    true length. Vessels run at every angle, so that is a systematic
+    underestimate of length density -- and it is worst at the angles a dense
+    bed has plenty of, not at some rare edge case.
+
+    Counts each adjacency once, from one side only, which is why the slices do
+    not overlap.
+    """
+    s = np.asarray(skel) > 0
+    if not np.any(s):
+        return 0.0
+    n_orth = (int(np.count_nonzero(s[:, :-1] & s[:, 1:]))
+              + int(np.count_nonzero(s[:-1, :] & s[1:, :])))
+    n_diag = (int(np.count_nonzero(s[:-1, :-1] & s[1:, 1:]))
+              + int(np.count_nonzero(s[:-1, 1:] & s[1:, :-1])))
+    return (n_orth + n_diag * float(np.sqrt(2.0))) * float(pixel_size_um)
+
+
+def _count_branch_points(skel):
+    """Number of skeleton junctions, each counted ONCE.
+
+    A junction is normally several adjacent skeleton pixels that all have three
+    or more neighbours, so counting pixels reports a single Y as two or three
+    branch points. Taking connected clusters of junction pixels makes one
+    junction count as one.
+    """
+    s = np.asarray(skel) > 0
+    if not np.any(s):
+        return 0
+    u = s.astype(np.uint8)
+    nbr = ndimage.convolve(u, np.ones((3, 3), np.uint8),
+                           mode='constant', cval=0) - u
+    junction = s & (nbr >= 3)
+    if not np.any(junction):
+        return 0
+    _, n = ndimage.label(junction, structure=np.ones((3, 3), dtype=int))
+    return int(n)
+
+
 def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2,
                      use_tubeness=False, sigmas=_VESSEL_TUBENESS_SIGMAS,
                      thr_scale=1.0, vessel_mask=None, target_area_frac=None):
@@ -923,9 +966,12 @@ def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2,
     ``use_tubeness`` to enhance tube-like CD31 (Sato) before thresholding.
     """
     img = np.asarray(cd31, dtype=np.float64)
+    # With no vessel found, area, length and branch density are genuinely zero
+    # -- but there is no diameter to report, and a 0.0 there would read as
+    # "vessels of zero width" rather than "no vessel was found".
     empty = (np.zeros(img.shape, dtype=bool), {
         'vessel_area_fraction': 0.0, 'vessel_length_density_um_per_um2': 0.0,
-        'vessel_branchpoint_density_per_mm2': 0.0, 'vessel_mean_diameter_um': 0.0,
+        'vessel_branchpoint_density_per_mm2': 0.0, 'vessel_mean_diameter_um': '',
         'vessel_threshold': 0.0})
     if vessel_mask is not None:
         # Caller supplied a reviewed/edited mask — measure that instead.
@@ -941,18 +987,23 @@ def _segment_vessels(cd31, pixel_size_um, min_object_um2=5.0, close_radius_px=2,
     from skimage.morphology import skeletonize
     area_um2 = vessels.size * (pixel_size_um ** 2)
     skel = skeletonize(vessels)
-    skel_len_um = int(skel.sum()) * pixel_size_um
+    skel_len_um = _skeleton_length_um(skel, pixel_size_um)
     dt = ndimage.distance_transform_edt(vessels)
-    mean_diam_um = float(2 * dt[skel].mean() * pixel_size_um) if skel.any() else 0.0
-    su = skel.astype(np.uint8)
-    nbr = ndimage.convolve(su, np.ones((3, 3), np.uint8),
-                           mode='constant', cval=0) - su
-    n_branch = int(np.count_nonzero(skel & (nbr >= 3)))
+    # 2 x the distance transform along the centreline. NOTE this runs about
+    # half a pixel high on a straight tube: the transform measures to the
+    # nearest background pixel CENTRE, which sits half a pixel outside the
+    # wall. Left as-is rather than silently recalibrated, because it is the
+    # conventional definition and changing it would move every number already
+    # measured -- but at 0.316 um/px it is roughly +0.16 um on every vessel.
+    mean_diam_um = (float(2 * dt[skel].mean() * pixel_size_um)
+                    if skel.any() else None)
+    n_branch = _count_branch_points(skel)
     metrics = {
         'vessel_area_fraction': round(float(vessels.mean()), 4),
         'vessel_length_density_um_per_um2': round(skel_len_um / area_um2, 6),
         'vessel_branchpoint_density_per_mm2': round(n_branch / (area_um2 / 1e6), 2),
-        'vessel_mean_diameter_um': round(mean_diam_um, 3),
+        'vessel_mean_diameter_um': (round(mean_diam_um, 3)
+                                    if mean_diam_um is not None else ''),
         'vessel_threshold': round(thr, 2),
     }
     return vessels, metrics
@@ -978,24 +1029,41 @@ def _quantify_leakage(vessel_mask, tracer, pixel_size_um,
     vessel_mask = vessel_mask > 0
     intra = t[vessel_mask]
     extra = t[~vessel_mask]
-    intra_mean = float(intra.mean()) if intra.size else 0.0
-    extra_mean = float(extra.mean()) if extra.size else 0.0
+    # NOTHING here is defined when segmentation found no vessel: there is no
+    # lumen to average, no barrier to be intact, and "outside the vessels" is
+    # the whole frame. Reporting 0.0 for the leakage index in that case reads
+    # as a perfectly intact barrier, which is the opposite of "this could not
+    # be measured". Blank means blank.
+    has_vessel = bool(intra.size)
+    intra_mean = float(intra.mean()) if has_vessel else None
+    extra_mean = float(extra.mean()) if extra.size else None
     # Extravascular signal footprint: parenchymal pixels brighter than the
-    # in-vessel median (i.e. tracer that has clearly left the lumen).
-    leak_thr = float(np.median(intra)) if intra.size else 0.0
-    extra_frac = float((extra > leak_thr).mean()) if extra.size else 0.0
+    # in-vessel median (i.e. tracer that has clearly left the lumen). Needs a
+    # lumen to set that median, so it goes with the rest.
+    if has_vessel and extra.size:
+        extra_frac = float((extra > float(np.median(intra))).mean())
+    else:
+        extra_frac = None
     m = {
-        'intravascular_mean': round(intra_mean, 3),
-        'extravascular_mean': round(extra_mean, 3),
-        'leakage_index': round(extra_mean / intra_mean, 4) if intra_mean > 0 else 0.0,
-        'extravascular_area_fraction': round(extra_frac, 4),
+        'intravascular_mean': round(intra_mean, 3) if has_vessel else '',
+        'extravascular_mean': (round(extra_mean, 3)
+                               if extra_mean is not None else ''),
+        'leakage_index': (round(extra_mean / intra_mean, 4)
+                          if (has_vessel and intra_mean > 0
+                              and extra_mean is not None) else ''),
+        'extravascular_area_fraction': (round(extra_frac, 4)
+                                        if extra_frac is not None else ''),
     }
     dist_um = ndimage.distance_transform_edt(~vessel_mask) * pixel_size_um
     for i in range(len(ring_edges_um) - 1):
         lo, hi = ring_edges_um[i], ring_edges_um[i + 1]
-        ring = (dist_um > lo) & (dist_um <= hi)
+        ring = (dist_um > lo) & (dist_um <= hi) if has_vessel else None
+        # A ring that does not exist -- no vessel, or the frame is not wide
+        # enough to hold it -- has no mean. 0.0 would read as "no tracer that
+        # far out", which is a measurement, not a gap.
         m['perivasc_%g_%gum_mean' % (lo, hi)] = (
-            round(float(t[ring].mean()), 3) if np.any(ring) else 0.0)
+            round(float(t[ring].mean()), 3)
+            if (ring is not None and np.any(ring)) else '')
     return m
 
 

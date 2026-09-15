@@ -1,5 +1,29 @@
 # MMPS — open items
 
+## Vessel diameter runs about half a pixel high  *(open, not fixed)*
+
+`vessel_mean_diameter_um` is `2 x` the distance transform along the skeleton.
+The transform measures to the nearest background pixel **centre**, which sits
+half a pixel outside the vessel wall, so on a straight tube the diameter comes
+out high. Measured on synthetic bands of every width from 3 to 20 px:
+
+```
+even widths   error +0.000 px   (the centre-pixel offset cancels)
+odd widths    error +0.979 px
+mean          error +0.492 px
+```
+
+At 0.316 um/px that is **+0.16 um on every vessel** — about 3% on a 5 um
+capillary. It is a bias, not noise, so it does not average out across a
+dataset, though it also does not differ between treatment groups.
+
+Deliberately NOT corrected: `2 x EDT` is the conventional definition (REAVER
+and friends do the same), and subtracting the half pixel would move every
+number already measured. Subtracting 0.5 from the diameter would centre the
+error on straight tubes (mean -0.008 px) but makes round cross-sections worse
+(mean -0.452 px from +0.048 px). Decide before publishing diameters, not
+after.
+
 ## BBB per-cell columns  *(changed)*
 
 Every per-cell BBB column is prefixed `bbb_`, and these are the only ones

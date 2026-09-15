@@ -132,11 +132,41 @@ def _vessel_binary(cd31, ps, use_tubeness=False, sigmas=TUBENESS_SIGMAS,
     return vessels, thr
 
 
+def skeleton_length_um(skel, ps):
+    """Skeleton length with a diagonal step counted as sqrt(2) pixels.
+    Counting pixels makes a 45-degree vessel measure 0.71 of its true length.
+    Mirrors _skeleton_length_um in MMPSv2.12.py."""
+    sk = np.asarray(skel) > 0
+    if not np.any(sk):
+        return 0.0
+    n_orth = (int(np.count_nonzero(sk[:, :-1] & sk[:, 1:]))
+              + int(np.count_nonzero(sk[:-1, :] & sk[1:, :])))
+    n_diag = (int(np.count_nonzero(sk[:-1, :-1] & sk[1:, 1:]))
+              + int(np.count_nonzero(sk[:-1, 1:] & sk[1:, :-1])))
+    return (n_orth + n_diag * float(np.sqrt(2.0))) * float(ps)
+
+
+def count_branch_points(skel):
+    """Junctions, each counted once. A junction spans several skeleton pixels,
+    so counting pixels reports one Y as three. Mirrors MMPSv2.12.py."""
+    sk = np.asarray(skel) > 0
+    if not np.any(sk):
+        return 0
+    u = sk.astype(np.uint8)
+    nbr = ndimage.convolve(u, np.ones((3, 3), np.uint8),
+                           mode='constant', cval=0) - u
+    junction = sk & (nbr >= 3)
+    if not np.any(junction):
+        return 0
+    _, n = ndimage.label(junction, structure=np.ones((3, 3), dtype=int))
+    return int(n)
+
+
 def segment_vessels(cd31, ps, min_object_um2=5.0, close_radius_px=2,
                     use_tubeness=USE_TUBENESS, sigmas=TUBENESS_SIGMAS):
     empty_metrics = {
         'vessel_area_fraction': 0.0, 'vessel_length_density_um_per_um2': 0.0,
-        'vessel_branchpoint_density_per_mm2': 0.0, 'vessel_mean_diameter_um': 0.0,
+        'vessel_branchpoint_density_per_mm2': 0.0, 'vessel_mean_diameter_um': '',
         'vessel_threshold': 0.0}
     vessels, thr = _vessel_binary(cd31, ps, use_tubeness, sigmas,
                                   min_object_um2, close_radius_px)
@@ -144,17 +174,19 @@ def segment_vessels(cd31, ps, min_object_um2=5.0, close_radius_px=2,
         return np.zeros(np.asarray(cd31).shape, dtype=bool), empty_metrics
     area_um2 = vessels.size * (ps ** 2)
     skel = skeletonize(vessels)
-    skel_len_um = int(skel.sum()) * ps
+    skel_len_um = skeleton_length_um(skel, ps)
     dt = ndimage.distance_transform_edt(vessels)
-    mean_diam_um = float(2 * dt[skel].mean() * ps) if skel.any() else 0.0
-    su = skel.astype(np.uint8)
-    nbr = ndimage.convolve(su, np.ones((3, 3), np.uint8), mode='constant', cval=0) - su
-    n_branch = int(np.count_nonzero(skel & (nbr >= 3)))
+    # NOTE about half a pixel high on a straight tube -- the transform measures
+    # to the nearest background pixel CENTRE, half a pixel outside the wall.
+    # Left as the conventional definition; see MMPSv2.12.py.
+    mean_diam_um = float(2 * dt[skel].mean() * ps) if skel.any() else None
+    n_branch = count_branch_points(skel)
     metrics = {
         'vessel_area_fraction': round(float(vessels.mean()), 4),
         'vessel_length_density_um_per_um2': round(skel_len_um / area_um2, 6),
         'vessel_branchpoint_density_per_mm2': round(n_branch / (area_um2 / 1e6), 2),
-        'vessel_mean_diameter_um': round(mean_diam_um, 3),
+        'vessel_mean_diameter_um': (round(mean_diam_um, 3)
+                                    if mean_diam_um is not None else ''),
         'vessel_threshold': round(thr, 2),
     }
     return vessels, metrics
@@ -190,22 +222,33 @@ def quantify_leakage(vessel_mask, tracer, ps, ring_edges_um=(0, 10, 20, 40)):
     vessel_mask = vessel_mask > 0
     intra = t[vessel_mask]
     extra = t[~vessel_mask]
-    intra_mean = float(intra.mean()) if intra.size else 0.0
-    extra_mean = float(extra.mean()) if extra.size else 0.0
-    leak_thr = float(np.median(intra)) if intra.size else 0.0
-    extra_frac = float((extra > leak_thr).mean()) if extra.size else 0.0
+    # Nothing here is defined when no vessel was found: 0.0 for the leakage
+    # index reads as a perfectly intact barrier, not as "unmeasurable".
+    # Mirrors MMPSv2.12.py.
+    has_vessel = bool(intra.size)
+    intra_mean = float(intra.mean()) if has_vessel else None
+    extra_mean = float(extra.mean()) if extra.size else None
+    if has_vessel and extra.size:
+        extra_frac = float((extra > float(np.median(intra))).mean())
+    else:
+        extra_frac = None
     m = {
-        'intravascular_mean': round(intra_mean, 3),
-        'extravascular_mean': round(extra_mean, 3),
-        'leakage_index': round(extra_mean / intra_mean, 4) if intra_mean > 0 else 0.0,
-        'extravascular_area_fraction': round(extra_frac, 4),
+        'intravascular_mean': round(intra_mean, 3) if has_vessel else '',
+        'extravascular_mean': (round(extra_mean, 3)
+                               if extra_mean is not None else ''),
+        'leakage_index': (round(extra_mean / intra_mean, 4)
+                          if (has_vessel and intra_mean > 0
+                              and extra_mean is not None) else ''),
+        'extravascular_area_fraction': (round(extra_frac, 4)
+                                        if extra_frac is not None else ''),
     }
     dist_um = ndimage.distance_transform_edt(~vessel_mask) * ps
     for i in range(len(ring_edges_um) - 1):
         lo, hi = ring_edges_um[i], ring_edges_um[i + 1]
-        ring = (dist_um > lo) & (dist_um <= hi)
+        ring = (dist_um > lo) & (dist_um <= hi) if has_vessel else None
         m['perivasc_%g_%gum_mean' % (lo, hi)] = (
-            round(float(t[ring].mean()), 3) if np.any(ring) else 0.0)
+            round(float(t[ring].mean()), 3)
+            if (ring is not None and np.any(ring)) else '')
     return m
 
 
