@@ -13,10 +13,11 @@ It does TWO things:
      columns added  ->  <master stem>_with_bulbs.(csv|xlsx)
      The original master file is never modified.
 
-The detector is identical to MMPSv2.12 / test_bulb_detection.py (morphological
-opening to isolate rounded terminal lobes, soma/body removed, size + distance
-gates, one-connecting-branch terminal rule, and rejection of any lobe a branch
-extends past).
+The detector (morphological opening to isolate rounded terminal lobes, soma/body
+removed, size + distance gates, one-connecting-branch terminal rule, and
+rejection of any lobe a branch extends past) matches test_bulb_detection.py.
+MMPS itself no longer computes bulbs — run this script against exported masks
+and merge the columns in, which is what it was written for.
 
 ------------------------------------------------------------------------------
 USAGE

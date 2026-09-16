@@ -586,184 +586,6 @@ def _grow_masks_for_soma(args):
     return masks
 
 
-def _branch_extends_past(touching, proc_labeled, proc_sizes, ring, blob_center,
-                         soma_center, distal_min_len_px, distal_cos):
-    """True if a process leaves the blob on the far side from the soma.
-
-    For each thin-process branch touching the blob, the vector from the blob
-    centre to where it attaches is compared with the direction toward the soma.
-    A branch whose attachment points *away* from the soma (cosine below
-    ``distal_cos``) and is at least ``distal_min_len_px`` long means the process
-    continues past the bulb — so it is not a clean terminal bulb.
-    """
-    cy, cx = blob_center
-    v_s = np.array([soma_center[0] - cy, soma_center[1] - cx], dtype=float)
-    ns = np.linalg.norm(v_s) + 1e-9
-    for t in touching:
-        if proc_sizes[t] < distal_min_len_px:
-            continue
-        ty, tx = np.nonzero((proc_labeled == t) & ring)
-        if ty.size == 0:
-            continue
-        v_t = np.array([ty.mean() - cy, tx.mean() - cx], dtype=float)
-        cos = float(v_t @ v_s / (np.linalg.norm(v_t) * ns + 1e-9))
-        if cos < distal_cos:
-            return True
-    return False
-
-
-def _detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
-                            soma_mask=None, soma_area_um2=None, soma_margin=1.3,
-                            open_radius_px=None, soma_dilation_px=3,
-                            min_tip_dist_factor=1.5, min_conn_len_px=10,
-                            max_connections=1, distal_min_len_px=4,
-                            distal_cos=-0.2):
-    """Detect bulbous terminal swellings (ATP-sensor end-bulbs) on microglia.
-
-    A bulb is a rounded terminal lobe: a blob connected to the rest of the cell
-    by exactly one thin process. The skeleton branches *inside* these lobes, so
-    endpoint-based detection fails; instead we isolate blobs morphologically.
-
-    Steps:
-      1. Morphological opening with a disk removes the thin processes, leaving the
-         soma/body and the rounded lobes as components. The disk radius adapts to
-         the cell: when ``open_radius_px`` is None it is sized just above this
-         cell's own process half-width (so thick-branched cells get a larger disk
-         and thin-branched cells a smaller one); pass a number to force a radius.
-      2. Drop the component containing the soma/body.
-      3. Keep blobs whose diameter (2 x max distance-transform radius) is at least
-         ``min_bulb_diameter_um`` and that lie at least ``min_tip_dist_factor``
-         soma-radii from the soma centre.
-      4. Terminal test: count the thin-process skeleton branches (length
-         >= ``min_conn_len_px``) that touch the blob; keep it only if that count
-         is <= ``max_connections`` (1). A junction has two or more, so it is
-         rejected. The opening itself enforces the thin-neck requirement (a thick
-         stub straight off the body stays attached and is excluded with it).
-
-    Returns a dict with ``num_bulbous_endings``, ``mean_bulb_diameter_um`` and
-    ``beading_index`` (bulbs per process tip), plus ``bulb_coords`` — (row, col)
-    of each bulb centre for an optional overlay.
-    """
-    from skimage.morphology import skeletonize, opening, disk
-
-    result = {
-        'num_bulbous_endings': 0,
-        'mean_bulb_diameter_um': 0.0,
-        'beading_index': 0.0,
-        'bulb_coords': [],
-    }
-
-    binary = (mask > 0)
-    if not np.any(binary):
-        return result
-
-    radius = ndimage.distance_transform_edt(binary)
-    skeleton = skeletonize(binary)
-    struct = np.ones((3, 3), dtype=int)
-
-    # Locate the soma (centre + radius) for the body exclusion and distance gate.
-    use_real_soma = (soma_mask is not None
-                     and np.shape(soma_mask) == binary.shape
-                     and np.any(soma_mask))
-    if use_real_soma:
-        soma_bin = (np.asarray(soma_mask) > 0)
-        srows, scols = np.nonzero(soma_bin)
-        soma_center = (float(srows.mean()), float(scols.mean()))
-        soma_radius_px = np.sqrt(srows.size / np.pi)
-        soma_region = soma_bin
-        if soma_dilation_px and soma_dilation_px > 0:
-            soma_region = ndimage.binary_dilation(soma_region,
-                                                  iterations=int(soma_dilation_px))
-    else:
-        soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
-        if soma_area_um2 and soma_area_um2 > 0:
-            soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
-        else:
-            soma_radius_px = float(radius[soma_center])
-        rr, cc = np.indices(binary.shape)
-        soma_region = (np.hypot(rr - soma_center[0],
-                                cc - soma_center[1]) <= soma_radius_px * soma_margin)
-
-    # Size the opening disk. If not forced, set it just above this cell's own
-    # process half-width (25th percentile of thickness along the non-soma
-    # skeleton), capped below the bulb size floor so qualifying lobes survive.
-    if open_radius_px is None:
-        proc_dt = radius[skeleton & ~soma_region]
-        thin_half = float(np.percentile(proc_dt, 25)) if proc_dt.size else 2.0
-        ceiling = max(3, int((min_bulb_diameter_um / pixel_size) / 2.0) - 1)
-        open_radius_px = int(min(max(round(thin_half + 2), 3), ceiling))
-
-    # Isolate rounded blobs (soma/body + lobes) by removing thin processes.
-    opened = opening(binary, disk(int(open_radius_px)))
-    labeled, n_labels = ndimage.label(opened, structure=struct)
-    if n_labels == 0:
-        return result
-
-    # The soma/body is the component at the soma centre (or the one most
-    # overlapping the soma region).
-    sc = (int(round(soma_center[0])), int(round(soma_center[1])))
-    soma_label = labeled[sc] if (0 <= sc[0] < labeled.shape[0]
-                                 and 0 <= sc[1] < labeled.shape[1]) else 0
-    if soma_label == 0:
-        overlap = labeled[soma_region]
-        overlap = overlap[overlap > 0]
-        if overlap.size:
-            soma_label = int(np.bincount(overlap).argmax())
-
-    # Thin-process skeleton (blobs removed) — used to count real connections.
-    proc_skel = skeleton & ~opened
-    proc_labeled, _ = ndimage.label(proc_skel, structure=struct)
-    proc_sizes = np.bincount(proc_labeled.ravel())
-
-    min_bulb_radius_px = (min_bulb_diameter_um / pixel_size) / 2.0
-    min_tip_dist_px = min_tip_dist_factor * soma_radius_px
-
-    coords = []
-    diameters = []
-    for lab in range(1, n_labels + 1):
-        if lab == soma_label:
-            continue
-        comp = (labeled == lab)
-        blob_radius = float(radius[comp].max())
-        if blob_radius < min_bulb_radius_px:
-            continue
-        ys, xs = np.nonzero(comp)
-        cy, cx = ys.mean(), xs.mean()
-        if np.hypot(cy - soma_center[0], cx - soma_center[1]) < min_tip_dist_px:
-            continue
-        # Count substantial thin-process branches touching the blob.
-        ring = ndimage.binary_dilation(comp, iterations=2)
-        touching = set(np.unique(proc_labeled[ring & proc_skel])) - {0}
-        n_conn = sum(1 for t in touching if proc_sizes[t] >= min_conn_len_px)
-        if n_conn > max_connections:
-            continue  # junction, not a terminal bulb
-        # A bulb is terminal: the connecting process must not continue PAST it.
-        # Reject if any process leaves the blob on the far side from the soma.
-        if _branch_extends_past(touching, proc_labeled, proc_sizes, ring,
-                                (cy, cx), soma_center, distal_min_len_px, distal_cos):
-            continue
-        peak = np.unravel_index(int(np.argmax(np.where(comp, radius, 0))),
-                                radius.shape)
-        coords.append((int(peak[0]), int(peak[1])))
-        diameters.append(2.0 * blob_radius * pixel_size)
-
-    if not coords:
-        return result
-
-    # Beading index: bulbs per process tip (degree-1 skeleton endpoints, non-soma).
-    skel_nosoma = skeleton & ~soma_region
-    su = skel_nosoma.astype(np.uint8)
-    nbr = ndimage.convolve(su, np.ones((3, 3), dtype=np.uint8),
-                           mode='constant', cval=0) - su
-    n_tips = int(np.count_nonzero(skel_nosoma & (nbr == 1)))
-
-    result['num_bulbous_endings'] = len(coords)
-    result['mean_bulb_diameter_um'] = round(float(np.mean(diameters)), 4)
-    result['beading_index'] = round(len(coords) / n_tips, 4) if n_tips else 0.0
-    result['bulb_coords'] = coords
-    return result
-
-
 # ============================================================================
 # BLOOD-BRAIN-BARRIER (BBB) ANALYSIS ENGINE
 # Vessel segmentation (CD31), tracer extravasation/leakage (intravascular
@@ -3013,17 +2835,16 @@ class MorphologyCalculator:
         self.pixel_size = pixel_size_um
         # Note: use_imagej parameter kept for backwards compatibility but not used
 
-    def calculate_all_parameters(self, cell_mask, soma_centroid, soma_area_um2=None,
-                                 soma_mask=None):
+    def calculate_all_parameters(self, cell_mask, soma_centroid,
+                                 soma_area_um2=None):
         """Calculate ONLY simple parameters - Sholl, Fractal, Hull, Skeleton done in ImageJ"""
         params = {}
 
-        params.update(self._calculate_simple_descriptors(cell_mask, soma_area_um2,
-                                                         soma_mask))
+        params.update(self._calculate_simple_descriptors(cell_mask, soma_area_um2))
 
         return params
 
-    def _calculate_simple_descriptors(self, mask, soma_area_um2=None, soma_mask=None):
+    def _calculate_simple_descriptors(self, mask, soma_area_um2=None):
         params = {}
         props = measure.regionprops(mask.astype(int))[0] if np.any(mask) else None
         if props:
@@ -3065,21 +2886,11 @@ class MorphologyCalculator:
 
             # Directional polarity via PCA on mask coordinates
             params.update(self._calculate_polarity(coords, centroid))
-
-            # Bulbous (spheroidal) terminal swellings — dystrophic marker.
-            bulb = _detect_bulbous_endings(mask, self.pixel_size,
-                                           soma_mask=soma_mask,
-                                           soma_area_um2=soma_area_um2)
-            params['num_bulbous_endings'] = bulb['num_bulbous_endings']
-            params['mean_bulb_diameter_um'] = bulb['mean_bulb_diameter_um']
-            params['beading_index'] = bulb['beading_index']
         else:
             params = {k: 0 for k in ['perimeter', 'mask_area', 'eccentricity',
                                      'roundness', 'avg_centroid_distance', 'soma_area',
                                      'polarity_index', 'principal_angle',
-                                     'major_axis_um', 'minor_axis_um',
-                                     'num_bulbous_endings', 'mean_bulb_diameter_um',
-                                     'beading_index']}
+                                     'major_axis_um', 'minor_axis_um']}
         return params
 
     def _calculate_polarity(self, coords, centroid):
@@ -3206,7 +3017,6 @@ class MorphologyCalculationThread(QThread):
 
             # Process remaining masks serially (in-memory)
             calculator_cache = {}
-            soma_mask_cache = {}
             somas_dir = os.path.join(self.output_dir, "somas") if self.output_dir else None
             for i in serial_indices:
                 flat_data = self.approved_masks[i]
@@ -3254,25 +3064,8 @@ class MorphologyCalculationThread(QThread):
                     calculator_cache[cache_key] = MorphologyCalculator(processed_img, ps_for_calc, use_imagej=self.use_imagej)
                 calculator = calculator_cache[cache_key]
 
-                # Real soma outline (full-image, pixel-aligned with the mask) so
-                # bulb detection excludes the exact soma rather than estimating it.
-                soma_mask_arr = None
-                if somas_dir:
-                    img_basename = os.path.splitext(img_name)[0]
-                    soma_key = (img_basename, mask_data['soma_id'])
-                    if soma_key not in soma_mask_cache:
-                        soma_path = os.path.join(
-                            somas_dir, f"{img_basename}_{mask_data['soma_id']}_soma.tif")
-                        try:
-                            soma_mask_cache[soma_key] = (
-                                (safe_tiff_read(soma_path) > 0)
-                                if os.path.exists(soma_path) else None)
-                        except Exception:
-                            soma_mask_cache[soma_key] = None
-                    soma_mask_arr = soma_mask_cache[soma_key]
-
                 params = calculator.calculate_all_parameters(
-                    mask_data['mask'], soma_centroid, soma_area_um2, soma_mask_arr)
+                    mask_data['mask'], soma_centroid, soma_area_um2)
 
                 meta = task_metadata[i]
                 params['image_name'] = meta[0]
@@ -7999,7 +7792,6 @@ Generated by MMPS on {timestamp}
 Computes per-mask morphology metrics from MMPS-exported mask TIFF files:
   - cell_spread, perimeter, mask_area, eccentricity, roundness
   - polarity_index, principal_angle, major_axis_um, minor_axis_um
-  - num_bulbous_endings, mean_bulb_diameter_um, beading_index (dystrophy)
   - soma_area (from somas/ folder if available)
 
 Usage:
@@ -8114,151 +7906,7 @@ def get_soma_area(somas_dir, image_name, soma_id, pixel_size):
     return None
 
 
-def get_soma_mask(somas_dir, image_name, soma_id):
-    """Load the soma outline TIFF as a binary mask (for bulb detection)."""
-    if not somas_dir or not os.path.isdir(somas_dir):
-        return None
-    candidates = [
-        f"{{image_name}}_{{soma_id}}_soma.tif",
-        f"{{image_name}}_{{soma_id}}.tif",
-    ]
-    for c in candidates:
-        path = os.path.join(somas_dir, c)
-        if os.path.exists(path):
-            return (tifffile.imread(path) > 0)
-    for f in os.listdir(somas_dir):
-        if soma_id in f and f.endswith(".tif") and not f.startswith("."):
-            return (tifffile.imread(os.path.join(somas_dir, f)) > 0)
-    return None
-
-
-def detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
-                           soma_mask=None, soma_area_um2=None, soma_margin=1.3,
-                           open_radius_px=None, soma_dilation_px=3,
-                           min_tip_dist_factor=1.5, min_conn_len_px=10,
-                           max_connections=1, distal_min_len_px=4,
-                           distal_cos=-0.2):
-    """Detect bulbous terminal swellings (ATP-sensor end-bulbs) on microglia.
-
-    A bulb is a rounded terminal lobe connected to the cell by exactly one thin
-    process. Opening with a disk of open_radius_px removes thin processes leaving
-    blobs; the soma/body component is dropped; remaining blobs are kept if their
-    diameter >= min_bulb_diameter_um, they lie >= min_tip_dist_factor soma-radii
-    from the soma, and at most max_connections thin-process branches (length
-    >= min_conn_len_px) touch them (junctions have more and are rejected).
-    """
-    from skimage.morphology import skeletonize, opening, disk
-    from scipy import ndimage
-
-    out = {{'num_bulbous_endings': 0, 'mean_bulb_diameter_um': 0.0,
-           'beading_index': 0.0}}
-
-    binary = (mask > 0)
-    if not np.any(binary):
-        return out
-
-    radius = ndimage.distance_transform_edt(binary)
-    skeleton = skeletonize(binary)
-    struct = np.ones((3, 3), dtype=int)
-
-    use_real_soma = (soma_mask is not None
-                     and np.shape(soma_mask) == binary.shape
-                     and np.any(soma_mask))
-    if use_real_soma:
-        soma_bin = (np.asarray(soma_mask) > 0)
-        srows, scols = np.nonzero(soma_bin)
-        soma_center = (float(srows.mean()), float(scols.mean()))
-        soma_radius_px = np.sqrt(srows.size / np.pi)
-        soma_region = soma_bin
-        if soma_dilation_px and soma_dilation_px > 0:
-            soma_region = ndimage.binary_dilation(soma_region,
-                                                  iterations=int(soma_dilation_px))
-    else:
-        soma_center = np.unravel_index(int(np.argmax(radius)), radius.shape)
-        if soma_area_um2 and soma_area_um2 > 0:
-            soma_radius_px = np.sqrt(soma_area_um2 / np.pi) / pixel_size
-        else:
-            soma_radius_px = float(radius[soma_center])
-        rr, cc = np.indices(binary.shape)
-        soma_region = (np.hypot(rr - soma_center[0],
-                                cc - soma_center[1]) <= soma_radius_px * soma_margin)
-
-    if open_radius_px is None:
-        proc_dt = radius[skeleton & ~soma_region]
-        thin_half = float(np.percentile(proc_dt, 25)) if proc_dt.size else 2.0
-        ceiling = max(3, int((min_bulb_diameter_um / pixel_size) / 2.0) - 1)
-        open_radius_px = int(min(max(round(thin_half + 2), 3), ceiling))
-
-    opened = opening(binary, disk(int(open_radius_px)))
-    labeled, n_labels = ndimage.label(opened, structure=struct)
-    if n_labels == 0:
-        return out
-
-    sc = (int(round(soma_center[0])), int(round(soma_center[1])))
-    soma_label = labeled[sc] if (0 <= sc[0] < labeled.shape[0]
-                                 and 0 <= sc[1] < labeled.shape[1]) else 0
-    if soma_label == 0:
-        overlap = labeled[soma_region]; overlap = overlap[overlap > 0]
-        if overlap.size:
-            soma_label = int(np.bincount(overlap).argmax())
-
-    proc_skel = skeleton & ~opened
-    proc_labeled, _ = ndimage.label(proc_skel, structure=struct)
-    proc_sizes = np.bincount(proc_labeled.ravel())
-
-    min_bulb_radius_px = (min_bulb_diameter_um / pixel_size) / 2.0
-    min_tip_dist_px = min_tip_dist_factor * soma_radius_px
-
-    diameters = []
-    for lab in range(1, n_labels + 1):
-        if lab == soma_label:
-            continue
-        comp = (labeled == lab)
-        blob_radius = float(radius[comp].max())
-        if blob_radius < min_bulb_radius_px:
-            continue
-        ys, xs = np.nonzero(comp); cy, cx = ys.mean(), xs.mean()
-        if np.hypot(cy - soma_center[0], cx - soma_center[1]) < min_tip_dist_px:
-            continue
-        ring = ndimage.binary_dilation(comp, iterations=2)
-        touching = set(np.unique(proc_labeled[ring & proc_skel])) - {{0}}
-        n_conn = sum(1 for t in touching if proc_sizes[t] >= min_conn_len_px)
-        if n_conn > max_connections:
-            continue
-        # Reject if a process extends PAST the bulb (far side from the soma).
-        v_s = np.array([soma_center[0] - cy, soma_center[1] - cx], dtype=float)
-        ns = np.linalg.norm(v_s) + 1e-9
-        extends_past = False
-        for t in touching:
-            if proc_sizes[t] < distal_min_len_px:
-                continue
-            ty, tx = np.nonzero((proc_labeled == t) & ring)
-            if ty.size == 0:
-                continue
-            v_t = np.array([ty.mean() - cy, tx.mean() - cx], dtype=float)
-            if float(v_t @ v_s / (np.linalg.norm(v_t) * ns + 1e-9)) < distal_cos:
-                extends_past = True
-                break
-        if extends_past:
-            continue
-        diameters.append(2.0 * blob_radius * pixel_size)
-
-    if not diameters:
-        return out
-
-    skel_nosoma = skeleton & ~soma_region
-    su = skel_nosoma.astype(np.uint8)
-    nbr = ndimage.convolve(su, np.ones((3, 3), dtype=np.uint8),
-                           mode='constant', cval=0) - su
-    n_tips = int(np.count_nonzero(skel_nosoma & (nbr == 1)))
-
-    out['num_bulbous_endings'] = len(diameters)
-    out['mean_bulb_diameter_um'] = round(float(np.mean(diameters)), 4)
-    out['beading_index'] = round(len(diameters) / n_tips, 4) if n_tips else 0.0
-    return out
-
-
-def compute_metrics(mask_path, pixel_size, soma_area_um2=None, soma_mask=None):
+def compute_metrics(mask_path, pixel_size, soma_area_um2=None):
     """Load a mask TIFF and compute all morphology metrics."""
     mask = tifffile.imread(mask_path)
     mask = (mask > 0).astype(np.uint8)
@@ -8331,13 +7979,6 @@ def compute_metrics(mask_path, pixel_size, soma_area_um2=None, soma_mask=None):
         params['major_axis_um'] = 0
         params['minor_axis_um'] = 0
 
-    # Bulbous (spheroidal) terminal swellings — dystrophic microglia marker.
-    bulb = detect_bulbous_endings(mask, pixel_size, soma_mask=soma_mask,
-                                  soma_area_um2=soma_area_um2)
-    params['num_bulbous_endings'] = bulb['num_bulbous_endings']
-    params['mean_bulb_diameter_um'] = bulb['mean_bulb_diameter_um']
-    params['beading_index'] = bulb['beading_index']
-
     return params
 
 
@@ -8370,11 +8011,10 @@ def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir, meta
     for filename, soma_id, area in mask_files:
         mask_path = os.path.join(masks_dir, filename)
         soma_area = get_soma_area(somas_dir, image_name, soma_id, pixel_size)
-        soma_mask = get_soma_mask(somas_dir, image_name, soma_id)
         aid, treat, sidx = get_meta_ids(metadata, image_name, soma_id)
 
         try:
-            metrics = compute_metrics(mask_path, pixel_size, soma_area, soma_mask)
+            metrics = compute_metrics(mask_path, pixel_size, soma_area)
         except Exception as e:
             print(f"  ERROR: {{filename}}: {{e}}")
             continue
@@ -8407,7 +8047,6 @@ def process_image(image_name, masks_dir, somas_dir, pixel_size, output_dir, meta
         'cell_spread', 'soma_area',
         'polarity_index', 'principal_angle',
         'major_axis_um', 'minor_axis_um',
-        'num_bulbous_endings', 'mean_bulb_diameter_um', 'beading_index',
     ]
     with open(csv_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

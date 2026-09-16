@@ -34,7 +34,8 @@ def detect_bulbous_endings(mask, pixel_size, min_bulb_diameter_um=1.4,
                            min_tip_dist_factor=1.5, min_conn_len_px=10,
                            max_connections=1, distal_min_len_px=4,
                            distal_cos=-0.2):
-    """Identical logic to MMPSv2.12.py — kept standalone for easy testing.
+    """The bulb detector. MMPS no longer carries a copy — this script and
+    add_bulbs_to_master.py are where it lives now.
 
     A bulb is a rounded terminal lobe: a blob (isolated by morphological opening,
     soma/body removed) above a size floor, beyond the soma-distance gate, with at

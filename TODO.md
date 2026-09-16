@@ -1,5 +1,20 @@
 # MMPS — open items
 
+## Bulb / beading metrics are out of MMPS  *(removed, recoverable)*
+
+`num_bulbous_endings`, `mean_bulb_diameter_um` and `beading_index` are no
+longer computed by the app or by the morphology cluster script it exports. The
+per-cell soma-outline TIFF load that existed only to feed the detector went
+with them, so morphology does one less disk read per cell.
+
+The detector itself is not lost. `test_bulb_detection.py` (single mask or a
+folder, with overlays for calibrating the thresholds) and
+`add_bulbs_to_master.py` (whole timepoint groups, merges the three columns into
+a copy of your master sheet) each carry a self-contained copy and still work
+against MMPS-exported masks.
+
+To put it back in the app, the removal is one commit — revert it.
+
 ## Vessel diameter runs about half a pixel high  *(open, not fixed)*
 
 `vessel_mean_diameter_um` is `2 x` the distance transform along the skeleton.
