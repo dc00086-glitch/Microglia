@@ -86,6 +86,21 @@ def main():
             fails.append(f"a circle reported polarity_index "
                          f"{p['polarity_index']} — should be ~0")
 
+    # --- no soma outline means no soma area, not a tenth of the mask ------
+    # The fallback wrote mask_area * 0.1, so mmps_phenotype_classifier.R --
+    # which computes soma_cell_ratio = soma_area / mask_area -- got exactly
+    # 0.1 for every such cell, a fabricated constant feeding a classifier.
+    mask = ellipse(60.0, 60.0)
+    got = calc.calculate_all_parameters(mask, (200.0, 200.0), None)['soma_area']
+    if got != '':
+        area = calc.calculate_all_parameters(mask, (200.0, 200.0), None)['mask_area']
+        fails.append(f"with no soma outline, soma_area = {got!r}; it must be "
+                     f"blank (mask_area * 0.1 would be {area * 0.1:.1f}, and "
+                     f"a soma_cell_ratio of exactly 0.1)")
+    got = calc.calculate_all_parameters(mask, (200.0, 200.0), 42.5)['soma_area']
+    if got != 42.5:
+        fails.append(f"a real soma area came through as {got!r}, expected 42.5")
+
     # A horizontal ellipse points along 0 degrees.
     p = calc.calculate_all_parameters(ellipse(120.0, 40.0), (200.0, 200.0), None)
     ang = p['principal_angle'] % 180

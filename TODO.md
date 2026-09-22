@@ -26,9 +26,15 @@ Pinned by `tools/test_morphology_math.py`.
   It is not a mean radius over the arbor, and one long process moves it a lot.
   Defined the same way in the app and the cluster script, so it is at least
   consistent.
-* `soma_area` falls back to `mask_area * 0.1` when no soma outline file is
-  found. That is a fabricated number sitting in a column that otherwise holds
-  a measurement, with nothing marking which rows are which.
+* ~~`soma_area` falls back to `mask_area * 0.1`~~ — **fixed**: it is blank when
+  no soma outline file is found. The fallback mattered more than it looked,
+  because `mmps_phenotype_classifier.R` computes
+  `soma_cell_ratio = soma_area / mask_area`, so every fallback row handed the
+  classifier a ratio of exactly 0.1. Blank reads as `NA` in R, and the script's
+  `mean(soma_area, na.rm = TRUE)` already handles that; `soma_cell_ratio` comes
+  out `NA` for those cells rather than a fake constant. Rows exported before
+  this cannot be told apart from real measurements — re-run morphology if any
+  cells were missing soma outlines.
 
 ## Bulb / beading metrics are out of MMPS  *(removed, recoverable)*
 
