@@ -317,13 +317,22 @@ def microglia_exposure(cell_mask, vessel_mask, tracers, ps, dist_um, soma_mask,
     if not np.any(cm):
         return m
     dist_region = soma_mask if (soma_mask is not None and np.any(soma_mask)) else cm
-    d_soma = float(dist_um[dist_region].min())
-    m['bbb_dist_to_vessel_um'] = round(d_soma, 3)
-    m['bbb_juxtavascular'] = 1 if d_soma <= juxta_max_um else 0
     n_cell = int(cm.sum())
-    overlap = cm & vessel_mask
-    m['bbb_vessel_contact_fraction'] = round(float(overlap.sum()) / n_cell, 4)
-    m['bbb_vessel_contact_area_um2'] = round(float(overlap.sum()) * (ps ** 2), 3)
+    # No vessel in the field means no vessel-relative measure. A distance to
+    # the frame corner and a juxtavascular 0 read as "not near a vessel" when
+    # the truth is "no vessel to be near". Mirrors MMPSv2.12.py.
+    if not vessel_mask.any():
+        m['bbb_dist_to_vessel_um'] = ''
+        m['bbb_juxtavascular'] = ''
+        m['bbb_vessel_contact_fraction'] = ''
+        m['bbb_vessel_contact_area_um2'] = ''
+    else:
+        d_soma = float(dist_um[dist_region].min())
+        m['bbb_dist_to_vessel_um'] = round(d_soma, 3)
+        m['bbb_juxtavascular'] = 1 if d_soma <= juxta_max_um else 0
+        overlap = cm & vessel_mask
+        m['bbb_vessel_contact_fraction'] = round(float(overlap.sum()) / n_cell, 4)
+        m['bbb_vessel_contact_area_um2'] = round(float(overlap.sum()) * (ps ** 2), 3)
     # Vessels come out of every exposure region: tracer in the lumen is blood,
     # not leak. A region with no extravascular pixel left has no value at all
     # and is blank, never zero.

@@ -1007,22 +1007,36 @@ def _microglia_leakage_exposure(cell_mask, vessel_mask, tracers, pixel_size_um,
             dist_region = sm
     if dist_region is None:
         dist_region = cm
-    d_soma = float(dist_um[dist_region].min())
-    m['bbb_dist_to_vessel_um'] = round(d_soma, 3)
-    # Juxtavascular: soma apposed to a vessel wall (standard field convention).
-    # Uses the same soma-based distance, so a lone process touching a vessel
-    # does not make the cell count as juxtavascular.
-    m['bbb_juxtavascular'] = 1 if d_soma <= juxta_max_um else 0
+    # With NO vessel anywhere in the field, none of the vessel-relative
+    # measures exist. They used to come out as a distance to the frame corner
+    # (the distance transform of an all-background image), a juxtavascular 0
+    # and a contact of 0.0 -- four plausible numbers saying "this cell is not
+    # near a vessel" when the truth is "there was no vessel to be near". Those
+    # rows then pooled with real ones and pulled every mean toward no-contact.
+    any_vessel = bool(vessel_mask.any())
     n_cell = int(cm.sum())
-    # Blood-vessel contact for this cell.
-    overlap = cm & vessel_mask
-    m['bbb_vessel_contact_fraction'] = (
-        round(float(overlap.sum()) / n_cell, 4) if n_cell else 0.0)
-    # Contact extent along the vessel wall, in µm² — area of the cell that
-    # actually sits on vessel. Complements the fraction (which is normalised by
-    # cell size, so a big ramified cell and a small round one aren't comparable).
-    m['bbb_vessel_contact_area_um2'] = round(
-        float(overlap.sum()) * (pixel_size_um ** 2), 3)
+    if not any_vessel:
+        m['bbb_dist_to_vessel_um'] = ''
+        m['bbb_juxtavascular'] = ''
+        m['bbb_vessel_contact_fraction'] = ''
+        m['bbb_vessel_contact_area_um2'] = ''
+    else:
+        d_soma = float(dist_um[dist_region].min())
+        m['bbb_dist_to_vessel_um'] = round(d_soma, 3)
+        # Juxtavascular: soma apposed to a vessel wall (standard field
+        # convention). Uses the same soma-based distance, so a lone process
+        # touching a vessel does not make the cell count as juxtavascular.
+        m['bbb_juxtavascular'] = 1 if d_soma <= juxta_max_um else 0
+        # Blood-vessel contact for this cell.
+        overlap = cm & vessel_mask
+        m['bbb_vessel_contact_fraction'] = (
+            round(float(overlap.sum()) / n_cell, 4) if n_cell else 0.0)
+        # Contact extent along the vessel wall, in µm² — area of the cell that
+        # actually sits on vessel. Complements the fraction (which is normalised
+        # by cell size, so a big ramified cell and a small round one are not
+        # comparable).
+        m['bbb_vessel_contact_area_um2'] = round(
+            float(overlap.sum()) * (pixel_size_um ** 2), 3)
     # Exposure regions: the footprint, and the footprint grown out to each
     # radius. Vessels come out of every one of them -- tracer still in the
     # lumen is blood, not leak, and must never count towards what the cell is

@@ -192,6 +192,39 @@ def check_halo(mod, label, fails):
                      f"{sorted(c for c in got_cols if not c.startswith('bbb_'))}")
 
 
+def check_no_vessel_in_field(mod, label, fails):
+    """No vessel anywhere means no vessel-RELATIVE measure for any cell.
+
+    These used to come out as a distance to the frame corner (the distance
+    transform of an all-background image), juxtavascular 0, and contact 0.0 --
+    four plausible numbers saying "this cell is not near a vessel" when the
+    truth is "there was no vessel to be near". Pooled with real rows they drag
+    every mean toward no-contact, and nothing in the sheet marks them.
+    """
+    vessel = np.zeros((H, W), bool)
+    cell = box(30, 40, 30, 40)
+    tracer = np.full((H, W), EXTRA)
+    out = expose(mod, cell, vessel, tracer)
+    for key in ('bbb_dist_to_vessel_um', 'bbb_juxtavascular',
+                'bbb_vessel_contact_fraction', 'bbb_vessel_contact_area_um2'):
+        if key not in out:
+            continue            # the standalone carries a smaller column set
+        if out[key] != '':
+            fails.append(f"{label}: with no vessel in the field, {key} = "
+                         f"{out[key]!r} — it is undefined and must be blank")
+    # Tracer exposure, by contrast, needs no vessel to be defined.
+    for tag, got in exposures(out).items():
+        if not isinstance(got, float) or abs(got - EXTRA) > 1e-6:
+            fails.append(f"{label}: with no vessel, exposure at {tag} = "
+                         f"{got!r}; the parenchymal tracer is still measurable")
+
+    # And a vessel that IS there still measures.
+    vessel[30:40, 45:55] = True
+    out = expose(mod, cell, vessel, tracer)
+    if not isinstance(out.get('bbb_dist_to_vessel_um'), float):
+        fails.append(f"{label}: a vessel in the field gave no distance")
+
+
 def check_rings(mod, fails):
     """Image-level: rings start OUTSIDE the wall, and the split is clean."""
     vessel = vessel_stripe(38, 43)
@@ -218,6 +251,7 @@ def main():
     check_no_lumen(mmps, 'MMPS', fails)
     check_undefined(mmps, 'MMPS', fails)
     check_halo(mmps, 'MMPS', fails)
+    check_no_vessel_in_field(mmps, 'MMPS', fails)
     check_rings(mmps, fails)
 
     # bbb_from_masks.py advertises identical math; hold it to that.
@@ -227,6 +261,7 @@ def main():
         check_no_lumen(alone, 'bbb_from_masks.py', fails)
         check_undefined(alone, 'bbb_from_masks.py', fails)
         check_halo(alone, 'bbb_from_masks.py', fails)
+        check_no_vessel_in_field(alone, 'bbb_from_masks.py', fails)
 
     if fails:
         print("FAIL")
