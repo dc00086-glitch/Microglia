@@ -2961,9 +2961,15 @@ class MorphologyCalculator:
         angle_deg = np.degrees(angle_rad) % 180  # Map to 0-180 range
         params['principal_angle'] = round(angle_deg, 2)
 
-        # Axis extents in microns (2 * sqrt(eigenvalue) gives the std dev extent)
-        params['major_axis_um'] = round(2 * np.sqrt(major_val) * self.pixel_size, 4)
-        params['minor_axis_um'] = round(2 * np.sqrt(max(minor_val, 0)) * self.pixel_size, 4)
+        # FULL axis length, 4 * sqrt(eigenvalue) -- the standard definition,
+        # the one skimage's axis_major_length uses, and the one the
+        # eccentricity and roundness in this same row are already built on.
+        # This was 2 * sqrt(...), which is the SEMI-axis: every major_axis_um
+        # and minor_axis_um was exactly half its own column name, and half what
+        # ImageJ or skimage report for the same cell. Values exported before
+        # this are recoverable by doubling them.
+        params['major_axis_um'] = round(4 * np.sqrt(major_val) * self.pixel_size, 4)
+        params['minor_axis_um'] = round(4 * np.sqrt(max(minor_val, 0)) * self.pixel_size, 4)
 
         return params
 
@@ -7998,8 +8004,10 @@ def compute_metrics(mask_path, pixel_size, soma_area_um2=None):
 
         angle_rad = np.arctan2(major_vec[0], major_vec[1])
         params['principal_angle'] = round(np.degrees(angle_rad) % 180, 2)
-        params['major_axis_um'] = round(2 * np.sqrt(major_val) * pixel_size, 4)
-        params['minor_axis_um'] = round(2 * np.sqrt(max(minor_val, 0)) * pixel_size, 4)
+        # FULL axis length: 4 * sqrt(eigenvalue), matching skimage and the
+        # eccentricity/roundness in the same row. 2 * sqrt(...) is the SEMI-axis.
+        params['major_axis_um'] = round(4 * np.sqrt(major_val) * pixel_size, 4)
+        params['minor_axis_um'] = round(4 * np.sqrt(max(minor_val, 0)) * pixel_size, 4)
     else:
         params['polarity_index'] = 0
         params['principal_angle'] = 0

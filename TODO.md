@@ -1,5 +1,35 @@
 # MMPS — open items
 
+## major_axis_um / minor_axis_um were half-length  *(fixed — re-export needed)*
+
+They came from `2 * sqrt(eigenvalue)`, which is the **semi**-axis. Every value
+was exactly half its own column name, and half what ImageJ or skimage report
+for the same cell. Measured on an ellipse with semi-axes 120 x 40 (true major
+axis 240): MMPS said 120.11, skimage 240.21 — a ratio of exactly 0.500.
+
+Worse, `eccentricity` and `roundness` in the SAME row were built on skimage's
+full-length axes, so one row carried two definitions of "major axis" and
+nothing flagged it. Those two were correct throughout and are unchanged.
+
+Now `4 * sqrt(eigenvalue)`, which matches skimage to four decimals. Fixed in
+both the app and the morphology cluster script it exports.
+
+**Any `major_axis_um` / `minor_axis_um` exported before this is exactly half.**
+Double the old column, or re-run morphology. Nothing else in the sheet moves.
+
+Pinned by `tools/test_morphology_math.py`.
+
+## Two more worth knowing, not bugs
+
+* `cell_spread` / `avg_centroid_distance` is the mean distance from the
+  centroid to only **four** pixels — topmost, bottommost, leftmost, rightmost.
+  It is not a mean radius over the arbor, and one long process moves it a lot.
+  Defined the same way in the app and the cluster script, so it is at least
+  consistent.
+* `soma_area` falls back to `mask_area * 0.1` when no soma outline file is
+  found. That is a fabricated number sitting in a column that otherwise holds
+  a measurement, with nothing marking which rows are which.
+
 ## Bulb / beading metrics are out of MMPS  *(removed, recoverable)*
 
 `num_bulbous_endings`, `mean_bulb_diameter_um` and `beading_index` are no
