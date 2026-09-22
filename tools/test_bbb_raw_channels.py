@@ -113,6 +113,53 @@ def main():
         if arr is None:
             fails.append("punctuation/case difference broke the match")
 
+    # --- a gap in the C-numbers must not shift the later channels ---------
+    # C1, C2, C4 stacked in sorted order put C4 where the dialog calls
+    # Channel 3: the wrong fluorophore under the right name, while the dialog
+    # still promised "Channel 1 = C1".
+    with tempfile.TemporaryDirectory() as d:
+        plane = np.ones((3, 4), dtype=np.uint16)
+        for c, val in ((1, 10), (2, 20), (4, 40)):
+            np.save(os.path.join(d, f'C{c}-gappy.tif.npy'), plane * val)
+            open(os.path.join(d, f'C{c}-gappy.tif'), 'w').close()
+        arr, why = m._load_raw_channel_stack(m._index_raw_channel_folder(d),
+                                             'gappy.tif')
+        if arr is None:
+            fails.append(f"a folder with a channel gap did not load: {why}")
+        else:
+            got = [int(arr[:, :, i].max()) for i in range(arr.shape[2])]
+            if got != [10, 20, 0, 40]:
+                fails.append(f"with C3 missing the planes came out {got}, "
+                             f"expected [10, 20, 0, 40] — channel N must stay "
+                             f"the file C N, with the gap left empty")
+            if 'missing' not in why:
+                fails.append(f"the gap is not mentioned in {why!r}")
+
+    # --- 'Slice_1' must not fall back onto 'Slice_10' ---------------------
+    # Same size, different image: neither the name nor the shape guard catches
+    # it, and the prefix rule accepted it as a unique match.
+    with tempfile.TemporaryDirectory() as d:
+        for c in (1, 2):
+            np.save(os.path.join(d, f'C{c}-Exp_Slice_10.tif.npy'),
+                    np.zeros((2, 2), np.uint16))
+            open(os.path.join(d, f'C{c}-Exp_Slice_10.tif'), 'w').close()
+        index = m._index_raw_channel_folder(d)
+        if m._lookup_raw_entry(index, 'Exp_Slice_1.tif') is not None:
+            fails.append("Exp_Slice_1 matched a folder holding only "
+                         "Exp_Slice_10 — a digit may not start the suffix")
+        if m._lookup_raw_entry(index, 'Exp_Slice_10.tif') is None:
+            fails.append("Exp_Slice_10 no longer matches its own files")
+    with tempfile.TemporaryDirectory() as d:
+        for c in (1, 2):
+            np.save(os.path.join(d, f'C{c}-Exp_Slice_1.tif.npy'),
+                    np.zeros((2, 2), np.uint16))
+            open(os.path.join(d, f'C{c}-Exp_Slice_1.tif'), 'w').close()
+        # the legitimate case the prefix rule exists for
+        if m._lookup_raw_entry(m._index_raw_channel_folder(d),
+                               'Exp_Slice_1_composite.tif') is None:
+            fails.append("a '_composite' export no longer matches its raw "
+                         "files — the prefix rule is now too strict")
+
     # --- ambiguity must not resolve to a guess -----------------------------
     with tempfile.TemporaryDirectory() as d:
         for base in ('Slice_1_a', 'Slice_1_b'):
@@ -129,6 +176,13 @@ def main():
     rgb[..., 0] = 7
     check(m._flatten_single_channel(rgb).shape, (20, 30), "RGB channel file flattened")
     check(int(m._flatten_single_channel(rgb).max()), 7, "flattened value")
+    # RGBA: alpha is opacity, not signal. A constant 255 alpha max()es over the
+    # real channel and turns it into a flat ceiling.
+    rgba = np.zeros((20, 30, 4), np.uint16)
+    rgba[..., 0] = 7
+    rgba[..., 3] = 255
+    check(int(m._flatten_single_channel(rgba).max()), 7,
+          "RGBA channel file: alpha must not be read as signal")
     # A Z-stack's leading axis must not be mistaken for colour, even when it is
     # small enough to look like one.
     zstack = np.zeros((3, 20, 30), np.uint16)

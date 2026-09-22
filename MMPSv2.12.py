@@ -1163,7 +1163,16 @@ def _lookup_raw_entry(index, image_name):
     # longer or shorter name ('..._composite', '..._RGB'), so allow one name to
     # be a prefix of the other. An AMBIGUOUS match is treated as no match --
     # measuring the wrong image's tracers is worse than measuring none.
-    hits = [v for k, v in index.items() if k and (key.startswith(k) or k.startswith(key))]
+    def _extends(short, long_):
+        """True if ``long_`` is ``short`` plus a suffix that starts a new
+        token. The digit test is the whole point: without it 'Slice_1' matches
+        'Slice_10', which is a different image of the same size, so neither the
+        name nor the shape guard catches it."""
+        return (len(long_) > len(short) and long_.startswith(short)
+                and not long_[len(short)].isdigit())
+
+    hits = [v for k, v in index.items()
+            if k and (_extends(k, key) or _extends(key, k))]
     return hits[0] if len(hits) == 1 else None
 
 
@@ -1179,6 +1188,11 @@ def _flatten_single_channel(arr):
         # A trailing axis of 3 or 4 is colour only when it is also the SMALLEST
         # axis; otherwise it is image width and the leading axis is the stack.
         if a.shape[-1] <= 4 and a.shape[-1] == min(a.shape):
+            # Four planes means RGBA, and alpha is opacity, not signal -- it is
+            # usually a constant 255, which a max() would return for every
+            # pixel, turning the channel into a flat ceiling.
+            if a.shape[-1] == 4:
+                a = a[..., :3]
             a = a.max(axis=-1)
         else:
             a = a.max(axis=0)
@@ -1200,9 +1214,22 @@ def _load_raw_channel_stack(index, image_name):
         if len(shapes) != 1:
             return None, ("channel files differ in size (%s)"
                           % ", ".join("%dx%d" % s for s in sorted(shapes)))
-        stack = np.stack(planes, axis=-1)
-        return stack, ("%d channel files, C%s" % (len(nums),
-                                                  "+C".join(str(n) for n in nums)))
+        # Place each plane at ITS OWN channel number, not at its position in
+        # the sorted list. With C3 missing, stacking C1,C2,C4 in order put C4
+        # where the dialog calls Channel 3 -- the wrong fluorophore measured
+        # under the right name, with the dialog still promising "Channel 1 =
+        # C1". A gap is an empty plane instead, which is visible at a glance.
+        by_num = dict(zip(nums, planes))
+        missing = [n for n in range(1, max(nums) + 1) if n not in by_num]
+        blank = np.zeros_like(planes[0])
+        stack = np.stack([by_num.get(n, blank) for n in range(1, max(nums) + 1)],
+                         axis=-1)
+        desc = "%d channel files, C%s" % (len(nums),
+                                          "+C".join(str(n) for n in nums))
+        if missing:
+            desc += (" — C%s missing, left empty so Channel N stays C N"
+                     % "+C".join(str(n) for n in missing))
+        return stack, desc
     whole = entry.get('whole')
     if whole:
         arr = np.asarray(load_tiff_image(whole))
@@ -11599,10 +11626,16 @@ if __name__ == '__main__':
                         if area is None:
                             for fld in ('mask_file', 'cell_name',
                                         'skeleton_file'):
-                                m = _re.search(r'_area(\d+)',
-                                               str(row.get(fld, '')))
-                                if m:
-                                    area = int(m.group(1))
+                                # LAST match, not the first: the mask name is
+                                # <image>_<soma>_area<N>_mask.tif, and an image
+                                # name that itself contains '_area<digits>'
+                                # would otherwise hand back that number and
+                                # merge the whole file as zero matches -- the
+                                # very failure this fallback exists to prevent.
+                                hits = _re.findall(r'_area(\d+)',
+                                                   str(row.get(fld, '')))
+                                if hits:
+                                    area = int(hits[-1])
                                     break
 
                     prefix_map = {'sholl': 'sholl_', 'skeleton': 'skel_', 'fractal': 'fractal_'}
@@ -19440,7 +19473,13 @@ if __name__ == '__main__':
             if self._qa_grid_soma_idx < len(self._qa_soma_order) - 1:
                 self._qa_grid_soma_idx += 1
                 self._show_qa_grid()
-                return
+            else:
+                # Last soma, nothing left on it: the pass is over. Falling
+                # through here redrew the finished grid instead, so approving
+                # the final cell looked like the click did nothing. Reject
+                # always ended properly, because it goes via _qa_grid_next.
+                self._handle_grid_qa_end()
+            return
 
         self.current_image_name = img_name
         self._set_image_name_overlay(img_name)

@@ -173,6 +173,25 @@ def main():
             fails.append("auto-zoom did not come back for the next cell — a "
                          "new cell is elsewhere and has to be found")
 
+    # --- approving the LAST soma must end the pass, like rejecting does ----
+    # _show_qa_grid only advanced while there was a later soma, so on the final
+    # one it redrew the finished grid and the click looked like it did nothing.
+    # Reject never had the bug: it ends via _qa_grid_next.
+    for action, label in ((lambda g: g.approve_current_mask(), 'Approve'),
+                          (lambda g: g.reject_current_mask(), 'Reject')):
+        gui = build(app, n_somas=2)
+        for f in gui.all_masks_flat:          # everything but the last is done
+            if f['mask_data']['soma_id'] != 's1':
+                f['mask_data']['approved'] = True
+                gui._qa_approved_count += 1
+        gui._qa_use_grid = True
+        gui._qa_grid_soma_idx = len(gui._qa_soma_order) - 1
+        gui._show_qa_grid()
+        action(gui)
+        if gui.mask_qa_active:
+            fails.append(f"{label} on the final soma left QA running — the "
+                         f"grid redrew instead of finishing the pass")
+
     # --- Reject still works off the displayed soma in grid view -------------
     gui = build(app)
     gui._qa_use_grid = False
