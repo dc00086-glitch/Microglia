@@ -82,6 +82,15 @@ growing cross a short sub-threshold run when the process continues beyond it.
 It is implemented in the shared `_priority_region_grow`, so it covers the
 **None** and **Watershed** segmentation modes, in the app and in `Redo Masks`.
 
+`Redo Masks (This Image)` carries its own copy of the control, because focus
+drift belongs to one slide and not to the batch: switch it on there and only
+that image is regrown. The redo dialog borrows the app's globals for the length
+of one image and hands them back in a `finally`, so nothing it chooses reaches
+the next whole-batch generation. The per-image choice lives only in the log —
+it is not written into the session or the exported settings, so a batch re-run
+from those settings would NOT reproduce a bridged image. Note the span used in
+your notes if it matters.
+
 It does NOT yet cover:
 
 * **Competitive growth** — `_create_competitive_masks` grows every soma from

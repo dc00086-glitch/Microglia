@@ -198,6 +198,103 @@ def main():
     if int(np.asarray(on)[60, BEYOND].sum()) != 32:
         fails.append("the bridge setting does not reach _grow_masks_for_soma")
 
+    # --- "Redo Masks (This Image)" must expose it, per image ----------------
+    # Focus drift is a property of one slide, not of the batch. The redo dialog
+    # is the place to fix it: turn bridging on for the image that drifted,
+    # leave every other image grown exactly as it was. The settings it uses are
+    # globals borrowed for one image, so they must also be handed back.
+    from PyQt5.QtWidgets import QCheckBox, QSlider, QDialog
+    from PyQt5.QtCore import QTimer
+
+    proc = np.zeros((H, W), np.uint16)
+    proc[:] = 10
+    proc[58:63, 58:63] = 900
+    proc[60, 63:80] = 600
+    proc[60, BREAK] = 12
+    proc[60, BEYOND] = 600
+    outline = np.zeros((H, W), np.uint8)
+    outline[58:63, 58:63] = 1
+
+    gui.images['a.tif'] = {
+        'raw_path': '/x/a.tif', 'processed': proc, 'processed_path': None,
+        'somas': [(60.0, 60.0)], 'soma_ids': ['a_s1'], 'soma_groups': [],
+        'soma_outlines': [{'soma_id': 'a_s1', 'soma_idx': 0,
+                           'polygon_points': [(58, 58), (62, 58), (62, 62),
+                                              (58, 62)],
+                           'outline': outline, 'centroid': (60.0, 60.0),
+                           'soma_area_um2': 25.0}],
+        'masks': [], 'status': 'outlined', 'selected': True, 'animal_id': '',
+        'treatment': '', 'region': '', 'timepoint': '',
+        'rolling_ball_radius': 50, 'pixel_size': 1.0}
+    gui.current_image_name = 'a.tif'
+    gui.mask_min_area = 300
+    gui.mask_max_area = 400
+    gui.mask_step_size = 100
+    gui.min_intensity_percent = 10
+    gui.use_circular_constraint = False
+
+    # The batch setting stays OFF throughout: what the dialog turns on must
+    # reach this image and nothing else.
+    gui.mask_bridge_gaps = False
+    gui.mask_bridge_px = 3
+    seen = {'checkbox': False, 'slider': False}
+
+    def reaper():
+        dlg = QApplication.activeModalWidget()
+        if dlg is None:
+            return
+        boxes = [b for b in dlg.findChildren(QCheckBox)
+                 if 'across small breaks' in b.text()]
+        if isinstance(dlg, QDialog) and boxes:
+            seen['checkbox'] = True
+            boxes[0].setChecked(True)
+            for sl in dlg.findChildren(QSlider):
+                if sl.maximum() == 15:      # the break-span slider
+                    sl.setValue(6)
+                    seen['slider'] = True
+            dlg.accept()
+        else:
+            dlg.reject() if isinstance(dlg, QDialog) else dlg.close()
+
+    timer = QTimer()
+    timer.timeout.connect(reaper)
+    timer.start(30)
+    gui.regenerate_masks_current_image()
+    timer.stop()
+
+    if not seen['checkbox']:
+        fails.append("the Redo Masks dialog has no gap-bridging checkbox; "
+                     "breaks can only be addressed by changing the batch "
+                     "setting and regenerating everything")
+    if not seen['slider']:
+        fails.append("the Redo Masks dialog offers no break-span slider")
+
+    regen = gui.images['a.tif']['masks']
+    if not regen:
+        fails.append("Redo Masks produced no masks at all")
+    else:
+        biggest = max(regen, key=lambda m: int(np.asarray(m['mask']).sum()))
+        got = int(np.asarray(biggest['mask'])[60, BEYOND].sum())
+        if got == 0:
+            fails.append("the redo dialog's bridging setting never reached "
+                         "the grower — the mask still stops at the break")
+
+    if gui.mask_bridge_gaps is not False or gui.mask_bridge_px != 3:
+        fails.append(f"the per-image redo leaked its bridging setting into "
+                     f"the batch settings (gaps={gui.mask_bridge_gaps}, "
+                     f"px={gui.mask_bridge_px}); the next whole-batch "
+                     f"generation would silently bridge too")
+
+    # ...and it must be handed back even when the redo cannot run.
+    gui.images['a.tif']['processed'] = None
+    gui.images['a.tif']['processed_path'] = '/nonexistent/a.tif'
+    timer.start(30)
+    gui.regenerate_masks_current_image()
+    timer.stop()
+    if gui.mask_bridge_gaps is not False or gui.mask_bridge_px != 3:
+        fails.append("a redo that failed part way left the batch bridging "
+                     "setting overwritten")
+
     if fails:
         print("FAIL")
         for f in fails:

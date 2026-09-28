@@ -17266,6 +17266,47 @@ if __name__ == '__main__':
 
         layout.addSpacing(5)
 
+        # --- bridge out-of-focus breaks, per image -------------------------
+        # Breaks are a property of one image's focus, not of the batch, so this
+        # is where the setting is actually useful: turn it on for the slide
+        # that drifted, leave every other image grown exactly as it was.
+        layout.addWidget(QLabel("<b>Out-of-Focus Breaks</b>"))
+        regen_bridge_check = QCheckBox("Follow processes across small breaks")
+        regen_bridge_check.setChecked(bool(getattr(self, 'mask_bridge_gaps', False)))
+        regen_bridge_check.setToolTip(
+            "A process that dips out of the focal plane for a few pixels stops "
+            "the growth dead, and everything past the break is lost — the cell "
+            "reads as truncated, or as beaded and dystrophic when it is "
+            "neither.\nWith this on, growth looks past a short dim run and "
+            "carries on when the process continues on the far side. The gap is "
+            "only crossed when real signal is found beyond it, so a process "
+            "that genuinely ends is not extended.\n\nSet here it applies to "
+            "THIS image only. The batch setting in Mask Generation Settings is "
+            "left alone.")
+        layout.addWidget(regen_bridge_check)
+
+        regen_bridge_row = QHBoxLayout()
+        regen_bridge_row.addWidget(QLabel("  Largest break to cross:"))
+        regen_bridge_slider = QSlider(Qt.Horizontal)
+        regen_bridge_slider.setRange(1, 15)
+        regen_bridge_slider.setValue(max(1, int(getattr(self, 'mask_bridge_px', 3))))
+        regen_bridge_row.addWidget(regen_bridge_slider)
+        regen_bridge_label = QLabel(
+            f"{max(1, int(getattr(self, 'mask_bridge_px', 3)))} px")
+        regen_bridge_slider.valueChanged.connect(
+            lambda v: regen_bridge_label.setText(f"{v} px"))
+        regen_bridge_row.addWidget(regen_bridge_label)
+        layout.addLayout(regen_bridge_row)
+
+        bridge_hint = QLabel(
+            "Bridged pixels become part of the mask, so they count toward area "
+            "and skeleton length. Cross only what the focus actually lost.")
+        bridge_hint.setStyleSheet("color: palette(dark); font-size: 10px;")
+        bridge_hint.setWordWrap(True)
+        layout.addWidget(bridge_hint)
+
+        layout.addSpacing(5)
+
         # Buttons
         button_layout = QHBoxLayout()
         cancel_btn = QPushButton("Cancel")
@@ -17320,43 +17361,58 @@ if __name__ == '__main__':
         saved_use_intensity = self.use_min_intensity
         saved_circular = self.use_circular_constraint
         saved_buffer = self.circular_buffer_um2
+        saved_bridge_on = getattr(self, 'mask_bridge_gaps', False)
+        saved_bridge_px = getattr(self, 'mask_bridge_px', 3)
         self.min_intensity_percent = regen_intensity
         self.use_min_intensity = regen_intensity > 0
         self.use_circular_constraint = regen_circular_check.isChecked()
         self.circular_buffer_um2 = regen_buffer_spin.value()
+        self.mask_bridge_gaps = regen_bridge_check.isChecked()
+        self.mask_bridge_px = regen_bridge_slider.value()
 
         circ_info = f", circular buffer {self.circular_buffer_um2} µm²" if self.use_circular_constraint else ""
+        bridge_info = (f", bridging breaks up to {self.mask_bridge_px} px"
+                       if self._bridge_px() else "")
         self.log(f"Redoing masks for {img_name}: {regen_min}-{regen_max} µm², "
-                 f"step {regen_step}, intensity {regen_intensity}%{circ_info}")
+                 f"step {regen_step}, intensity {regen_intensity}%{circ_info}"
+                 f"{bridge_info}")
 
-        # Ensure processed image is loaded (may have been freed to save RAM)
-        processed_img = self._ensure_processed_loaded(img_name)
-        if processed_img is None:
-            QMessageBox.warning(self, "Error", f"Cannot reload processed image for {img_name}")
-            return
+        # try/finally, because the settings above are GLOBALS borrowed for one
+        # image. Every early exit below used to leave them borrowed, so a
+        # failed redo silently re-pointed the next batch generation at this
+        # image's intensity floor, circular buffer and bridge span.
+        try:
+            # Ensure processed image is loaded (may have been freed to save RAM)
+            processed_img = self._ensure_processed_loaded(img_name)
+            if processed_img is None:
+                QMessageBox.warning(self, "Error", f"Cannot reload processed image for {img_name}")
+                return
 
-        # Reconstruct outline masks from polygon_points if needed
-        self._ensure_outline_masks(img_name, processed_img.shape[:2])
+            # Reconstruct outline masks from polygon_points if needed
+            self._ensure_outline_masks(img_name, processed_img.shape[:2])
 
-        for soma_data in img_data['soma_outlines']:
-            centroid = soma_data['centroid']
-            soma_idx = soma_data['soma_idx']
-            soma_id = soma_data['soma_id']
-            soma_area_um2 = soma_data.get('soma_area_um2', 0)
-            soma_outline = soma_data.get('outline')
+            for soma_data in img_data['soma_outlines']:
+                centroid = soma_data['centroid']
+                soma_idx = soma_data['soma_idx']
+                soma_id = soma_data['soma_id']
+                soma_area_um2 = soma_data.get('soma_area_um2', 0)
+                soma_outline = soma_data.get('outline')
 
-            masks = self._create_annulus_masks(
-                centroid, area_list, pixel_size, soma_idx, soma_id,
-                processed_img, img_name, soma_area_um2,
-                soma_outline_mask=soma_outline
-            )
-            img_data['masks'].extend(masks)
-
-        # Restore global settings
-        self.min_intensity_percent = saved_intensity
-        self.use_min_intensity = saved_use_intensity
-        self.use_circular_constraint = saved_circular
-        self.circular_buffer_um2 = saved_buffer
+                masks = self._create_annulus_masks(
+                    centroid, area_list, pixel_size, soma_idx, soma_id,
+                    processed_img, img_name, soma_area_um2,
+                    soma_outline_mask=soma_outline
+                )
+                img_data['masks'].extend(masks)
+        finally:
+            # The redo dialog is per-image, so nothing chosen in it is allowed
+            # to leak into the next batch generation.
+            self.min_intensity_percent = saved_intensity
+            self.use_min_intensity = saved_use_intensity
+            self.use_circular_constraint = saved_circular
+            self.circular_buffer_um2 = saved_buffer
+            self.mask_bridge_gaps = saved_bridge_on
+            self.mask_bridge_px = saved_bridge_px
 
         # Export all regenerated masks to disk
         if self.masks_dir and os.path.isdir(self.masks_dir):
