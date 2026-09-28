@@ -504,9 +504,16 @@ def _priority_region_grow(roi, cy_roi, cx_roi, soma_outline_roi,
         span = bridged_gap.pop((r, c), None)
         if span:
             for br, bc in span:
+                # Two bridges can cross -- a horizontal probe and a vertical one
+                # share the pixel where their lines meet. Appending it twice
+                # would put a duplicate in growth_order, and since the masks are
+                # PREFIXES of that list, the running count would reach each
+                # target area a pixel early and the mask would come out smaller
+                # than asked for. Already committed means already in the mask,
+                # at an earlier prefix, so connectivity is unaffected.
                 if not visited[br, bc]:
                     visited[br, bc] = True
-                growth_order.append((br, bc))
+                    growth_order.append((br, bc))
         growth_order.append((r, c))
         _push_neighbours(r, c)
 

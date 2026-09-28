@@ -105,6 +105,50 @@ def main():
                          f"pixel that justified it")
             break
 
+    # --- two bridges that cross must not double-count the shared pixel ------
+    # A horizontal probe and a vertical one can cross, and then the pixel where
+    # their lines meet sits in BOTH spans. Committing it twice would put a
+    # duplicate in the growth order, and since masks are prefixes of that list,
+    # every target area would be reached a pixel early -- each mask comes out
+    # smaller than the area asked for, silently.
+    roi3 = np.full((H, W), 10.0)
+    soma3 = np.zeros((H, W), np.uint8)
+    soma3[58:63, 58:63] = 1
+    roi3[58:63, 58:63] = 900.0
+    roi3[60, 63:78] = 600.0        # arm A runs right from the soma
+    roi3[60, 78:81] = 12.0         # ...and breaks
+    roi3[60, 81:90] = 600.0        # ...then carries on
+    roi3[50:58, 60] = 600.0        # arm B goes up,
+    roi3[50, 60:81] = 600.0        # ...across,
+    roi3[51:60, 80] = 600.0        # ...and back down, straight into arm A's
+    roi3[60:63, 80] = 12.0         # break, so both gaps contain (60, 80)
+    roi3[63:70, 80] = 600.0
+
+    order3, _ = mmps._priority_region_grow(
+        roi3, 60, 60, soma3, FLOOR, None, None, 0, None, 5000, 4)
+    if len(order3) != len(set(order3)):
+        dupes = sorted({p for p in order3 if order3.count(p) > 1})
+        fails.append(f"crossing bridges put duplicates in the growth order "
+                     f"({dupes}); masks are prefixes of it, so every mask "
+                     f"would come out short of its target area")
+    m3 = np.zeros((H, W), np.uint8)
+    for r, c in order3:
+        m3[r, c] = 1
+    if int(m3[60, 81:90].sum()) != 9:
+        fails.append(f"the horizontal arm past the crossing recovered "
+                     f"{int(m3[60, 81:90].sum())}/9 pixels")
+    if int(m3[63:70, 80].sum()) != 7:
+        fails.append(f"the vertical arm past the crossing recovered "
+                     f"{int(m3[63:70, 80].sum())}/7 pixels")
+    for n in range(4, len(order3) + 1, 5):
+        m = np.zeros((H, W), np.uint8)
+        for r, c in order3[:n]:
+            m[r, c] = 1
+        if ndimage.label(m)[1] > 1:
+            fails.append(f"crossing bridges left the mask in pieces at prefix "
+                         f"length {n}")
+            break
+
     # --- a process that simply ends must not be extended -------------------
     roi2, soma2 = scene(with_signal_beyond=False)
     mask = grow(roi2, soma2, 8)
