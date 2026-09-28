@@ -1,5 +1,24 @@
 # MMPS — open items
 
+## Cleaning preview is computed from different data than the real output  *(open)*
+
+The preview (`_update_preview`) runs `extract_channel()`, which rescales the
+channel to **0-255 uint8 by that image's own min and max**. The worker
+(`BackgroundRemovalThread._clean_single_channel`) deliberately does NOT — it
+slices the raw channel at full bit depth, with a comment saying why.
+
+So the picture you tune the sliders against is not the picture that gets
+written. Measured on a synthetic 16-bit channel (range 0-3000, rolling ball
+r=20): the two agree on SHAPE (correlation 0.9999, so the radius you pick does
+transfer) but not on scale — worker output mean 465, preview mean 39, and the
+preview is renormalised per image so two sections of different brightness look
+identical in the preview while differing in the data.
+
+Fixing it means having the preview slice the raw channel like the worker and
+leaving the 0-255 mapping to the display path. Not done yet because the display
+path needs checking first — a 16-bit array handed straight to the pixmap
+conversion may render near-black.
+
 ## major_axis_um / minor_axis_um were half-length  *(fixed — re-export needed)*
 
 They came from `2 * sqrt(eigenvalue)`, which is the **semi**-axis. Every value

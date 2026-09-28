@@ -3187,10 +3187,19 @@ class BackgroundRemovalThread(QThread):
         img_dtype = img.dtype
         result = img.copy()
 
+        # Upper clip bound: the dtype's own ceiling for integers, and the
+        # image's own max for floats -- np.iinfo raises on a float dtype, which
+        # made a float32 (e.g. deconvolved) TIFF fail to process at all, with
+        # the exception swallowed into the per-image status line.
+        if np.issubdtype(img_dtype, np.integer):
+            clip_max = float(np.iinfo(img_dtype).max)
+        else:
+            clip_max = float(np.asarray(img).max()) or 1.0
+
         if rb_enabled:
             background = restoration.rolling_ball(img, radius=radius)
             result = img - background
-            result = np.clip(result, 0, np.iinfo(img_dtype).max)
+            result = np.clip(result, 0, clip_max)
 
         if denoise_enabled:
             result = ndimage.median_filter(result, size=denoise_size)
@@ -3199,7 +3208,7 @@ class BackgroundRemovalThread(QThread):
             blurred = ndimage.gaussian_filter(result.astype(np.float32), sigma=2)
             result_float = result.astype(np.float32)
             sharpened = result_float + sharpen_amount * (result_float - blurred)
-            result = np.clip(sharpened, 0, np.iinfo(img_dtype).max).astype(img_dtype)
+            result = np.clip(sharpened, 0, clip_max).astype(img_dtype)
 
         if branch_boost_enabled and branch_boost_amount and branch_boost_amount > 0:
             result = _branch_boost(result, branch_boost_amount)
@@ -12426,13 +12435,24 @@ if __name__ == '__main__':
             ch_check.setVisible(i < n)
 
     def _get_channels_to_clean(self):
-        """Return list of channel indices to clean. Always includes the primary channel."""
-        channels = [self.grayscale_channel]
+        """Channel indices to clean, PRIMARY FIRST.
+
+        The ORDER is the contract. BackgroundRemovalThread takes element 0 as
+        the primary and writes it to <name>_processed.tif -- the image soma
+        picking, outlining, mask growing and every morphology measurement then
+        use. This returned sorted(), which puts the lowest-numbered ticked
+        channel first instead: with IBA1 on Channel 3 and Channel 1 also ticked
+        for cleaning, the list was [0, 2] and the whole analysis ran on
+        Channel 1. Single-channel cleaning was never affected, because then the
+        list holds only the primary.
+        """
+        primary = self.grayscale_channel
+        extras = []
         if self.multi_clean_check.isChecked():
             for i, ch_check in enumerate(self.clean_ch_checks):
-                if ch_check.isChecked() and i != self.grayscale_channel:
-                    channels.append(i)
-        return sorted(set(channels))
+                if ch_check.isChecked() and i != primary:
+                    extras.append(i)
+        return [primary] + sorted(set(extras))
 
     def _on_process_channel_changed(self, index):
         """Update the grayscale channel when user changes the dropdown"""
