@@ -75,6 +75,25 @@ against MMPS-exported masks.
 
 To put it back in the app, the removal is one commit — revert it.
 
+## Gap bridging is not in every grower yet  *(partial)*
+
+"Follow processes across small breaks" (Mask Generation Settings) lets region
+growing cross a short sub-threshold run when the process continues beyond it.
+It is implemented in the shared `_priority_region_grow`, so it covers the
+**None** and **Watershed** segmentation modes, in the app and in `Redo Masks`.
+
+It does NOT yet cover:
+
+* **Competitive growth** — `_create_competitive_masks` grows every soma from
+  one shared priority queue and has its own loop. The generation log says so
+  when that mode is selected with bridging on, rather than silently ignoring it.
+* **The exported cluster script** — it carries its own copy of the grower. The
+  setting is deliberately left OUT of the settings the export writes, so the
+  script cannot be handed a flag it would quietly ignore.
+
+Extending it to both means porting the same probe into two more loops; the
+competitive one needs care because its heap entries carry a soma index.
+
 ## Vessel diameter runs about half a pixel high  *(open, not fixed)*
 
 `vessel_mean_diameter_um` is `2 x` the distance transform along the skeleton.

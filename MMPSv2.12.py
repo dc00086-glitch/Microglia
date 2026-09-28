@@ -394,7 +394,7 @@ def _growth_intensity_floor(roi, cy_roi, cx_roi, floor_mode,
 def _priority_region_grow(roi, cy_roi, cx_roi, soma_outline_roi,
                           intensity_floor, intensity_floor_map,
                           territory_roi, my_label, max_radius_px_sq,
-                          largest_target_px):
+                          largest_target_px, bridge_px=0):
     """Brightest-first priority region growing from the soma seed.
 
     Shared core of the single-soma mask growers. Seeds the growth with the soma
@@ -402,6 +402,20 @@ def _priority_region_grow(roi, cy_roi, cx_roi, soma_outline_roi,
     brightest 4-connected neighbour above the intensity floor, within the
     watershed territory and the circular constraint, until the largest target
     area is reached. Returns ``(growth_order, soma_seed_count)``.
+
+    ``bridge_px`` (0 = off) lets the frontier cross a run of up to that many
+    sub-threshold pixels when signal continues on the far side. A process that
+    dips out of the focal plane for a few pixels otherwise stops the growth
+    dead, and everything past the break is lost -- the cell reads as truncated,
+    or as beaded and dystrophic when it is neither. Filling holes in the
+    finished mask cannot fix that: the growth never reached the far side, so
+    there is nothing there to enclose a hole.
+
+    A bridge is only taken when a pixel within reach passes the floor on its
+    own, and the gap pixels are committed only if that far pixel is actually
+    popped, so an abandoned probe leaves no stub behind. The territory and
+    circular limits apply to every pixel of the bridge, so it cannot leak into
+    a neighbouring cell.
     """
     import heapq
     h, w = roi.shape
@@ -418,9 +432,53 @@ def _priority_region_grow(roi, cy_roi, cx_roi, soma_outline_roi,
         dx = c - cx_roi
         return (dy * dy + dx * dx) <= max_radius_px_sq
 
+    def _passes(r, c):
+        """In bounds, above the floor, and inside both limits."""
+        if not (0 <= r < h and 0 <= c < w):
+            return False
+        fv = (intensity_floor_map[r, c] if intensity_floor_map is not None
+              else intensity_floor)
+        return roi[r, c] >= fv and _in_territory(r, c) and _in_circle(r, c)
+
     visited = np.zeros((h, w), dtype=bool)
     growth_order = []
     heap = []
+    # (far pixel) -> the sub-threshold pixels crossed to reach it. Held until
+    # the far pixel is popped so a probe that never pays off adds nothing.
+    bridged_gap = {}
+
+    def _probe_gap(r, c, dr, dc):
+        """Look straight past a sub-threshold run for signal that carries on."""
+        span = []
+        for _ in range(bridge_px):
+            r += dr
+            c += dc
+            if not (0 <= r < h and 0 <= c < w):
+                return None
+            if not (_in_territory(r, c) and _in_circle(r, c)):
+                return None
+            span.append((r, c))
+            nr, nc = r + dr, c + dc
+            if _passes(nr, nc):
+                return nr, nc, span
+        return None
+
+    def _push_neighbours(r, c):
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < h and 0 <= nc < w) or visited[nr, nc]:
+                continue
+            if _passes(nr, nc):
+                visited[nr, nc] = True
+                heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+            elif bridge_px > 0:
+                got = _probe_gap(r, c, dr, dc)
+                if got is not None:
+                    fr, fc, span = got
+                    if not visited[fr, fc]:
+                        visited[fr, fc] = True
+                        bridged_gap[(fr, fc)] = span
+                        heapq.heappush(heap, (-roi[fr, fc], fr, fc))
 
     soma_seed_count = 0
     if soma_outline_roi is not None:
@@ -431,36 +489,26 @@ def _priority_region_grow(roi, cy_roi, cx_roi, soma_outline_roi,
                 growth_order.append((sr, sc))
                 soma_seed_count += 1
         for sr, sc in zip(soma_ys, soma_xs):
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nr, nc = sr + dr, sc + dc
-                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
-                    if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
-                        visited[nr, nc] = True
-                        heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+            _push_neighbours(sr, sc)
 
     if soma_seed_count == 0:
         visited[cy_roi, cx_roi] = True
         growth_order.append((cy_roi, cx_roi))
         soma_seed_count = 1
-        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            nr, nc = cy_roi + dr, cx_roi + dc
-            if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
-                if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
-                    visited[nr, nc] = True
-                    heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+        _push_neighbours(cy_roi, cx_roi)
 
     while heap and len(growth_order) < largest_target_px:
         neg_intensity, r, c = heapq.heappop(heap)
+        # Commit the gap first, so the mask stays one connected piece at every
+        # prefix length -- the masks are prefixes of this list.
+        span = bridged_gap.pop((r, c), None)
+        if span:
+            for br, bc in span:
+                if not visited[br, bc]:
+                    visited[br, bc] = True
+                growth_order.append((br, bc))
         growth_order.append((r, c))
-        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
-                if roi[nr, nc] >= floor_val and _in_territory(nr, nc) and _in_circle(nr, nc):
-                    visited[nr, nc] = True
-                    heapq.heappush(heap, (-roi[nr, nc], nr, nc))
+        _push_neighbours(r, c)
 
     return growth_order, soma_seed_count
 
@@ -485,6 +533,8 @@ def _grow_masks_for_soma(args):
     floor_mode = args[20] if len(args) > 20 else 'percent'
     # Optional whole-image max so the percent floor matches the preview.
     global_max = args[21] if len(args) > 21 else None
+    # Optional gap-bridging span in pixels (0 = off).
+    bridge_px = int(args[22]) if len(args) > 22 else 0
 
     y_min, y_max, x_min, x_max = roi_bounds
     roi = roi_data  # already float64
@@ -523,7 +573,7 @@ def _grow_masks_for_soma(args):
         roi, cy_roi, cx_roi, soma_outline_roi,
         intensity_floor, intensity_floor_map,
         territory_roi_data, my_territory_label,
-        max_radius_px_sq, largest_target_px)
+        max_radius_px_sq, largest_target_px, bridge_px)
 
     soma_area_px = soma_seed_count
     masks = []
@@ -5066,6 +5116,11 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_floor_radius_px = 100
         self.mask_smooth_enabled = True
         self.mask_smooth_gap_size = 4
+        # Let region growing cross a short out-of-focus break in a process and
+        # keep following it. 0 = off. Filling holes in the finished mask cannot
+        # do this: the growth never reaches the far side of a break.
+        self.mask_bridge_gaps = False
+        self.mask_bridge_px = 3
         self.use_imagej = False
         # Colocalization mode - show images in color
         self.colocalization_mode = False
@@ -9061,6 +9116,8 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             'mask_floor_mode': self.mask_floor_mode,
             'mask_smooth_enabled': self.mask_smooth_enabled,
             'mask_smooth_gap_size': self.mask_smooth_gap_size,
+            'mask_bridge_gaps': getattr(self, 'mask_bridge_gaps', False),
+            'mask_bridge_px': getattr(self, 'mask_bridge_px', 3),
             'coloc_channel_1': self.coloc_channel_1,
             'coloc_channel_2': self.coloc_channel_2,
             'grayscale_channel': self.grayscale_channel,
@@ -9394,6 +9451,35 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         smooth_layout_d1.addWidget(smooth_label)
         intensity_layout.addLayout(smooth_layout_d1)
 
+        # --- bridge out-of-focus breaks while growing ----------------------
+        bridge_check = QCheckBox("Follow processes across small breaks")
+        bridge_check.setChecked(bool(getattr(self, 'mask_bridge_gaps', False)))
+        bridge_check.setToolTip(
+            "A process that dips out of the focal plane for a few pixels stops "
+            "the growth dead, and everything past the break is lost — the cell "
+            "reads as truncated, or as beaded and dystrophic when it is "
+            "neither.\nWith this on, growth looks past a short dim run and "
+            "carries on when the process continues on the far side. The gap is "
+            "only crossed when real signal is found beyond it, so a process "
+            "that genuinely ends is not extended.\n\nThis is NOT the same as "
+            "'Smooth masks' above, which fills holes in the finished mask and "
+            "cannot recover anything past a break.\n\nApplies to the None and "
+            "Watershed segmentation modes. Competitive growth uses a different "
+            "grower and ignores it; the log says so if you pick that.")
+        intensity_layout.addWidget(bridge_check)
+
+        bridge_row = QHBoxLayout()
+        bridge_row.addWidget(QLabel("Largest break to cross:"))
+        bridge_slider = QSlider(Qt.Horizontal)
+        bridge_slider.setRange(1, 15)
+        bridge_slider.setValue(max(1, int(getattr(self, 'mask_bridge_px', 3))))
+        bridge_row.addWidget(bridge_slider)
+        bridge_label = QLabel(f"{max(1, int(getattr(self, 'mask_bridge_px', 3)))} px")
+        bridge_slider.valueChanged.connect(
+            lambda v: bridge_label.setText(f"{v} px"))
+        bridge_row.addWidget(bridge_label)
+        intensity_layout.addLayout(bridge_row)
+
         intensity_group.setLayout(intensity_layout)
         layout.addWidget(intensity_group)
 
@@ -9482,6 +9568,8 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         local_intensity_window = local_win_spin.value()
         self.mask_floor_mode = floor_mode_combo.currentData()
         self.mask_smooth_enabled = smooth_check.isChecked()
+        self.mask_bridge_gaps = bridge_check.isChecked()
+        self.mask_bridge_px = bridge_slider.value()
         self.mask_smooth_gap_size = smooth_slider.value()
         mask_min_area = min_area_spin.value()
         mask_max_area = max_area_spin.value()
@@ -12537,6 +12625,12 @@ if __name__ == '__main__':
             self.clean_ch_checks.append(ch_check)
         for i, ch_check in enumerate(self.clean_ch_checks):
             ch_check.setVisible(i < n)
+
+    def _bridge_px(self):
+        """Gap-bridging span for region growing, in pixels. 0 when switched off."""
+        if not getattr(self, 'mask_bridge_gaps', False):
+            return 0
+        return max(0, int(getattr(self, 'mask_bridge_px', 0)))
 
     def _get_channels_to_clean(self):
         """Channel indices to clean, PRIMARY FIRST.
@@ -16832,6 +16926,15 @@ if __name__ == '__main__':
                             cl_rows.append([mask_key, '0'])
                     self._write_checklist(img_cl_path, cl_rows, ['Mask', 'Generated'])
 
+                bridge_px = self._bridge_px()
+                if bridge_px and seg_method == 'competitive':
+                    self.log(f"  NOTE: gap bridging ({bridge_px} px) does not "
+                             f"apply to competitive segmentation — that mode "
+                             f"grows every soma from one shared queue and has "
+                             f"its own grower. Use None or Watershed for it.")
+                elif bridge_px:
+                    self.log(f"  Gap bridging ON: growth will cross breaks of "
+                             f"up to {bridge_px} px")
                 if seg_method == 'competitive':
                     # Competitive growth: all somas grow simultaneously
                     n_img_somas = len(img_data['soma_outlines'])
@@ -16936,7 +17039,8 @@ if __name__ == '__main__':
                             self.local_intensity_window,
                             self.mask_smooth_enabled, self.mask_smooth_gap_size,
                             getattr(self, 'mask_floor_mode', 'percent'),
-                            float(processed_img.max())
+                            float(processed_img.max()),
+                            self._bridge_px(),
                         ))
 
                     # Run serially (desktops are not set up for parallel work)
@@ -17642,7 +17746,8 @@ if __name__ == '__main__':
         growth_order, soma_seed_count = _priority_region_grow(
             roi, cy_roi, cx_roi, soma_outline_roi,
             intensity_floor, intensity_floor_map,
-            territory_roi, my_label, max_radius_px_sq, largest_target_px)
+            territory_roi, my_label, max_radius_px_sq, largest_target_px,
+            self._bridge_px())
 
         print(f"  {soma_id}: soma={soma_seed_count}px, grew to {len(growth_order)}px (target: {largest_target_px})")
 
