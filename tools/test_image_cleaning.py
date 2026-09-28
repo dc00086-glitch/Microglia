@@ -321,6 +321,43 @@ def main():
         if got and not np.array_equal(got[0], cached):
             fails.append("the reused result is not the cached array")
 
+    # --- branch boost reaches 200, and still does something up there -------
+    # The slider and the spin box are bound to each other, so a spin box left
+    # at a lower maximum catches every slider move above it and drags the
+    # slider back down: the dial just refuses to pass the smaller ceiling.
+    sl, sp = gui.branch_boost_slider, gui.branch_boost_spin
+    if sl.maximum() != 200:
+        fails.append(f"the branch boost slider stops at {sl.maximum()}, not 200")
+    if sp.maximum() != sl.maximum():
+        fails.append(f"the branch boost spin box stops at {sp.maximum()} while "
+                     f"the slider goes to {sl.maximum()}; bound together, the "
+                     f"lower one wins and the dial cannot pass it")
+    sl.setValue(200)
+    app.processEvents()
+    if sl.value() != 200 or sp.value() != 200:
+        fails.append(f"asking for 200 left the slider at {sl.value()} and the "
+                     f"spin at {sp.value()}")
+    sp.setValue(200)
+    app.processEvents()
+    if sl.value() != 200:
+        fails.append(f"typing 200 into the spin box left the slider at {sl.value()}")
+
+    # The strength must keep responding at the top, not sit saturated.
+    line = np.full((200, 200), 200.0)
+    line[100, 20:180] = 900.0
+    line = line.astype(np.uint16)
+    got = [float(mmps._branch_boost(line, dial * 2)[100, 20:180].mean())
+           for dial in (0, 50, 100, 150, 200)]
+    if not all(b > a for a, b in zip(got, got[1:])):
+        fails.append(f"branch boost stops increasing with strength: {got}")
+    if got[-1] <= got[2]:
+        fails.append(f"dial 200 is no stronger than dial 100 ({got[-1]:.0f} vs "
+                     f"{got[2]:.0f}) — the extra range buys nothing")
+    # Existing settings must still mean what they meant.
+    if abs(float(mmps._branch_boost(line, 60)[100, 20:180].mean()) - 1437.5) > 1.0:
+        fails.append("a dial of 30 (internal 60) no longer produces what it did; "
+                     "raising the ceiling must not rescale existing values")
+
     if fails:
         print("FAIL")
         for f in fails:

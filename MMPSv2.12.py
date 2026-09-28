@@ -5557,20 +5557,24 @@ class MicrogliaAnalysisGUI(QMainWindow):
         branch_boost_layout.setContentsMargins(sub_indent, 0, 0, 0)
         branch_boost_layout.addWidget(QLabel("Boost strength:"))
         self.branch_boost_slider = QSlider(Qt.Horizontal)
-        self.branch_boost_slider.setRange(0, 100)     # 0-100 strength dial
+        self.branch_boost_slider.setRange(0, 200)     # 0-200 strength dial
         self.branch_boost_slider.setValue(30)
         self.branch_boost_slider.setSingleStep(1)
         self.branch_boost_slider.setPageStep(5)
         self.branch_boost_slider.setTickPosition(QSlider.TicksBelow)
-        self.branch_boost_slider.setTickInterval(10)
+        self.branch_boost_slider.setTickInterval(20)
         branch_boost_layout.addWidget(self.branch_boost_slider)
         self.branch_boost_spin = QSpinBox()
-        self.branch_boost_spin.setRange(0, 100)
+        # MUST match the slider's range. The two are bound to each other, so a
+        # spin box still capped at 100 would catch every slider move above it
+        # and drag the slider straight back down -- the dial would look like it
+        # simply refused to go past 100.
+        self.branch_boost_spin.setRange(0, 200)
         self.branch_boost_spin.setValue(30)
         self.branch_boost_slider.valueChanged.connect(self.branch_boost_spin.setValue)
         self.branch_boost_spin.valueChanged.connect(self.branch_boost_slider.setValue)
         branch_boost_layout.addWidget(self.branch_boost_spin)
-        branch_boost_layout.addWidget(QLabel("(0–100)"))
+        branch_boost_layout.addWidget(QLabel("(0–200)"))
         extra_layout.addLayout(branch_boost_layout)
 
         extra_processing_group.setLayout(extra_layout)
