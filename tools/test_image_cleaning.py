@@ -26,7 +26,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 try:
     import numpy as np
-    from PyQt5.QtWidgets import QApplication
+    from PyQt5.QtWidgets import QApplication, QDialog
+    from PyQt5.QtCore import QTimer
 except ImportError as e:
     print(f"SKIP: needs numpy and PyQt5 ({e})")
     sys.exit(0)
@@ -45,6 +46,17 @@ def main():
     app = QApplication([])
     gui = mmps.MicrogliaAnalysisGUI()
     assert app is not None
+
+    # Dismiss any modal the app raises. _background_removal_finished ends with
+    # a QMessageBox, which blocks a headless run forever without this.
+    def _dismiss():
+        w = QApplication.activeModalWidget()
+        if w is not None:
+            w.reject() if isinstance(w, QDialog) else w.close()
+
+    reaper = QTimer()
+    reaper.timeout.connect(_dismiss)
+    reaper.start(30)
     fails = []
 
     # --- the primary channel must come FIRST, whatever its number ----------
@@ -163,12 +175,88 @@ def main():
             fails.append(f"background subtraction made {n} {np.dtype(dt).name} "
                          f"pixels BRIGHTER — an unsigned subtraction wrapped")
 
+    # --- a run must actually show progress --------------------------------
+    # The bar is shared with outlining, which leaves a maximum of the soma
+    # count behind; cleaning set only the VALUE, so it wrote into someone
+    # else's range. And the worker's "which image" line went to the log pane
+    # only, leaving the visible caption static for the whole run -- a long run
+    # looked like nothing was happening.
+    import tempfile
+    from PyQt5.QtCore import QEventLoop
+
+    try:
+        import tifffile
+    except ImportError:
+        tifffile = None
+
+    if tifffile is not None:
+        src_dir = tempfile.mkdtemp()
+        out_dir = tempfile.mkdtemp()
+        names = []
+        for i in range(3):
+            n = f'img{i}.tif'
+            names.append(n)
+            tifffile.imwrite(os.path.join(src_dir, n),
+                             (rng.random((120, 120)) * 3000).astype(np.uint16))
+
+        # Leave the bar as an outlining run would.
+        gui.progress_bar.setFormat("%v / %m somas outlined")
+        gui.progress_bar.setMaximum(40)
+
+        # Rolling ball off: this checks the PROGRESS plumbing, and the filter
+        # itself is covered above. Leaving it on makes the test take minutes,
+        # which is exactly why the bar is needed in the first place.
+        plist = [(os.path.join(src_dir, n), n, 25, False, False, 3, False, 1.0,
+                  False, 0, [0]) for n in names]
+        gui.processed_dir = out_dir
+        gui.thread = mmps.BackgroundRemovalThread(plist, out_dir)
+        seen = []
+        gui.thread.status_update.connect(gui._on_clean_status)
+        gui.thread.progress.connect(gui._update_progress)
+        gui.thread.progress.connect(lambda v: seen.append(
+            (v, gui.progress_bar.maximum(), gui.progress_status_label.text())))
+        gui._begin_progress(len(plist), "%v / %m images")
+
+        if gui.progress_bar.maximum() != len(plist):
+            fails.append(f"the bar kept a maximum of "
+                         f"{gui.progress_bar.maximum()} from the previous run "
+                         f"instead of taking {len(plist)}")
+        if 'somas' in gui.progress_bar.format():
+            fails.append(f"the bar still reads {gui.progress_bar.format()!r} "
+                         f"during an image-cleaning run")
+        if not gui.progress_bar.isVisible():
+            fails.append("the progress bar is not visible during a run")
+
+        loop = QEventLoop()
+        gui.thread.finished.connect(loop.quit)
+        gui.thread.start()
+        QTimer.singleShot(30000, loop.quit)
+        loop.exec_()
+
+        if [v for v, _, _ in seen] != list(range(1, len(plist) + 1)):
+            fails.append(f"the bar stepped {[v for v, _, _ in seen]}, expected "
+                         f"{list(range(1, len(plist) + 1))} — progress must "
+                         f"advance once per image, as a count")
+        if any(mx != len(plist) for _, mx, _ in seen):
+            fails.append("the bar's maximum changed mid-run")
+        labels = [lab for _, _, lab in seen]
+        if not all(any(n in lab for n in names) for lab in labels):
+            fails.append(f"the status line never named the image being "
+                         f"processed: {labels}")
+
+        gui._background_removal_finished()
+        if gui.progress_bar.maximum() != 100 or gui.progress_bar.format() != "%p%":
+            fails.append(f"after finishing, the bar was left at "
+                         f"max={gui.progress_bar.maximum()} "
+                         f"format={gui.progress_bar.format()!r} instead of a "
+                         f"plain 0-100 percentage for the next run")
+
     if fails:
         print("FAIL")
         for f in fails:
             print("  " + f)
         sys.exit(1)
-    print("OK: cleaning uses the channel you chose, and every dtype survives")
+    print("OK: right channel, every dtype, live button and a real progress bar")
 
 
 if __name__ == '__main__':

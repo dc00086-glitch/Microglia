@@ -3224,7 +3224,8 @@ class BackgroundRemovalThread(QThread):
                     branch_boost_amount, process_channels) in enumerate(
                 self.image_data_list):
                 try:
-                    self.status_update.emit(f"Processing: {img_name}")
+                    self.status_update.emit(
+                        f"Processing {i + 1}/{total}: {img_name}")
                     raw_img = load_tiff_image(img_path)
 
                     # process_channels is a list; first element is the primary channel
@@ -3253,7 +3254,8 @@ class BackgroundRemovalThread(QThread):
                         for ch_idx in extra_channels:
                             if ch_idx < raw_img.shape[2]:
                                 self.status_update.emit(
-                                    f"Processing: {img_name} (Ch {ch_idx + 1})")
+                                    f"Processing {i + 1}/{total}: {img_name} "
+                                    f"(Ch {ch_idx + 1})")
                                 ch_result = self._clean_single_channel(
                                     raw_img, ch_idx, radius, rb_enabled,
                                     denoise_enabled, denoise_size,
@@ -3267,7 +3269,9 @@ class BackgroundRemovalThread(QThread):
                         if extra_results:
                             self.finished_extra_channels.emit(img_name, extra_results)
 
-                    self.progress.emit(int((i + 1) / total * 100))
+                    # A COUNT, not a percentage: the bar's range is the
+                    # image count, so "3 / 12 images" is what it shows.
+                    self.progress.emit(i + 1)
                 except Exception as e:
                     self.error_occurred.emit(f"Error: {img_name}: {e}")
         except Exception as e:
@@ -13206,25 +13210,53 @@ if __name__ == '__main__':
                                  branch_boost_enabled, branch_boost_amount,
                                  channels_to_clean))
         self.thread = BackgroundRemovalThread(process_list, self.processed_dir)
-        self.thread.status_update.connect(self.log)
+        self.thread.status_update.connect(self._on_clean_status)
         self.thread.progress.connect(self._update_progress)
         self.thread.finished_image.connect(self._handle_processed_image)
         self.thread.finished_extra_channels.connect(self._handle_extra_channels)
         self.thread.finished.connect(self._background_removal_finished)
         self.thread.error_occurred.connect(self._on_clean_error)
-        self.progress_bar.setVisible(True)
+        self._begin_progress(len(process_list), "%v / %m images")
         self.progress_status_label.setVisible(True)
-        if len(channels_to_clean) > 1:
-            self.progress_status_label.setText(f"Processing {len(channels_to_clean)} channels...")
-        elif len(steps) > 1:
-            self.progress_status_label.setText(f"Processing Channel {process_channel + 1}...")
-        else:
-            self.progress_status_label.setText(f"Extracting Channel {process_channel + 1}...")
+        n_img = len(process_list)
+        self.progress_status_label.setText(
+            f"Starting: {n_img} image{'s' if n_img != 1 else ''}"
+            + (f", {len(channels_to_clean)} channels each"
+               if len(channels_to_clean) > 1 else ""))
+        QApplication.processEvents()   # paint the bar before the thread starts
         self.process_selected_btn.setEnabled(False)
         self.thread.start()
 
+    def _begin_progress(self, total, fmt="%v / %m"):
+        """Take the shared progress bar for a new run.
+
+        Cleaning, outlining, mask generation and morphology all drive
+        self.progress_bar, and most of them set only its VALUE.
+        _update_outline_progress leaves a maximum of the soma count behind and
+        _finish_outlining resets the format but not the maximum, so the next run
+        wrote percentages into a bar whose maximum was the soma count and it
+        slammed to full on the first step -- or kept the "%v / %m somas
+        outlined" caption over an unrelated run. Claiming range, format and
+        value together is what makes a run's bar mean what it says.
+        """
+        self.progress_bar.setRange(0, max(int(total), 1))
+        self.progress_bar.setFormat(fmt)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+
     def _update_progress(self, value):
         self.progress_bar.setValue(value)
+
+    def _on_clean_status(self, msg):
+        """Cleaning progress goes to the status line as well as the log.
+
+        The worker already said which image it was on, but that only reached
+        the log pane; the visible caption sat on a static "Processing Channel
+        1..." for the whole run, so a long run looked like nothing happening.
+        """
+        self.log(msg)
+        self.progress_status_label.setText(msg)
+        self.progress_status_label.setVisible(True)
 
     def _handle_processed_image(self, output_path, img_name, processed_data):
         if img_name in self.images:
@@ -13322,6 +13354,8 @@ if __name__ == '__main__':
     def _background_removal_finished(self):
 
         self.progress_bar.setVisible(False)
+        self.progress_bar.setFormat("%p%")      # leave it as the next run expects
+        self.progress_bar.setRange(0, 100)
         self.progress_status_label.setVisible(False)
         self.process_selected_btn.setEnabled(True)
         self.batch_pick_somas_btn.setEnabled(True)
@@ -16282,6 +16316,9 @@ if __name__ == '__main__':
         self._clear_ml_review_order()
         self.progress_bar.setVisible(False)
         self.progress_bar.setFormat("%p%")  # Reset to default format
+        self.progress_bar.setRange(0, 100)  # ...and its range, or the next run
+                                            # writes percentages into a bar
+                                            # whose maximum is the soma count
         self.outline_controls_widget.setVisible(False)
         self.batch_mode = False
         self.processed_label.polygon_mode = False
