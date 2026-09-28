@@ -11536,7 +11536,7 @@ if __name__ == '__main__':
         has_somas = any(d['somas'] for d in self.images.values())
         has_outlines = any(d['soma_outlines'] for d in self.images.values())
 
-        self.process_selected_btn.setEnabled(has_selected)
+        self._refresh_process_button()
         if has_processed:
             self.batch_pick_somas_btn.setEnabled(True)
         if has_somas:
@@ -12764,7 +12764,7 @@ if __name__ == '__main__':
             img_name = item.data(Qt.UserRole)
             self.images[img_name]['selected'] = True
         self.log(f"Selected all {self.file_list.count()} images")
-        # self.update_workflow_status()
+        self._refresh_process_button()
 
     def clear_all_images(self):
         """Deselect all images and uncheck all checkboxes"""
@@ -12774,8 +12774,35 @@ if __name__ == '__main__':
             img_name = item.data(Qt.UserRole)
             self.images[img_name]['selected'] = False
         self.log(f"Cleared selection for all images")
-        # self.update_workflow_status()
-        # self.update_workflow_status()
+        self._refresh_process_button()
+
+    def _on_clean_error(self, msg):
+        """Log a cleaning failure and hand the button back.
+
+        This used to only log. Process Selected Images is disabled the moment a
+        run starts and re-enabled by the finished handler, so a worker that died
+        first left it dead with no way back short of restarting the app.
+        """
+        self.log(f"ERROR: {msg}")
+        self._refresh_process_button()
+
+    def _refresh_process_button(self):
+        """Enable "Process Selected Images" whenever images are loaded.
+
+        Ticking a checkbox only ever updated images[...]['selected'], so a
+        session restored with nothing ticked left this button disabled by
+        _update_buttons_after_session_load with NOTHING able to re-enable it --
+        not ticking an image, not Select All. The same dead end followed a
+        processing run that raised before its finished handler.
+
+        Loading a folder enables it on self.images alone, and
+        process_selected_images already warns when nothing is ticked, so match
+        that: the button offers the action and the handler explains what is
+        missing. Stays disabled only while a run is actually in flight.
+        """
+        th = getattr(self, 'thread', None)
+        running = bool(th is not None and hasattr(th, 'isRunning') and th.isRunning())
+        self.process_selected_btn.setEnabled(bool(self.images) and not running)
 
     def on_item_checkbox_changed(self, item):
         """Handle checkbox state changes for images in the list"""
@@ -12783,6 +12810,7 @@ if __name__ == '__main__':
         if img_name and img_name in self.images:
             is_checked = item.checkState() == Qt.Checked
             self.images[img_name]['selected'] = is_checked
+        self._refresh_process_button()
 
     def on_image_selected(self, item):
         img_name = item.data(Qt.UserRole)
@@ -13183,7 +13211,7 @@ if __name__ == '__main__':
         self.thread.finished_image.connect(self._handle_processed_image)
         self.thread.finished_extra_channels.connect(self._handle_extra_channels)
         self.thread.finished.connect(self._background_removal_finished)
-        self.thread.error_occurred.connect(lambda msg: self.log(f"ERROR: {msg}"))
+        self.thread.error_occurred.connect(self._on_clean_error)
         self.progress_bar.setVisible(True)
         self.progress_status_label.setVisible(True)
         if len(channels_to_clean) > 1:

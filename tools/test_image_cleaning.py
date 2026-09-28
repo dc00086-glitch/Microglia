@@ -75,6 +75,60 @@ def main():
         if got != [primary]:
             fails.append(f"single-channel cleaning on Ch{primary + 1} gave {got}")
 
+    # --- "Process Selected Images" must never get stuck grey ---------------
+    # Ticking a checkbox only updated images[...]['selected'], so a session
+    # restored with nothing ticked left the button disabled with nothing able
+    # to re-enable it -- not ticking an image, not Select All. Same dead end
+    # after a run that errored before its finished handler.
+    from PyQt5.QtWidgets import QListWidgetItem
+    from PyQt5.QtCore import Qt
+
+    def add(name, selected):
+        gui.images[name] = {
+            'raw_path': '/x/' + name, 'processed': None,
+            'processed_channels': {}, 'rolling_ball_radius': 50, 'somas': [],
+            'soma_ids': [], 'soma_groups': [], 'soma_outlines': [], 'masks': [],
+            'status': 'loaded', 'selected': selected, 'animal_id': '',
+            'treatment': '', 'region': '', 'timepoint': '', 'pixel_size': None}
+        item = QListWidgetItem(name)
+        item.setData(Qt.UserRole, name)
+        item.setCheckState(Qt.Checked if selected else Qt.Unchecked)
+        gui.file_list.addItem(item)
+        return item
+
+    first = add('a.tif', False)
+    add('b.tif', False)
+    gui._update_buttons_after_session_load()
+    if not gui.process_selected_btn.isEnabled():
+        fails.append("after a session restored with nothing ticked, Process "
+                     "Selected Images is disabled")
+    first.setCheckState(Qt.Checked)
+    app.processEvents()
+    if not gui.process_selected_btn.isEnabled():
+        fails.append("ticking an image did not re-enable Process Selected Images")
+    gui.select_all_images()
+    if not gui.process_selected_btn.isEnabled():
+        fails.append("Select All did not re-enable Process Selected Images")
+    gui.clear_all_images()
+    if not gui.process_selected_btn.isEnabled():
+        fails.append("Clear All left Process Selected Images disabled; the "
+                     "handler warns about an empty selection, the button "
+                     "should still offer the action")
+
+    # A run that dies before its finished handler must hand the button back.
+    gui.process_selected_btn.setEnabled(False)
+    gui._on_clean_error("Error: a.tif: boom")
+    if not gui.process_selected_btn.isEnabled():
+        fails.append("a cleaning run that errored left Process Selected Images "
+                     "disabled with no way back")
+
+    # With no images at all it stays off, which is the one correct disable.
+    gui.images.clear()
+    gui.file_list.clear()
+    gui._refresh_process_button()
+    if gui.process_selected_btn.isEnabled():
+        fails.append("Process Selected Images is enabled with no images loaded")
+
     # --- every plausible dtype must clean, not raise -----------------------
     worker = mmps.BackgroundRemovalThread([], '/tmp')
     rng = np.random.default_rng(0)
