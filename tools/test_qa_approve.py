@@ -206,6 +206,18 @@ def main():
     if rejected != {f"{target}@{s}" for s in SIZES}:
         fails.append(f"grid Reject on soma {target}: rejected {sorted(rejected)}")
 
+    # --- the space bar must not approve anything ---------------------------
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QKeyEvent
+    gui = build(app, n_somas=2)
+    gui.keyPressEvent(QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Space, Qt.NoModifier))
+    if any(f['mask_data']['approved'] is not None for f in gui.all_masks_flat):
+        fails.append("pressing Space approved a mask; that binding was removed")
+    gui.keyPressEvent(QKeyEvent(QKeyEvent.KeyPress, Qt.Key_A, Qt.NoModifier))
+    if not any(f['mask_data']['approved'] is True for f in gui.all_masks_flat):
+        fails.append("pressing A no longer approves — removing Space took the "
+                     "A binding with it")
+
     if fails:
         print("FAIL")
         for f in fails:

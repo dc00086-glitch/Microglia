@@ -251,6 +251,76 @@ def main():
                          f"format={gui.progress_bar.format()!r} instead of a "
                          f"plain 0-100 percentage for the next run")
 
+    # --- the fast background must match the exact one, and never exceed it --
+    from skimage import restoration as _rest
+    yy, xx = np.mgrid[:512, :512]
+    field = (400 + 300 * np.sin(xx / 150.) + 200 * np.cos(yy / 120.))
+    for _ in range(8):
+        cy, cx = rng.integers(40, 470, 2)
+        field = field + 2500 * np.exp(-(((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 7. ** 2)))
+    field = np.clip(field + rng.normal(0, 20, field.shape), 0, 65535).astype(np.uint16)
+
+    exact = mmps._rolling_ball_background(field, 50, fast=False)
+    fast = mmps._rolling_ball_background(field, 50, fast=True)
+    se = np.clip(field.astype(float) - exact, 0, None)
+    sf = np.clip(field.astype(float) - fast, 0, None)
+    corr = (((se - se.mean()) * (sf - sf.mean())).mean()
+            / (se.std() * sf.std() + 1e-12))
+    if corr < 0.99:
+        fails.append(f"the fast background tracks the exact one at only "
+                     f"r={corr:.4f}; below 0.99 it is not a drop-in")
+    # The unsigned subtraction downstream is only safe because a rolling-ball
+    # background never exceeds the image. Upsampling can break that.
+    if np.any(np.asarray(fast) > field.astype(np.float32)):
+        n = int((np.asarray(fast) > field.astype(np.float32)).sum())
+        fails.append(f"the fast background exceeds the image at {n} pixels — "
+                     f"the subtraction that follows would wrap and turn the "
+                     f"dimmest pixels into the brightest")
+    # A small radius has nothing to gain and must run exactly.
+    a = mmps._rolling_ball_background(field, 8, fast=True)
+    b = mmps._rolling_ball_background(field, 8, fast=False)
+    if not np.array_equal(np.asarray(a), np.asarray(b)):
+        fails.append("a radius below the fast-path threshold did not run exactly")
+
+    # --- preview and worker must compute the SAME thing --------------------
+    # This is what makes reusing a preview result for processing sound. They
+    # used to have separate copies and the preview rescaled its input to 0-255.
+    raw3 = np.dstack([field, field // 2, field // 3]).astype(np.uint16)
+    args = (50, True, False, 3, False, 1.0, False, 0, True)
+    from_worker = worker._clean_single_channel(raw3, 0, *args)
+    from_shared = mmps._clean_channel(raw3, 0, *args)
+    if not np.array_equal(from_worker, from_shared):
+        fails.append("the worker and the shared cleaning function disagree, so "
+                     "a cached preview cannot be trusted for processing")
+    if from_shared.dtype != raw3.dtype:
+        fails.append(f"cleaning a {raw3.dtype} channel returned "
+                     f"{from_shared.dtype} — the preview would be rescaled")
+
+    # --- a cached preview is reused, not recomputed ------------------------
+    if tifffile is not None:
+        cdir = tempfile.mkdtemp()
+        cout = tempfile.mkdtemp()
+        cname = 'cached.tif'
+        tifffile.imwrite(os.path.join(cdir, cname), raw3)
+        cached = mmps._clean_channel(raw3, 0, *args)
+        plist2 = [(os.path.join(cdir, cname), cname, 50, True, False, 3, False,
+                   1.0, False, 0, [0])]
+        th = mmps.BackgroundRemovalThread(
+            plist2, cout, precomputed={(cname, 0): cached}, fast_background=True)
+        said = []
+        th.status_update.connect(said.append)
+        got = []
+        th.finished_image.connect(lambda p_, n_, d_: got.append(d_))
+        loop2 = QEventLoop()
+        th.finished.connect(loop2.quit)
+        th.start()
+        QTimer.singleShot(30000, loop2.quit)
+        loop2.exec_()
+        if not any('Reusing' in msg for msg in said):
+            fails.append(f"a cached preview was not reused: {said}")
+        if got and not np.array_equal(got[0], cached):
+            fails.append("the reused result is not the cached array")
+
     if fails:
         print("FAIL")
         for f in fails:

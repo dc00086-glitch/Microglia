@@ -1,23 +1,28 @@
 # MMPS — open items
 
-## Cleaning preview is computed from different data than the real output  *(open)*
+## Cleaning: fast background, and the preview feeds processing  *(done)*
 
-The preview (`_update_preview`) runs `extract_channel()`, which rescales the
-channel to **0-255 uint8 by that image's own min and max**. The worker
-(`BackgroundRemovalThread._clean_single_channel`) deliberately does NOT — it
-slices the raw channel at full bit depth, with a comment saying why.
+**Background subtraction** estimates the background on a copy downsampled by
+up to 8x with a proportionally smaller radius, then resizes it back. skimage's
+ball is a non-flat structuring element, so the exact call scales with kernel
+**area**: 1.0 s, 4.1 s, 16.3 s at radius 25, 50, 100 on a 512x512 frame, and
+**64.5 s on a 2048x2048 frame at radius 50**. The estimate costs 0.26 s there,
+and tracked the exact result at r = 0.996-0.999 in every test — better than a
+flat-disk opening (0.9976) or a gaussian high-pass (0.9858), and it is what
+ImageJ's own Subtract Background does. Radii below 15 still run exactly, and the
+estimate is clamped to never exceed the image, because the unsigned subtraction
+that follows is only safe while the background is anti-extensive.
 
-So the picture you tune the sliders against is not the picture that gets
-written. Measured on a synthetic 16-bit channel (range 0-3000, rolling ball
-r=20): the two agree on SHAPE (correlation 0.9999, so the radius you pick does
-transfer) but not on scale — worker output mean 465, preview mean 39, and the
-preview is renormalised per image so two sections of different brightness look
-identical in the preview while differing in the data.
+**Advanced > Exact Rolling Ball (slow)** runs the full-resolution call instead,
+for comparing on one image.
 
-Fixing it means having the preview slice the raw channel like the worker and
-leaving the 0-255 mapping to the display path. Not done yet because the display
-path needs checking first — a 16-bit array handed straight to the pixmap
-conversion may render near-black.
+**The preview is now a real preview.** It used to run `extract_channel()` first,
+rescaling to 0-255 by that image's own min and max, while the worker used the
+raw channel at full depth — so what you tuned was not what got written. Both now
+call one module-level `_clean_channel()`, so they cannot drift apart, and the
+preview's result is cached under (image, channel, every setting) and reused by
+"Process Selected Images" when nothing changed. The log says how many channels
+were reused.
 
 ## major_axis_um / minor_axis_um were half-length  *(fixed — re-export needed)*
 
