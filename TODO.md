@@ -80,7 +80,9 @@ To put it back in the app, the removal is one commit — revert it.
 "Follow processes across small breaks" (Mask Generation Settings) lets region
 growing cross a short sub-threshold run when the process continues beyond it.
 It is implemented in the shared `_priority_region_grow`, so it covers the
-**None** and **Watershed** segmentation modes, in the app and in `Redo Masks`.
+**None** and **Watershed** segmentation modes, and separately in
+`_create_competitive_masks` for **Competitive** — so all three modes bridge,
+in the app and in `Redo Masks`.
 
 `Redo Masks (This Image)` carries its own copy of the control, because focus
 drift belongs to one slide and not to the batch: switch it on there and only
@@ -93,15 +95,31 @@ your notes if it matters.
 
 It does NOT yet cover:
 
-* **Competitive growth** — `_create_competitive_masks` grows every soma from
-  one shared priority queue and has its own loop. The generation log says so
-  when that mode is selected with bridging on, rather than silently ignoring it.
 * **The exported cluster script** — it carries its own copy of the grower. The
   setting is deliberately left OUT of the settings the export writes, so the
   script cannot be handed a flag it would quietly ignore.
 
-Extending it to both means porting the same probe into two more loops; the
-competitive one needs care because its heap entries carry a soma index.
+**Competitive growth now bridges too**, which matters because that is the mode
+the study data was grown in. Its rules are stricter than the single-soma
+grower's, because the dark valley between two cells is exactly what competition
+uses to place the boundary:
+
+* a probe refuses to cross any visited pixel, whoever owns it
+* the gap pixels are reserved (visited + owned) when the bridge is queued, not
+  when it is committed — so by the time the far pixel is popped the pixels
+  behind it are still ours and still uncommitted, and the mask is connected at
+  every prefix length
+* reserving also arbitrates two bridges over one gap: the first probe wins, the
+  loser does not bridge at all (the single-soma grower instead lets them share
+  the crossing pixel)
+
+What it does NOT prevent: a bridge reaching unclaimed signal that morphologically
+belongs to the neighbour, when it gets there before the neighbour's own growth
+does. It cannot take a pixel the neighbour already owns. The generation log says
+this when the two are combined.
+
+Extending it to the exported cluster script means porting the same probe into
+that script's own copy of the grower.
 
 ## Vessel diameter runs about half a pixel high  *(open, not fixed)*
 

@@ -198,6 +198,78 @@ def main():
     if int(np.asarray(on)[60, BEYOND].sum()) != 32:
         fails.append("the bridge setting does not reach _grow_masks_for_soma")
 
+    # --- competitive growth must bridge too, without swapping pixels -------
+    # This is the mode the study data was grown in, so "the option exists" is
+    # worth nothing if it stops at the other two. Competition makes it
+    # stricter: the dark valley between two cells is what places the boundary,
+    # so a bridge must never pull a pixel out of a neighbouring cell.
+    from PyQt5.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    g = mmps.MicrogliaAnalysisGUI()
+    g.use_min_intensity = True
+    g.min_intensity_percent = 10
+    g.local_intensity_window = 0
+    g.use_circular_constraint = False
+    g.mask_smooth_enabled = False
+
+    # Two cells facing each other, each with a broken process. The break in
+    # cell A's process sits 2 px from cell B's own signal.
+    comp = np.full((H, W), 10.0)
+    comp[28:33, 28:33] = 900.0                 # cell A soma
+    comp[30, 33:44] = 600.0                    # A's process, running right
+    comp[30, 44:47] = 12.0                     # ...broken
+    comp[30, 47:58] = 600.0                    # ...and continuing
+    comp[28:33, 78:83] = 900.0                 # cell B soma, well clear
+    comp[30, 70:78] = 600.0                    # B's process, running left
+    oa = np.zeros((H, W), np.uint8); oa[28:33, 28:33] = 1
+    ob = np.zeros((H, W), np.uint8); ob[28:33, 78:83] = 1
+    somas = [
+        {'soma_idx': 0, 'soma_id': 'A', 'centroid': (30.0, 30.0),
+         'soma_area_um2': 25.0, 'outline': oa},
+        {'soma_idx': 1, 'soma_id': 'B', 'centroid': (30.0, 80.0),
+         'soma_area_um2': 25.0, 'outline': ob},
+    ]
+
+    def comp_masks(bridge):
+        g.mask_bridge_gaps = bool(bridge)
+        g.mask_bridge_px = max(1, bridge)
+        out = g._create_competitive_masks(
+            comp.astype(np.uint16), somas, [400], 1.0, 'c.tif')
+        by = {}
+        for m in out:
+            by[m['soma_id']] = np.asarray(m['mask'])
+        return by
+
+    off = comp_masks(0)
+    on = comp_masks(4)
+
+    if int(off['A'][30, 47:58].sum()) != 0:
+        fails.append("competitive growth crossed the break with bridging off")
+    got = int(on['A'][30, 47:58].sum())
+    if got != 11:
+        fails.append(f"competitive growth recovered {got}/11 pixels past the "
+                     f"break — bridging does not reach this mode, which is the "
+                     f"one the study data uses")
+
+    # No pixel may end up in two cells at once, bridged or not.
+    for tag, masks in (('off', off), ('on', on)):
+        overlap = int((masks['A'] & masks['B']).sum())
+        if overlap:
+            fails.append(f"bridging {tag}: {overlap} pixels belong to both "
+                         f"cells at once")
+
+    # Each cell's mask must still be a single connected piece.
+    for tag, masks in (('off', off), ('on', on)):
+        for sid, m in masks.items():
+            n = ndimage.label(m)[1]
+            if n > 1:
+                fails.append(f"bridging {tag}: cell {sid}'s mask is in {n} "
+                             f"pieces")
+
+    # A bridge must not reach into the neighbour's own process.
+    if int(on['A'][30, 70:78].sum()):
+        fails.append("cell A's bridge took pixels from cell B's process")
+
     # --- "Redo Masks (This Image)" must expose it, per image ----------------
     # Focus drift is a property of one slide, not of the batch. The redo dialog
     # is the place to fix it: turn bridging on for the image that drifted,

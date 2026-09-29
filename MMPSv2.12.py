@@ -16934,14 +16934,16 @@ if __name__ == '__main__':
                     self._write_checklist(img_cl_path, cl_rows, ['Mask', 'Generated'])
 
                 bridge_px = self._bridge_px()
-                if bridge_px and seg_method == 'competitive':
-                    self.log(f"  NOTE: gap bridging ({bridge_px} px) does not "
-                             f"apply to competitive segmentation — that mode "
-                             f"grows every soma from one shared queue and has "
-                             f"its own grower. Use None or Watershed for it.")
-                elif bridge_px:
+                if bridge_px:
                     self.log(f"  Gap bridging ON: growth will cross breaks of "
                              f"up to {bridge_px} px")
+                if bridge_px and seg_method == 'competitive':
+                    self.log(f"    competitive growth places cell boundaries "
+                             f"along the dark valleys between cells, and a "
+                             f"bridge looks past dark pixels — so keep the "
+                             f"span to what the focus actually lost. A bridge "
+                             f"cannot cross a pixel another cell already "
+                             f"owns, but it can reach unclaimed signal first.")
                 if seg_method == 'competitive':
                     # Competitive growth: all somas grow simultaneously
                     n_img_somas = len(img_data['soma_outlines'])
@@ -17139,6 +17141,45 @@ if __name__ == '__main__':
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Failed: {e}")
+
+    def _qa_recount(self):
+        """Rebuild the QA counters and per-image soma counts from the queue.
+
+        They are running totals kept for an O(1) status readout, so anything
+        that rebuilds all_masks_flat has to rebuild these with it. Redoing one
+        image's masks does exactly that -- it drops that image's entries and
+        splices new ones in -- and used to leave the totals describing masks
+        that no longer exist, so the progress line drifted further from the
+        truth with every redo.
+        """
+        self._qa_soma_order = []
+        seen = set()
+        for flat in self.all_masks_flat:
+            key = (flat['image_name'], flat['mask_data']['soma_id'])
+            if key not in seen:
+                seen.add(key)
+                self._qa_soma_order.append(key)
+        # Keep the existing finalized set -- only somas still present matter.
+        self._qa_finalized_somas = {k for k in
+                                    getattr(self, '_qa_finalized_somas', set())
+                                    if k in seen}
+
+        self._qa_image_soma_count = {}
+        for img, _sid in self._qa_soma_order:
+            self._qa_image_soma_count[img] = \
+                self._qa_image_soma_count.get(img, 0) + 1
+
+        self._qa_auto_rejected_count = 0
+        self._qa_approved_count = 0
+        self._qa_user_rejected_count = 0
+        for f in self.all_masks_flat:
+            md = f['mask_data']
+            if md.get('duplicate'):
+                self._qa_auto_rejected_count += 1
+            elif md.get('approved') is True:
+                self._qa_approved_count += 1
+            elif md.get('approved') is False:
+                self._qa_user_rejected_count += 1
 
     def regenerate_masks_current_image(self):
         """Regenerate masks for the image currently shown in QA with custom settings."""
@@ -17351,6 +17392,15 @@ if __name__ == '__main__':
                     except Exception:
                         pass
 
+        # Where this image's masks sat in the QA queue. The new ones are
+        # spliced back in at the same place: appending them instead puts this
+        # image BEHIND every other one, so its cells reappear at the very end
+        # of the pass, long after you have moved on. Entries before the first
+        # occurrence are all other images, so this index is the same in the
+        # filtered list.
+        insert_at = next((i for i, flat in enumerate(self.all_masks_flat)
+                          if flat['image_name'] == img_name),
+                         len(self.all_masks_flat))
         self.all_masks_flat = [flat for flat in self.all_masks_flat
                                if flat['image_name'] != img_name]
 
@@ -17422,35 +17472,53 @@ if __name__ == '__main__':
         self._update_file_list_item(img_name)
 
         if img_data['selected']:
-            for mask_data in img_data['masks']:
-                self.all_masks_flat.append({
-                    'image_name': img_name,
-                    'mask_data': mask_data,
-                })
+            self.all_masks_flat[insert_at:insert_at] = [
+                {'image_name': img_name, 'mask_data': mask_data}
+                for mask_data in img_data['masks']]
 
-        # Rebuild soma ordering after regeneration
-        self._qa_soma_order = []
-        seen_somas = set()
-        for flat in self.all_masks_flat:
-            key = (flat['image_name'], flat['mask_data']['soma_id'])
-            if key not in seen_somas:
-                seen_somas.add(key)
-                self._qa_soma_order.append(key)
-        # Keep existing finalized set — only somas still present matter
-        self._qa_finalized_somas = {k for k in self._qa_finalized_somas if k in seen_somas}
+        # Soma ordering AND the running QA counters, both of which describe
+        # the queue that was just rebuilt.
+        self._qa_recount()
 
         total = len(img_data['masks'])
         self.log(f"Generated {total} new masks for {img_name}")
         self._auto_save()
 
-        # If QA was active, jump to the first new mask for this image
+        # The queue was rebuilt under the old index, so it now points at
+        # somebody else's mask. Re-anchor it, and ALWAYS put something real on
+        # screen: both ways of finding no new mask to review used to return
+        # here silently, leaving the previous cell on display with a stale
+        # index behind it, so the next accept landed on the wrong mask.
+        #
+        #   * every new mask can be resolved already -- generation
+        #     auto-rejects a size that came out identical to a smaller one,
+        #     and if growth stopped early that is every size
+        #   * the image may not be selected for QA, in which case none of its
+        #     masks is in the queue at all
         if self.mask_qa_active:
-            for i, flat in enumerate(self.all_masks_flat):
-                if flat['image_name'] == img_name and flat['mask_data']['approved'] is None:
-                    self.mask_qa_idx = i
-                    self._show_current_mask()
-                    return
+            target = next((i for i, flat in enumerate(self.all_masks_flat)
+                           if flat['image_name'] == img_name
+                           and flat['mask_data']['approved'] is None), None)
+            if target is None:
+                short = os.path.splitext(img_name)[0]
+                if not img_data['selected']:
+                    self.log(f"  {short} is not selected for QA, so its new "
+                             f"masks are not in the review queue")
+                else:
+                    self.log(f"  nothing left to review for {short} — every "
+                             f"new mask was auto-rejected as a duplicate of a "
+                             f"smaller size, which means growth stopped before "
+                             f"the smallest target. Lower the intensity floor "
+                             f"or check the channel.")
+                target = insert_at
+            self.mask_qa_idx = max(0, min(target, len(self.all_masks_flat) - 1))
+            if self.all_masks_flat:
+                self._show_current_mask()
+            else:
+                self._check_qa_complete()
         else:
+            self.mask_qa_idx = max(0, min(self.mask_qa_idx,
+                                          len(self.all_masks_flat) - 1))
             self.batch_qa_btn.setEnabled(True)
             self.opacity_widget.setVisible(True)
             QMessageBox.information(self, "Done",
@@ -17549,6 +17617,85 @@ if __name__ == '__main__':
         visited = np.zeros((h, w), dtype=bool)
         heap = []  # shared priority queue: (-intensity, row, col, soma_index)
 
+        # --- gap bridging -----------------------------------------------------
+        # Same idea as in _priority_region_grow: look straight past a short
+        # sub-threshold run and carry on when the process continues on the far
+        # side. Competition makes it stricter here. A dark valley between two
+        # cells is exactly what this mode uses to place the boundary, so a
+        # bridge must never be able to grow one cell through a pixel another
+        # cell has already taken. Two rules keep that true:
+        #
+        #   * a probe refuses to cross any visited pixel, whoever owns it
+        #   * the gap pixels are RESERVED (visited + owned) the moment the
+        #     bridge is queued, not at commit time
+        #
+        # Reserving up front is what guarantees the mask is connected: by the
+        # time the far pixel is popped, the pixels between it and the soma are
+        # still ours and still uncommitted, so they can be added immediately
+        # before it. Reserving also arbitrates between two bridges over the
+        # same gap -- the first probe wins, and the loser simply does not
+        # bridge. A bridge that is abandoned (its far pixel claimed by another
+        # soma, or its soma finishing first) leaves its reserved pixels in no
+        # mask at all, so an unpaid probe still adds nothing.
+        bridge_px = self._bridge_px()
+        bridged_gap = {}          # far pixel -> (soma index, reserved span)
+
+        def _floor_at(r, c):
+            return (intensity_floor_map[r, c]
+                    if intensity_floor_map is not None else intensity_floor)
+
+        def _in_circle(r, c, si):
+            if max_radius_px_sq is None:
+                return True
+            cy_s, cx_s = soma_centroids[si]
+            dy = r - cy_s
+            dx = c - cx_s
+            return (dy * dy + dx * dx) <= max_radius_px_sq
+
+        def _probe_gap(r, c, dr, dc, si):
+            """Look straight past a sub-threshold run for signal that carries on."""
+            span = []
+            for _ in range(bridge_px):
+                r += dr
+                c += dc
+                if not (0 <= r < h and 0 <= c < w):
+                    return None
+                if visited[r, c] or not _in_circle(r, c, si):
+                    return None
+                span.append((r, c))
+                nr, nc = r + dr, c + dc
+                if (0 <= nr < h and 0 <= nc < w and not visited[nr, nc]
+                        and roi[nr, nc] >= _floor_at(nr, nc)
+                        and _in_circle(nr, nc, si)):
+                    return nr, nc, span
+            return None
+
+        def _push_neighbours(r, c, si):
+            """Claim and queue this pixel's 4 neighbours for soma ``si``."""
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < h and 0 <= nc < w) or visited[nr, nc]:
+                    continue
+                if roi[nr, nc] >= _floor_at(nr, nc):
+                    if not _in_circle(nr, nc, si):
+                        continue
+                    visited[nr, nc] = True
+                    owner_map[nr, nc] = si
+                    heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
+                elif bridge_px > 0:
+                    # Below the floor. Only a focus break is worth looking
+                    # past, so nothing outside the circle is probed.
+                    got = _probe_gap(r, c, dr, dc, si)
+                    if got is not None:
+                        fr, fc, span = got
+                        for br, bc in span:
+                            visited[br, bc] = True
+                            owner_map[br, bc] = si
+                        visited[fr, fc] = True
+                        owner_map[fr, fc] = si
+                        bridged_gap[(fr, fc)] = (si, span)
+                        heapq.heappush(heap, (-roi[fr, fc], fr, fc, si))
+
         # Per-soma growth tracking
         n_somas = len(soma_outlines_data)
         growth_orders = [[] for _ in range(n_somas)]  # growth_orders[i] = [(r,c), ...]
@@ -17575,19 +17722,7 @@ if __name__ == '__main__':
                         soma_seed_counts[si] += 1
                 # Push boundary neighbors
                 for sr, sc in zip(soma_ys, soma_xs):
-                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                        nr, nc = sr + dr, sc + dc
-                        if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                            floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
-                            if roi[nr, nc] >= floor_val:
-                                if max_radius_px_sq is not None:
-                                    dy = nr - cy
-                                    dx = nc - cx
-                                    if (dy * dy + dx * dx) > max_radius_px_sq:
-                                        continue
-                                visited[nr, nc] = True
-                                owner_map[nr, nc] = si
-                                heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
+                    _push_neighbours(sr, sc, si)
                 seeded = True
 
             if not seeded:
@@ -17596,19 +17731,7 @@ if __name__ == '__main__':
                     owner_map[cy, cx] = si
                     growth_orders[si].append((cy, cx))
                     soma_seed_counts[si] = 1
-                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                        nr, nc = cy + dr, cx + dc
-                        if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                            floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
-                            if roi[nr, nc] >= floor_val:
-                                if max_radius_px_sq is not None:
-                                    dy = nr - cy
-                                    dx = nc - cx
-                                    if (dy * dy + dx * dx) > max_radius_px_sq:
-                                        continue
-                                visited[nr, nc] = True
-                                owner_map[nr, nc] = si
-                                heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
+                    _push_neighbours(cy, cx, si)
 
         # Competitive growth: all somas grow simultaneously
         # Stop each soma when it reaches its largest target
@@ -17623,14 +17746,26 @@ if __name__ == '__main__':
             # Check if this pixel was already claimed by another soma
             # (can happen if a neighbor was pushed by multiple somas before being popped)
             if owner_map[r, c] != si:
+                bridged_gap.pop((r, c), None)
                 continue
 
             # Check if this soma has reached its target
             if len(growth_orders[si]) >= largest_target_px:
                 soma_done[si] = True
+                bridged_gap.pop((r, c), None)
                 if all(soma_done):
                     break
                 continue
+
+            # Commit the reserved gap first, so this soma's mask is one
+            # connected piece at every prefix length -- the masks are prefixes
+            # of this list, and a gap committed out of turn would leave a
+            # floating fragment in some of them.
+            got = bridged_gap.pop((r, c), None)
+            if got is not None:
+                for br, bc in got[1]:
+                    growth_orders[si].append((br, bc))
+                    pixels_since_update += 1
 
             growth_orders[si].append((r, c))
             pixels_since_update += 1
@@ -17641,20 +17776,7 @@ if __name__ == '__main__':
                 progress_callback(pct)
 
             # Push unclaimed 4-connected neighbors
-            sc_cy, sc_cx = soma_centroids[si]
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
-                    floor_val = intensity_floor_map[nr, nc] if intensity_floor_map is not None else intensity_floor
-                    if roi[nr, nc] >= floor_val:
-                        if max_radius_px_sq is not None:
-                            dy = nr - sc_cy
-                            dx = nc - sc_cx
-                            if (dy * dy + dx * dx) > max_radius_px_sq:
-                                continue
-                        visited[nr, nc] = True
-                        owner_map[nr, nc] = si
-                        heapq.heappush(heap, (-roi[nr, nc], nr, nc, si))
+            _push_neighbours(r, c, si)
 
         all_masks = []
         for si, soma_data in enumerate(soma_outlines_data):
