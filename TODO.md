@@ -84,6 +84,13 @@ It is implemented in the shared `_priority_region_grow`, so it covers the
 `_create_competitive_masks` for **Competitive** — so all three modes bridge,
 in the app and in `Redo Masks`.
 
+The span is a typed spin box (1-500 px) with a µm readout beside it, in both
+dialogs. It was a slider capped at 15 px, which at 0.316 µm/px was under 5 µm --
+wider breaks simply could not be entered, and the setting read as doing nothing
+because no bridge was ever taken. The generation log now reports how many breaks
+were actually crossed, so "the span is too short" is distinguishable from "the
+setting is not wired up".
+
 `Redo Masks (This Image)` carries its own copy of the control, because focus
 drift belongs to one slide and not to the batch: switch it on there and only
 that image is regrown. The redo dialog borrows the app's globals for the length

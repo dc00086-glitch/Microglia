@@ -58,7 +58,7 @@ def scene(with_signal_beyond=True):
 
 
 def grow(roi, soma, bridge_px, territory=None, label=0):
-    order, _ = mmps._priority_region_grow(
+    order, _, _ = mmps._priority_region_grow(
         roi, 60, 60, soma, FLOOR, None, territory, label, None, 5000,
         bridge_px)
     mask = np.zeros((H, W), np.uint8)
@@ -92,7 +92,7 @@ def main():
     # --- the mask must be ONE connected piece at every prefix length --------
     # Masks are prefixes of the growth order, so a bridge committed out of turn
     # would produce a mask with a floating fragment.
-    order, _ = mmps._priority_region_grow(
+    order, _, _ = mmps._priority_region_grow(
         roi, 60, 60, soma, FLOOR, None, None, 0, None, 5000, 5)
     from scipy import ndimage
     for n in range(4, len(order) + 1, 7):
@@ -124,7 +124,7 @@ def main():
     roi3[60:63, 80] = 12.0         # break, so both gaps contain (60, 80)
     roi3[63:70, 80] = 600.0
 
-    order3, _ = mmps._priority_region_grow(
+    order3, _, _ = mmps._priority_region_grow(
         roi3, 60, 60, soma3, FLOOR, None, None, 0, None, 5000, 4)
     if len(order3) != len(set(order3)):
         dupes = sorted({p for p in order3 if order3.count(p) > 1})
@@ -275,7 +275,7 @@ def main():
     # is the place to fix it: turn bridging on for the image that drifted,
     # leave every other image grown exactly as it was. The settings it uses are
     # globals borrowed for one image, so they must also be handed back.
-    from PyQt5.QtWidgets import QCheckBox, QSlider, QDialog
+    from PyQt5.QtWidgets import QCheckBox, QSpinBox, QDialog
     from PyQt5.QtCore import QTimer
 
     proc = np.zeros((H, W), np.uint16)
@@ -309,7 +309,7 @@ def main():
     # reach this image and nothing else.
     gui.mask_bridge_gaps = False
     gui.mask_bridge_px = 3
-    seen = {'checkbox': False, 'slider': False}
+    seen = {'checkbox': False, 'slider': False, 'typed': False, 'max': None}
 
     def reaper():
         dlg = QApplication.activeModalWidget()
@@ -320,9 +320,11 @@ def main():
         if isinstance(dlg, QDialog) and boxes:
             seen['checkbox'] = True
             boxes[0].setChecked(True)
-            for sl in dlg.findChildren(QSlider):
-                if sl.maximum() == 15:      # the break-span slider
-                    sl.setValue(6)
+            for sb in dlg.findChildren(QSpinBox):
+                if sb.suffix().strip() == 'px':
+                    seen['typed'] = True
+                    seen['max'] = sb.maximum()
+                    sb.setValue(6)
                     seen['slider'] = True
             dlg.accept()
         else:
@@ -333,6 +335,15 @@ def main():
     timer.start(30)
     gui.regenerate_masks_current_image()
     timer.stop()
+
+    # The span must be typed, not dragged: breaks are measured off the image,
+    # and a slider capped at 15 px silently refuses anything wider (under 5 µm
+    # at 0.316 µm/px). It must also reach a value a slider never could.
+    if seen['max'] is not None and seen['max'] < 100:
+        fails.append(f"the break-span control tops out at {seen['max']} px; a "
+                     f"break wider than that cannot be entered at all")
+    if not seen['typed']:
+        fails.append("the break span is not a spin box, so it cannot be typed")
 
     if not seen['checkbox']:
         fails.append("the Redo Masks dialog has no gap-bridging checkbox; "

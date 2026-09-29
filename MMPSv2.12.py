@@ -416,6 +416,10 @@ def _priority_region_grow(roi, cy_roi, cx_roi, soma_outline_roi,
     popped, so an abandoned probe leaves no stub behind. The territory and
     circular limits apply to every pixel of the bridge, so it cannot leak into
     a neighbouring cell.
+
+    Returns ``(growth_order, soma_seed_count, bridges_taken)``. The last is how
+    many bridges were actually committed, which is the only way to tell "the
+    span is too short for these breaks" apart from "nothing tried to cross".
     """
     import heapq
     h, w = roi.shape
@@ -443,6 +447,7 @@ def _priority_region_grow(roi, cy_roi, cx_roi, soma_outline_roi,
     visited = np.zeros((h, w), dtype=bool)
     growth_order = []
     heap = []
+    bridges_taken = 0
     # (far pixel) -> the sub-threshold pixels crossed to reach it. Held until
     # the far pixel is popped so a probe that never pays off adds nothing.
     bridged_gap = {}
@@ -503,6 +508,7 @@ def _priority_region_grow(roi, cy_roi, cx_roi, soma_outline_roi,
         # prefix length -- the masks are prefixes of this list.
         span = bridged_gap.pop((r, c), None)
         if span:
+            bridges_taken += 1
             for br, bc in span:
                 # Two bridges can cross -- a horizontal probe and a vertical one
                 # share the pixel where their lines meet. Appending it twice
@@ -517,7 +523,7 @@ def _priority_region_grow(roi, cy_roi, cx_roi, soma_outline_roi,
         growth_order.append((r, c))
         _push_neighbours(r, c)
 
-    return growth_order, soma_seed_count
+    return growth_order, soma_seed_count, bridges_taken
 
 
 def _grow_masks_for_soma(args):
@@ -576,11 +582,14 @@ def _grow_masks_for_soma(args):
             min_intensity_percent, local_intensity_window, global_max=global_max)
 
     # Priority region growing (shared core).
-    growth_order, soma_seed_count = _priority_region_grow(
+    growth_order, soma_seed_count, bridges_taken = _priority_region_grow(
         roi, cy_roi, cx_roi, soma_outline_roi,
         intensity_floor, intensity_floor_map,
         territory_roi_data, my_territory_label,
         max_radius_px_sq, largest_target_px, bridge_px)
+    if bridge_px:
+        print(f"    {soma_id}: {bridges_taken} break(s) crossed "
+              f"(span {bridge_px} px)")
 
     soma_area_px = soma_seed_count
     masks = []
@@ -9477,14 +9486,24 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
 
         bridge_row = QHBoxLayout()
         bridge_row.addWidget(QLabel("Largest break to cross:"))
-        bridge_slider = QSlider(Qt.Horizontal)
-        bridge_slider.setRange(1, 15)
+        # A spin box, not a slider: how many pixels a process drops out of
+        # focus for is a number the user measures off their own images, and a
+        # slider capped at 15 px silently refuses anything wider. At 0.316
+        # µm/px that cap was under 5 µm.
+        bridge_slider = QSpinBox()
+        bridge_slider.setRange(1, 500)
+        bridge_slider.setSuffix(" px")
         bridge_slider.setValue(max(1, int(getattr(self, 'mask_bridge_px', 3))))
         bridge_row.addWidget(bridge_slider)
-        bridge_label = QLabel(f"{max(1, int(getattr(self, 'mask_bridge_px', 3)))} px")
-        bridge_slider.valueChanged.connect(
-            lambda v: bridge_label.setText(f"{v} px"))
+        bridge_label = QLabel("")
         bridge_row.addWidget(bridge_label)
+        bridge_row.addStretch()
+
+        def _bridge_um(v):
+            px = self._get_pixel_size()
+            bridge_label.setText(f"≈ {v * px:.1f} µm" if px else "")
+        bridge_slider.valueChanged.connect(_bridge_um)
+        _bridge_um(bridge_slider.value())
         intensity_layout.addLayout(bridge_row)
 
         intensity_group.setLayout(intensity_layout)
@@ -17328,15 +17347,24 @@ if __name__ == '__main__':
 
         regen_bridge_row = QHBoxLayout()
         regen_bridge_row.addWidget(QLabel("  Largest break to cross:"))
-        regen_bridge_slider = QSlider(Qt.Horizontal)
-        regen_bridge_slider.setRange(1, 15)
+        regen_bridge_slider = QSpinBox()
+        regen_bridge_slider.setRange(1, 500)
+        regen_bridge_slider.setSuffix(" px")
         regen_bridge_slider.setValue(max(1, int(getattr(self, 'mask_bridge_px', 3))))
         regen_bridge_row.addWidget(regen_bridge_slider)
-        regen_bridge_label = QLabel(
-            f"{max(1, int(getattr(self, 'mask_bridge_px', 3)))} px")
-        regen_bridge_slider.valueChanged.connect(
-            lambda v: regen_bridge_label.setText(f"{v} px"))
+        regen_bridge_label = QLabel("")
         regen_bridge_row.addWidget(regen_bridge_label)
+        regen_bridge_row.addStretch()
+
+        # In µm, against THIS image's pixel size -- that is the number you can
+        # measure on screen, and it differs between studies (0.1046 vs 0.316).
+        _regen_px = self._get_pixel_size(img_name)
+
+        def _regen_bridge_um(v):
+            regen_bridge_label.setText(
+                f"≈ {v * _regen_px:.1f} µm" if _regen_px else "")
+        regen_bridge_slider.valueChanged.connect(_regen_bridge_um)
+        _regen_bridge_um(regen_bridge_slider.value())
         layout.addLayout(regen_bridge_row)
 
         bridge_hint = QLabel(
@@ -17431,6 +17459,7 @@ if __name__ == '__main__':
         # image. Every early exit below used to leave them borrowed, so a
         # failed redo silently re-pointed the next batch generation at this
         # image's intensity floor, circular buffer and bridge span.
+        self._bridge_tally = {'somas': 0, 'bridges': 0}
         try:
             # Ensure processed image is loaded (may have been freed to save RAM)
             processed_img = self._ensure_processed_loaded(img_name)
@@ -17482,6 +17511,26 @@ if __name__ == '__main__':
 
         total = len(img_data['masks'])
         self.log(f"Generated {total} new masks for {img_name}")
+
+        # Say whether bridging actually did anything. "It does nothing" is
+        # almost always a span shorter than the breaks, and without this the
+        # user cannot tell that apart from the setting not being wired up.
+        tally = self._bridge_tally
+        if tally['somas']:
+            px = self._get_pixel_size(img_name)
+            span_um = f" ({self.mask_bridge_px * px:.1f} µm)" if px else ""
+            if tally['bridges']:
+                self.log(f"  crossed {tally['bridges']} break(s) at up to "
+                         f"{self.mask_bridge_px} px{span_um}")
+            else:
+                self.log(f"  NO break was crossed at {self.mask_bridge_px} px"
+                         f"{span_um}. Either nothing is broken, or the breaks "
+                         f"are wider than that — raise the span and redo. "
+                         f"Growth also has to reach the break in the first "
+                         f"place, so check the intensity floor and, if the "
+                         f"circular constraint is on, that the far side is "
+                         f"inside the circle.")
+        self._bridge_tally = None
         self._auto_save()
 
         # The queue was rebuilt under the old index, so it now points at
@@ -17928,11 +17977,20 @@ if __name__ == '__main__':
         # Priority region growing (shared core), seeded from the soma outline.
         soma_outline_roi = (soma_outline_mask[y_min:y_max, x_min:x_max]
                             if soma_outline_mask is not None else None)
-        growth_order, soma_seed_count = _priority_region_grow(
+        bridge_px = self._bridge_px()
+        growth_order, soma_seed_count, bridges_taken = _priority_region_grow(
             roi, cy_roi, cx_roi, soma_outline_roi,
             intensity_floor, intensity_floor_map,
             territory_roi, my_label, max_radius_px_sq, largest_target_px,
-            self._bridge_px())
+            bridge_px)
+        # Tally it. Asked to bridge and never managed it is the case that makes
+        # the setting look broken, when the real answer is usually that the
+        # breaks are wider than the span allows -- so it has to be reportable.
+        if bridge_px:
+            tally = getattr(self, '_bridge_tally', None)
+            if tally is not None:
+                tally['somas'] += 1
+                tally['bridges'] += bridges_taken
 
         print(f"  {soma_id}: soma={soma_seed_count}px, grew to {len(growth_order)}px (target: {largest_target_px})")
 
