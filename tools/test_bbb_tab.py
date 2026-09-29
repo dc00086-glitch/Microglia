@@ -20,6 +20,7 @@ What has to hold for a tab to be an improvement rather than a swap:
 """
 import os
 import sys
+import shutil
 import tempfile
 import warnings
 
@@ -153,6 +154,66 @@ def main():
     gui._open_bbb_tab(colour, {'raw_dir': '', 'extra_radius_um': 0.0})
     if gui.tabs.indexOf(gui.bbb_panel) < 0:
         fails.append("BBB could not be reopened after being closed")
+
+    # --- the channel count must not cost a full image read ------------------
+    # Opening the panel used to load a whole multi-channel stack off disk to
+    # ask it shape[2]. On a drive-backed image that blocks the main thread for
+    # seconds before anything appears -- a beachball, and on macOS the app can
+    # drop behind the desktop, which reads as a crash.
+    d = tempfile.mkdtemp()
+    cases = {
+        'c4.tif': np.random.randint(0, 500, (30, 40, 4), np.uint16),
+        'c2.tif': np.random.randint(0, 500, (30, 40, 2), np.uint16),
+        'planar.tif': np.random.randint(0, 500, (3, 30, 40), np.uint16),
+        'flat.tif': np.random.randint(0, 500, (30, 40), np.uint16),
+    }
+    want = {'c4.tif': 4, 'c2.tif': 2, 'planar.tif': 3, 'flat.tif': 1}
+    for name, arr in cases.items():
+        tifffile.imwrite(os.path.join(d, name), arr)
+    for name, expect in want.items():
+        got = mmps._bbb_channel_count(os.path.join(d, name))
+        if got != expect:
+            fails.append(f"{name}: channel count read as {got}, expected "
+                         f"{expect}")
+    if mmps._bbb_channel_count(os.path.join(d, 'nope.tif')) is not None:
+        fails.append("a missing file returned a channel count instead of None")
+    if mmps._bbb_channel_count(__file__) is not None:
+        fails.append("a non-TIFF returned a channel count instead of None")
+
+    # It must read the HEADER, not the pixels: a file whose pixel data has been
+    # truncated still answers, where a full load would raise.
+    trunc = os.path.join(d, 'truncated.tif')
+    with open(os.path.join(d, 'c4.tif'), 'rb') as f:
+        blob = f.read()
+    with open(trunc, 'wb') as f:
+        f.write(blob[:len(blob) // 2])
+    if mmps._bbb_channel_count(trunc) is None:
+        fails.append("the channel count needed the pixel data — it is still "
+                     "reading the whole image")
+
+    # --- the panel does not stretch its rows apart --------------------------
+    # In a tab the scroll area is resizable, so the inner widget grows and a
+    # QVBoxLayout hands the slack out between rows unless something absorbs it.
+    panel = mmps.BBBAnalysisPanel(None, color_image=colour,
+                                  defaults={'raw_dir': '',
+                                            'extra_radius_um': 0.0})
+    from PyQt5.QtWidgets import QScrollArea, QVBoxLayout
+    scrolls = [sa for sa in panel.findChildren(QScrollArea) if sa.widget()]
+    if not scrolls:
+        fails.append("the panel has no scroll area; a long channel list could "
+                     "not be reached in a short tab")
+    else:
+        inner = scrolls[0].widget().layout()
+        has_stretch = any(
+            inner.itemAt(i).spacerItem() is not None
+            for i in range(inner.count()))
+        if not has_stretch:
+            fails.append("nothing absorbs the slack in the panel layout, so "
+                         "every row floats in its own band of empty space")
+        if isinstance(inner, QVBoxLayout) and inner.spacing() > 12:
+            fails.append(f"the panel's row spacing is {inner.spacing()}px")
+    panel.deleteLater()
+    shutil.rmtree(d, ignore_errors=True)
 
     timer.stop()
     if fails:

@@ -1613,6 +1613,39 @@ def _bbb_load_checkpoint_mask(out_dir, payload):
         return None
 
 
+def _bbb_channel_count(path):
+    """How many channels a TIFF has, WITHOUT reading its pixels.
+
+    Opening the BBB panel used to load a whole multi-channel image off disk to
+    ask it ``shape[2]`` -- the one and only thing the panel wants from it. On a
+    large stack over a USB drive that is seconds of the main thread blocked
+    before anything appears, which macOS renders as a beachball and, if you
+    click through it, by hiding the app. It read as a crash.
+
+    tifffile exposes the series shape from the header alone, so this costs a
+    seek instead of a read. Returns None when it cannot tell.
+    """
+    try:
+        with tifffile.TiffFile(path) as tf:
+            shape = tf.series[0].shape
+    except Exception:
+        return None
+    if not shape:
+        return None
+    if len(shape) == 2:
+        return 1
+    # Channels are the smallest axis of a plain multi-channel plane; a (C,Y,X)
+    # and a (Y,X,C) file are both common, and a size-2 axis is never an image
+    # dimension here.
+    if len(shape) == 3:
+        y_x = sorted(shape)[-2:]
+        for ax in shape:
+            if ax not in y_x or shape.count(ax) > 1 and ax == min(shape):
+                return int(ax)
+        return int(min(shape))
+    return int(min(shape))
+
+
 def _bbb_adopt_prior_csv(out_dir, already_done):
     """Recognise images finished BEFORE checkpoints existed, from the CSVs.
 
@@ -4707,11 +4740,16 @@ class VesselReviewDialog(QDialog):
         self.draw_combo.addItem("Off", "off")
         self.draw_combo.addItem("Mark vessel (include)", "mark")
         self.draw_combo.addItem("Erase (exclude)", "erase")
+        # Start on the brush, not on Off. Marking vessels is what this window
+        # is for -- every review that needed a correction began by noticing
+        # nothing happened, then finding the combo. Off stays one click away.
+        self.draw_combo.setCurrentIndex(
+            max(0, self.draw_combo.findData("mark")))
         prow.addWidget(self.draw_combo)
         prow.addWidget(QLabel("Brush:"))
         self.brush_spin = QSpinBox()
         self.brush_spin.setRange(1, 100)
-        self.brush_spin.setValue(12)
+        self.brush_spin.setValue(30)
         self.brush_spin.setSuffix(" px")
         prow.addWidget(self.brush_spin)
         self.only_marked_check = QCheckBox("Keep only marked vessels")
@@ -5119,6 +5157,7 @@ class BBBAnalysisPanel(QWidget):
             return combo
 
         layout = QVBoxLayout()   # parented at the end by _fit_dialog_to_screen
+        layout.setSpacing(6)
 
         # --- Raw individual-channel folder ---------------------------------
         layout.addWidget(QLabel(
@@ -5247,6 +5286,13 @@ class BBBAnalysisPanel(QWidget):
                       "the channels were read from.")
         note.setStyleSheet("color: gray;")
         layout.addWidget(note)
+
+        # Absorb the slack HERE. In a tab the scroll area is resizable, so the
+        # inner widget grows to fill it and a QVBoxLayout hands the extra
+        # height out between the rows -- every label ends up floating in its
+        # own band of empty space. One stretch at the bottom takes all of it,
+        # and the rows sit together at the top where they are readable.
+        layout.addStretch(1)
 
         btns = QHBoxLayout()
         run_btn = QPushButton("Run BBB Analysis")
@@ -10822,27 +10868,28 @@ if __name__ == '__main__':
         if not self.images:
             QMessageBox.warning(self, "BBB Analysis", "Load images first.")
             return
-        color_img = None
+        # Only the CHANNEL COUNT is needed here, so read it from the TIFF
+        # header rather than loading the image. Loading blocked the main thread
+        # for seconds on a drive-backed stack before the tab appeared, which
+        # reads as the app hanging or quitting.
+        n_channels = None
         for name in ([self.current_image_name] + list(self.images)):
             if not name:
                 continue
             idata = self.images.get(name, {})
-            ci = None
             rp = idata.get('raw_path')
-            # Prefer the raw file via tifffile so ALL channels (incl. far-red)
-            # are exposed; fall back to any cached color image.
             if rp and os.path.exists(rp):
-                try:
-                    raw = _load_bbb_image(rp)
-                    ci = raw if (raw is not None and raw.ndim == 3) else None
-                except Exception:
-                    ci = None
-            if ci is None:
-                cc = idata.get('color_image')
-                ci = cc if (cc is not None and getattr(cc, 'ndim', 0) == 3) else None
-            if ci is not None and getattr(ci, 'ndim', 0) == 3:
-                color_img = ci
+                n_channels = _bbb_channel_count(rp)
+                if n_channels and n_channels > 1:
+                    break
+            cc = idata.get('color_image')
+            if cc is not None and getattr(cc, 'ndim', 0) == 3:
+                n_channels = int(cc.shape[2])
                 break
+        # The panel reads shape[2] and nothing else, so a 1x1 stand-in carries
+        # the channel count without a single pixel being read.
+        color_img = (np.zeros((1, 1, int(n_channels)), np.uint8)
+                     if n_channels and n_channels > 1 else None)
         # A single-channel loaded image is no longer a dead end: the dialog's
         # raw channel folder can supply the channels, and that is exactly the
         # case where it is needed most.
