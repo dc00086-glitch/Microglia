@@ -25,6 +25,7 @@ from matplotlib.path import Path as mplPath
 import cv2
 import glob
 import json
+import datetime
 import csv
 import math
 import multiprocessing
@@ -1528,6 +1529,88 @@ def _save_vessel_seg_preview(path, cd31, pixel_size_um,
     fig.tight_layout()
     fig.savefig(path, dpi=110, bbox_inches='tight')
     plt.close(fig)
+
+
+BBB_PROGRESS_DIR = 'bbb_progress'
+
+
+def _bbb_checkpoint_path(out_dir, img_base):
+    return os.path.join(out_dir, BBB_PROGRESS_DIR, img_base + '.json')
+
+
+def _bbb_save_checkpoint(out_dir, img_base, vessel_row, cell_rows, settings,
+                         vessel_mask=None, pixel_size_um=None):
+    """Persist one image's BBB result the moment it is finished.
+
+    Everything used to be buffered in memory and written after the LAST image,
+    so an interrupted run wrote nothing at all -- every vessel reviewed in it
+    was lost, and vessel review is the expensive part. One file per image means
+    the work survives whatever ends the run, and a later run can pick up from
+    the images that are still missing.
+
+    The reviewed mask is saved beside the numbers so resuming does not have to
+    ask about an image again: the review IS the expensive decision, and it is
+    the one thing that was never recoverable.
+    """
+    try:
+        d = os.path.join(out_dir, BBB_PROGRESS_DIR)
+        os.makedirs(d, exist_ok=True)
+        payload = {
+            'image': img_base,
+            'saved_at': datetime.datetime.now().isoformat(timespec='seconds'),
+            'vessel_row': vessel_row,
+            'cell_rows': cell_rows,
+            'settings': settings or {},
+        }
+        if vessel_mask is not None:
+            mpath = os.path.join(d, img_base + '_vesselmask.tif')
+            try:
+                tifffile.imwrite(mpath,
+                                 (np.asarray(vessel_mask) > 0).astype(np.uint8))
+                payload['vessel_mask_file'] = os.path.basename(mpath)
+            except Exception:
+                pass
+        # Write beside the target and rename, so a crash mid-write cannot leave
+        # a half-written checkpoint that reads as a finished image.
+        tmp = os.path.join(d, img_base + '.json.part')
+        with open(tmp, 'w') as f:
+            json.dump(payload, f, separators=(',', ':'))
+        os.replace(tmp, _bbb_checkpoint_path(out_dir, img_base))
+        return True
+    except Exception:
+        return False
+
+
+def _bbb_load_checkpoints(out_dir):
+    """Every finished image, as {img_base: payload}. Unreadable ones are skipped."""
+    out = {}
+    d = os.path.join(out_dir, BBB_PROGRESS_DIR)
+    if not os.path.isdir(d):
+        return out
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith('.json'):
+            continue
+        try:
+            with open(os.path.join(d, fn)) as f:
+                payload = json.load(f)
+            base = payload.get('image') or os.path.splitext(fn)[0]
+            if payload.get('vessel_row') is not None:
+                out[base] = payload
+        except Exception:
+            continue
+    return out
+
+
+def _bbb_load_checkpoint_mask(out_dir, payload):
+    """The reviewed vessel mask for a finished image, or None."""
+    fn = payload.get('vessel_mask_file')
+    if not fn:
+        return None
+    try:
+        arr = tifffile.imread(os.path.join(out_dir, BBB_PROGRESS_DIR, fn))
+        return (np.asarray(arr) > 0)
+    except Exception:
+        return None
 
 
 def _merge_bbb_into_morphology(csv_path, cell_rows, bbb_cols):
@@ -10819,6 +10902,7 @@ if __name__ == '__main__':
             return None, 'not multi-channel'
 
         vessel_rows, cell_rows, n_imgs = [], [], 0
+        stopped_early = False
         skipped_imgs = []      # images that could not be analysed, with reason
         review_vessels = bool(channels.get('review_vessels', False))
         thr_scale = 1.0        # carried forward once the user accepts settings
@@ -10835,6 +10919,40 @@ if __name__ == '__main__':
                 "No images are selected.\n\nTick the images you want to "
                 "analyse in the file list, then run BBB again.")
             return
+
+        # --- resume ---------------------------------------------------------
+        # One checkpoint per finished image, written the moment that image is
+        # done. A run that ends early -- a drive ejecting, a bad file, a
+        # cancelled review -- therefore costs only the image in progress, and
+        # the images already reviewed are not asked about again.
+        done = _bbb_load_checkpoints(out_dir)
+        todo = [(nm, d) for nm, d in targets
+                if os.path.splitext(nm)[0] not in done]
+        resumed = len(targets) - len(todo)
+        if resumed:
+            ans = QMessageBox.question(
+                self, "BBB Analysis",
+                f"{resumed} of {len(targets)} selected image(s) already have "
+                f"BBB results saved.\n\n"
+                f"Keep them and review only the remaining {len(todo)}?\n\n"
+                f"No = review all {len(targets)} again, replacing what is "
+                f"saved for them.",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes)
+            if ans == QMessageBox.Cancel:
+                return
+            if ans == QMessageBox.Yes:
+                targets = todo
+                self.log(f"BBB: resuming — keeping {resumed} finished image(s), "
+                         f"{len(todo)} left to review")
+            else:
+                done = {}
+                self.log(f"BBB: re-reviewing all {len(targets)} image(s)")
+        if not targets:
+            # Everything is already done: nothing to review, but the CSVs are
+            # still written out of the checkpoints below.
+            self.log("BBB: every selected image already has results — "
+                     "rewriting the CSVs from them, nothing to review")
 
         from PyQt5.QtWidgets import QProgressDialog
 
@@ -10965,13 +11083,16 @@ if __name__ == '__main__':
                     # Closing the window (red X / Esc) aborts the whole run,
                     # rather than quietly skipping just this image.
                     if not accepted:
-                        self.log("BBB analysis cancelled — vessel review window "
-                                 "was closed.")
-                        progress.close()
-                        QMessageBox.information(
-                            self, "BBB Analysis",
-                            "BBB analysis cancelled.\n\nNo results were written.")
-                        return
+                        # Stop reviewing, but still write what is finished.
+                        # This used to return outright, so closing the review
+                        # window on image 50 of 135 threw away all 50 -- the
+                        # CSVs were only written after the last image. Every
+                        # finished image is now checkpointed, so stopping here
+                        # costs nothing that was already done.
+                        self.log("BBB: stopped at the vessel review — writing "
+                                 "the images finished so far.")
+                        stopped_early = True
+                        break
                     if st['action'] == 'skip':
                         self.log(f"BBB: skipped {img_base} (vessel review)")
                         continue
@@ -11022,6 +11143,7 @@ if __name__ == '__main__':
                 vessel_rows.append(row)
 
                 # One row per microglia — EVERY picked soma, mask or not.
+                cell_rows_start = len(cell_rows)
                 dist_um = ndimage.distance_transform_edt(~(vessel_mask > 0)) * ps
 
                 # Largest approved mask per soma_id (best footprint when present).
@@ -11141,6 +11263,22 @@ if __name__ == '__main__':
                             cell_colour=cell_colour)
                     except Exception as e:
                         self.log(f"BBB: overlay failed for {img_name}: {e}")
+
+                # Checkpoint NOW, not at the end of the run. Vessel review is
+                # the expensive part and it was the one thing never persisted:
+                # everything was buffered until after the last image, so a run
+                # that ended early wrote nothing and every review in it was
+                # lost. Saved here, an interrupted run costs one image.
+                if not _bbb_save_checkpoint(
+                        out_dir, img_base, row,
+                        cell_rows[cell_rows_start:],
+                        {'use_tubeness': bool(use_tube),
+                         'thr_scale': float(thr_scale),
+                         'target_area_pct': target_area_pct},
+                        vessel_mask=vessel_mask, pixel_size_um=ps):
+                    self.log(f"BBB: could NOT save progress for {img_base} — "
+                             f"is {out_dir} still mounted and writable? This "
+                             f"image would have to be reviewed again.")
                 n_imgs += 1
             except Exception as e:
                 self.log(f"BBB: error on {img_name}: {e}")
@@ -11148,6 +11286,24 @@ if __name__ == '__main__':
         progress.setLabelText("Writing results…")
         progress.setValue(len(targets))
         QApplication.processEvents()
+
+        # Fold in every image finished in an EARLIER run. Without this the CSV
+        # would hold only what this run covered, and because the morphology
+        # merge blanks the BBB columns of any row it does not match, finishing
+        # an interrupted run used to ERASE the part already done.
+        carried = 0
+        run_images = {r.get('image_name') for r in vessel_rows}
+        for base, payload in sorted(done.items()):
+            if base in run_images:
+                continue          # reviewed again in this run; that wins
+            vrow = payload.get('vessel_row')
+            if vrow:
+                vessel_rows.append(vrow)
+                cell_rows.extend(payload.get('cell_rows') or [])
+                carried += 1
+        if carried:
+            self.log(f"BBB: carried {carried} image(s) forward from earlier "
+                     f"runs; the CSVs cover all {len(vessel_rows)}")
 
         def _write(path, rows):
             keys = []
@@ -11197,12 +11353,23 @@ if __name__ == '__main__':
                           "bbb_microglia_exposure.csv (run morphology first to "
                           "merge into the master)")
         progress.close()
-        self.log(f"BBB analysis complete: {n_imgs} images, {len(cell_rows)} microglia.")
+        carried_msg = (f" ({n_imgs} reviewed now, {carried} carried forward "
+                       f"from earlier runs)" if carried else "")
+        if stopped_early:
+            left = len(todo) - n_imgs if resumed else len(targets) - n_imgs
+            self.log(f"BBB: stopped early — {max(0, left)} image(s) still to "
+                     f"review. Run BBB again and choose Yes to pick up from "
+                     f"here.")
+        self.log(f"BBB analysis complete: {len(vessel_rows)} images"
+                 f"{carried_msg}, {len(cell_rows)} microglia.")
         self.log(f"  {merged_msg}")
         self.log(f"  Vessel/leakage: bbb_vessel_leakage.csv; overlays: bbb_overlays/")
+        self.log(f"  Per-image progress kept in {BBB_PROGRESS_DIR}/ — delete a "
+                 f"file there to make that image reviewable again.")
         QMessageBox.information(
             self, "BBB Analysis",
-            f"Done: {n_imgs} images, {len(cell_rows)} microglia.\n"
+            f"Done: {len(vessel_rows)} images{carried_msg}, "
+            f"{len(cell_rows)} microglia.\n"
             f"{merged_msg}\n"
             f"Leak overlays saved to bbb_overlays/ in:\n{out_dir}")
         if skipped_imgs:

@@ -75,6 +75,40 @@ against MMPS-exported masks.
 
 To put it back in the app, the removal is one commit — revert it.
 
+## BBB analysis is resumable  *(new)*
+
+Every row used to be buffered in memory and written after the LAST image. A
+run that ended early -- a drive ejecting, a bad file, the review window closed
+-- wrote nothing at all, and every vessel reviewed in it was lost. Vessel
+review is the expensive part and it was the one thing never persisted; only a
+PNG preview was saved, which is a picture, not a mask.
+
+Finishing the job later made it worse rather than better, because
+`_merge_bbb_into_morphology` blanks the BBB columns of any row the run did not
+cover:
+
+    for c in bbb_cols:
+        r[c] = hit.get(c, '') if hit else ''
+
+so the second run ERASED the first.
+
+Now: one checkpoint per image in `bbb_progress/`, written the moment that image
+finishes -- its vessel row, its per-cell rows, the review settings, and the
+REVIEWED vessel mask as a TIFF. Written to a `.part` file and renamed, so a
+crash mid-write cannot leave something that reads as a finished image.
+
+* starting a BBB run finds the finished images and offers to keep them and
+  review only the rest (or to redo everything)
+* closing the vessel review window now stops and WRITES, instead of returning
+  with nothing
+* the CSVs are written from every checkpoint, not only from what this run
+  reviewed, so the merge covers all runs and can no longer erase an earlier one
+* re-reviewing an image replaces its checkpoint rather than duplicating it
+* delete a file from `bbb_progress/` to make that one image reviewable again
+
+`tools/merge_bbb_runs.py` remains for results produced BEFORE this existed,
+where the only copies are two CSVs that each blanked the other's rows.
+
 ## BBB analysis is a tab, not a pop-up  *(new)*
 
 It was a modal `QDialog`. That took the whole app hostage while it was up, and
