@@ -13,8 +13,9 @@ from PyQt5.QtWidgets import (
     QProgressBar, QListWidgetItem, QDialog, QScrollArea, QTableWidget, QTableWidgetItem, QHeaderView,
     QCheckBox, QComboBox
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QKeySequence, QIcon
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
+from PyQt5.QtGui import (QPixmap, QPainter, QPen, QColor, QImage, QBrush,
+                         QKeySequence, QIcon, QPolygon)
 from PyQt5.QtWidgets import QShortcut
 from PIL import Image
 import tifffile
@@ -276,11 +277,73 @@ def _smooth_mask(mask, max_gap_size=4):
     return smoothed
 
 
-def _smooth_masks(masks, max_gap_size=4):
+def _solidify_mask(mask, radius=2):
+    """Close the ragged edge of a grown mask, then fill what that encloses.
+
+    ``_smooth_mask`` only fills a hole that is FULLY ENCLOSED. That is the
+    right rule for a clean mask and the wrong one for a frayed one: where
+    growth took roughly every other pixel the gaps join up and reach the
+    outside through the frayed edge, so not one of them counts as a hole and
+    the mask stays speckled at any gap size.
+
+    Filling the outer contour does not help either -- the contour TRACES every
+    notch, so filling it reproduces the lace exactly. What closes a channel is
+    a morphological close with a kernel wider than the channel, which is what
+    this does before filling whatever the close turned into a real hole.
+
+    Closing is extensive, so this can only ADD pixels, never remove them: a
+    solidified mask never measures smaller than the same cell unsolidified.
+    Keep the radius small -- it is wider than half the width of a thin process
+    that will start merging neighbouring branches.
+
+    ``radius`` of 0 returns the mask untouched.
+    """
+    if mask is None or radius <= 0 or np.count_nonzero(mask) == 0:
+        return mask
+    # Same bounding-box trick as _smooth_mask: a cell covers a tiny part of the
+    # frame, and these costs scale with the array, not with the mask. Pad by
+    # the kernel so the close sees the true background around the mask.
+    H, W = mask.shape[:2]
+    pad = radius + 2
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    y0 = max(int(np.argmax(rows)) - pad, 0)
+    y1 = min(H - int(np.argmax(rows[::-1])) + pad, H)
+    x0 = max(int(np.argmax(cols)) - pad, 0)
+    x1 = min(W - int(np.argmax(cols[::-1])) + pad, W)
+    sub = np.ascontiguousarray((mask[y0:y1, x0:x1] > 0).astype(np.uint8))
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                  (2 * radius + 1, 2 * radius + 1))
+    closed = cv2.morphologyEx(sub, cv2.MORPH_CLOSE, k)
+
+    # Fill everything the close enclosed. No size limit here -- the point is to
+    # end up with the shape the outline describes, and a hole that survived the
+    # close is one the close decided was interior.
+    inverted = (closed == 0).astype(np.uint8)
+    labeled, n = ndimage.label(inverted)
+    if n:
+        border = np.unique(np.concatenate([
+            labeled[0, :], labeled[-1, :], labeled[:, 0], labeled[:, -1]]))
+        interior = (labeled > 0) & ~np.isin(labeled, border)
+        closed[interior] = 1
+
+    out = mask.copy()
+    # Paste back with the mask's own dtype and "on" value, so a mask stored as
+    # 0/255 does not come back 0/1 and silently read as empty everywhere.
+    on = mask[mask > 0].flat[0]
+    out[y0:y1, x0:x1] = np.where(closed > 0, on,
+                                 mask[y0:y1, x0:x1]).astype(mask.dtype)
+    return out
+
+
+def _smooth_masks(masks, max_gap_size=4, solidify_px=0):
     """Apply smoothing to all non-duplicate masks in a list."""
     for m in masks:
         if m.get('mask') is not None and not m.get('duplicate', False):
             m['mask'] = _smooth_mask(m['mask'], max_gap_size)
+            if solidify_px:
+                m['mask'] = _solidify_mask(m['mask'], solidify_px)
 
 
 def _enforce_mask_subset_invariant(masks):
@@ -548,6 +611,7 @@ def _grow_masks_for_soma(args):
     global_max = args[21] if len(args) > 21 else None
     # Optional gap-bridging span in pixels (0 = off).
     bridge_px = int(args[22]) if len(args) > 22 else 0
+    solidify_px = int(args[23]) if len(args) > 23 else 0
 
     y_min, y_max, x_min, x_max = roi_bounds
     roi = roi_data  # already float64
@@ -644,7 +708,7 @@ def _grow_masks_for_soma(args):
                 masks[idx]['duplicate'] = True
 
     if smooth_enabled:
-        _smooth_masks(masks, smooth_gap_size)
+        _smooth_masks(masks, smooth_gap_size, solidify_px)
 
     # Enforce subset invariant: every smaller mask ⊆ every larger mask
     _enforce_mask_subset_invariant(masks)
@@ -3467,6 +3531,14 @@ class InteractiveImageLabel(QLabel):
         self.measure_pt2 = None
         # Mask overlay opacity (0.0 - 1.0)
         self.overlay_opacity = 0.4
+        # Outline, like the QA grid, rather than a filled overlay. Filling
+        # every mask pixel draws the interior as it really is -- speckled,
+        # full of one-pixel holes where growth skipped a dim pixel -- and at
+        # full resolution that reads as a ragged blob rather than a cell. The
+        # grid has always drawn a contour, which is why it looks clean.
+        # Painting turns the fill back on, because you cannot edit what you
+        # cannot see.
+        self.mask_outline_only = True
         # Centroid dragging
         self.dragging_centroid = False
         self.dragging_centroid_idx = None
@@ -3963,9 +4035,14 @@ class InteractiveImageLabel(QLabel):
         mask = self.mask_overlay
         if not self.pix_source or not self.scaled_pixmap:
             return
-        mask_coords = np.argwhere(mask > 0)
-        if len(mask_coords) == 0:
+        if not np.any(mask):
             return
+
+        if getattr(self, 'mask_outline_only', True):
+            self._draw_mask_outline(painter, mask)
+            return
+
+        mask_coords = np.argwhere(mask > 0)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(0, 255, 0))
         painter.setOpacity(self.overlay_opacity)
@@ -3981,6 +4058,39 @@ class InteractiveImageLabel(QLabel):
             x_pos, y_pos = self._to_display_coords((img_y, img_x))
             painter.drawRect(int(x_pos), int(y_pos), rect_w, rect_h)
         painter.setOpacity(1.0)
+
+    def _draw_mask_outline(self, painter, mask):
+        """Trace the mask boundary, the way the QA grid does.
+
+        Same call the grid uses (findContours + RETR_EXTERNAL), so the two
+        views agree about where the mask ends. It is also far cheaper: a
+        contour is a few hundred points where the fill was one drawRect per
+        mask pixel, tens of thousands of them on every repaint.
+        """
+        try:
+            import cv2 as _cv2
+        except Exception:
+            return
+        contours, _ = _cv2.findContours((mask > 0).astype(np.uint8),
+                                        _cv2.RETR_EXTERNAL,
+                                        _cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return
+        painter.setOpacity(1.0)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(0, 255, 0), 2))
+        for cnt in contours:
+            pts = []
+            for point in cnt:
+                px, py = int(point[0][0]), int(point[0][1])
+                x_pos, y_pos = self._to_display_coords((py, px))
+                pts.append(QPoint(int(x_pos), int(y_pos)))
+            if len(pts) > 2:
+                painter.drawPolygon(QPolygon(pts))
+            elif len(pts) == 2:
+                painter.drawLine(pts[0], pts[1])
+            elif pts:
+                painter.drawPoint(pts[0])
 
     def _draw_polygon(self, painter):
         pen = QPen(QColor(255, 165, 0), 3)
@@ -5132,9 +5242,15 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.mask_floor_radius_px = 100
         self.mask_smooth_enabled = True
         self.mask_smooth_gap_size = 4
+        # Close the ragged edge of each grown mask, so the mask MEASURED is
+        # the shape being reviewed rather than a speckled version of it.
+        self.mask_solidify_px = 2
         # Let region growing cross a short out-of-focus break in a process and
         # keep following it. 0 = off. Filling holes in the finished mask cannot
         # do this: the growth never reaches the far side of a break.
+        # Remembers the outline setting across a paint session, so leaving
+        # paint mode restores the view instead of stranding the user in fill.
+        self._outline_before_paint = None
         self.mask_bridge_gaps = False
         self.mask_bridge_px = 3
         self.use_imagej = False
@@ -5929,6 +6045,21 @@ class MicrogliaAnalysisGUI(QMainWindow):
         self.opacity_value_label = QLabel("40%")
         self.opacity_value_label.setFixedWidth(35)
         opacity_layout.addWidget(self.opacity_value_label)
+
+        # Outline vs fill. The fill shows the mask interior exactly as grown,
+        # holes and all, which at full resolution reads as a ragged blob; the
+        # outline is what the QA grid draws, and what most review actually
+        # wants. Opacity only means something for the fill, so it is disabled
+        # while the outline is on rather than sitting there doing nothing.
+        self.mask_outline_check = QCheckBox("Outline")
+        self.mask_outline_check.setChecked(True)
+        self.mask_outline_check.setToolTip(
+            "Draw the mask as a contour, the way the QA grid does.\n"
+            "Unchecked fills every mask pixel instead, which shows the "
+            "interior — useful while painting, noisy while reviewing.")
+        self.mask_outline_check.toggled.connect(self._on_mask_outline_toggled)
+        opacity_layout.addWidget(self.mask_outline_check)
+        self.opacity_slider.setEnabled(False)
         self.opacity_widget.setVisible(False)
         layout.addWidget(self.opacity_widget)
 
@@ -8740,6 +8871,30 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         else:
             self.log("Measure tool OFF")
 
+    def _on_mask_outline_toggled(self, checked):
+        """Switch every image label between contour and filled overlay."""
+        self.opacity_slider.setEnabled(not checked)
+        for label in (self.original_label, self.preview_label,
+                      self.processed_label, self.mask_label):
+            label.mask_outline_only = checked
+            label._update_display()
+
+    def _paint_needs_fill(self, on):
+        """Painting needs the fill: you cannot edit what you cannot see.
+
+        Turning a paint tool on drops to the filled overlay and remembers the
+        outline setting, so leaving paint puts the view back the way the user
+        had it instead of stranding them in fill.
+        """
+        if on:
+            if self._outline_before_paint is None:
+                self._outline_before_paint = self.mask_outline_check.isChecked()
+            self.mask_outline_check.setChecked(False)
+        elif not (self.mask_label.paint_mode or self.mask_label.erase_mode):
+            if self._outline_before_paint is not None:
+                self.mask_outline_check.setChecked(self._outline_before_paint)
+                self._outline_before_paint = None
+
     def _toggle_paint_mode(self, checked):
         """Toggle paint fill mode for mask editing during QA."""
         self.mask_label.paint_mode = checked
@@ -8752,6 +8907,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             if not self.mask_label.erase_mode:
                 self.mask_label.setCursor(Qt.ArrowCursor)
             self.log("Paint fill OFF")
+        self._paint_needs_fill(checked)
 
     def _toggle_erase_mode(self, checked):
         self.mask_label.erase_mode = checked
@@ -8764,6 +8920,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             if not self.mask_label.paint_mode:
                 self.mask_label.setCursor(Qt.ArrowCursor)
             self.log("Pixel smooth OFF")
+        self._paint_needs_fill(checked)
 
     def _cascade_erase_to_smaller_masks(self):
         """After flood-disconnect on current mask, remove those pixels from all smaller masks."""
@@ -9132,6 +9289,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
             'mask_floor_mode': self.mask_floor_mode,
             'mask_smooth_enabled': self.mask_smooth_enabled,
             'mask_smooth_gap_size': self.mask_smooth_gap_size,
+            'mask_solidify_px': getattr(self, 'mask_solidify_px', 2),
             'mask_bridge_gaps': getattr(self, 'mask_bridge_gaps', False),
             'mask_bridge_px': getattr(self, 'mask_bridge_px', 3),
             'coloc_channel_1': self.coloc_channel_1,
@@ -9467,6 +9625,17 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         smooth_layout_d1.addWidget(smooth_label)
         intensity_layout.addLayout(smooth_layout_d1)
 
+        solid_row = QHBoxLayout()
+        solid_row.addWidget(QLabel("Solidify ragged edges:"))
+        solid_spin = QSpinBox()
+        solid_spin.setRange(0, 10)
+        solid_spin.setSuffix(" px")
+        solid_spin.setValue(max(0, int(getattr(self, 'mask_solidify_px', 2))))
+        solid_spin.setToolTip("""Close the ragged edge of each grown mask, so the mask MEASURED is the shape you are reviewing.\n\n'Max gap size' above only fills a hole that is fully enclosed. Where growth took roughly every other pixel the gaps join up and reach the outside through the frayed edge, so none of them counts as a hole and the mask stays speckled at any gap size.\n\nThis closes channels narrower than the radius, then fills what that encloses. It can only ADD pixels, never remove them, so area and skeleton length come out at or above the same cell unsolidified — do not mix solidified and unsolidified cells in one analysis.\n\nKeep it small: a radius wider than half a thin process starts merging neighbouring branches. 0 = leave as grown.""")
+        solid_row.addWidget(solid_spin)
+        solid_row.addStretch()
+        intensity_layout.addLayout(solid_row)
+
         # --- bridge out-of-focus breaks while growing ----------------------
         bridge_check = QCheckBox("Follow processes across small breaks")
         bridge_check.setChecked(bool(getattr(self, 'mask_bridge_gaps', False)))
@@ -9491,6 +9660,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         # slider capped at 15 px silently refuses anything wider. At 0.316
         # µm/px that cap was under 5 µm.
         bridge_slider = QSpinBox()
+        bridge_slider.setObjectName('bridge_span')
         bridge_slider.setRange(1, 500)
         bridge_slider.setSuffix(" px")
         bridge_slider.setValue(max(1, int(getattr(self, 'mask_bridge_px', 3))))
@@ -9597,6 +9767,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
         self.mask_bridge_gaps = bridge_check.isChecked()
         self.mask_bridge_px = bridge_slider.value()
         self.mask_smooth_gap_size = smooth_slider.value()
+        self.mask_solidify_px = solid_spin.value()
         mask_min_area = min_area_spin.value()
         mask_max_area = max_area_spin.value()
         mask_step_size = step_spin.value()
@@ -11350,6 +11521,7 @@ if __name__ == '__main__':
             self.mask_floor_mode = session.get('mask_floor_mode', 'percent')
             self.mask_smooth_enabled = session.get('mask_smooth_enabled', True)
             self.mask_smooth_gap_size = session.get('mask_smooth_gap_size', 4)
+            self.mask_solidify_px = session.get('mask_solidify_px', 2)
             self.coloc_channel_1 = session.get('coloc_channel_1', 0)
             self.coloc_channel_2 = session.get('coloc_channel_2', 1)
             self.grayscale_channel = session.get('grayscale_channel', 0)
@@ -12651,6 +12823,12 @@ if __name__ == '__main__':
             self.clean_ch_checks.append(ch_check)
         for i, ch_check in enumerate(self.clean_ch_checks):
             ch_check.setVisible(i < n)
+
+    def _solidify_px(self):
+        """Closing radius for the ragged mask edge. 0 = leave it as grown."""
+        if not getattr(self, 'mask_smooth_enabled', True):
+            return 0
+        return max(0, int(getattr(self, 'mask_solidify_px', 2)))
 
     def _bridge_px(self):
         """Gap-bridging span for region growing, in pixels. 0 when switched off."""
@@ -17069,6 +17247,7 @@ if __name__ == '__main__':
                             getattr(self, 'mask_floor_mode', 'percent'),
                             float(processed_img.max()),
                             self._bridge_px(),
+                            self._solidify_px(),
                         ))
 
                     # Run serially (desktops are not set up for parallel work)
@@ -17348,6 +17527,7 @@ if __name__ == '__main__':
         regen_bridge_row = QHBoxLayout()
         regen_bridge_row.addWidget(QLabel("  Largest break to cross:"))
         regen_bridge_slider = QSpinBox()
+        regen_bridge_slider.setObjectName('bridge_span')
         regen_bridge_slider.setRange(1, 500)
         regen_bridge_slider.setSuffix(" px")
         regen_bridge_slider.setValue(max(1, int(getattr(self, 'mask_bridge_px', 3))))
@@ -17373,6 +17553,17 @@ if __name__ == '__main__':
         bridge_hint.setStyleSheet("color: palette(dark); font-size: 10px;")
         bridge_hint.setWordWrap(True)
         layout.addWidget(bridge_hint)
+
+        regen_solid_row = QHBoxLayout()
+        regen_solid_row.addWidget(QLabel("  Solidify ragged edges:"))
+        regen_solid_spin = QSpinBox()
+        regen_solid_spin.setRange(0, 10)
+        regen_solid_spin.setSuffix(" px")
+        regen_solid_spin.setValue(max(0, int(getattr(self, 'mask_solidify_px', 2))))
+        regen_solid_spin.setToolTip("""Close the ragged edge of each grown mask, so the mask MEASURED is the shape you are reviewing.\n\n'Max gap size' above only fills a hole that is fully enclosed. Where growth took roughly every other pixel the gaps join up and reach the outside through the frayed edge, so none of them counts as a hole and the mask stays speckled at any gap size.\n\nThis closes channels narrower than the radius, then fills what that encloses. It can only ADD pixels, never remove them, so area and skeleton length come out at or above the same cell unsolidified — do not mix solidified and unsolidified cells in one analysis.\n\nKeep it small: a radius wider than half a thin process starts merging neighbouring branches. 0 = leave as grown.""")
+        regen_solid_row.addWidget(regen_solid_spin)
+        regen_solid_row.addStretch()
+        layout.addLayout(regen_solid_row)
 
         layout.addSpacing(5)
 
@@ -17441,12 +17632,14 @@ if __name__ == '__main__':
         saved_buffer = self.circular_buffer_um2
         saved_bridge_on = getattr(self, 'mask_bridge_gaps', False)
         saved_bridge_px = getattr(self, 'mask_bridge_px', 3)
+        saved_solid = getattr(self, 'mask_solidify_px', 2)
         self.min_intensity_percent = regen_intensity
         self.use_min_intensity = regen_intensity > 0
         self.use_circular_constraint = regen_circular_check.isChecked()
         self.circular_buffer_um2 = regen_buffer_spin.value()
         self.mask_bridge_gaps = regen_bridge_check.isChecked()
         self.mask_bridge_px = regen_bridge_slider.value()
+        self.mask_solidify_px = regen_solid_spin.value()
 
         circ_info = f", circular buffer {self.circular_buffer_um2} µm²" if self.use_circular_constraint else ""
         bridge_info = (f", bridging breaks up to {self.mask_bridge_px} px"
@@ -17492,6 +17685,7 @@ if __name__ == '__main__':
             self.circular_buffer_um2 = saved_buffer
             self.mask_bridge_gaps = saved_bridge_on
             self.mask_bridge_px = saved_bridge_px
+            self.mask_solidify_px = saved_solid
 
         # Export all regenerated masks to disk
         if self.masks_dir and os.path.isdir(self.masks_dir):
@@ -17883,7 +18077,8 @@ if __name__ == '__main__':
                               f"(duplicate of {all_masks[soma_masks_start + keep_idx]['target_area_um2']} µm², both {n_px} px)")
 
             if self.mask_smooth_enabled:
-                _smooth_masks(all_masks[soma_masks_start:], self.mask_smooth_gap_size)
+                _smooth_masks(all_masks[soma_masks_start:],
+                              self.mask_smooth_gap_size, self._solidify_px())
 
             # Enforce subset invariant for this soma's masks
             _enforce_mask_subset_invariant(all_masks[soma_masks_start:])
@@ -18062,7 +18257,8 @@ if __name__ == '__main__':
                           f"(duplicate of {masks[keep_idx]['target_area_um2']} µm², both {n_px} px)")
 
         if self.mask_smooth_enabled:
-            _smooth_masks(masks, self.mask_smooth_gap_size)
+            _smooth_masks(masks, self.mask_smooth_gap_size,
+                          self._solidify_px())
 
         # Enforce subset invariant
         _enforce_mask_subset_invariant(masks)

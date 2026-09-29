@@ -75,6 +75,43 @@ against MMPS-exported masks.
 
 To put it back in the app, the removal is one commit — revert it.
 
+## Masks are solidified before they are measured  *(new)*
+
+Growth takes pixels one at a time, so a grown mask has a frayed edge: around
+the cell body it takes roughly every other pixel, and the result reads as a
+speckled blob rather than a cell. The QA grid never showed this because it
+draws a contour on a downscaled thumbnail; the single view drew every mask
+pixel, so the two views disagreed about the same mask.
+
+Two changes, and they are different in kind:
+
+* **Display.** The single mask view now draws a contour, the same
+  `findContours` call the grid uses, so both views agree. The filled overlay
+  is still there behind the `Outline` toggle, and turning on a paint tool
+  switches to it automatically (you cannot edit what you cannot see) and back
+  on the way out.
+* **The mask itself.** `Solidify ragged edges` (default 2 px) closes channels
+  narrower than the radius and fills what that encloses, so the mask
+  MEASURED is the shape being reviewed. This changes area and skeleton
+  length. 0 = leave as grown.
+
+Two things that do NOT work for this, both tried:
+
+* `_smooth_mask` alone — it fills only a FULLY ENCLOSED hole. In a frayed
+  edge the gaps join up and reach the outside, so none of them qualifies and
+  the mask stays speckled at any gap size (341 holes as grown, 21 after
+  smoothing at gap size 50, 11 after solidify r=2).
+* filling the outer contour — the contour TRACES every notch, so filling it
+  reproduces the lace exactly.
+
+Solidify is extensive: it can only add pixels, so a cell never measures
+smaller than it did unsolidified. **Do not mix solidified and unsolidified
+cells in one analysis.** Anything exported before this was unsolidified.
+
+The exported cluster script does NOT solidify — it carries its own copy of
+the grower, and the setting is deliberately left out of what the export
+writes rather than handing it a flag it would ignore.
+
 ## Gap bridging is not in every grower yet  *(partial)*
 
 "Follow processes across small breaks" (Mask Generation Settings) lets region

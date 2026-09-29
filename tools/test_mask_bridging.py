@@ -321,7 +321,7 @@ def main():
             seen['checkbox'] = True
             boxes[0].setChecked(True)
             for sb in dlg.findChildren(QSpinBox):
-                if sb.suffix().strip() == 'px':
+                if sb.objectName() == 'bridge_span':
                     seen['typed'] = True
                     seen['max'] = sb.maximum()
                     sb.setValue(6)
