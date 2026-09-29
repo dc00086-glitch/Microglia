@@ -147,6 +147,66 @@ def main():
     if again['img1']['vessel_row'].get('vessel_area_frac') != 0.99:
         fails.append("re-reviewing an image did not replace its saved result")
 
+    # --- images finished BEFORE checkpoints existed are recognised ---------
+    # A run that predates bbb_progress/ still left one row per image in
+    # bbb_vessel_leakage.csv and the per-cell columns in the master sheet.
+    # Reading those back is what stops the app asking for 50 vessels to be
+    # reviewed again just because it gained a progress file.
+    import csv as _csv
+    d2 = tempfile.mkdtemp()
+    with open(os.path.join(d2, 'bbb_vessel_leakage.csv'), 'w', newline='') as f:
+        w = _csv.DictWriter(f, fieldnames=['image_name', 'vessel_area_frac'])
+        w.writeheader()
+        for i in range(3):
+            w.writerow({'image_name': f'old{i}.tif',
+                        'vessel_area_frac': f'0.{i}'})
+    with open(os.path.join(d2, 'combined_morphology_results.csv'), 'w',
+              newline='') as f:
+        cols = ['image_name', 'soma_id', 'area_um2',
+                'bbb_dist_to_vessel_um', 'bbb_microglia_exposure_mean']
+        w = _csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for i in range(3):
+            w.writerow({'image_name': f'old{i}.tif', 'soma_id': f's{i}',
+                        'area_um2': '120',
+                        'bbb_dist_to_vessel_um': f'{i}.5',
+                        'bbb_microglia_exposure_mean': f'{i}00'})
+        # a cell no run ever covered: blank BBB columns, must NOT be adopted
+        w.writerow({'image_name': 'old0.tif', 'soma_id': 'never',
+                    'area_um2': '99', 'bbb_dist_to_vessel_um': '',
+                    'bbb_microglia_exposure_mean': ''})
+
+    ad = mmps._bbb_adopt_prior_csv(d2, {})
+    if set(ad) != {'old0', 'old1', 'old2'}:
+        fails.append(f"adopting from the CSVs found {sorted(ad)}, expected the "
+                     f"three images in bbb_vessel_leakage.csv")
+    else:
+        if ad['old1']['vessel_row'].get('vessel_area_frac') != '0.1':
+            fails.append("an adopted image lost its vessel row")
+        cr = ad['old1']['cell_rows']
+        if len(cr) != 1:
+            fails.append(f"adopted image old1 carried {len(cr)} cell rows, "
+                         f"expected 1")
+        elif cr[0].get('bbb_dist_to_vessel_um') != '1.5':
+            fails.append("an adopted cell row lost its BBB value")
+        elif 'area_um2' in cr[0]:
+            fails.append("adoption carried a morphology column back into the "
+                         "BBB rows; the master sheet owns those")
+        if any(r.get('soma_id') == 'never' for r in ad['old0']['cell_rows']):
+            fails.append("a cell with no BBB values was adopted as covered")
+        if not ad['old0'].get('adopted_from_csv'):
+            fails.append("an adopted image is not marked as coming from the "
+                         "CSVs; the user cannot be told its mask is gone")
+
+    # an image that already has a real checkpoint is not adopted over
+    if mmps._bbb_adopt_prior_csv(d2, {'old1': {}}).get('old1') is not None:
+        fails.append("adoption overrode an image that has a real checkpoint")
+
+    # no CSV at all is not an error
+    if mmps._bbb_adopt_prior_csv(tempfile.mkdtemp(), {}) != {}:
+        fails.append("adoption invented results with no CSVs present")
+
+    shutil.rmtree(d2, ignore_errors=True)
     shutil.rmtree(d, ignore_errors=True)
     if fails:
         print("FAIL")

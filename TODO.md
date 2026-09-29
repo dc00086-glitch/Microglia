@@ -106,8 +106,16 @@ crash mid-write cannot leave something that reads as a finished image.
 * re-reviewing an image replaces its checkpoint rather than duplicating it
 * delete a file from `bbb_progress/` to make that one image reviewable again
 
-`tools/merge_bbb_runs.py` remains for results produced BEFORE this existed,
-where the only copies are two CSVs that each blanked the other's rows.
+Runs from BEFORE checkpoints existed are recognised too: `bbb_vessel_leakage.csv`
+has one row per finished image, and the master sheet has that image's per-cell
+BBB columns, which is enough to know the image is done and to carry its numbers
+forward. Otherwise the app would ask a user to re-review 50 vessels purely
+because it gained a progress file. What such an image CANNOT do is be
+re-measured — a PNG preview is a picture, not a mask — so the prompt says so,
+and the payload is marked `adopted_from_csv`.
+
+`tools/merge_bbb_runs.py` remains for the case where the two runs' CSVs live in
+separate folders and each blanked the other's rows, which adoption cannot see.
 
 ## BBB analysis is a tab, not a pop-up  *(new)*
 

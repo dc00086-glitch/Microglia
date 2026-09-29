@@ -1613,6 +1613,90 @@ def _bbb_load_checkpoint_mask(out_dir, payload):
         return None
 
 
+def _bbb_adopt_prior_csv(out_dir, already_done):
+    """Recognise images finished BEFORE checkpoints existed, from the CSVs.
+
+    A run that predates ``bbb_progress/`` still left its results on disk: one
+    row per image in bbb_vessel_leakage.csv, and the per-cell BBB columns in
+    combined_morphology_results.csv. That is enough to know the image is done
+    and to carry its numbers forward, which is the whole point -- the user
+    should not re-review 50 vessels because the app changed underneath them.
+
+    What cannot be recovered is the reviewed MASK; a PNG preview is a picture,
+    not a mask. So an adopted image is carried as numbers only: it is skipped
+    on a later run and its rows are written out again, but it cannot be
+    re-measured without reviewing it again. Re-running that image deliberately
+    is always available, and replaces this.
+
+    Returns {img_base: payload} for images not already in ``already_done``.
+    """
+    import csv as _csv
+    adopted = {}
+    vpath = os.path.join(out_dir, 'bbb_vessel_leakage.csv')
+    if not os.path.exists(vpath):
+        return adopted
+
+    def _norm(name):
+        n = str(name).strip()
+        low = n.lower()
+        if low.endswith('.tiff'):
+            return n[:-5]
+        if low.endswith('.tif'):
+            return n[:-4]
+        return n
+
+    try:
+        with open(vpath, newline='') as f:
+            for row in _csv.DictReader(f):
+                base = _norm(row.get('image_name', ''))
+                if not base or base in already_done:
+                    continue
+                adopted[base] = {'image': base, 'vessel_row': dict(row),
+                                 'cell_rows': [], 'settings': {},
+                                 'adopted_from_csv': True}
+    except Exception:
+        return {}
+    if not adopted:
+        return adopted
+
+    # Per-cell rows: the master sheet if the merge already happened, otherwise
+    # the standalone file. Only the BBB columns are carried -- the morphology
+    # columns belong to the master and must not be written back from here.
+    for cpath, only_bbb in (
+            (os.path.join(out_dir, 'bbb_microglia_exposure.csv'), False),
+            (os.path.join(out_dir, 'combined_morphology_results.csv'), True)):
+        if not os.path.exists(cpath):
+            continue
+        try:
+            with open(cpath, newline='') as f:
+                reader = _csv.DictReader(f)
+                fields = list(reader.fieldnames or [])
+                if 'image_name' not in fields or 'soma_id' not in fields:
+                    continue
+                keep = [c for c in fields
+                        if not only_bbb or c.startswith('bbb_')
+                        or ('_' in c and c not in (
+                            'image_name', 'soma_id', 'animal_id', 'treatment',
+                            'region', 'timepoint') and c.endswith(
+                                ('_exposure_mean', '_leakage_index')))]
+                for row in reader:
+                    base = _norm(row.get('image_name', ''))
+                    payload = adopted.get(base)
+                    if payload is None:
+                        continue
+                    vals = {c: row.get(c, '') for c in keep}
+                    if not any(str(v).strip() for v in vals.values()):
+                        continue      # this cell was never covered by a run
+                    vals['image_name'] = base
+                    vals['soma_id'] = row.get('soma_id', '')
+                    payload['cell_rows'].append(vals)
+        except Exception:
+            continue
+        if any(p['cell_rows'] for p in adopted.values()):
+            break
+    return adopted
+
+
 def _merge_bbb_into_morphology(csv_path, cell_rows, bbb_cols):
     """Add the per-cell BBB columns to an existing morphology CSV in place,
     matched on image_name + soma_id. Returns the number of rows matched."""
@@ -10926,14 +11010,29 @@ if __name__ == '__main__':
         # cancelled review -- therefore costs only the image in progress, and
         # the images already reviewed are not asked about again.
         done = _bbb_load_checkpoints(out_dir)
+        # Runs from before checkpoints existed left their results in the CSVs.
+        # Reading them back is what stops the app asking a user to re-review
+        # images they already did, just because it gained a progress file.
+        adopted = _bbb_adopt_prior_csv(out_dir, done)
+        done.update(adopted)
         todo = [(nm, d) for nm, d in targets
                 if os.path.splitext(nm)[0] not in done]
         resumed = len(targets) - len(todo)
+        n_adopted = sum(1 for nm, _ in targets
+                        if os.path.splitext(nm)[0] in adopted)
         if resumed:
+            adopted_note = ""
+            if n_adopted:
+                adopted_note = (
+                    f"\n\n{n_adopted} of those were found in the existing "
+                    f"CSVs rather than in {BBB_PROGRESS_DIR}/ — their numbers "
+                    f"carry forward, but the vessel masks they were measured "
+                    f"from were not saved, so they cannot be re-measured "
+                    f"without reviewing them again.")
             ans = QMessageBox.question(
                 self, "BBB Analysis",
                 f"{resumed} of {len(targets)} selected image(s) already have "
-                f"BBB results saved.\n\n"
+                f"BBB results.{adopted_note}\n\n"
                 f"Keep them and review only the remaining {len(todo)}?\n\n"
                 f"No = review all {len(targets)} again, replacing what is "
                 f"saved for them.",
@@ -10943,8 +11042,10 @@ if __name__ == '__main__':
                 return
             if ans == QMessageBox.Yes:
                 targets = todo
-                self.log(f"BBB: resuming — keeping {resumed} finished image(s), "
-                         f"{len(todo)} left to review")
+                src = (f" ({n_adopted} read back from the existing CSVs)"
+                       if n_adopted else "")
+                self.log(f"BBB: resuming — keeping {resumed} finished image(s)"
+                         f"{src}, {len(todo)} left to review")
             else:
                 done = {}
                 self.log(f"BBB: re-reviewing all {len(targets)} image(s)")
