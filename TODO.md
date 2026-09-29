@@ -75,6 +75,30 @@ against MMPS-exported masks.
 
 To put it back in the app, the removal is one commit — revert it.
 
+## BBB analysis is a tab, not a pop-up  *(new)*
+
+It was a modal `QDialog`. That took the whole app hostage while it was up, and
+being a separate top-level window it opened wherever the window manager put it
+-- routinely on another screen or behind the main window -- so the menu item
+read as doing nothing.
+
+`BBBAnalysisPanel` is now a plain `QWidget` that the app puts in a tab beside
+Masks. The tab is created the first time BBB analysis is asked for and removed
+by Close, so the sessions that never touch BBB never carry it. Run leaves the
+tab up on purpose: the settings that produced a run stay on screen to compare
+against the overlays, and a second run with one radius changed is a single
+click.
+
+`BBBAnalysisDialog` is kept as a thin modal wrapper around the panel, so the
+panel can still be opened standalone and a caller that only wants the settings
+back has a blocking form. It forwards attribute access to the panel.
+
+Noted while testing, NOT changed: the "assign a vessel channel and at least one
+tracer" guard in `_run_bbb_from_panel` is unreachable. Both pickers are built
+with `allow_none=False`, so `cd31` is always a real channel and the tracer list
+is never empty. It is harmless and would matter again if either picker ever
+gains a None entry.
+
 ## Masks are solidified before they are measured  *(new)*
 
 Growth takes pixels one at a time, so a grown mask has a frayed edge: around

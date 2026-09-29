@@ -4903,21 +4903,31 @@ def _fit_dialog_to_screen(dialog, layout, keep_last=1, max_height_frac=0.85):
         dialog.resize(hint)
 
 
-class BBBAnalysisDialog(QDialog):
+class BBBAnalysisPanel(QWidget):
     """Assign channels and run BBB analysis: CD31 vessel segmentation, tracer
     extravasation/leakage, and per-microglia tracer exposure. The number of
     tracers is user-settable (1..#channels) and each tracer is named by the user
     (the name is used as the column prefix and overlay title). Non-destructive.
+
+    A PANEL, not a dialog, so it can live in a tab beside Masks. It was a modal
+    pop-up, which took the whole app hostage while it was up and -- being a
+    separate top-level window -- opened wherever the window manager felt like
+    putting it, routinely on another screen or behind the main window, so it
+    read as the menu item doing nothing. In a tab it opens where the user is
+    looking, and the images stay visible behind the settings being chosen for
+    them.
     """
+    runRequested = pyqtSignal()
+    closeRequested = pyqtSignal()
     # Tracer rows are built once and shown/hidden, so pointing the dialog at a
     # raw folder with MORE channels than the loaded composite still has rows to
     # show. Eight is the channel ceiling the TIFF loaders already assume.
     MAX_TRACER_ROWS = 8
 
-    def __init__(self, parent, color_image=None, defaults=None, image_names=None):
+    def __init__(self, parent=None, color_image=None, defaults=None,
+                 image_names=None):
         super().__init__(parent)
         self.setWindowTitle("Blood-Brain-Barrier Analysis")
-        self.setModal(True)
         from PyQt5.QtWidgets import QComboBox, QSpinBox, QLineEdit
         n = 4
         if color_image is not None and getattr(color_image, 'ndim', 0) == 3:
@@ -5074,9 +5084,9 @@ class BBBAnalysisDialog(QDialog):
         btns = QHBoxLayout()
         run_btn = QPushButton("Run BBB Analysis")
         run_btn.setDefault(True)
-        run_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
+        run_btn.clicked.connect(self.runRequested.emit)
+        cancel_btn = QPushButton("Close")
+        cancel_btn.clicked.connect(self.closeRequested.emit)
         btns.addWidget(run_btn)
         btns.addWidget(cancel_btn)
         layout.addLayout(btns)
@@ -5196,6 +5206,38 @@ class BBBAnalysisDialog(QDialog):
                 'review_vessels': self.review_check.isChecked()}
 
 
+class BBBAnalysisDialog(QDialog):
+    """The BBB panel in a modal window.
+
+    The app puts the panel in a tab instead. This is kept so the panel can
+    still be opened standalone, and so a caller that only wants the settings
+    back has a blocking form to use.
+    """
+
+    def __init__(self, parent=None, color_image=None, defaults=None,
+                 image_names=None):
+        super().__init__(parent)
+        self.setWindowTitle("Blood-Brain-Barrier Analysis")
+        self.setModal(True)
+        self.panel = BBBAnalysisPanel(self, color_image=color_image,
+                                      defaults=defaults,
+                                      image_names=image_names)
+        self.panel.runRequested.connect(self.accept)
+        self.panel.closeRequested.connect(self.reject)
+        lay = QVBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.panel)
+        self.setLayout(lay)
+
+    def __getattr__(self, name):
+        # Forward to the panel, so get_channels() and every control a caller
+        # reaches for still answer on the dialog.
+        panel = self.__dict__.get('panel')
+        if panel is not None and hasattr(panel, name):
+            return getattr(panel, name)
+        raise AttributeError(name)
+
+
 class MicrogliaAnalysisGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -5259,6 +5301,8 @@ class MicrogliaAnalysisGUI(QMainWindow):
         # Remembers the outline setting across a paint session, so leaving
         # paint mode restores the view instead of stranding the user in fill.
         self._outline_before_paint = None
+        # The BBB panel lives in a tab, created on demand and removed on Close.
+        self.bbb_panel = None
         self.mask_bridge_gaps = False
         self.mask_bridge_px = 3
         self.use_imagej = False
@@ -10645,11 +10689,55 @@ if __name__ == '__main__':
         defaults.setdefault('raw_dir', getattr(self, 'bbb_raw_dir', ''))
         defaults.setdefault('extra_radius_um',
                             getattr(self, 'bbb_extra_radius_um', 0.0))
-        dlg = BBBAnalysisDialog(self, color_image=color_img, defaults=defaults,
-                                image_names=list(self.images))
-        if dlg.exec_() != QDialog.Accepted:
+        self._open_bbb_tab(color_img, defaults)
+
+    def _open_bbb_tab(self, color_img, defaults):
+        """Show the BBB panel in a tab beside Masks, creating it on demand.
+
+        The tab exists only once BBB analysis has been asked for, and Close
+        takes it away again, so it is not sitting in the tab bar for the many
+        sessions that never touch BBB.
+        """
+        existing = getattr(self, 'bbb_panel', None)
+        if existing is not None and self.tabs.indexOf(existing) >= 0:
+            # Already open. Re-point it at the current images rather than
+            # stacking a second copy, and bring it forward.
+            self.tabs.setCurrentIndex(self.tabs.indexOf(existing))
             return
-        ch = dlg.get_channels()
+
+        panel = BBBAnalysisPanel(self, color_image=color_img,
+                                 defaults=defaults,
+                                 image_names=list(self.images))
+        panel.runRequested.connect(self._run_bbb_from_panel)
+        panel.closeRequested.connect(self._close_bbb_tab)
+        self.bbb_panel = panel
+        idx = self.tabs.addTab(panel, "BBB")
+        self.tabs.setCurrentIndex(idx)
+        self.log("BBB Analysis opened in its own tab — set the channels there, "
+                 "then Run. Close removes the tab.")
+
+    def _close_bbb_tab(self):
+        """Take the BBB tab away and drop the panel."""
+        panel = getattr(self, 'bbb_panel', None)
+        if panel is None:
+            return
+        idx = self.tabs.indexOf(panel)
+        if idx >= 0:
+            self.tabs.removeTab(idx)
+        panel.deleteLater()
+        self.bbb_panel = None
+
+    def _run_bbb_from_panel(self):
+        """Read the panel's settings and run, leaving the tab open.
+
+        The tab stays up on purpose: the settings that produced a run are still
+        on screen to compare against the overlays, and a second run with one
+        radius changed costs one click instead of reopening everything.
+        """
+        panel = getattr(self, 'bbb_panel', None)
+        if panel is None:
+            return
+        ch = panel.get_channels()
         if ch.get('cd31', -1) < 0 or not ch.get('tracers'):
             QMessageBox.warning(self, "BBB Analysis",
                                 "Assign the CD31 channel and at least one tracer.")
