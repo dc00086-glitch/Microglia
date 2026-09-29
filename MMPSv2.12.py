@@ -4038,10 +4038,18 @@ class InteractiveImageLabel(QLabel):
         if not np.any(mask):
             return
 
-        if getattr(self, 'mask_outline_only', True):
-            self._draw_mask_outline(painter, mask)
-            return
+        # The outline is ALWAYS drawn, fill or not. Opacity applies only to the
+        # fill, and a mask drawn solely as a fill disappears completely at 0 --
+        # which reads as the mask failing to load, or as the view not switching
+        # at all, because the grid beside it draws a contour and still shows
+        # the cell. Drawing the contour underneath costs nothing and makes an
+        # invisible mask impossible.
+        if not getattr(self, 'mask_outline_only', True) and self.overlay_opacity > 0:
+            self._draw_mask_fill(painter, mask)
+        self._draw_mask_outline(painter, mask)
 
+    def _draw_mask_fill(self, painter, mask):
+        """Shade every mask pixel, so paint and erase have something to hit."""
         mask_coords = np.argwhere(mask > 0)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(0, 255, 0))
@@ -17340,8 +17348,8 @@ if __name__ == '__main__':
             traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Failed: {e}")
 
-    def _qa_recount(self):
-        """Rebuild the QA counters and per-image soma counts from the queue.
+    def _qa_recount(self, reset_finalized=False):
+        """Rebuild every index and counter that describes all_masks_flat.
 
         They are running totals kept for an O(1) status readout, so anything
         that rebuilds all_masks_flat has to rebuild these with it. Redoing one
@@ -17351,16 +17359,27 @@ if __name__ == '__main__':
         truth with every redo.
         """
         self._qa_soma_order = []
+        self._qa_soma_order_index = {}
+        self._qa_soma_mask_index = {}
         seen = set()
-        for flat in self.all_masks_flat:
-            key = (flat['image_name'], flat['mask_data']['soma_id'])
+        for i, flat in enumerate(self.all_masks_flat):
+            key = (flat['image_name'], flat['mask_data'].get('soma_id', ''))
             if key not in seen:
                 seen.add(key)
+                self._qa_soma_order_index[key] = len(self._qa_soma_order)
                 self._qa_soma_order.append(key)
-        # Keep the existing finalized set -- only somas still present matter.
-        self._qa_finalized_somas = {k for k in
-                                    getattr(self, '_qa_finalized_somas', set())
-                                    if k in seen}
+            # POSITIONS in all_masks_flat, so this has to be rebuilt with the
+            # list. Switching grid -> single picks the mask to show out of
+            # here, and stale positions point into whatever the rebuild left
+            # at that offset.
+            self._qa_soma_mask_index.setdefault(key, []).append(i)
+        if reset_finalized:
+            self._qa_finalized_somas = set()
+        else:
+            # Keep the existing set -- only somas still present matter.
+            self._qa_finalized_somas = {
+                k for k in getattr(self, '_qa_finalized_somas', set())
+                if k in seen}
 
         self._qa_image_soma_count = {}
         for img, _sid in self._qa_soma_order:
@@ -19031,36 +19050,9 @@ if __name__ == '__main__':
 
         # Build soma ordering for sliding window memory management
         # and soma->masks index for O(1) lookup instead of O(n) scans
-        self._qa_soma_order = []
-        self._qa_soma_order_index = {}  # soma_key -> position in _qa_soma_order
-        self._qa_finalized_somas = set()
-        self._qa_soma_mask_index = {}  # (img, soma_id) -> [list of flat indices]
-        seen_somas = set()
-        for i, flat in enumerate(self.all_masks_flat):
-            key = (flat['image_name'], flat['mask_data'].get('soma_id', ''))
-            if key not in seen_somas:
-                seen_somas.add(key)
-                self._qa_soma_order_index[key] = len(self._qa_soma_order)
-                self._qa_soma_order.append(key)
-            self._qa_soma_mask_index.setdefault(key, []).append(i)
-
-        # Per-image soma count for fast "all somas finalized?" check
-        self._qa_image_soma_count = {}
-        for key in self._qa_soma_order:
-            self._qa_image_soma_count[key[0]] = self._qa_image_soma_count.get(key[0], 0) + 1
-
-        # Build running counters for O(1) status display (avoid O(n) scans)
-        self._qa_auto_rejected_count = 0
-        self._qa_approved_count = 0
-        self._qa_user_rejected_count = 0
-        for f in self.all_masks_flat:
-            md = f['mask_data']
-            if md.get('duplicate'):
-                self._qa_auto_rejected_count += 1
-            elif md.get('approved') is True:
-                self._qa_approved_count += 1
-            elif md.get('approved') is False:
-                self._qa_user_rejected_count += 1
+        # One implementation, shared with the rebuild a per-image redo does, so
+        # the two cannot drift apart over which indexes exist.
+        self._qa_recount(reset_finalized=True)
 
         # Deferred checklist: track updates in memory, flush with auto-save
         self._qa_checklist_dirty = {}

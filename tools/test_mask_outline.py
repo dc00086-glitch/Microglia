@@ -89,6 +89,21 @@ def main():
     label.mask_outline_only = False
     fill_px = painted(label, mask)
 
+    # --- a mask can never become invisible ---------------------------------
+    # Opacity applies to the fill only. A mask drawn solely as a fill vanishes
+    # completely at 0, which reads as the mask failing to load or the view not
+    # switching -- the grid beside it draws a contour and still shows the
+    # cell. So the outline is drawn either way.
+    label.overlay_opacity = 0.0
+    zero_px = painted(label, mask)
+    label.overlay_opacity = 0.4
+    if zero_px == 0:
+        fails.append("at opacity 0 in fill mode the mask disappeared "
+                     "entirely; nothing on screen says why")
+    if zero_px > fill_px * 0.5:
+        fails.append(f"opacity 0 still painted {zero_px} px against the "
+                     f"fill's {fill_px}; the fill is ignoring opacity")
+
     if outline_px == 0:
         fails.append("outline mode drew nothing at all")
     if fill_px == 0:

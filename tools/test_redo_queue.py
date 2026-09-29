@@ -199,6 +199,40 @@ def main():
         fails.append("the per-image soma counts do not match the queue after "
                      "a redo")
 
+    # --- the soma POSITION maps must be rebuilt with the queue -------------
+    # _qa_soma_mask_index holds positions in all_masks_flat, and a redo
+    # rebuilds that list. Switching grid -> single picks the mask to show out
+    # of this map, so stale positions point at whatever the rebuild left at
+    # that offset -- another image's mask, or past the end.
+    gui5 = fresh()
+    gui5.mask_qa_idx = [f['image_name'] for f in gui5.all_masks_flat].index('b.tif')
+    gui5.regenerate_masks_current_image()
+    mask_index = getattr(gui5, '_qa_soma_mask_index', None)
+    order_index = getattr(gui5, '_qa_soma_order_index', None)
+    if mask_index is None or order_index is None:
+        fails.append("a redo left the soma position maps missing entirely; "
+                     "switching grid -> single reads them")
+        mask_index, order_index = {}, {}
+    for key, idxs in mask_index.items():
+        for fi in idxs:
+            if not (0 <= fi < len(gui5.all_masks_flat)):
+                fails.append(f"soma {key} indexes position {fi} in a queue of "
+                             f"{len(gui5.all_masks_flat)}")
+                break
+            got = gui5.all_masks_flat[fi]
+            if (got['image_name'], got['mask_data']['soma_id']) != key:
+                fails.append(
+                    f"soma {key} indexes position {fi}, which now holds "
+                    f"{(got['image_name'], got['mask_data']['soma_id'])}; "
+                    f"grid -> single would open the wrong cell")
+                break
+    for key, pos in order_index.items():
+        if not (0 <= pos < len(gui5._qa_soma_order)) or \
+                gui5._qa_soma_order[pos] != key:
+            fails.append(f"the soma order index disagrees with the soma order "
+                         f"for {key}")
+            break
+
     timer.stop()
     if fails:
         print("FAIL")
