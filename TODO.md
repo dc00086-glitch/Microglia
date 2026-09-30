@@ -75,6 +75,26 @@ against MMPS-exported masks.
 
 To put it back in the app, the removal is one commit — revert it.
 
+## The BBB columns survive the ImageJ merge  *(new)*
+
+BBB writes its per-cell columns into `combined_morphology_results.csv`, or into
+`bbb_microglia_exposure.csv` when that master does not exist yet. The ImageJ
+merge reads ONE morphology CSV:
+
+    morphology_path = simple_path or .../combined_morphology_results.csv
+
+so ticking a simple-characteristics export in the merge dialog produced a
+merged sheet with no BBB columns at all. Nothing errored — they were simply not
+in the file it read, and the numbers looked lost.
+
+`_attach_bbb_columns` now looks in the other place and joins on
+`image_name` + `soma_id`, and the log names how many columns it carried and
+which file lacked them. A cell no BBB run covered gets a blank, not a number.
+
+Still true and worth knowing: **run BBB after the morphology export**, not
+before. BBB with no master to merge into falls back to the standalone file,
+which is now picked up, but it is one less thing to depend on.
+
 ## BBB analysis is resumable  *(new)*
 
 Every row used to be buffered in memory and written after the LAST image. A

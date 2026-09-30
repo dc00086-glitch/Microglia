@@ -1613,6 +1613,73 @@ def _bbb_load_checkpoint_mask(out_dir, payload):
         return None
 
 
+def _attach_bbb_columns(rows, fieldnames, out_dir, morphology_path):
+    """Carry the per-cell BBB columns into a merge that did not read them.
+
+    The BBB columns are written into combined_morphology_results.csv, or into
+    bbb_microglia_exposure.csv when that master did not exist yet. The ImageJ
+    merge reads ONE morphology CSV -- whichever was picked in its dialog -- so
+    choosing a simple-characteristics export, or having BBB fall back to the
+    standalone file, silently produced a merged sheet with no BBB columns at
+    all. Nothing errored; the columns were simply not in the file it read.
+
+    Looks for them in the other place and joins on image_name + soma_id.
+    Returns the column names added, or [] if there were none to add.
+    """
+    import csv as _csv
+
+    def _norm(name):
+        n = str(name).strip()
+        low = n.lower()
+        if low.endswith('.tiff'):
+            return n[:-5]
+        if low.endswith('.tif'):
+            return n[:-4]
+        return n
+
+    if not rows or 'image_name' not in fieldnames or 'soma_id' not in fieldnames:
+        return []
+    if any(c.startswith('bbb_') for c in fieldnames):
+        return []          # already there; nothing to do
+
+    here = os.path.abspath(morphology_path or '')
+    for cand in ('combined_morphology_results.csv',
+                 'bbb_microglia_exposure.csv'):
+        path = os.path.join(out_dir, cand)
+        if not os.path.exists(path) or os.path.abspath(path) == here:
+            continue
+        try:
+            with open(path, newline='') as f:
+                reader = _csv.DictReader(f)
+                cols = [c for c in (reader.fieldnames or [])
+                        if c.startswith('bbb_')]
+                if not cols:
+                    continue
+                lut = {}
+                for r in reader:
+                    vals = {c: r.get(c, '') for c in cols}
+                    if any(str(v).strip() for v in vals.values()):
+                        lut[(_norm(r.get('image_name', '')),
+                             str(r.get('soma_id', '')).strip())] = vals
+        except Exception:
+            continue
+        if not lut:
+            continue
+        hit = 0
+        for row in rows:
+            got = lut.get((_norm(row.get('image_name', '')),
+                           str(row.get('soma_id', '')).strip()))
+            if got:
+                row.update(got)
+                hit += 1
+            else:
+                for c in cols:
+                    row.setdefault(c, '')
+        if hit:
+            return cols
+    return []
+
+
 def _bbb_channel_count(path):
     """How many channels a TIFF has, WITHOUT reading its pixels.
 
@@ -12633,6 +12700,19 @@ if __name__ == '__main__':
                 self.log(f"  Morphology: loaded {len(morphology_rows)} cells from {os.path.basename(morphology_path)}")
             except Exception as e:
                 self.log(f"  ERROR reading morphology results: {e}")
+
+        # The BBB columns live in combined_morphology_results.csv (or in
+        # bbb_microglia_exposure.csv when that master did not exist at the
+        # time). This merge reads ONE morphology CSV, so picking a
+        # simple-characteristics export used to drop them without a word.
+        bbb_added = _attach_bbb_columns(morphology_rows, morph_fieldnames,
+                                        self.output_dir, morphology_path)
+        if bbb_added:
+            morph_fieldnames = morph_fieldnames + [
+                c for c in bbb_added if c not in morph_fieldnames]
+            self.log(f"  Carried {len(bbb_added)} BBB column(s) in from the "
+                     f"BBB results; they are not in "
+                     f"{os.path.basename(morphology_path)}")
 
         # Build descriptive filename from what's being merged
         merge_parts = []
