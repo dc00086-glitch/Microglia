@@ -89,6 +89,35 @@ def main():
             fails.append("a cell no BBB run covered got a value instead of a "
                          "blank")
 
+    # --- and they must survive the WRITE, not just reach the rows ----------
+    # The merged sheet is written with extrasaction='ignore', so a column that
+    # reaches the rows but never reaches fieldnames is dropped in silence --
+    # which is this bug all over again, one step later. Reproduce the app's
+    # own fieldname assembly and check a value comes out the other side.
+    fields_w, rows_w = simple_sheet()
+    added_w = mmps._attach_bbb_columns(rows_w, fields_w, d, simple)
+    morph_fieldnames = fields_w + [c for c in added_w if c not in fields_w]
+    all_keys = morph_fieldnames + ['Sholl_max', 'Skel_branches']
+    seen, ordered = set(), []
+    for k in all_keys:
+        if k not in seen:
+            seen.add(k)
+            ordered.append(k)
+    out = os.path.join(d, 'merged.csv')
+    with open(out, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=ordered, extrasaction='ignore')
+        w.writeheader()
+        w.writerows(rows_w)
+    with open(out, newline='') as f:
+        back = list(csv.DictReader(f))
+    missing = [c for c in BBB_COLS if c not in (back[0] if back else {})]
+    if missing:
+        fails.append(f"{missing} reached the rows but not the merged file's "
+                     f"header, so extrasaction='ignore' dropped them silently")
+    elif back[0].get(BBB_COLS[0]) != '4.25':
+        fails.append("the BBB column is in the merged header but its value did "
+                     "not survive the write")
+
     # --- .tif / .tiff / bare names must match, as elsewhere -----------------
     fields2, rows2 = simple_sheet()
     rows2[0]['image_name'] = 'i1'          # no extension
