@@ -1775,12 +1775,14 @@ def _bbb_adopt_prior_csv(out_dir, already_done):
                 fields = list(reader.fieldnames or [])
                 if 'image_name' not in fields or 'soma_id' not in fields:
                     continue
+                # Every per-cell BBB column is bbb_-prefixed by contract
+                # (see _microglia_leakage_exposure), tracer name included, so
+                # the prefix is the whole rule. This used to also match two
+                # suffixes that no column actually has -- a guess at tracer
+                # naming that matched nothing and would have broken the moment
+                # a tracer was named something else.
                 keep = [c for c in fields
-                        if not only_bbb or c.startswith('bbb_')
-                        or ('_' in c and c not in (
-                            'image_name', 'soma_id', 'animal_id', 'treatment',
-                            'region', 'timepoint') and c.endswith(
-                                ('_exposure_mean', '_leakage_index')))]
+                        if not only_bbb or c.startswith('bbb_')]
                 for row in reader:
                     base = _norm(row.get('image_name', ''))
                     payload = adopted.get(base)

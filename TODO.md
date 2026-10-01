@@ -91,6 +91,14 @@ in the file it read, and the numbers looked lost.
 `image_name` + `soma_id`, and the log names how many columns it carried and
 which file lacked them. A cell no BBB run covered gets a blank, not a number.
 
+Nothing anywhere keys on a TRACER NAME. Tracers are named by the user in the
+BBB panel, and every per-cell column is `bbb_`-prefixed by contract (see
+`_microglia_leakage_exposure`), so the prefix is the whole rule in both the
+merge carry and the prior-run adoption. A stale clause in adoption also matched
+`_exposure_mean` and `_leakage_index` — suffixes no column has ever had — and
+is gone; it matched nothing and would have broken the moment a tracer was
+renamed.
+
 It adds only the columns a sheet is MISSING, rather than bailing when the
 sheet has any `bbb_` column at all. With a second tracer that distinction
 matters: a BSA sheet carries `bbb_bsa_*` and is still missing

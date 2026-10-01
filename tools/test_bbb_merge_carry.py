@@ -169,6 +169,56 @@ def main():
         fails.append("the other tracer's value did not come across")
     shutil.rmtree(d5, ignore_errors=True)
 
+    # --- tracer NAMES must not matter, only the bbb_ prefix ----------------
+    # Tracers are named by the user in the BBB panel, so nothing may key on a
+    # particular name. Two tracers with names this code has never seen must
+    # both come across, with every ring and the vessel mean.
+    d6 = tempfile.mkdtemp()
+    odd = ['bbb_FITC_albumin_488_exposure_microglia',
+           'bbb_FITC_albumin_488_exposure_10um',
+           'bbb_FITC_albumin_488_exposure_20um',
+           'bbb_FITC_albumin_488_exposure_30um',
+           'bbb_FITC_albumin_488_exposure_45um',   # a custom extra radius
+           'bbb_FITC_albumin_488_vessel_mean',
+           'bbb_cadaverine_555_exposure_microglia',
+           'bbb_cadaverine_555_vessel_mean',
+           'bbb_dist_to_vessel_um']
+    write(os.path.join(d6, 'combined_morphology_results.csv'),
+          ['image_name', 'soma_id'] + odd,
+          [dict({'image_name': 'i1.tif', 'soma_id': 'soma_1_1'},
+                **{c: str(i + 1) for i, c in enumerate(odd)})])
+    f6, r6 = simple_sheet()
+    got6 = mmps._attach_bbb_columns(r6, f6, d6,
+                                    os.path.join(d6, 'simple.csv'))
+    missing6 = [c for c in odd if c not in got6]
+    if missing6:
+        fails.append(f"these tracer columns were not carried: {missing6} — "
+                     f"something is keying on the tracer's name rather than "
+                     f"the bbb_ prefix")
+    if r6[0].get('bbb_cadaverine_555_vessel_mean') != '8':
+        fails.append("an unfamiliar tracer's value did not land on its cell")
+
+    # the same must hold for adopting a prior run's CSV
+    import csv as _c6
+    with open(os.path.join(d6, 'bbb_vessel_leakage.csv'), 'w', newline='') as f:
+        w = _c6.DictWriter(f, fieldnames=['image_name', 'vessel_area_fraction'])
+        w.writeheader()
+        w.writerow({'image_name': 'i1.tif', 'vessel_area_fraction': '0.02'})
+    ad6 = mmps._bbb_adopt_prior_csv(d6, {})
+    if 'i1' not in ad6:
+        fails.append("adopting a prior run did not find the image")
+    else:
+        carried = ad6['i1']['cell_rows']
+        if not carried:
+            fails.append("adoption carried no cell rows for an unfamiliar "
+                         "tracer")
+        else:
+            miss = [c for c in odd if c not in carried[0]]
+            if miss:
+                fails.append(f"adoption dropped {miss}; it is keying on "
+                             f"tracer names rather than the bbb_ prefix")
+    shutil.rmtree(d6, ignore_errors=True)
+
     # --- a sheet that already has them is left alone ------------------------
     if mmps._attach_bbb_columns(
             [{'image_name': 'i1.tif', 'soma_id': 'soma_1_1'}],
