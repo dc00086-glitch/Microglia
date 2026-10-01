@@ -1639,8 +1639,6 @@ def _attach_bbb_columns(rows, fieldnames, out_dir, morphology_path):
 
     if not rows or 'image_name' not in fieldnames or 'soma_id' not in fieldnames:
         return []
-    if any(c.startswith('bbb_') for c in fieldnames):
-        return []          # already there; nothing to do
 
     here = os.path.abspath(morphology_path or '')
     for cand in ('combined_morphology_results.csv',
@@ -1651,8 +1649,12 @@ def _attach_bbb_columns(rows, fieldnames, out_dir, morphology_path):
         try:
             with open(path, newline='') as f:
                 reader = _csv.DictReader(f)
+                # Only the columns this sheet does NOT already have. With two
+                # tracers a sheet can carry bbb_bsa_* and still be missing
+                # bbb_dextran_*; bailing on "has any bbb_ column" would leave
+                # the second tracer's numbers out and look like the first bug.
                 cols = [c for c in (reader.fieldnames or [])
-                        if c.startswith('bbb_')]
+                        if c.startswith('bbb_') and c not in fieldnames]
                 if not cols:
                     continue
                 lut = {}

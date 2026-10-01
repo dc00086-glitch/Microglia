@@ -140,6 +140,35 @@ def main():
     elif rows3[0].get(BBB_COLS[0]) != '7.5':
         fails.append("the standalone BBB file's values did not come across")
 
+    # --- two tracers: a sheet with one must still pick up the other --------
+    # With a second tracer a sheet can carry bbb_bsa_* and still be missing
+    # bbb_dextran_*. Bailing on "has any bbb_ column" would leave the second
+    # run's numbers out and look exactly like the bug this guards against.
+    d5 = tempfile.mkdtemp()
+    write(os.path.join(d5, 'combined_morphology_results.csv'),
+          ['image_name', 'soma_id', 'bbb_dist_to_vessel_um',
+           'bbb_dextran_exposure_microglia'],
+          [{'image_name': 'i1.tif', 'soma_id': 'soma_1_1',
+            'bbb_dist_to_vessel_um': '4.25',
+            'bbb_dextran_exposure_microglia': '881'}])
+    bsa_fields = ['image_name', 'soma_id', 'bbb_bsa_exposure_microglia']
+    bsa_rows = [{'image_name': 'i1.tif', 'soma_id': 'soma_1_1',
+                 'bbb_bsa_exposure_microglia': '404'}]
+    got5 = mmps._attach_bbb_columns(bsa_rows, bsa_fields, d5,
+                                    os.path.join(d5, 'simple_bsa.csv'))
+    if 'bbb_dextran_exposure_microglia' not in got5:
+        fails.append("a sheet carrying bbb_bsa_* did not pick up the dextran "
+                     "columns; one tracer's numbers would be missing from the "
+                     "merge")
+    if 'bbb_bsa_exposure_microglia' in got5:
+        fails.append("a column the sheet already has was added again")
+    if bsa_rows[0].get('bbb_bsa_exposure_microglia') != '404':
+        fails.append("the sheet's own tracer value was overwritten by the "
+                     "carry")
+    if bsa_rows[0].get('bbb_dextran_exposure_microglia') != '881':
+        fails.append("the other tracer's value did not come across")
+    shutil.rmtree(d5, ignore_errors=True)
+
     # --- a sheet that already has them is left alone ------------------------
     if mmps._attach_bbb_columns(
             [{'image_name': 'i1.tif', 'soma_id': 'soma_1_1'}],

@@ -91,6 +91,12 @@ in the file it read, and the numbers looked lost.
 `image_name` + `soma_id`, and the log names how many columns it carried and
 which file lacked them. A cell no BBB run covered gets a blank, not a number.
 
+It adds only the columns a sheet is MISSING, rather than bailing when the
+sheet has any `bbb_` column at all. With a second tracer that distinction
+matters: a BSA sheet carries `bbb_bsa_*` and is still missing
+`bbb_dextran_*`, and an all-or-nothing check would leave one tracer's numbers
+out of the merge — the same bug wearing a different hat.
+
 Still true and worth knowing: **run BBB after the morphology export**, not
 before. BBB with no master to merge into falls back to the standalone file,
 which is now picked up, but it is one less thing to depend on.
