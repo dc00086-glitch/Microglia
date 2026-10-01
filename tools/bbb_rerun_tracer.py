@@ -173,11 +173,13 @@ def main():
             masks.setdefault(m.group('base'), {}).setdefault(
                 m.group('sid'), []).append((int(m.group('a')), p))
 
+    # Recursive, because a study folder is usually nested (timepoint /
+    # Image Directory / ...) and pointing at the top of it is the natural
+    # thing to do.
     images = {}
-    for p in glob.glob(os.path.join(a.images, '*.tif')) + \
-             glob.glob(os.path.join(a.images, '*.tiff')) + \
-             glob.glob(os.path.join(a.images, '*.TIF')):
-        images[norm(os.path.basename(p))] = p
+    for pat in ('*.tif', '*.tiff', '*.TIF', '*.TIFF'):
+        for p in glob.glob(os.path.join(a.images, '**', pat), recursive=True):
+            images.setdefault(norm(os.path.basename(p)), p)
 
     ch = a.tracer_channel - 1
     radii = tuple(sorted(set(mmps._EXPOSURE_RADII_UM) |
@@ -252,8 +254,38 @@ def main():
             n_rebuilt += 1
 
     if not rows:
-        sys.exit("Nothing measured. Check --images points at the new images "
-                 "and their names match the first run's.")
+        # Say WHAT was found, not just that nothing was. The usual cause is
+        # --images pointing somewhere with no TIFFs, or the new images being
+        # named differently from the first run's -- and both are obvious the
+        # moment the two name lists are put side by side.
+        want = sorted(set(vmasks) | set(area_frac))
+        msg = ["Nothing measured.", ""]
+        msg.append(f"  {len(want)} image(s) have a vessel mask or a recorded "
+                   f"area fraction in --prior")
+        msg.append(f"  {len(images)} image file(s) found in --images "
+                   f"({a.images})")
+        if not images:
+            msg.append("")
+            msg.append("  --images has no .tif/.tiff anywhere under it, "
+                       "subfolders included. Check the path.")
+        else:
+            msg.append("")
+            msg.append("  names the first run used:")
+            for b in want[:5]:
+                msg.append(f"      {b}")
+            msg.append("  names in --images:")
+            for b in sorted(images)[:5]:
+                msg.append(f"      {b}")
+            msg.append("")
+            msg.append("  These have to match. If the new images are named "
+                       "differently, rename them or say so and the mapping "
+                       "can be added.")
+        if skipped:
+            msg.append("")
+            msg.append(f"  {len(skipped)} image(s) skipped:")
+            for b, why in skipped[:5]:
+                msg.append(f"      {b}: {why}")
+        sys.exit("\n".join(msg))
 
     fields = ['image_name', 'soma_id']
     for r in rows:
