@@ -121,6 +121,11 @@ def main():
     ap.add_argument('--tubeness', action='store_true',
                     help='reconstruct with tubeness enhancement, matching how '
                          'the first run was segmented')
+    ap.add_argument('--overlays', default=None,
+                    help='folder to write a leak overlay per image: the NEW '
+                         'tracer as a heatmap with the SAME vessel and cell '
+                         'outlines the first run used, so the two tracers can '
+                         'be shown side by side on the same boundaries')
     ap.add_argument('--extra-radius', type=float, default=0.0,
                     help='one more exposure ring in µm; microglia, 10, 20 and '
                          '30 µm are always measured')
@@ -190,6 +195,27 @@ def main():
     rows, skipped = [], []
     n_reviewed = n_rebuilt = 0
     todo = sorted(set(vmasks) | set(area_frac))
+
+    # ONE display range across every image, the way MMPS does it, so leak maps
+    # can be compared by eye between images -- and, since the first run used
+    # the same rule, between the two tracers. Per-image autoscaling would make
+    # a faint image look as bright as a leaking one.
+    overlay_vmax = None
+    if a.overlays:
+        os.makedirs(a.overlays, exist_ok=True)
+        print("measuring one display range across all images…", flush=True)
+        vals = []
+        for base in todo:
+            ip = images.get(base)
+            if ip is None:
+                continue
+            try:
+                vals.append(float(np.percentile(load_plane(ip, ch), 99)))
+            except Exception:
+                continue
+        overlay_vmax = {a.tracer: max(vals)} if vals else None
+        if overlay_vmax:
+            print(f"  {a.tracer}: 0–{overlay_vmax[a.tracer]:.0f}", flush=True)
     print(f"{len(todo)} image(s): {len(vmasks)} with a saved mask, "
           f"{len(area_frac)} to reconstruct", flush=True)
     if area_frac and a.tubeness:
@@ -244,6 +270,7 @@ def main():
             skipped.append((base, 'no masks or somas for this image'))
             continue
 
+        drawn_cells = []
         for sid in ids:
             cell = None
             sizes = per_soma.get(sid)
@@ -259,6 +286,7 @@ def main():
                 cell = soma
             if cell is None or cell.shape != vessel.shape:
                 continue
+            drawn_cells.append(cell)
             exp = mmps._microglia_leakage_exposure(
                 cell, vessel, tracers, a.pixel_size, dist_um=dist_um,
                 soma_mask=soma, halo_radii_um=radii)
@@ -266,6 +294,20 @@ def main():
                    'bbb_vessel_mask_source': source}
             row.update(exp)
             rows.append(row)
+        if a.overlays:
+            # The SAME vessel and cell outlines as the first run, over the new
+            # tracer. That is what makes the two figures comparable: anything
+            # that differs between them is the tracer, not the segmentation.
+            try:
+                mmps._save_bbb_overlay(
+                    os.path.join(a.overlays, base + '_bbb.png'),
+                    vessel, {a.tracer: tracer}, cell_masks=drawn_cells,
+                    vmax_map=overlay_vmax,
+                    source_label=f"{a.tracer} from {os.path.basename(img_path)}"
+                                 f"; vessels {source}")
+            except Exception as e:
+                print(f"  (overlay failed: {e})", end='', flush=True)
+
         if source == 'reviewed':
             n_reviewed += 1
         else:

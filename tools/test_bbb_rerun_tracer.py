@@ -162,6 +162,56 @@ def main():
     if os.path.exists(os.path.join(d2, 'x.csv')):
         fails.append("a CSV was written even though it refused")
 
+    # --- overlays are drawn on the NEW tracer, same boundaries -------------
+    # The point of re-rendering is a figure that differs from the first run's
+    # ONLY in the tracer: same vessel outline, same cell outlines, same
+    # display range across images. Anything else and the two cannot be shown
+    # side by side as a comparison.
+    d7 = tempfile.mkdtemp()
+    prior7, imgs7 = build(d7)
+    ov = os.path.join(d7, 'bsa_overlays')
+    out7 = os.path.join(d7, 'o.csv')
+    p7 = subprocess.run(
+        [sys.executable, TOOL, '--prior', prior7, '--images', imgs7,
+         '--tracer', 'bsa', '--tracer-channel', '3', '--overlays', ov,
+         '--pixel-size', str(PX), '--out', out7],
+        capture_output=True, text=True)
+    if p7.returncode != 0:
+        print(p7.stdout + p7.stderr)
+        fails.append(f"--overlays exited {p7.returncode}")
+    made = sorted(os.listdir(ov)) if os.path.isdir(ov) else []
+    if len(made) != 2:
+        fails.append(f"wrote {len(made)} overlay(s), expected one per image")
+    for f_ in made:
+        if os.path.getsize(os.path.join(ov, f_)) < 5000:
+            fails.append(f"{f_} is too small to be a rendered figure")
+    if 'display range' not in p7.stdout:
+        fails.append("no shared display range was measured; per-image "
+                     "autoscaling would make a faint image look as bright as "
+                     "a leaking one")
+
+    # the first run's overlays must be untouched -- both are wanted
+    orig = os.path.join(prior7, 'bbb_overlays')
+    if len(os.listdir(orig)) != 2:
+        fails.append("the first run's overlays were disturbed; the whole "
+                     "point is to have both")
+    if os.path.abspath(ov) == os.path.abspath(orig):
+        fails.append("the new overlays were written over the old ones")
+
+    # without --overlays nothing is rendered
+    d8 = tempfile.mkdtemp()
+    prior8, imgs8 = build(d8)
+    subprocess.run(
+        [sys.executable, TOOL, '--prior', prior8, '--images', imgs8,
+         '--tracer', 'bsa', '--tracer-channel', '3',
+         '--pixel-size', str(PX), '--out', os.path.join(d8, 'o.csv')],
+        capture_output=True, text=True)
+    if os.path.isdir(os.path.join(d8, 'bsa_overlays')):
+        fails.append("overlays were written without being asked for")
+
+    shutil.rmtree(d7, ignore_errors=True)
+    shutil.rmtree(d8, ignore_errors=True)
+
     # --- images with no saved mask can be REBUILT from the recorded area ---
     # bbb_vessel_leakage.csv records vessel_area_fraction for every image the
     # first run measured, and _segment_vessels can segment TO an area
