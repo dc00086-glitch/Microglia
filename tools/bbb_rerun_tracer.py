@@ -200,8 +200,18 @@ def main():
                          'their CD31 to the vessel_area_fraction recorded in '
                          "bbb_vessel_leakage.csv. Needs --cd31-channel.")
     ap.add_argument('--cd31-channel', type=int, default=None,
-                    help='1-based CD31 channel in the new images; only needed '
+                    help='1-based CD31 channel to re-segment; only needed '
                          'with --reconstruct')
+    ap.add_argument('--reconstruct-from', default=None,
+                    help="folder of the ORIGINAL images the first run measured "
+                         "(e.g. the dextran images). Reconstruction re-segments "
+                         "CD31 to the area fraction that run recorded, and that "
+                         "number came from THESE pixels -- so segmenting them "
+                         "reproduces the original mask, where segmenting the "
+                         "new images applies the old target to a different "
+                         "exposure and can land anywhere. Defaults to --images, "
+                         "which is only right when the two sets are the same "
+                         "acquisition.")
     ap.add_argument('--tubeness', action='store_true',
                     help='reconstruct with tubeness enhancement, matching how '
                          'the first run was segmented')
@@ -283,6 +293,18 @@ def main():
         for p in glob.glob(os.path.join(a.images, '**', pat), recursive=True):
             images.setdefault(norm(os.path.basename(p)), p)
 
+    # Where CD31 is re-segmented FROM. The recorded area fraction came from
+    # the original images, so those are the pixels it describes.
+    cd31_images = images
+    if a.reconstruct and a.reconstruct_from:
+        cd31_images = {}
+        for pat in ('*.tif', '*.tiff', '*.TIF', '*.TIFF'):
+            for q in glob.glob(os.path.join(a.reconstruct_from, '**', pat),
+                               recursive=True):
+                cd31_images.setdefault(norm(os.path.basename(q)), q)
+        print(f"reconstructing CD31 from {len(cd31_images)} original image(s) "
+              f"in {a.reconstruct_from}", flush=True)
+
     ch = a.tracer_channel - 1
     print(f"reading tracer '{a.tracer}' from channel {a.tracer_channel}"
           + (f", CD31 from channel {a.cd31_channel}" if a.reconstruct else ""),
@@ -342,8 +364,9 @@ def main():
             vessel = np.asarray(tifffile.imread(vmasks[base])) > 0
             source = 'reviewed'
         else:
+            cd_path = cd31_images.get(base, img_path)
             try:
-                cd31 = load_plane(img_path, a.cd31_channel - 1)
+                cd31 = load_plane(cd_path, a.cd31_channel - 1)
             except Exception as e:
                 print(f"  — could not read CD31: {e}", flush=True)
                 skipped.append((base, f'could not read CD31: {e}'))
@@ -353,6 +376,19 @@ def main():
                 target_area_frac=area_frac[base])
             vessel = np.asarray(vessel) > 0
             source = 'reconstructed'
+            # An empty or near-empty reconstruction is a failure, not a result:
+            # every distance and every ring is measured out from this mask, so
+            # a blank one makes the whole image meaningless rather than zero.
+            got_frac = float(vessel.mean())
+            want = area_frac[base]
+            if got_frac < want * 0.25:
+                print(f"  — reconstruction produced {100 * got_frac:.3f}% "
+                      f"vessel against the {100 * want:.3f}% recorded; "
+                      f"skipping", flush=True)
+                skipped.append((base, f'reconstruction gave '
+                                      f'{100 * got_frac:.3f}% vessel, not the '
+                                      f'{100 * want:.3f}% recorded'))
+                continue
         if vessel.shape != tracer.shape:
             print(f"  — mask {vessel.shape} != image {tracer.shape}",
                   flush=True)

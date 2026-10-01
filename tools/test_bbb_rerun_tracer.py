@@ -355,6 +355,67 @@ def main():
             fails.append("a reconstructed image produced only blanks; the "
                          "rebuilt mask found no vessel")
 
+    # --- CD31 is re-segmented from the ORIGINAL images when told ----------
+    # The recorded area fraction came from the first run's pixels, so those
+    # are the pixels it describes. Applying that target to a differently
+    # exposed second acquisition can land anywhere -- including on nothing.
+    d10 = tempfile.mkdtemp()
+    prior10, imgs10 = build(d10)
+    os.remove(os.path.join(prior10, 'bbb_progress', 'fieldB_vesselmask.tif'))
+    orig = os.path.join(d10, 'orig')
+    os.makedirs(orig, exist_ok=True)
+    for base in ('fieldA', 'fieldB'):
+        cd = np.zeros((H, W), np.uint16); cd[38:42, :] = 3000
+        tifffile.imwrite(os.path.join(orig, base + '.tif'),
+                         np.dstack([cd, cd, cd]).astype(np.uint16))
+        p_img = os.path.join(imgs10, base + '.tif')
+        st = np.asarray(tifffile.imread(p_img)).astype(np.uint16)
+        st[:, :, 0] = 5          # the NEW image's ch1 is flat: nothing to find
+        tifffile.imwrite(p_img, st)
+    import csv as _c10
+    with open(os.path.join(prior10, 'bbb_vessel_leakage.csv'), 'w',
+              newline='') as f:
+        w = _c10.DictWriter(f, fieldnames=['image_name',
+                                           'vessel_area_fraction'])
+        w.writeheader()
+        for base in ('fieldA', 'fieldB'):
+            w.writerow({'image_name': base + '.tif',
+                        'vessel_area_fraction': f'{4.0 / H:.4f}'})
+
+    out10 = os.path.join(d10, 'from_orig.csv')
+    p10 = subprocess.run(
+        [sys.executable, TOOL, '--prior', prior10, '--images', imgs10,
+         '--tracer', 'bsa', '--tracer-channel', '3', '--reconstruct',
+         '--cd31-channel', '1', '--reconstruct-from', orig,
+         '--pixel-size', str(PX), '--out', out10],
+        capture_output=True, text=True)
+    if 'reconstructing CD31 from' not in p10.stdout:
+        fails.append("--reconstruct-from was ignored")
+    r10 = []
+    if os.path.exists(out10):
+        with open(out10, newline='') as f:
+            r10 = list(_c10.DictReader(f))
+    if not any(x['image_name'] == 'fieldB' for x in r10):
+        fails.append("segmenting the ORIGINAL image still produced nothing for "
+                     "the image with no saved mask")
+
+    # ...and without it, the flat new channel must be CAUGHT, not measured
+    out11 = os.path.join(d10, 'from_new.csv')
+    p11 = subprocess.run(
+        [sys.executable, TOOL, '--prior', prior10, '--images', imgs10,
+         '--tracer', 'bsa', '--tracer-channel', '3', '--reconstruct',
+         '--cd31-channel', '1', '--pixel-size', str(PX), '--out', out11],
+        capture_output=True, text=True)
+    r11 = []
+    if os.path.exists(out11):
+        with open(out11, newline='') as f:
+            r11 = list(_c10.DictReader(f))
+    if any(x['image_name'] == 'fieldB' for x in r11):
+        fails.append("a reconstruction that found far less vessel than "
+                     "recorded was measured anyway; every distance and ring "
+                     "would be taken from an empty mask")
+    shutil.rmtree(d10, ignore_errors=True)
+
     # --reconstruct without --cd31-channel must refuse, not guess a plane
     p5 = subprocess.run(
         [sys.executable, TOOL, '--prior', prior4, '--images', imgs4,
