@@ -190,6 +190,28 @@ def main():
                      "autoscaling would make a faint image look as bright as "
                      "a leaking one")
 
+    # --- the outline colours are the user's to set -------------------------
+    import importlib.util as _iu
+    _sp = _iu.spec_from_file_location('rerun', TOOL)
+    _rr = _iu.module_from_spec(_sp); _sp.loader.exec_module(_rr)
+    if _rr.parse_colour('green', (9, 9, 9)) != (0.0, 1.0, 0.0):
+        fails.append("'green' did not resolve to green")
+    if _rr.parse_colour('0,0,255', (9, 9, 9)) != (0.0, 0.0, 1.0):
+        fails.append("an 0-255 triple was not scaled to 0-1")
+    if _rr.parse_colour('0.5,0.5,0.5', (9, 9, 9)) != (0.5, 0.5, 0.5):
+        fails.append("an 0-1 triple was rescaled when it should not be")
+    if _rr.parse_colour('not a colour', (1, 2, 3)) != (1, 2, 3):
+        fails.append("an unparseable colour did not fall back")
+    if _rr.parse_colour('', (1, 2, 3)) != (1, 2, 3):
+        fails.append("an empty colour did not fall back")
+    # vessel green and microglia blue by default, as asked
+    import argparse as _ap
+    src = open(TOOL).read()
+    if "'--vessel-colour', default='green'" not in src:
+        fails.append("vessels do not default to green")
+    if "'--cell-colour', default='blue'" not in src:
+        fails.append("microglia do not default to blue")
+
     # the first run's overlays must be untouched -- both are wanted
     orig = os.path.join(prior7, 'bbb_overlays')
     if len(os.listdir(orig)) != 2:

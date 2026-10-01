@@ -74,6 +74,32 @@ SOMA_RE = re.compile(r'^(?P<base>.+?)_(?P<sid>soma_\d+_\d+)_soma\.tiff?$')
 MASK_RE = re.compile(r'^(?P<base>.+?)_(?P<sid>soma_\d+_\d+)_area(?P<a>\d+)_mask\.tiff?$')
 
 
+NAMED_COLOURS = {
+    'green': (0.0, 1.0, 0.0), 'blue': (0.25, 0.45, 1.0),
+    'cyan': (0.0, 0.85, 1.0), 'red': (1.0, 0.2, 0.2),
+    'magenta': (1.0, 0.2, 1.0), 'yellow': (1.0, 0.9, 0.1),
+    'white': (1.0, 1.0, 1.0), 'orange': (1.0, 0.6, 0.1),
+}
+
+
+def parse_colour(text, fallback):
+    """A colour name or 'R,G,B' (0-1 or 0-255) as a 0-1 triple."""
+    if not text:
+        return fallback
+    t = str(text).strip().lower()
+    if t in NAMED_COLOURS:
+        return NAMED_COLOURS[t]
+    try:
+        parts = [float(x) for x in t.replace(';', ',').split(',')]
+    except ValueError:
+        return fallback
+    if len(parts) != 3:
+        return fallback
+    if max(parts) > 1.0:
+        parts = [x / 255.0 for x in parts]
+    return tuple(min(max(x, 0.0), 1.0) for x in parts)
+
+
 def norm(name):
     n = str(name).strip()
     low = n.lower()
@@ -126,6 +152,12 @@ def main():
                          'tracer as a heatmap with the SAME vessel and cell '
                          'outlines the first run used, so the two tracers can '
                          'be shown side by side on the same boundaries')
+    ap.add_argument('--vessel-colour', default='green',
+                    help='colour for the vessel outline in the overlays: a '
+                         'name (green, blue, cyan, red, magenta, yellow, '
+                         'white) or R,G,B 0-1 or 0-255')
+    ap.add_argument('--cell-colour', default='blue',
+                    help='colour for the microglia outlines, same forms')
     ap.add_argument('--extra-radius', type=float, default=0.0,
                     help='one more exposure ring in µm; microglia, 10, 20 and '
                          '30 µm are always measured')
@@ -200,9 +232,13 @@ def main():
     # can be compared by eye between images -- and, since the first run used
     # the same rule, between the two tracers. Per-image autoscaling would make
     # a faint image look as bright as a leaking one.
+    v_colour = parse_colour(a.vessel_colour, NAMED_COLOURS['green'])
+    c_colour = parse_colour(a.cell_colour, NAMED_COLOURS['blue'])
     overlay_vmax = None
     if a.overlays:
         os.makedirs(a.overlays, exist_ok=True)
+        print(f"vessels in {a.vessel_colour}, microglia in {a.cell_colour}",
+              flush=True)
         print("measuring one display range across all images…", flush=True)
         vals = []
         for base in todo:
@@ -304,7 +340,8 @@ def main():
                     vessel, {a.tracer: tracer}, cell_masks=drawn_cells,
                     vmax_map=overlay_vmax,
                     source_label=f"{a.tracer} from {os.path.basename(img_path)}"
-                                 f"; vessels {source}")
+                                 f"; vessels {source}",
+                    vessel_colour=v_colour, cell_colour=c_colour)
             except Exception as e:
                 print(f"  (overlay failed: {e})", end='', flush=True)
 
