@@ -182,18 +182,32 @@ def main():
             images.setdefault(norm(os.path.basename(p)), p)
 
     ch = a.tracer_channel - 1
+    print(f"reading tracer '{a.tracer}' from channel {a.tracer_channel}"
+          + (f", CD31 from channel {a.cd31_channel}" if a.reconstruct else ""),
+          flush=True)
     radii = tuple(sorted(set(mmps._EXPOSURE_RADII_UM) |
                          ({float(a.extra_radius)} if a.extra_radius else set())))
     rows, skipped = [], []
     n_reviewed = n_rebuilt = 0
-    for base in sorted(set(vmasks) | set(area_frac)):
+    todo = sorted(set(vmasks) | set(area_frac))
+    print(f"{len(todo)} image(s): {len(vmasks)} with a saved mask, "
+          f"{len(area_frac)} to reconstruct", flush=True)
+    if area_frac and a.tubeness:
+        print("  reconstructing with tubeness — the Sato filter is slow, "
+              "expect tens of seconds per image", flush=True)
+    for i, base in enumerate(todo, 1):
+        # Per image, flushed. Without it a long run is indistinguishable from
+        # a hung one, and the reconstruct path is slow enough to look hung.
+        print(f"  [{i}/{len(todo)}] {base}", end='', flush=True)
         img_path = images.get(base)
         if img_path is None:
+            print("  — no matching image in --images", flush=True)
             skipped.append((base, 'no matching image in --images'))
             continue
         try:
             tracer = load_plane(img_path, ch)
         except Exception as e:
+            print(f"  — could not read channel: {e}", flush=True)
             skipped.append((base, f'could not read channel: {e}'))
             continue
 
@@ -204,6 +218,7 @@ def main():
             try:
                 cd31 = load_plane(img_path, a.cd31_channel - 1)
             except Exception as e:
+                print(f"  — could not read CD31: {e}", flush=True)
                 skipped.append((base, f'could not read CD31: {e}'))
                 continue
             vessel, _ = mmps._segment_vessels(
@@ -212,6 +227,8 @@ def main():
             vessel = np.asarray(vessel) > 0
             source = 'reconstructed'
         if vessel.shape != tracer.shape:
+            print(f"  — mask {vessel.shape} != image {tracer.shape}",
+                  flush=True)
             skipped.append((base, f'vessel mask {vessel.shape} does not match '
                                   f'image {tracer.shape} — are these the same '
                                   f'fields?'))
@@ -223,6 +240,7 @@ def main():
         soma_files = somas.get(base, {})
         ids = sorted(set(per_soma) | set(soma_files))
         if not ids:
+            print("  — no masks or somas for this image", flush=True)
             skipped.append((base, 'no masks or somas for this image'))
             continue
 
@@ -252,6 +270,7 @@ def main():
             n_reviewed += 1
         else:
             n_rebuilt += 1
+        print(f"  — {len(ids)} cells, mask {source}", flush=True)
 
     if not rows:
         # Say WHAT was found, not just that nothing was. The usual cause is
