@@ -162,6 +162,85 @@ def main():
     if os.path.exists(os.path.join(d2, 'x.csv')):
         fails.append("a CSV was written even though it refused")
 
+    # --- images with no saved mask can be REBUILT from the recorded area ---
+    # bbb_vessel_leakage.csv records vessel_area_fraction for every image the
+    # first run measured, and _segment_vessels can segment TO an area
+    # fraction. That reproduces a stated rule rather than decoding a figure.
+    d4 = tempfile.mkdtemp()
+    prior4, imgs4 = build(d4)
+    os.remove(os.path.join(prior4, 'bbb_progress', 'fieldB_vesselmask.tif'))
+    # give the CD31 channel real vessel signal so a re-segmentation has
+    # something to find, and record the area the first run measured
+    for base in ('fieldA', 'fieldB'):
+        p_img = os.path.join(imgs4, base + '.tif')
+        stack = np.asarray(tifffile.imread(p_img)).astype(np.uint16)
+        cd = np.zeros((H, W), np.uint16)
+        cd[38:42, :] = 3000
+        stack[:, :, 0] = cd
+        tifffile.imwrite(p_img, stack)
+    with open(os.path.join(prior4, 'bbb_vessel_leakage.csv'), 'w',
+              newline='') as f:
+        w = csv.DictWriter(f, fieldnames=['image_name',
+                                          'vessel_area_fraction'])
+        w.writeheader()
+        for base in ('fieldA', 'fieldB'):
+            w.writerow({'image_name': base + '.tif',
+                        'vessel_area_fraction': f'{4.0 / H:.4f}'})
+
+    out4 = os.path.join(d4, 'o.csv')
+    p4 = subprocess.run(
+        [sys.executable, TOOL, '--prior', prior4, '--images', imgs4,
+         '--tracer', 'bsa', '--tracer-channel', '3', '--reconstruct',
+         '--cd31-channel', '1', '--pixel-size', str(PX), '--out', out4],
+        capture_output=True, text=True)
+    if p4.returncode != 0:
+        print(p4.stdout + p4.stderr)
+        fails.append(f"--reconstruct exited {p4.returncode}")
+    with open(out4, newline='') as f:
+        rows4 = list(csv.DictReader(f))
+    srcs = {r['image_name']: r.get('bbb_vessel_mask_source') for r in rows4}
+    if srcs.get('fieldA') != 'reviewed':
+        fails.append(f"fieldA has a saved mask but is marked "
+                     f"{srcs.get('fieldA')!r}")
+    if srcs.get('fieldB') != 'reconstructed':
+        fails.append(f"fieldB had no saved mask; it is marked "
+                     f"{srcs.get('fieldB')!r}, so a rebuilt mask could not be "
+                     f"told from a reviewed one")
+    if not any(r['image_name'] == 'fieldB' for r in rows4):
+        fails.append("the image with no saved mask was not measured at all "
+                     "despite --reconstruct")
+    else:
+        fb = [r for r in rows4 if r['image_name'] == 'fieldB']
+        if all(str(r.get('bbb_dist_to_vessel_um', '')).strip() == ''
+               for r in fb):
+            fails.append("a reconstructed image produced only blanks; the "
+                         "rebuilt mask found no vessel")
+
+    # --reconstruct without --cd31-channel must refuse, not guess a plane
+    p5 = subprocess.run(
+        [sys.executable, TOOL, '--prior', prior4, '--images', imgs4,
+         '--tracer', 'bsa', '--tracer-channel', '3', '--reconstruct',
+         '--pixel-size', str(PX), '--out', os.path.join(d4, 'x.csv')],
+        capture_output=True, text=True)
+    if p5.returncode == 0:
+        fails.append("--reconstruct ran without being told which plane is "
+                     "CD31")
+
+    # without --reconstruct the missing image is simply absent, not invented
+    out6 = os.path.join(d4, 'o6.csv')
+    subprocess.run(
+        [sys.executable, TOOL, '--prior', prior4, '--images', imgs4,
+         '--tracer', 'bsa', '--tracer-channel', '3',
+         '--pixel-size', str(PX), '--out', out6],
+        capture_output=True, text=True)
+    with open(out6, newline='') as f:
+        rows6 = list(csv.DictReader(f))
+    if any(r['image_name'] == 'fieldB' for r in rows6):
+        fails.append("an image with no saved mask was measured even without "
+                     "--reconstruct")
+
+    shutil.rmtree(d4, ignore_errors=True)
+
     # --- a mismatched field must be skipped, not measured -------------------
     d3 = tempfile.mkdtemp()
     prior3, imgs3 = build(d3)
@@ -190,7 +269,8 @@ def main():
             print("  " + f)
         sys.exit(1)
     print("OK: a second tracer is measured against the first run's reviewed "
-          "vessel masks, and refused when they were never saved")
+          "masks, rebuilt to the recorded area where none was saved, and "
+          "refused when there is neither")
 
 
 if __name__ == '__main__':

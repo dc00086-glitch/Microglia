@@ -10,16 +10,29 @@ WHAT IS REUSED, AND WHAT IS NOT
     bbb_progress/<image>_vesselmask.tif   the REVIEWED vessel mask. Reused.
     Output/masks/*_mask.tif               the microglia masks. Reused.
     Output/somas/*_soma.tif               the soma outlines. Reused.
-    bbb_overlays/*.png                    NOT usable. These are rendered
-                                          composites -- a drawn outline in a
-                                          lossy picture. Turning one back into
-                                          a binary mask would invent the
-                                          boundary, and every number here is
-                                          measured against that boundary.
+    bbb_overlays/, bbb_vessel_previews/   NOT usable as masks. Both are
+                                          matplotlib figures: a 1.1 px
+                                          anti-aliased contour over greyscale,
+                                          rendered at 110 dpi with a tight
+                                          bounding box. Cropping a panel back
+                                          out, resampling it to image pixels
+                                          and filling an open contour whose
+                                          thin vessels have already collapsed
+                                          would invent the boundary every
+                                          number is measured against.
 
-So this needs the FIRST run to have been made by a build that writes
-bbb_progress/. If that folder is missing, the masks were never saved and the
-vessels have to be reviewed again -- the script says so rather than guessing.
+IMAGES WITH NO SAVED MASK (--reconstruct)
+    bbb_vessel_leakage.csv records vessel_area_fraction for every image the
+    first run measured, and _segment_vessels can segment TO a given area
+    fraction. So a missing mask can be REPRODUCED at the area the measured one
+    had, which is a stated rule rather than a picture decoded.
+
+    This is not the same thing as the saved mask and is not pretended to be.
+    Where the reviewer only moved the sensitivity slider it reproduces that
+    rule's output; where they painted vessels in or erased some, the area
+    matches but the distribution can differ. Every row carries
+    ``bbb_vessel_mask_source`` -- ``reviewed`` or ``reconstructed`` -- so the
+    two can be compared, or the reconstructed ones dropped.
 
     python3 tools/bbb_rerun_tracer.py \
         --prior  "/Volumes/.../Dextran Output" \
@@ -98,6 +111,16 @@ def main():
     ap.add_argument('--tracer-channel', type=int, required=True,
                     help='1-based channel holding the new tracer')
     ap.add_argument('--pixel-size', type=float, required=True, help='µm/px')
+    ap.add_argument('--reconstruct', action='store_true',
+                    help='for images with no saved vessel mask, re-segment '
+                         'their CD31 to the vessel_area_fraction recorded in '
+                         "bbb_vessel_leakage.csv. Needs --cd31-channel.")
+    ap.add_argument('--cd31-channel', type=int, default=None,
+                    help='1-based CD31 channel in the new images; only needed '
+                         'with --reconstruct')
+    ap.add_argument('--tubeness', action='store_true',
+                    help='reconstruct with tubeness enhancement, matching how '
+                         'the first run was segmented')
     ap.add_argument('--extra-radius', type=float, default=0.0,
                     help='one more exposure ring in µm; microglia, 10, 20 and '
                          '30 µm are always measured')
@@ -109,13 +132,34 @@ def main():
     for p in glob.glob(os.path.join(prog, '*_vesselmask.tif')):
         base = os.path.basename(p)[:-len('_vesselmask.tif')]
         vmasks[base] = p
-    if not vmasks:
+    # Area fractions for images whose mask was never saved, so they can be
+    # reproduced at the area the measured mask had.
+    area_frac = {}
+    vcsv = os.path.join(a.prior, 'bbb_vessel_leakage.csv')
+    if a.reconstruct and os.path.exists(vcsv):
+        with open(vcsv, newline='') as f:
+            for r in csv.DictReader(f):
+                base = norm(r.get('image_name', ''))
+                try:
+                    v = float(r.get('vessel_area_fraction', ''))
+                except (TypeError, ValueError):
+                    continue
+                if base and base not in vmasks and v > 0:
+                    area_frac[base] = v
+    if a.reconstruct and a.cd31_channel is None:
+        sys.exit("--reconstruct needs --cd31-channel, to know which plane to "
+                 "re-segment.")
+
+    if not vmasks and not area_frac:
         sys.exit(
             f"No reviewed vessel masks in {prog}\n\n"
             f"That folder is written by MMPS as each image finishes. If the "
-            f"first run predates it, only rendered PNGs were saved and the "
+            f"first run predates it, only rendered figures were saved and the "
             f"vessel boundary cannot be recovered from those -- the vessels "
-            f"have to be reviewed again on the new images.")
+            f"have to be reviewed again on the new images.\n\n"
+            f"If bbb_vessel_leakage.csv is present, --reconstruct can instead "
+            f"re-segment each image to the vessel area fraction that run "
+            f"recorded.")
 
     somas = {}
     for p in glob.glob(os.path.join(a.prior, 'somas', '*_soma.tif*')):
@@ -139,7 +183,8 @@ def main():
     radii = tuple(sorted(set(mmps._EXPOSURE_RADII_UM) |
                          ({float(a.extra_radius)} if a.extra_radius else set())))
     rows, skipped = [], []
-    for base in sorted(vmasks):
+    n_reviewed = n_rebuilt = 0
+    for base in sorted(set(vmasks) | set(area_frac)):
         img_path = images.get(base)
         if img_path is None:
             skipped.append((base, 'no matching image in --images'))
@@ -150,7 +195,20 @@ def main():
             skipped.append((base, f'could not read channel: {e}'))
             continue
 
-        vessel = np.asarray(tifffile.imread(vmasks[base])) > 0
+        if base in vmasks:
+            vessel = np.asarray(tifffile.imread(vmasks[base])) > 0
+            source = 'reviewed'
+        else:
+            try:
+                cd31 = load_plane(img_path, a.cd31_channel - 1)
+            except Exception as e:
+                skipped.append((base, f'could not read CD31: {e}'))
+                continue
+            vessel, _ = mmps._segment_vessels(
+                cd31, a.pixel_size, use_tubeness=a.tubeness,
+                target_area_frac=area_frac[base])
+            vessel = np.asarray(vessel) > 0
+            source = 'reconstructed'
         if vessel.shape != tracer.shape:
             skipped.append((base, f'vessel mask {vessel.shape} does not match '
                                   f'image {tracer.shape} — are these the same '
@@ -184,9 +242,14 @@ def main():
             exp = mmps._microglia_leakage_exposure(
                 cell, vessel, tracers, a.pixel_size, dist_um=dist_um,
                 soma_mask=soma, halo_radii_um=radii)
-            row = {'image_name': base, 'soma_id': sid}
+            row = {'image_name': base, 'soma_id': sid,
+                   'bbb_vessel_mask_source': source}
             row.update(exp)
             rows.append(row)
+        if source == 'reviewed':
+            n_reviewed += 1
+        else:
+            n_rebuilt += 1
 
     if not rows:
         sys.exit("Nothing measured. Check --images points at the new images "
@@ -207,6 +270,12 @@ def main():
     print(f"{len(rows)} cells over {len(set(r['image_name'] for r in rows))} "
           f"images -> {a.out}")
     print(f"  columns: {', '.join(c for c in fields if c.startswith('bbb_'))}")
+    print(f"  {n_reviewed} image(s) used the saved reviewed mask, "
+          f"{n_rebuilt} were reconstructed to the recorded area fraction")
+    if n_rebuilt:
+        print("  a reconstructed mask reproduces the area the measured one "
+              "had, not the measured mask itself — bbb_vessel_mask_source "
+              "marks those rows so they can be compared or dropped")
     if skipped:
         print(f"  {len(skipped)} image(s) skipped:")
         for b, why in skipped[:10]:
