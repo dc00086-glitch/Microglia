@@ -234,6 +234,73 @@ def main():
     shutil.rmtree(d7, ignore_errors=True)
     shutil.rmtree(d8, ignore_errors=True)
 
+    # --- image-level leakage joins onto an existing vessel CSV -------------
+    # The perivascular rings live at IMAGE level, not per cell, so they belong
+    # in bbb_vessel_leakage.csv beside the first tracer's.
+    d9 = tempfile.mkdtemp()
+    prior9, imgs9 = build(d9)
+    vcsv = os.path.join(d9, 'bbb_vessel_leakage.csv')
+    import csv as _c9
+    with open(vcsv, 'w', newline='') as f:
+        w = _c9.DictWriter(f, fieldnames=['image_name', 'vessel_area_fraction',
+                                          'dextran_leakage_index'])
+        w.writeheader()
+        w.writerow({'image_name': 'fieldA.tif', 'vessel_area_fraction': '0.05',
+                    'dextran_leakage_index': '0.40'})
+        w.writerow({'image_name': 'fieldB', 'vessel_area_fraction': '0.06',
+                    'dextran_leakage_index': '0.33'})
+        w.writerow({'image_name': 'never_run.tif',
+                    'vessel_area_fraction': '0.01',
+                    'dextran_leakage_index': '0.10'})
+    p9 = subprocess.run(
+        [sys.executable, TOOL, '--prior', prior9, '--images', imgs9,
+         '--tracer', 'bsa', '--tracer-channel', '3', '--vessel-csv', vcsv,
+         '--pixel-size', str(PX), '--out', os.path.join(d9, 'o.csv')],
+        capture_output=True, text=True)
+    if p9.returncode != 0:
+        print(p9.stdout + p9.stderr)
+        fails.append(f"--vessel-csv exited {p9.returncode}")
+
+    with open(vcsv, newline='') as f:
+        back = list(_c9.DictReader(f))
+    cols = set(back[0]) if back else set()
+    rings = sorted(c for c in cols if 'perivasc' in c)
+    if not rings:
+        fails.append("no perivascular columns were added to the vessel CSV")
+    if not any(c.startswith('bsa_') for c in rings):
+        fails.append(f"the rings are not prefixed with the tracer: {rings}")
+    for need in ('bsa_leakage_index', 'bsa_intravascular_mean',
+                 'bsa_extravascular_mean'):
+        if need not in cols:
+            fails.append(f"{need} was not added")
+
+    by9 = {r['image_name']: r for r in back}
+    if len(back) != 3:
+        fails.append(f"the vessel CSV has {len(back)} rows, expected its own 3")
+    if by9.get('fieldA.tif', {}).get('dextran_leakage_index') != '0.40':
+        fails.append("an existing column was altered")
+    if not str(by9.get('fieldB', {}).get(rings[0] if rings else '', '')).strip():
+        fails.append("a bare image name did not match, so its rings are blank")
+    if str(by9.get('never_run.tif', {}).get(rings[0] if rings else '', 'X')).strip():
+        fails.append("an image this run never measured got a ring value "
+                     "instead of a blank")
+    if not os.path.exists(vcsv + '.bak'):
+        fails.append("the original vessel CSV was rewritten with no backup")
+
+    # running again must not duplicate the columns
+    before_cols = len(cols)
+    subprocess.run(
+        [sys.executable, TOOL, '--prior', prior9, '--images', imgs9,
+         '--tracer', 'bsa', '--tracer-channel', '3', '--vessel-csv', vcsv,
+         '--pixel-size', str(PX), '--out', os.path.join(d9, 'o2.csv')],
+        capture_output=True, text=True)
+    with open(vcsv, newline='') as f:
+        again = list(_c9.DictReader(f))
+    if again and len(set(again[0])) != before_cols:
+        fails.append("running twice changed the column count; the columns are "
+                     "being duplicated or dropped")
+    shutil.rmtree(d9, ignore_errors=True)
+
     # --- images with no saved mask can be REBUILT from the recorded area ---
     # bbb_vessel_leakage.csv records vessel_area_fraction for every image the
     # first run measured, and _segment_vessels can segment TO an area

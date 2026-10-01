@@ -124,6 +124,64 @@ def load_plane(path, channel):
     return np.moveaxis(arr, cax, 0)[channel].astype(np.float64)
 
 
+def _add_vessel_columns(path, image_rows, tracer):
+    """Add one tracer's image-level columns to an existing vessel CSV.
+
+    Joined on image_name. Only columns the file does NOT already have are
+    added, and every existing column and row is written back untouched -- an
+    image this run did not cover keeps what it had and gets BLANKS in the new
+    columns, because a blank says "not measured" where a 0 is a measurement.
+
+    The original is copied to .bak first: this rewrites a file the user's
+    results already live in, and a rewrite with no way back is not something
+    to do quietly.
+    """
+    import csv as _csv
+    import shutil as _sh
+    if not os.path.exists(path):
+        print(f"  --vessel-csv not found, nothing added: {path}")
+        return
+    with open(path, newline='') as f:
+        reader = _csv.DictReader(f)
+        fields = list(reader.fieldnames or [])
+        rows = list(reader)
+    if 'image_name' not in fields:
+        print("  --vessel-csv has no image_name column; cannot join")
+        return
+
+    new_cols = []
+    for r in image_rows.values():
+        for c in r:
+            if c != 'image_name' and c not in fields and c not in new_cols:
+                new_cols.append(c)
+    if not new_cols:
+        print("  --vessel-csv already has every column this would add")
+        return
+
+    _sh.copyfile(path, path + '.bak')
+    hit = 0
+    for r in rows:
+        src = image_rows.get(norm(r.get('image_name', '')))
+        if src:
+            hit += 1
+        for c in new_cols:
+            r[c] = src.get(c, '') if src else ''
+    out_fields = fields + new_cols
+    with open(path, 'w', newline='') as f:
+        w = _csv.DictWriter(f, fieldnames=out_fields, extrasaction='ignore')
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, '') for k in out_fields})
+    rings = [c for c in new_cols if 'perivasc' in c]
+    print(f"  {len(new_cols)} {tracer} column(s) added to "
+          f"{os.path.basename(path)} for {hit}/{len(rows)} rows "
+          f"({len(rings)} perivascular ring(s)); original kept as .bak")
+    missed = len(image_rows) - hit
+    if missed > 0:
+        print(f"    {missed} measured image(s) had no row in that CSV and were "
+              f"not added; it decides which images exist")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--prior', required=True,
@@ -152,6 +210,13 @@ def main():
                          'tracer as a heatmap with the SAME vessel and cell '
                          'outlines the first run used, so the two tracers can '
                          'be shown side by side on the same boundaries')
+    ap.add_argument('--vessel-csv', default=None,
+                    help="an existing bbb_vessel_leakage.csv to ADD this "
+                         "tracer's image-level columns to -- intravascular and "
+                         "extravascular means, the leakage index, and the "
+                         "perivascular rings. Joined on image_name. The "
+                         "original is copied to .bak first and only new "
+                         "columns are added.")
     ap.add_argument('--vessel-colour', default='green',
                     help='colour for the vessel outline in the overlays: a '
                          'name (green, blue, cyan, red, magenta, yellow, '
@@ -224,7 +289,7 @@ def main():
           flush=True)
     radii = tuple(sorted(set(mmps._EXPOSURE_RADII_UM) |
                          ({float(a.extra_radius)} if a.extra_radius else set())))
-    rows, skipped = [], []
+    rows, skipped, image_rows = [], [], {}
     n_reviewed = n_rebuilt = 0
     todo = sorted(set(vmasks) | set(area_frac))
 
@@ -305,6 +370,18 @@ def main():
             print("  — no masks or somas for this image", flush=True)
             skipped.append((base, 'no masks or somas for this image'))
             continue
+
+        # Image-level leakage for the new tracer: intravascular and
+        # extravascular means, the leakage index, and the perivascular rings.
+        # The app's own function against the SAME vessel mask, so these sit
+        # beside the first tracer's columns and mean the same thing.
+        if a.vessel_csv:
+            vrow = {'image_name': base,
+                    '%s_vessel_mask_source' % a.tracer: source}
+            for k, v in mmps._quantify_leakage(
+                    vessel, tracer, a.pixel_size).items():
+                vrow['%s_%s' % (a.tracer, k)] = v
+            image_rows[base] = vrow
 
         drawn_cells = []
         for sid in ids:
@@ -412,6 +489,10 @@ def main():
             print(f"    {b}: {why}")
         if len(skipped) > 10:
             print(f"    ...and {len(skipped) - 10} more")
+    if a.overlays:
+        print(f"  overlays -> {a.overlays}")
+    if a.vessel_csv and image_rows:
+        _add_vessel_columns(a.vessel_csv, image_rows, a.tracer)
     print("\nTick this as the morphology CSV in MMPS's ImageJ merge, or join "
           "it on image_name + soma_id.")
 
