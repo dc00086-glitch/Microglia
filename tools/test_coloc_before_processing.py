@@ -35,6 +35,12 @@ mmps = importlib.util.module_from_spec(spec)
 sys.modules['mmps'] = mmps
 spec.loader.exec_module(mmps)
 
+# MMPS installs a global exception hook that puts the error in a dialog. That
+# is right in the app and fatal in a test: with no one to dismiss the modal the
+# run HANGS instead of failing, so a regression stalls the suite rather than
+# reporting. Importing the module installed it; take it back.
+sys.excepthook = sys.__excepthook__
+
 
 def load(gui, d, names, channels=3):
     for n in names:
@@ -59,6 +65,20 @@ def main():
     fails = []
     assert app is not None
     d = tempfile.mkdtemp()
+
+    # ...and close anything modal that still gets through, for the same reason.
+    from PyQt5.QtWidgets import QDialog
+    from PyQt5.QtCore import QTimer
+
+    def reaper():
+        w = QApplication.activeModalWidget()
+        if w is None:
+            return
+        w.reject() if isinstance(w, QDialog) else w.close()
+
+    timer = QTimer()
+    timer.timeout.connect(reaper)
+    timer.start(25)
 
     gui = mmps.MicrogliaAnalysisGUI()
     load(gui, d, ['b.tif', 'a.tif', 'c.tif'])
@@ -111,7 +131,14 @@ def main():
 
     # --- with nothing loaded it must not invent an image -------------------
     gui5 = mmps.MicrogliaAnalysisGUI()
-    if gui5._ensure_current_image() is not None:
+    # getattr, so a build without the helper is a reported failure rather than
+    # an AttributeError disappearing into the app's own error dialog.
+    ensure = getattr(gui5, '_ensure_current_image', None)
+    if ensure is None:
+        fails.append("_ensure_current_image does not exist, so nothing "
+                     "resolves a current image and every display path stays "
+                     "gated on an image click")
+    elif ensure() is not None:
         fails.append("an image was named with none loaded")
     gui5._toggle_colocalization_mode(True)      # must not raise
     gui5.toggle_color_view()                    # must not raise
@@ -125,6 +152,7 @@ def main():
     if gui6.original_label.pix_source is None:
         fails.append("a single-channel image drew nothing in colour mode")
 
+    timer.stop()
     import shutil
     shutil.rmtree(d, ignore_errors=True)
     shutil.rmtree(d2, ignore_errors=True)
