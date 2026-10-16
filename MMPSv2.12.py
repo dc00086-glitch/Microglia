@@ -11619,9 +11619,9 @@ if __name__ == '__main__':
             self.show_color_view = False
             self.color_toggle_btn.setText("Show Color (C)")
 
-        # Refresh display if an image is loaded
-        if self.current_image_name:
-            self._display_current_image()
+        # Refresh the display. _display_current_image resolves a current image
+        # itself, so this works before anything has been clicked.
+        self._display_current_image()
 
 
     # ----------------------------------------------------------------
@@ -13374,7 +13374,10 @@ if __name__ == '__main__':
     def update_display(self):
         """Update the display with current brightness/contrast settings"""
         try:
-            # Refresh the current image display
+            # Refresh the current image display. Resolve a current image first,
+            # or the C hotkey and the colour button no-op whenever nothing has
+            # been clicked yet.
+            self._ensure_current_image()
             if self.current_image_name and self.current_image_name in self.images:
                 current_tab = self.tabs.currentIndex()
                 img_data = self.images[self.current_image_name]
@@ -13662,6 +13665,11 @@ if __name__ == '__main__':
             self.images[img_name]['selected'] = True
         self.log(f"Selected all {self.file_list.count()} images")
         self._refresh_process_button()
+        # Show one of them. Select All used to tick every box and leave the
+        # canvas blank, so the next thing the user did -- colocalization, the
+        # colour toggle -- had nothing to act on.
+        if self._ensure_current_image():
+            self._display_current_image()
 
     def clear_all_images(self):
         """Deselect all images and uncheck all checkboxes"""
@@ -13726,8 +13734,34 @@ if __name__ == '__main__':
         else:
             self._display_current_image()
 
+    def _ensure_current_image(self):
+        """Point current_image_name at something real when nothing is current.
+
+        EVERY display path is gated on this name, so while it is None the
+        colour toggle, the C hotkey and colocalization mode all silently do
+        nothing: the mode flips, the button text changes, and the canvas never
+        redraws. Clicking an image in the list was the only thing that set it,
+        which is why clicking one appeared to "fix" the colour -- and why
+        turning colocalization on before touching the list looked like a dead
+        app.
+
+        Prefers a selected image, since that is what the user has told the app
+        they care about, and falls back to the first loaded one.
+        """
+        if self.current_image_name and self.current_image_name in self.images:
+            return self.current_image_name
+        if not self.images:
+            return None
+        selected = [n for n, d in self.images.items() if d.get('selected')]
+        self.current_image_name = sorted(selected or self.images)[0]
+        try:
+            self._set_image_name_overlay(self.current_image_name)
+        except Exception:
+            pass
+        return self.current_image_name
+
     def _display_current_image(self):
-        if not self.current_image_name or self.current_image_name not in self.images:
+        if self._ensure_current_image() is None:
             return
         self._set_image_name_overlay()
         try:
