@@ -396,6 +396,34 @@ actually holds the far-red tracer.
 
 ---
 
+## An image with no cells is a zero, not a missing row  *(new)*
+
+Colocalization mode picks somas in two passes -- coloc cells first,
+single-channel cells second. Both per-image colocalization CSVs were built from
+the images that **have** somas:
+
+```python
+picked = [(nm, d) for nm, d in self.images.items() if d.get('somas')]
+```
+
+So an image the user went through in both passes and found no cells on produced
+no row at all. The zero disappeared instead of being recorded, which pulls up
+the mean of every group holding a cell-free section -- a 0/3 animal silently
+became a 2-image animal.
+
+Fixed in `colocalization_counts.csv` and `colocalization_summary.csv`. The zero
+only counts where it was measured: `_load_image_for_soma_picking` records which
+pass each image was shown in (`img_data['coloc_passes_seen']`, persisted in the
+session), and `_coloc_fully_reviewed` admits an image as a zero only once BOTH
+passes have put it on screen. An image the run never reached stays out, and a
+plain non-colocalization picking run still writes nothing.
+
+`percent_coloc` on such a row is blank, not `0.0`: no cells means no proportion
+was measured, and `0.0` would read as "0% colocalized". The summary table's log
+line prints `n/a` there.
+
+Covered by `tools/test_coloc_zero_cells.py`.
+
 ## Other deferred items
 
 * **Smoke-test the app end-to-end.** This session removed 3D mode (~50

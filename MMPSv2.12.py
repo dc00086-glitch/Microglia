@@ -9687,6 +9687,7 @@ echo "Cancel with:   scancel $ARRAY_JOB_ID $MERGE_JOB_ID"
                 'somas': [tuple(float(c) for c in s) for s in img_data.get('somas', [])],
                 'soma_ids': img_data.get('soma_ids', []),
                 'soma_groups': img_data.get('soma_groups', []),
+                'coloc_passes_seen': list(img_data.get('coloc_passes_seen') or []),
                 'soma_outlines': [],
             }
             # Save soma outlines with full metadata (2D only)
@@ -12177,6 +12178,8 @@ if __name__ == '__main__':
                     'somas': [tuple(s) for s in img_session.get('somas', [])],
                     'soma_ids': img_session.get('soma_ids', []),
                     'soma_groups': img_session.get('soma_groups', []),
+                    'coloc_passes_seen': list(
+                        img_session.get('coloc_passes_seen') or []),
                     'masks': [],
                     'status': img_session.get('status', 'loaded'),
                     'selected': img_session.get('selected', False),
@@ -14481,6 +14484,16 @@ if __name__ == '__main__':
         if not self.current_image_name:
             return
         img_data = self.images[self.current_image_name]
+        # Remember that this image was put in front of the user on this pass.
+        # An image reviewed in BOTH coloc passes with nothing clicked is a
+        # measured zero and has to appear in the counts as such; without this
+        # record an image with no cells is indistinguishable from one the run
+        # never reached, so it was silently left out of the CSV.
+        pass_no = getattr(self, '_coloc_soma_pass', 0)
+        if pass_no:
+            seen = img_data.setdefault('coloc_passes_seen', [])
+            if pass_no not in seen:
+                seen.append(pass_no)
         self._set_image_name_overlay()
         # Keep the other tabs on the image the queue has advanced to.
         self._render_original_tab(img_data)
@@ -21581,6 +21594,15 @@ if __name__ == '__main__':
 
         dialog.exec_()
 
+    @staticmethod
+    def _coloc_fully_reviewed(img_data):
+        """True if this image was shown in both colocalization picking passes.
+
+        Only then does "no somas picked" mean a cell-free image rather than one
+        the picking run never reached, so only then may it be counted as zero.
+        """
+        return {1, 2}.issubset(set(img_data.get('coloc_passes_seen') or ()))
+
     def export_coloc_counts(self, auto=False):
         """Per-image colocalization counts straight from the picked somas.
 
@@ -21591,7 +21613,12 @@ if __name__ == '__main__':
         required.
         """
         import csv as _csv
-        picked = [(nm, d) for nm, d in self.images.items() if d.get('somas')]
+        # An image the user went through in both passes without clicking
+        # anything is a measured zero, so it gets a row of its own. Leaving it
+        # out would drop every cell-free image from the comparison and pull the
+        # group averages up with it.
+        picked = [(nm, d) for nm, d in self.images.items()
+                  if d.get('somas') or self._coloc_fully_reviewed(d)]
         if not picked:
             if auto:
                 return
@@ -21599,9 +21626,10 @@ if __name__ == '__main__':
                                 "No somas have been picked yet.")
             return
 
+        reviewed = [d for _, d in picked if self._coloc_fully_reviewed(d)]
         tagged = sum(1 for _, d in picked
                      for g in (d.get('soma_groups') or []) if g)
-        if tagged == 0:
+        if tagged == 0 and not reviewed:
             # Nothing to count. Automatic export happens after every picking
             # session, most of which are not colocalisation runs, so this is
             # the normal case rather than a problem to report.
@@ -21898,6 +21926,22 @@ if __name__ == '__main__':
                                  'timepoint': r.get('timepoint', '')}
             by_image[img]['results'].append(r)
 
+        # Images the user reviewed in both passes without picking a cell have
+        # no rows in `results` at all, because results are per cell. They are
+        # still measured zeros, so give them their own row rather than letting
+        # a cell-free image vanish from the table.
+        for full_name, img_data in self.images.items():
+            if img_data.get('somas') or not self._coloc_fully_reviewed(img_data):
+                continue
+            base = os.path.splitext(full_name)[0]
+            if base in by_image:
+                continue
+            by_image[base] = {'results': [],
+                              'animal_id': img_data.get('animal_id', ''),
+                              'treatment': img_data.get('treatment', ''),
+                              'region': img_data.get('region', ''),
+                              'timepoint': img_data.get('timepoint', '')}
+
         summary_rows = []
         for img_name, data in sorted(by_image.items()):
             img_results = data['results']
@@ -21915,7 +21959,10 @@ if __name__ == '__main__':
                     else:
                         single_cells += 1
 
-            percent_coloc = round((coloc_cells / total_cells) * 100, 2) if total_cells > 0 else 0.0
+            # No cells means no proportion to report; a literal 0.0 here
+            # would read as "0% colocalized", which is not what was measured.
+            percent_coloc = (round((coloc_cells / total_cells) * 100, 2)
+                             if total_cells > 0 else '')
 
             summary_rows.append({
                 'image_name': img_name,
@@ -21948,9 +21995,11 @@ if __name__ == '__main__':
         self.log(f"{'Image':<30} {'Treatment':<15} {'Total':>6} {ch1_name + ' only':>10} {ch2_name + '+' + ch1_name:>12} {'% Coloc':>8}")
         self.log("-" * 85)
         for row in summary_rows:
+            pct = row['percent_coloc']
+            pct_txt = f"{pct:>7.1f}%" if pct != '' else f"{'n/a':>8}"
             self.log(f"{row['image_name']:<30} {row['treatment']:<15} "
                      f"{row['total_cells']:>6} {row[f'{ch1_name}_only']:>10} "
-                     f"{row[f'{ch2_name}+{ch1_name}']:>12} {row['percent_coloc']:>7.1f}%")
+                     f"{row[f'{ch2_name}+{ch1_name}']:>12} {pct_txt}")
         self.log("")
 
     # ----------------------------------------------------------------
