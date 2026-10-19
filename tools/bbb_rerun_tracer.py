@@ -227,10 +227,14 @@ def main():
                          "perivascular rings. Joined on image_name. The "
                          "original is copied to .bak first and only new "
                          "columns are added.")
-    ap.add_argument('--background', action='store_true',
-                    help="add <tracer>_background_mean: the mean of every "
-                         "pixel in the image that is NOT inside a microglia "
-                         "mask and NOT inside the vessel mask. Needs "
+    ap.add_argument('--outside-mean', '--background', action='store_true',
+                    dest='outside_mean',
+                    help="add <tracer>_mean_outside_vessel_and_microglia: the "
+                         "average intensity of every pixel that is NOT inside "
+                         "a vessel mask and NOT inside a microglia mask. Note "
+                         "<tracer>_extravascular_mean already exists and "
+                         "excludes only the VESSEL, so it still contains every "
+                         "microglia pixel -- this is the stricter one. Needs "
                          "--vessel-csv to have somewhere to write it.")
     ap.add_argument('--vessel-colour', default='green',
                     help='colour for the vessel outline in the overlays: a '
@@ -416,7 +420,7 @@ def main():
         # extravascular means, the leakage index, and the perivascular rings.
         # The app's own function against the SAME vessel mask, so these sit
         # beside the first tracer's columns and mean the same thing.
-        if a.vessel_csv or a.background:
+        if a.vessel_csv or a.outside_mean:
             vrow = {'image_name': base,
                     '%s_vessel_mask_source' % a.tracer: source}
             for k, v in mmps._quantify_leakage(
@@ -448,15 +452,18 @@ def main():
                    'bbb_vessel_mask_source': source}
             row.update(exp)
             rows.append(row)
-        if a.background and base in image_rows:
-            # Every pixel that is neither vessel nor microglia, averaged. The
-            # masks are the ones this image was measured with, so the number
-            # describes the same tissue the per-cell columns were taken from.
+        if a.outside_mean and base in image_rows:
+            # The average intensity of every pixel that is neither vessel nor
+            # microglia. NOT named "background": that reads as background
+            # subtraction, and <tracer>_extravascular_mean already means
+            # "outside the vessel" while still containing every microglia
+            # pixel. The name says which pixels are left out.
             occupied = np.asarray(vessel) > 0
             for cm in drawn_cells:
                 occupied |= np.asarray(cm) > 0
             free = ~occupied
-            image_rows[base]['%s_background_mean' % a.tracer] = (
+            image_rows[base]['%s_mean_outside_vessel_and_microglia'
+                             % a.tracer] = (
                 round(float(tracer[free].mean()), 3) if free.any() else '')
 
         if a.overlays:
@@ -543,8 +550,8 @@ def main():
             print(f"    ...and {len(skipped) - 10} more")
     if a.overlays:
         print(f"  overlays -> {a.overlays}")
-    if a.background and not a.vessel_csv:
-        print("  --background needs --vessel-csv to have somewhere to write "
+    if a.outside_mean and not a.vessel_csv:
+        print("  --outside-mean needs --vessel-csv to have somewhere to write "
               "the column; nothing was added")
     if a.vessel_csv and image_rows:
         _add_vessel_columns(a.vessel_csv, image_rows, a.tracer)

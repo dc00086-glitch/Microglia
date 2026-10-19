@@ -301,7 +301,7 @@ def main():
                      "being duplicated or dropped")
     shutil.rmtree(d9, ignore_errors=True)
 
-    # --- background: every pixel outside both masks, averaged --------------
+    # --- the average intensity of every pixel outside both masks -----------
     d12 = tempfile.mkdtemp()
     prior12, imgs12 = build(d12)
     vcsv12 = os.path.join(d12, 'bbb_vessel_leakage.csv')
@@ -330,16 +330,16 @@ def main():
 
     p12 = subprocess.run(
         [sys.executable, TOOL, '--prior', prior12, '--images', imgs12,
-         '--tracer', 'bsa', '--tracer-channel', '3', '--background',
+         '--tracer', 'bsa', '--tracer-channel', '3', '--outside-mean',
          '--vessel-csv', vcsv12, '--pixel-size', str(PX),
          '--out', os.path.join(d12, 'o.csv')],
         capture_output=True, text=True)
     if p12.returncode != 0:
         print(p12.stdout + p12.stderr)
-        fails.append(f"--background exited {p12.returncode}")
+        fails.append(f"--outside-mean exited {p12.returncode}")
     with open(vcsv12, newline='') as f:
         rows12 = list(_c12.DictReader(f))
-    col = 'bsa_background_mean'
+    col = 'bsa_mean_outside_vessel_and_microglia'
     if not rows12 or col not in rows12[0]:
         fails.append(f"{col} was not added to the vessel CSV")
     else:
@@ -353,11 +353,11 @@ def main():
     # --- and without --vessel-csv it says so rather than silently dropping it
     p13 = subprocess.run(
         [sys.executable, TOOL, '--prior', prior12, '--images', imgs12,
-         '--tracer', 'bsa', '--tracer-channel', '3', '--background',
+         '--tracer', 'bsa', '--tracer-channel', '3', '--outside-mean',
          '--pixel-size', str(PX), '--out', os.path.join(d12, 'o2.csv')],
         capture_output=True, text=True)
     if 'needs --vessel-csv' not in p13.stdout:
-        fails.append("--background with nowhere to write said nothing")
+        fails.append("--outside-mean with nowhere to write said nothing")
     shutil.rmtree(d12, ignore_errors=True)
 
     # --- images with no saved mask can be REBUILT from the recorded area ---
