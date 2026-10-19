@@ -301,6 +301,65 @@ def main():
                      "being duplicated or dropped")
     shutil.rmtree(d9, ignore_errors=True)
 
+    # --- background: every pixel outside both masks, averaged --------------
+    d12 = tempfile.mkdtemp()
+    prior12, imgs12 = build(d12)
+    vcsv12 = os.path.join(d12, 'bbb_vessel_leakage.csv')
+    import csv as _c12
+    with open(vcsv12, 'w', newline='') as f:
+        w = _c12.DictWriter(f, fieldnames=['image_name'])
+        w.writeheader()
+        for b in ('fieldA', 'fieldB'):
+            w.writerow({'image_name': b + '.tif'})
+
+    # Paint the tracer so the answer is known: 1000 everywhere the masks cover,
+    # 100 everywhere else. A correct background mean is 100 -- anything near
+    # 1000 means masked pixels are being counted.
+    vm12 = np.zeros((H, W), bool)
+    vm12[38:42, :] = True
+    cells12 = np.zeros((H, W), bool)
+    for r0 in (34, 66):
+        cells12[r0:r0 + 6, 20:26] = True
+    for b in ('fieldA', 'fieldB'):
+        ip = os.path.join(imgs12, b + '.tif')
+        st = np.asarray(tifffile.imread(ip)).astype(np.uint16)
+        plane = np.full((H, W), 100, np.uint16)
+        plane[vm12 | cells12] = 1000
+        st[:, :, 2] = plane
+        tifffile.imwrite(ip, st)
+
+    p12 = subprocess.run(
+        [sys.executable, TOOL, '--prior', prior12, '--images', imgs12,
+         '--tracer', 'bsa', '--tracer-channel', '3', '--background',
+         '--vessel-csv', vcsv12, '--pixel-size', str(PX),
+         '--out', os.path.join(d12, 'o.csv')],
+        capture_output=True, text=True)
+    if p12.returncode != 0:
+        print(p12.stdout + p12.stderr)
+        fails.append(f"--background exited {p12.returncode}")
+    with open(vcsv12, newline='') as f:
+        rows12 = list(_c12.DictReader(f))
+    col = 'bsa_background_mean'
+    if not rows12 or col not in rows12[0]:
+        fails.append(f"{col} was not added to the vessel CSV")
+    else:
+        vals = [float(r[col]) for r in rows12 if r.get(col, '').strip()]
+        if not vals:
+            fails.append("every background value came back blank")
+        elif max(abs(v - 100.0) for v in vals) > 1.0:
+            fails.append(f"background came out {vals}, expected ~100 — pixels "
+                         f"inside a mask are being counted (they are 1000)")
+
+    # --- and without --vessel-csv it says so rather than silently dropping it
+    p13 = subprocess.run(
+        [sys.executable, TOOL, '--prior', prior12, '--images', imgs12,
+         '--tracer', 'bsa', '--tracer-channel', '3', '--background',
+         '--pixel-size', str(PX), '--out', os.path.join(d12, 'o2.csv')],
+        capture_output=True, text=True)
+    if 'needs --vessel-csv' not in p13.stdout:
+        fails.append("--background with nowhere to write said nothing")
+    shutil.rmtree(d12, ignore_errors=True)
+
     # --- images with no saved mask can be REBUILT from the recorded area ---
     # bbb_vessel_leakage.csv records vessel_area_fraction for every image the
     # first run measured, and _segment_vessels can segment TO an area

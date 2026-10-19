@@ -227,6 +227,11 @@ def main():
                          "perivascular rings. Joined on image_name. The "
                          "original is copied to .bak first and only new "
                          "columns are added.")
+    ap.add_argument('--background', action='store_true',
+                    help="add <tracer>_background_mean: the mean of every "
+                         "pixel in the image that is NOT inside a microglia "
+                         "mask and NOT inside the vessel mask. Needs "
+                         "--vessel-csv to have somewhere to write it.")
     ap.add_argument('--vessel-colour', default='green',
                     help='colour for the vessel outline in the overlays: a '
                          'name (green, blue, cyan, red, magenta, yellow, '
@@ -411,7 +416,7 @@ def main():
         # extravascular means, the leakage index, and the perivascular rings.
         # The app's own function against the SAME vessel mask, so these sit
         # beside the first tracer's columns and mean the same thing.
-        if a.vessel_csv:
+        if a.vessel_csv or a.background:
             vrow = {'image_name': base,
                     '%s_vessel_mask_source' % a.tracer: source}
             for k, v in mmps._quantify_leakage(
@@ -443,6 +448,17 @@ def main():
                    'bbb_vessel_mask_source': source}
             row.update(exp)
             rows.append(row)
+        if a.background and base in image_rows:
+            # Every pixel that is neither vessel nor microglia, averaged. The
+            # masks are the ones this image was measured with, so the number
+            # describes the same tissue the per-cell columns were taken from.
+            occupied = np.asarray(vessel) > 0
+            for cm in drawn_cells:
+                occupied |= np.asarray(cm) > 0
+            free = ~occupied
+            image_rows[base]['%s_background_mean' % a.tracer] = (
+                round(float(tracer[free].mean()), 3) if free.any() else '')
+
         if a.overlays:
             # The SAME vessel and cell outlines as the first run, over the new
             # tracer. That is what makes the two figures comparable: anything
@@ -527,6 +543,9 @@ def main():
             print(f"    ...and {len(skipped) - 10} more")
     if a.overlays:
         print(f"  overlays -> {a.overlays}")
+    if a.background and not a.vessel_csv:
+        print("  --background needs --vessel-csv to have somewhere to write "
+              "the column; nothing was added")
     if a.vessel_csv and image_rows:
         _add_vessel_columns(a.vessel_csv, image_rows, a.tracer)
     print("\nTick this as the morphology CSV in MMPS's ImageJ merge, or join "
