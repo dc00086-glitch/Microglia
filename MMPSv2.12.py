@@ -19611,18 +19611,37 @@ if __name__ == '__main__':
             self.log("=" * 50)
             self.log("🎨 Calculating colocalization metrics...")
             coloc_count = 0
-            # Build O(1) lookup: (image_base, soma_id) -> flat_data
+            # One entry per APPROVED MASK, not per cell. Results carry one row
+            # per approved mask size, and QA approves every size at or below
+            # the one chosen -- so a cell sized at 400 has six rows. Keying
+            # this by (image, soma) alone collapsed them: the dict kept
+            # whichever mask came last, and since the flat list runs largest
+            # first that was always the SMALLEST approved mask. Every row of a
+            # cell then reported the small mask's colocalisation -- its pixel
+            # counts, its overlap fraction, its correlation -- while claiming
+            # to describe its own size.
             mask_lookup = {}
             for flat_data in self.all_masks_flat:
-                if flat_data['mask_data'].get('approved'):
-                    key = (os.path.splitext(flat_data['image_name'])[0],
-                           flat_data['mask_data'].get('soma_id'))
-                    mask_lookup[key] = flat_data
+                md = flat_data['mask_data']
+                if not md.get('approved'):
+                    continue
+                base = os.path.splitext(flat_data['image_name'])[0]
+                area = md.get('target_area_um2', md.get('area_um2', None))
+                try:
+                    area = int(float(area)) if area is not None else None
+                except (ValueError, TypeError):
+                    area = None
+                mask_lookup[(base, md.get('soma_id'), area)] = flat_data
 
             for i, result in enumerate(all_results):
                 img_name = result.get('image_name', '')
-                key = (img_name, result.get('soma_id'))
-                flat_data = mask_lookup.get(key)
+                r_area = result.get('target_area_um2', None)
+                try:
+                    r_area = int(float(r_area)) if r_area is not None else None
+                except (ValueError, TypeError):
+                    r_area = None
+                flat_data = mask_lookup.get((img_name, result.get('soma_id'),
+                                             r_area))
                 if flat_data:
                     # Reload from disk if evicted
                     if flat_data['mask_data'].get('mask') is None:
@@ -19634,7 +19653,9 @@ if __name__ == '__main__':
                         result.update(coloc_results)
                         if coloc_results.get('coloc_status') == 'ok':
                             coloc_count += 1
-            self.log(f"✓ Colocalization calculated for {coloc_count}/{len(all_results)} cells")
+            self.log(f"✓ Colocalization calculated for {coloc_count}/"
+                     f"{len(all_results)} masks "
+                     f"({len({(r.get('image_name'), r.get('soma_id')) for r in all_results})} cells)")
 
         # Calculate nearest neighbor distance for each cell
         self.log("Calculating nearest neighbor distances...")
@@ -19663,7 +19684,9 @@ if __name__ == '__main__':
         self.log("=" * 50)
         self.log(f"✓ Simple characteristics calculated for {len(all_results)} cells")
         if self.colocalization_mode:
-            coloc_ok = sum(1 for r in all_results if r.get('coloc_status') == 'ok')
+            coloc_ok = len({(r.get('image_name'), r.get('soma_id'))
+                            for r in all_results
+                            if r.get('coloc_status') == 'ok'})
             self.log(f"✓ Colocalization metrics calculated for {coloc_ok} cells")
         self.log(f"✓ Masks exported to: {self.masks_dir}")
         self.log("")
@@ -19676,7 +19699,9 @@ if __name__ == '__main__':
 
         success_msg = f"Simple characteristics calculated for {len(all_results)} cells!\n\n"
         if self.colocalization_mode:
-            coloc_ok = sum(1 for r in all_results if r.get('coloc_status') == 'ok')
+            coloc_ok = len({(r.get('image_name'), r.get('soma_id'))
+                            for r in all_results
+                            if r.get('coloc_status') == 'ok'})
             success_msg += f"Colocalization metrics: {coloc_ok} cells\n\n"
         success_msg += f"Masks exported to:\n{self.masks_dir}\n\n"
         success_msg += "NEXT STEP:\nRun the ImageJ macro (imagej_batch_analysis.ijm)\nto calculate Sholl & Skeleton parameters."
@@ -20117,15 +20142,40 @@ if __name__ == '__main__':
         summary_rows = []
         for img_name, data in sorted(by_image.items()):
             img_results = data['results']
-            total_cells = len(img_results)
+
+            # One CELL per soma, not one per row. Results hold one row per
+            # approved mask size and QA approves every size up to the chosen
+            # one, so counting rows counted a cell once for each size it kept
+            # -- inflating every total, and weighting the percentage towards
+            # the cells that happened to accept the most sizes.
+            cells = {}
+            for r in img_results:
+                sid = r.get('soma_id', '')
+                try:
+                    a = float(r.get('target_area_um2') or 0)
+                except (ValueError, TypeError):
+                    a = 0.0
+                # Keep the LARGEST accepted size as the cell's representative.
+                # The signal-based fallback below reads pixel counts off it, and
+                # the largest accepted mask is the one holding the whole cell --
+                # a small one can miss a process carrying the second stain and
+                # report the cell as single-channel. Chosen explicitly rather
+                # than inherited from whatever order the rows arrived in.
+                prev = cells.get(sid)
+                if prev is None or a > prev[0]:
+                    cells[sid] = (a, r)
+            cells = {k: v[1] for k, v in cells.items()}
+            total_cells = len(cells)
 
             # Count cells by soma_group
-            coloc_cells = sum(1 for r in img_results if r.get('soma_group') == 'coloc')
-            single_cells = sum(1 for r in img_results if r.get('soma_group') == 'single_channel')
+            coloc_cells = sum(1 for r in cells.values()
+                              if r.get('soma_group') == 'coloc')
+            single_cells = sum(1 for r in cells.values()
+                               if r.get('soma_group') == 'single_channel')
 
             # If soma_groups weren't used, fall back to signal-based counting
             if coloc_cells == 0 and single_cells == 0:
-                for r in img_results:
+                for r in cells.values():
                     if r.get('coloc_status') == 'ok' and r.get('n_coloc_pixels', 0) > 0:
                         coloc_cells += 1
                     else:
