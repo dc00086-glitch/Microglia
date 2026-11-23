@@ -19230,7 +19230,18 @@ if __name__ == '__main__':
         # sixteen masks, so tile size was capped by width while most of the
         # height went unused -- the masks came out small with a dead band below
         # them. Every split is cheap to evaluate, so just try them all.
-        label_h = 20
+        # Height of the T:/A: strip under each thumbnail. Measured from a real
+        # label rather than assumed: the constant here was 20 against an actual
+        # 13, and the difference came off the tile height on EVERY row, so the
+        # thumbnails came out smaller than they needed to be for about half of
+        # all mask counts. Measuring also keeps it right at other font sizes
+        # and screen scalings, where any fixed number would drift.
+        label_h = getattr(self, '_qa_area_label_h', None)
+        if label_h is None:
+            _probe = QLabel("T:000")
+            _probe.setStyleSheet("font-size: 10px; font-weight: bold;")
+            label_h = max(8, _probe.sizeHint().height())
+            self._qa_area_label_h = label_h
         n_cols, n_rows, thumb_size = 1, n_masks, 80
         for cols in range(1, n_masks + 1):
             rows = (n_masks + cols - 1) // cols
