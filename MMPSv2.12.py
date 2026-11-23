@@ -3919,8 +3919,9 @@ class VesselReviewDialog(QDialog):
     response) is computed once per tubeness state and cached, so dragging the
     slider only re-thresholds and is instant.
 
-    result: 'accept' (use this mask), 'accept_all' (use these settings for every
-    remaining image without asking), or 'skip'.
+    result: 'accept' (use this mask) or 'skip'. Every image is reviewed on its
+    own: staining strength and vessel density vary enough between images that a
+    threshold confirmed on one is not evidence about the next.
     """
 
     def __init__(self, parent, cd31, pixel_size_um, img_name,
@@ -4053,7 +4054,9 @@ class VesselReviewDialog(QDialog):
         prow.addWidget(QLabel("Brush:"))
         self.brush_spin = QSpinBox()
         self.brush_spin.setRange(1, 100)
-        self.brush_spin.setValue(12)
+        # Vessels are drawn over at full-frame zoom, where a small brush means
+        # dozens of strokes per image.
+        self.brush_spin.setValue(40)
         self.brush_spin.setSuffix(" px")
         prow.addWidget(self.brush_spin)
         self.only_marked_check = QCheckBox("Keep only marked vessels")
@@ -4127,12 +4130,9 @@ class VesselReviewDialog(QDialog):
         accept_btn = QPushButton("Use this mask")
         accept_btn.setDefault(True)
         accept_btn.clicked.connect(lambda: self._finish('accept'))
-        all_btn = QPushButton("Use for ALL remaining images")
-        all_btn.clicked.connect(lambda: self._finish('accept_all'))
         skip_btn = QPushButton("Skip this image")
         skip_btn.clicked.connect(lambda: self._finish('skip'))
         btns.addWidget(accept_btn)
-        btns.addWidget(all_btn)
         btns.addWidget(skip_btn)
         layout.addLayout(btns)
 
@@ -4359,7 +4359,7 @@ class BBBAnalysisDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Blood-Brain-Barrier Analysis")
         self.setModal(True)
-        from PyQt5.QtWidgets import QComboBox, QSpinBox, QLineEdit
+        from PyQt5.QtWidgets import QComboBox, QSpinBox, QLineEdit, QSizePolicy
         n = 4
         if color_image is not None and getattr(color_image, 'ndim', 0) == 3:
             n = color_image.shape[2]
@@ -4378,28 +4378,68 @@ class BBBAnalysisDialog(QDialog):
             combo.setCurrentIndex(idx if idx >= 0 else 0)
             return combo
 
+        # Keeps the tracer header and its rows in the same columns.
+        _TRACER_LABEL_W = 24
+
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            "<b>Assign channels</b> (leak tracers must be intravascular):"))
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
 
-        cd31_row = QHBoxLayout()
-        cd31_row.addWidget(QLabel("CD31 (vessels):"))
+        intro = QLabel("Say which channel holds each stain. Leak tracers must "
+                       "be intravascular — the analysis measures how far they "
+                       "have left the vessel.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: gray;")
+        layout.addWidget(intro)
+
+        # --- channels -------------------------------------------------
+        # A form, so every control starts at the same x. Each row used to build
+        # its own horizontal box, which left the dropdowns in a ragged column
+        # whose indent changed with the length of the label beside it.
+        ch_group = QGroupBox("Channels")
+        ch_form = QFormLayout()
+        ch_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        ch_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        ch_form.setHorizontalSpacing(10)
+        ch_form.setVerticalSpacing(8)
         self.cd31_combo = channel_combo(defaults.get('cd31', 0), allow_none=False)
-        cd31_row.addWidget(self.cd31_combo)
-        layout.addLayout(cd31_row)
-
-        iba1_row = QHBoxLayout()
-        iba1_row.addWidget(QLabel("IBA1 (microglia, optional):"))
+        self.cd31_combo.setMinimumWidth(150)
+        ch_form.addRow("CD31 (vessels):", self.cd31_combo)
         self.iba1_combo = channel_combo(defaults.get('iba1', -1), allow_none=True)
-        iba1_row.addWidget(self.iba1_combo)
-        layout.addLayout(iba1_row)
+        self.iba1_combo.setMinimumWidth(150)
+        ch_form.addRow("IBA1 (microglia):", self.iba1_combo)
+        ch_group.setLayout(ch_form)
+        layout.addWidget(ch_group)
+
+        # --- tracers --------------------------------------------------
+        tr_group = QGroupBox("Leak tracers")
+        tr_layout = QVBoxLayout()
+        tr_layout.setSpacing(8)
 
         nt_row = QHBoxLayout()
-        nt_row.addWidget(QLabel("Number of tracers:"))
+        nt_row.addWidget(QLabel("How many:"))
         self.ntracer_spin = QSpinBox()
         self.ntracer_spin.setRange(1, max(1, self.num_channels))
+        self.ntracer_spin.setFixedWidth(60)
         nt_row.addWidget(self.ntracer_spin)
-        layout.addLayout(nt_row)
+        nt_row.addStretch()
+        tr_layout.addLayout(nt_row)
+
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(0, 4, 0, 0)
+        # The first column holds only the row number, so the heading for the
+        # name field has to start after it, not in it -- "Name" does not fit in
+        # the number's width and was clipped to "Na".
+        _spacer = QLabel("")
+        _spacer.setFixedWidth(_TRACER_LABEL_W)
+        hdr.addWidget(_spacer)
+        _h2 = QLabel("Name  <span style='color: gray;'>— becomes the column "
+                     "prefix</span>")
+        hdr.addWidget(_h2, 1)
+        _h3 = QLabel("Channel")
+        _h3.setFixedWidth(150)
+        hdr.addWidget(_h3)
+        tr_layout.addLayout(hdr)
 
         default_tracers = defaults.get('tracers') or [
             {'name': 'red_dextran', 'channel': 1 if self.num_channels > 1 else 0},
@@ -4409,62 +4449,105 @@ class BBBAnalysisDialog(QDialog):
             w = QWidget()
             rl = QHBoxLayout(w)
             rl.setContentsMargins(0, 0, 0, 0)
-            rl.addWidget(QLabel(f"Tracer {i + 1} name:"))
+            rl.setSpacing(10)
+            num = QLabel(f"{i + 1}.")
+            num.setFixedWidth(_TRACER_LABEL_W)
+            rl.addWidget(num)
             name_edit = QLineEdit()
             dt = default_tracers[i] if i < len(default_tracers) else {}
             name_edit.setText(dt.get('name', f"tracer{i + 1}"))
             name_edit.setPlaceholderText("e.g. red_dextran")
-            rl.addWidget(name_edit)
-            rl.addWidget(QLabel("channel:"))
+            rl.addWidget(name_edit, 1)
             combo = channel_combo(dt.get('channel', min(i + 1, self.num_channels - 1)),
                                   allow_none=False)
+            combo.setFixedWidth(150)
             rl.addWidget(combo)
-            layout.addWidget(w)
+            tr_layout.addWidget(w)
             self.tracer_rows.append((w, name_edit, combo))
+
+        tr_group.setLayout(tr_layout)
+        layout.addWidget(tr_group)
+
+        def _fit_height():
+            # Qt's own minimum for this dialog comes out shorter than the
+            # content needs, because it measures the wrapped labels at their
+            # shortest. Dragged down to that minimum, the group boxes were
+            # compressed and the tracer rows drew over one another. Take the
+            # minimum from the layout instead, releasing it first so hiding a
+            # tracer row can still shrink the dialog.
+            self.setMinimumHeight(0)
+            self.setMinimumHeight(self.sizeHint().height())
 
         def _update_visible(nt):
             for j, (row_w, _, _) in enumerate(self.tracer_rows):
                 row_w.setVisible(j < nt)
+            _fit_height()
+            if self.isVisible():
+                self.adjustSize()
         self.ntracer_spin.valueChanged.connect(_update_visible)
         self.ntracer_spin.setValue(min(len(default_tracers), max(1, self.num_channels)) or 1)
         _update_visible(self.ntracer_spin.value())
 
-        self.tubeness_check = QCheckBox(
-            "Enhance vessels with tubeness (Sato) — recommended for faint CD31")
+        # --- vessel detection -----------------------------------------
+        vd_group = QGroupBox("Vessel detection")
+        vd_layout = QVBoxLayout()
+        vd_layout.setSpacing(8)
+
+        self.tubeness_check = QCheckBox("Enhance faint vessels (tubeness)")
         # On by default: plain Otsu splits a hazy CD31 background into large
         # blobs instead of finding the thin vessel slits (measured ~39% "vessel"
         # area vs ~3% with tubeness). Untick only if your CD31 is high-contrast.
         self.tubeness_check.setChecked(True)
         self.tubeness_check.setToolTip(
-            "Runs a multi-scale ridge filter before thresholding so thin, faint "
-            "vessels are found instead of bright background patches.")
-        layout.addWidget(self.tubeness_check)
+            "Recommended for faint CD31. Runs a multi-scale ridge filter before "
+            "thresholding so thin, faint vessels are found instead of bright "
+            "background patches. Untick only if your CD31 is high-contrast.")
+        vd_layout.addWidget(self.tubeness_check)
 
-        self.review_check = QCheckBox(
-            "Manually review the vessel mask for each image before measuring")
+        self.review_check = QCheckBox("Review each vessel mask before measuring")
         self.review_check.setChecked(True)
         self.review_check.setToolTip(
             "Shows the CD31 image with the vessel outline and a sensitivity "
-            "slider so you can confirm or adjust it. You can accept settings "
-            "for all remaining images from inside that dialog.")
-        layout.addWidget(self.review_check)
+            "slider so you can confirm or adjust it, one image at a time.")
+        vd_layout.addWidget(self.review_check)
+        vd_group.setLayout(vd_layout)
+        layout.addWidget(vd_group)
 
-        note = QLabel("Runs on all loaded images with masks. Saves leak overlays\n"
-                      "(bbb_overlays/), an Otsu-vs-tubeness vessel comparison\n"
-                      "(bbb_vessel_previews/), and folds per-cell exposure into\n"
-                      "the morphology master CSV.")
+        note = QLabel(
+            "Runs on every loaded image that has masks. Writes leak overlays to "
+            "<b>bbb_overlays/</b>, an Otsu-vs-tubeness comparison to "
+            "<b>bbb_vessel_previews/</b>, and folds per-cell exposure into the "
+            "morphology master CSV. Nothing existing is overwritten.")
+        note.setWordWrap(True)
         note.setStyleSheet("color: gray;")
         layout.addWidget(note)
 
+        # A wrapped label's height depends on the width it is given, and a
+        # vertical box layout does not account for that: it computes a minimum
+        # from the labels at their shortest, then the labels wrap to more lines
+        # than that and the difference comes out of the group boxes, which were
+        # compressed to two-thirds of their height with the tracer rows drawn
+        # over one another. Fixing their vertical policy makes them
+        # incompressible, so the dialog grows instead.
+        for _g in (ch_group, tr_group, vd_group):
+            _g.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+        layout.addStretch()
+
         btns = QHBoxLayout()
-        run_btn = QPushButton("Run BBB Analysis")
-        run_btn.setDefault(True)
-        run_btn.clicked.connect(self.accept)
+        btns.addStretch()
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        btns.addWidget(run_btn)
         btns.addWidget(cancel_btn)
+        run_btn = QPushButton("Run BBB Analysis")
+        run_btn.setDefault(True)
+        run_btn.setStyleSheet("font-weight: bold; padding: 6px 14px;")
+        run_btn.clicked.connect(self.accept)
+        btns.addWidget(run_btn)
         layout.addLayout(btns)
+
+        self.setMinimumWidth(560)
+        _fit_height()
 
     def get_channels(self):
         import re
@@ -10130,13 +10213,6 @@ if __name__ == '__main__':
                     target_area_pct = st['target_area_pct']
                     reviewed_mask = st['mask']
                     self.bbb_use_tubeness = use_tube
-                    if st['action'] == 'accept_all':
-                        review_vessels = False
-                        rule = (f"target area {target_area_pct:.1f}%"
-                                if target_area_pct else
-                                f"sensitivity {thr_scale:.2f}x")
-                        self.log(f"BBB: using reviewed settings (tubeness="
-                                 f"{use_tube}, {rule}) for all remaining images")
                 vessel_mask, vmetrics = _segment_vessels(
                     cd31, ps, use_tubeness=use_tube, thr_scale=thr_scale,
                     vessel_mask=reviewed_mask,
