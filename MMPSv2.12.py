@@ -13309,6 +13309,10 @@ if __name__ == '__main__':
         removed_id = img_data['soma_ids'].pop() if img_data['soma_ids'] else None
         if img_data.get('soma_groups'):
             img_data['soma_groups'].pop()
+        # Nothing renumbers here, but the entry still has to go: the next soma
+        # picked lands on this index and would inherit the old score.
+        self._drop_ml_confidence_at(self.current_image_name,
+                                    len(img_data['somas']), shift=False)
 
         if self._color_display(img_data):
             # Use processed channel in color composite if available
@@ -14767,6 +14771,8 @@ if __name__ == '__main__':
             img_data['soma_ids'].pop(soma_idx)
         if soma_idx < len(img_data.get('soma_groups', [])):
             img_data['soma_groups'].pop(soma_idx)
+        # Keyed by position, so it renumbers with the lists above.
+        self._drop_ml_confidence_at(img_name, soma_idx)
 
         # Fix soma_idx references in remaining outlines (shift down indices above the removed one)
         for ol in img_data.get('soma_outlines', []):
@@ -15415,6 +15421,37 @@ if __name__ == '__main__':
                             f"{area_um2:.2f}"])
         except Exception:
             pass
+
+    def _drop_ml_confidence_at(self, img_name, soma_idx, shift=True):
+        """Keep the confidence map aligned when a soma is removed.
+
+        It is keyed by POSITION in the image's soma list, so removing a soma
+        from the middle renumbers every soma after it and silently leaves each
+        remaining entry pointing at its neighbour. The badge then shows the
+        wrong cell's confidence, and -- worse -- the wrong number is written to
+        soma_ml_feedback.csv, which is what the model's accuracy is measured
+        from afterwards.
+
+        `shift=False` for a removal from the END, where nothing renumbers but
+        the entry must still go, or the next soma picked into that position
+        inherits the dead one's score.
+        """
+        conf = getattr(self, 'ml_confidence', None)
+        if not conf:
+            return
+        out = {}
+        for (nm, idx), v in conf.items():
+            if nm != img_name:
+                out[(nm, idx)] = v
+            elif idx < soma_idx:
+                out[(nm, idx)] = v
+            elif idx == soma_idx:
+                continue
+            elif shift:
+                out[(nm, idx - 1)] = v
+            else:
+                out[(nm, idx)] = v
+        self.ml_confidence = out
 
     def _record_ml_confidence(self, img_name, soma_idx, conf):
         """Remember how much the model trusted one outline."""
