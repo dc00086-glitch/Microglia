@@ -792,6 +792,11 @@ def _sigmas_for_width(max_width_px):
                          for s in np.geomspace(1.0, hi, n)}))
 
 
+#: Intensity percentile the CD31 channel is clipped to before thresholding, so
+#: a handful of saturated pixels cannot drag Otsu up past every real vessel.
+_VESSEL_CLIP_PCT = 99.9
+
+
 def _vessel_response(cd31, use_tubeness=False, sigmas=_VESSEL_TUBENESS_SIGMAS):
     """Return (response, otsu_threshold) for the CD31 channel.
 
@@ -804,6 +809,18 @@ def _vessel_response(cd31, use_tubeness=False, sigmas=_VESSEL_TUBENESS_SIGMAS):
     img = np.asarray(cd31, dtype=np.float64)
     if img.max() <= 0 or not np.any(img > 0):
         return np.zeros(img.shape, dtype=np.float64), 0.0
+    # Saturated specks -- hot pixels, dust, a bright edge artefact -- are a few
+    # pixels at the sensor ceiling, and Otsu then splits THOSE from everything
+    # else. Measured on a synthetic frame: one saturated pixel moved the
+    # threshold from 654 to 2102, three pixels cleared it, the minimum-object
+    # filter removed those three, and the image reported NO VESSELS AT ALL --
+    # area fraction zero, every cell infinitely far from a vessel, no error.
+    # Clipping at a high percentile removes their influence and leaves real
+    # vessels alone: they are extended, so they sit well below it. On the same
+    # frame this moved the clean threshold by 1%.
+    hi = float(np.percentile(img[img > 0], _VESSEL_CLIP_PCT))
+    if hi > 0:
+        img = np.minimum(img, hi)
     if use_tubeness:
         from skimage.filters import sato
         mx = float(img.max())
@@ -10069,6 +10086,7 @@ if __name__ == '__main__':
                             if channels.get(n, -1) >= 0]
         vessel_rows, cell_rows, n_imgs = [], [], 0
         skipped_imgs = []      # images that could not be analysed, with reason
+        self._bbb_no_vessels = []   # segmented, but the mask came out empty
         review_vessels = bool(channels.get('review_vessels', False))
         thr_scale = 1.0        # carried forward once the user accepts settings
         target_area_pct = None  # if set, the same target area rule for all images
@@ -10218,6 +10236,14 @@ if __name__ == '__main__':
                     vessel_mask=reviewed_mask,
                     target_area_frac=(target_area_pct / 100.0
                                       if target_area_pct else None))
+                # An empty mask is not a measurement. Every number downstream
+                # still comes out -- area fraction zero, every cell infinitely
+                # far from a vessel, leakage index zero -- and all of it looks
+                # like a finding rather than a failed segmentation.
+                if not np.any(vessel_mask):
+                    self._bbb_no_vessels.append(img_base)
+                    self.log(f"BBB: ⚠ NO VESSELS found in {img_base} — its "
+                             f"rows are zeros, not measurements")
                 # Save an Otsu-vs-tubeness vessel comparison so the choice is visible.
                 try:
                     prev_dir = os.path.join(out_dir, 'bbb_vessel_previews')
@@ -10417,6 +10443,20 @@ if __name__ == '__main__':
             f"Done: {n_imgs} images, {len(cell_rows)} microglia.\n"
             f"{merged_msg}\n"
             f"Leak overlays saved to bbb_overlays/ in:\n{out_dir}")
+        if self._bbb_no_vessels:
+            names = "\n".join(f"  {n}" for n in self._bbb_no_vessels[:12])
+            more = (f"\n  ...and {len(self._bbb_no_vessels) - 12} more"
+                    if len(self._bbb_no_vessels) > 12 else "")
+            self.log(f"BBB: ⚠ {len(self._bbb_no_vessels)} image(s) produced an "
+                     f"empty vessel mask")
+            QMessageBox.warning(
+                self, "No vessels found",
+                f"{len(self._bbb_no_vessels)} image(s) came out with NO "
+                f"vessels:\n\n{names}{more}\n\nTheir rows are zeros, not "
+                f"measurements — area fraction 0, every cell reading as far "
+                f"from a vessel. Exclude them, or re-run those images with "
+                f"the vessel review and adjust the sensitivity.")
+
         if skipped_imgs:
             lines = "\n".join(f"  {n}  ({why})" for n, why in skipped_imgs[:12])
             more = (f"\n  ...and {len(skipped_imgs) - 12} more"
